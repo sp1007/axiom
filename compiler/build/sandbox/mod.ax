@@ -1,0 +1,740 @@
+// Hermetic Build Sandbox, Filesystem/Environment/Network/Clock Isolation
+// (`compiler/build/sandbox/mod.ax`, T863 / E20.4).
+//
+// Implements SPEC-113 §2 (`AXS-HERM-010`..`AXS-HERM-015`, `AXS-HERM-050`..`AXS-HERM-053`,
+// `INV-HERM-001`, `REQ-PKG-022`, `REQ-PKG-024`).
+
+module compiler.build.sandbox
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+use compiler.kernel.hash.ax_hash_bytes
+use compiler.kernel.hash.ax_hash_u64
+use compiler.kernel.hash.ax_hash_combine
+use compiler.kernel.interner.StrView
+use compiler.source.span.span_none
+
+use compiler.diag.code.diag_code
+use compiler.diag.code.AX_DRIVER_BAD_MANIFEST
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.DiagDataEntry
+use compiler.diag.emitter.DiagDataValue
+use compiler.diag.emitter.DiagDataKind
+use compiler.diag.emitter.diag_new
+use compiler.diag.emitter.diag_sink_report
+
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_new
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+use compiler.diag.format.diag_buf_as_str_view
+
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+use compiler.diag.ux2.ux2_sv_contains
+
+use compiler.build.manifest.bld_sv_starts_with
+use compiler.build.manifest.bld_sv_byte
+use compiler.build.manifest.bld_sv_slice
+use compiler.build.manifest.bld_sv_cmp
+
+use compiler.build.workspace.Digest256
+use compiler.build.workspace.digest256_zero
+use compiler.build.workspace.digest256_domain_init
+use compiler.build.workspace.digest256_mix_sv
+use compiler.build.workspace.digest256_mix_u64
+use compiler.build.workspace.digest256_combine
+use compiler.build.workspace.push_u64_hex16
+
+// =============================================================================
+// 1. Sandbox Constants, Mounts, Permissions & Policies (`AXS-HERM-010`..`015`)
+// =============================================================================
+
+pub const SANDBOX_MOUNT_SOURCE: u8 = 0u8
+pub const SANDBOX_MOUNT_DEPENDENCIES: u8 = 1u8
+pub const SANDBOX_MOUNT_BUILD: u8 = 2u8
+pub const SANDBOX_MOUNT_OUTPUT: u8 = 3u8
+pub const SANDBOX_MOUNT_CACHE: u8 = 4u8
+pub const SANDBOX_MOUNT_SYSROOT: u8 = 5u8
+
+pub const FS_PERM_DENIED: u8 = 0u8
+pub const FS_PERM_READ: u8 = 1u8
+pub const FS_PERM_READ_WRITE: u8 = 2u8
+pub const FS_PERM_READ_WRITE_CREATE: u8 = 3u8
+
+pub const FS_OP_READ: u8 = 0u8
+pub const FS_OP_WRITE: u8 = 1u8
+pub const FS_OP_CREATE: u8 = 2u8
+pub const FS_OP_DELETE: u8 = 3u8
+pub const FS_OP_RENAME: u8 = 4u8
+
+pub const NET_POLICY_DENIED: u8 = 0u8
+pub const NET_POLICY_ALLOWED: u8 = 1u8
+
+pub const PROCESS_POLICY_DENIED: u8 = 0u8
+pub const PROCESS_POLICY_ALLOWED: u8 = 1u8
+
+pub const CLOCK_POLICY_FROZEN: u8 = 0u8
+pub const CLOCK_POLICY_DETERMINISTIC: u8 = 1u8
+pub const CLOCK_POLICY_DENIED: u8 = 2u8
+pub const CLOCK_POLICY_HOST_TIME: u8 = 3u8
+
+pub const RNG_POLICY_DETERMINISTIC: u8 = 0u8
+pub const RNG_POLICY_DENIED: u8 = 1u8
+pub const RNG_POLICY_OS_ENTROPY: u8 = 2u8
+
+pub enum SandboxPathKind {
+    Source,
+    Dependency,
+    BuildScratch,
+    ArtifactOutput,
+    Sysroot,
+    ForbiddenHost,
+}
+
+@derive(Copy)
+pub struct SandboxMount {
+    pub mount_point: StrView,
+    pub host_path: StrView,
+    pub perm: u8,
+    pub is_active: bool,
+}
+
+@derive(Copy)
+pub struct EnvVarEntry {
+    pub key: StrView,
+    pub val: StrView,
+}
+
+@derive(Copy)
+pub struct SandboxConfig {
+    pub pkg_namespace: StrView,
+    pub pkg_name: StrView,
+    pub pkg_version: StrView,
+    pub source_dir: StrView,
+    pub output_dir: StrView,
+    pub scratch_dir: StrView,
+    pub sysroot_dir: StrView,
+    pub target_triple: StrView,
+    pub host_triple: StrView,
+    pub profile: StrView,
+    pub edition: StrView,
+    pub source_date_epoch: u64,
+    pub clock_policy: u8,
+    pub random_policy: u8,
+    pub random_seed: u64,
+    pub network_policy: u8,
+    pub process_policy: u8,
+    pub hermetic: bool,
+    pub env_allowlist: [8]StrView,
+    pub env_allowlist_count: usize,
+    pub env_allowlist_values: [8]StrView,
+}
+
+@derive(Copy)
+pub struct BuildSandbox {
+    pub config: SandboxConfig,
+    pub mounts: [8]SandboxMount,
+    pub mount_count: usize,
+    pub virtual_clock_ticks: u64,
+    pub prng_state: u64,
+    pub canonical_env: [16]EnvVarEntry,
+    pub canonical_env_count: usize,
+    pub violation_count: u32,
+}
+
+// =============================================================================
+// 2. Diagnostic Reporting Helpers (`AXS-HERM-050`)
+// =============================================================================
+
+fn make_str_entry(key: str, val: StrView) -> DiagDataEntry {
+    DiagDataEntry {
+        key: ux2_sv(key),
+        value: DiagDataValue {
+            kind: DiagDataKind.String,
+            str_val: val,
+            int_val: 0i64,
+            bool_val: false,
+            list_items: 0 as *mut StrView,
+            list_count: 0usize,
+        },
+    }
+}
+
+pub fn report_sandbox_diag(
+    sink: mut_view<DiagSink>,
+    msg: str,
+    kind: str,
+    k1: str,
+    v1: StrView,
+    k2: str,
+    v2: StrView,
+    k3: str,
+    v3: StrView
+) {
+    let mut d = diag_new(diag_code(AX_DRIVER_BAD_MANIFEST), span_none(), ux2_sv(msg))
+    let mut entries: [4]DiagDataEntry = [
+        make_str_entry("kind", ux2_sv(kind)),
+        make_str_entry(k1, v1),
+        make_str_entry(k2, v2),
+        make_str_entry(k3, v3),
+    ]
+    d.data = unsafe { address_of_mut(entries[0]) }
+    d.data_count = 4usize
+    diag_sink_report(mut_view(*sink), view(d))
+}
+
+// =============================================================================
+// 3. Sandbox Construction & Canonical Environment Init (`AXS-HERM-010`, `013`)
+// =============================================================================
+
+pub fn sandbox_config_default(
+    pkg_name: StrView,
+    source_dir: StrView,
+    output_dir: StrView
+) -> SandboxConfig {
+    let empty_sv = ux2_sv_empty()
+    SandboxConfig {
+        pkg_namespace: ux2_sv("default"),
+        pkg_name: pkg_name,
+        pkg_version: ux2_sv("0.1.0"),
+        source_dir: source_dir,
+        output_dir: output_dir,
+        scratch_dir: ux2_sv(".axiom/target/scratch"),
+        sysroot_dir: ux2_sv("std"),
+        target_triple: ux2_sv("x86_64-pc-windows-msvc"),
+        host_triple: ux2_sv("x86_64-pc-windows-msvc"),
+        profile: ux2_sv("dev"),
+        edition: ux2_sv("2026"),
+        source_date_epoch: 0u64,
+        clock_policy: CLOCK_POLICY_FROZEN,
+        random_policy: RNG_POLICY_DETERMINISTIC,
+        random_seed: 0x9E3779B97F4A7C15u64,
+        network_policy: NET_POLICY_DENIED,
+        process_policy: PROCESS_POLICY_DENIED,
+        hermetic: true,
+        env_allowlist: [empty_sv; 8],
+        env_allowlist_count: 0usize,
+        env_allowlist_values: [empty_sv; 8],
+    }
+}
+
+pub fn build_sandbox_new(config: view<SandboxConfig>) -> BuildSandbox {
+    let empty_sv = ux2_sv_empty()
+    let empty_mount = SandboxMount {
+        mount_point: empty_sv,
+        host_path: empty_sv,
+        perm: FS_PERM_DENIED,
+        is_active: false,
+    }
+    let mut mounts: [8]SandboxMount = [empty_mount; 8]
+    mounts[0] = SandboxMount {
+        mount_point: ux2_sv("/source"),
+        host_path: config.source_dir,
+        perm: FS_PERM_READ,
+        is_active: true,
+    }
+    mounts[1] = SandboxMount {
+        mount_point: ux2_sv("/dependencies"),
+        host_path: ux2_sv(".axiom/cache/pkg"),
+        perm: FS_PERM_READ,
+        is_active: true,
+    }
+    mounts[2] = SandboxMount {
+        mount_point: ux2_sv("/build"),
+        host_path: config.scratch_dir,
+        perm: FS_PERM_READ_WRITE,
+        is_active: true,
+    }
+    mounts[3] = SandboxMount {
+        mount_point: ux2_sv("/output"),
+        host_path: config.output_dir,
+        perm: FS_PERM_READ_WRITE_CREATE,
+        is_active: true,
+    }
+    mounts[4] = SandboxMount {
+        mount_point: ux2_sv("/cache"),
+        host_path: ux2_sv(".axiom/cache"),
+        perm: FS_PERM_READ,
+        is_active: true,
+    }
+    mounts[5] = SandboxMount {
+        mount_point: ux2_sv("@std"),
+        host_path: config.sysroot_dir,
+        perm: FS_PERM_READ,
+        is_active: true,
+    }
+
+    let empty_env = EnvVarEntry { key: empty_sv, val: empty_sv }
+    let mut canonical_env: [16]EnvVarEntry = [empty_env; 16]
+    canonical_env[0] = EnvVarEntry { key: ux2_sv("AXIOM_PKG_NAMESPACE"), val: config.pkg_namespace }
+    canonical_env[1] = EnvVarEntry { key: ux2_sv("AXIOM_PKG_NAME"), val: config.pkg_name }
+    canonical_env[2] = EnvVarEntry { key: ux2_sv("AXIOM_PKG_VERSION"), val: config.pkg_version }
+    canonical_env[3] = EnvVarEntry { key: ux2_sv("AXIOM_TARGET_TRIPLE"), val: config.target_triple }
+    canonical_env[4] = EnvVarEntry { key: ux2_sv("AXIOM_HOST_TRIPLE"), val: config.host_triple }
+    canonical_env[5] = EnvVarEntry { key: ux2_sv("AXIOM_PROFILE"), val: config.profile }
+    canonical_env[6] = EnvVarEntry { key: ux2_sv("AXIOM_EDITION"), val: config.edition }
+    canonical_env[7] = EnvVarEntry { key: ux2_sv("AXIOM_SOURCE_DIR"), val: ux2_sv("/source") }
+    canonical_env[8] = EnvVarEntry { key: ux2_sv("AXIOM_OUT_DIR"), val: ux2_sv("/output") }
+    canonical_env[9] = EnvVarEntry { key: ux2_sv("SOURCE_DATE_EPOCH"), val: ux2_sv("0") }
+    canonical_env[10] = EnvVarEntry { key: ux2_sv("TZ"), val: ux2_sv("UTC") }
+    canonical_env[11] = EnvVarEntry { key: ux2_sv("LC_ALL"), val: ux2_sv("C") }
+
+    BuildSandbox {
+        config: *config,
+        mounts: mounts,
+        mount_count: 6usize,
+        virtual_clock_ticks: 0u64,
+        prng_state: config.random_seed,
+        canonical_env: canonical_env,
+        canonical_env_count: 12usize,
+        violation_count: 0u32,
+    }
+}
+
+// =============================================================================
+// 4. Filesystem Path Normalization & Authorization (`AXS-HERM-011`)
+// =============================================================================
+
+fn is_drive_letter_prefix(path: StrView) -> bool {
+    if path.len >= 2usize {
+        let b0 = bld_sv_byte(path, 0usize)
+        let b1 = bld_sv_byte(path, 1usize)
+        let is_letter = (b0 >= 65u8 && b0 <= 90u8) || (b0 >= 97u8 && b0 <= 122u8)
+        if is_letter && b1 == 58u8 { // ':'
+            return true
+        }
+    }
+    false
+}
+
+pub fn sandbox_normalize_path(raw: StrView, out_buf: mut_view<DiagBuffer>) -> bool {
+    if raw.len == 0usize {
+        return false
+    }
+
+    let mut i: usize = 0usize
+    let mut prev_slash = false
+
+    // Convert backslashes and strip duplicate slashes
+    while i < raw.len {
+        let mut b = bld_sv_byte(raw, i)
+        if b == 92u8 { // '\\'
+            b = 47u8   // '/'
+        }
+        if b == 47u8 {
+            if !prev_slash {
+                diag_buf_push_byte(mut_view(*out_buf), b)
+                prev_slash = true
+            }
+        } else {
+            diag_buf_push_byte(mut_view(*out_buf), b)
+            prev_slash = false
+        }
+        i = i + 1usize
+    }
+
+    let norm = diag_buf_as_str_view(view(*out_buf))
+    let ends_with_dotdot = if norm.len >= 3usize {
+        bld_sv_byte(norm, norm.len - 1usize) == 46u8 &&
+        bld_sv_byte(norm, norm.len - 2usize) == 46u8 &&
+        bld_sv_byte(norm, norm.len - 3usize) == 47u8
+    } else {
+        false
+    }
+    if bld_sv_starts_with(norm, ux2_sv("../")) ||
+       ux2_sv_eq(norm, ux2_sv("..")) ||
+       ux2_sv_contains(norm, ux2_sv("/../")) ||
+       ends_with_dotdot ||
+       bld_sv_starts_with(raw, ux2_sv("../")) ||
+       bld_sv_starts_with(raw, ux2_sv("..\\")) {
+        return false
+    }
+
+    true
+}
+
+pub fn verify_sandbox_fs_access(
+    sandbox: mut_view<BuildSandbox>,
+    op: u8,
+    raw_path: StrView,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if raw_path.len == 0usize {
+        sandbox.violation_count = sandbox.violation_count + 1u32
+        report_sandbox_diag(
+            sink,
+            "sandbox rejected empty filesystem path",
+            "sandbox_fs_violation",
+            "operation",
+            ux2_sv("empty_path"),
+            "requested_path",
+            raw_path,
+            "reason",
+            ux2_sv("empty_path")
+        )
+        return false
+    }
+
+    // Step 1: Detect path traversal escaping roots
+    let mut buf = diag_buf_new()
+    diag_buf_init(mut_view(buf))
+    let norm_ok = sandbox_normalize_path(raw_path, mut_view(buf))
+    let norm_path = diag_buf_as_str_view(view(buf))
+
+    if !norm_ok {
+        diag_buf_free(mut_view(buf))
+        sandbox.violation_count = sandbox.violation_count + 1u32
+        report_sandbox_diag(
+            sink,
+            "sandbox rejected parent path traversal escaping roots",
+            "sandbox_fs_violation",
+            "operation",
+            ux2_sv("path_escape"),
+            "requested_path",
+            raw_path,
+            "reason",
+            ux2_sv("path_escape_outside_source")
+        )
+        return false
+    }
+
+    // Step 2: Detect unauthorized absolute host paths
+    let is_host_abs = is_drive_letter_prefix(norm_path) ||
+                      bld_sv_starts_with(norm_path, ux2_sv("/etc/")) ||
+                      bld_sv_starts_with(norm_path, ux2_sv("/var/")) ||
+                      bld_sv_starts_with(norm_path, ux2_sv("/usr/")) ||
+                      bld_sv_starts_with(norm_path, ux2_sv("/home/")) ||
+                      bld_sv_starts_with(norm_path, ux2_sv("//"))
+
+    if is_host_abs {
+        // Check if it matches any active mount's physical host path
+        let mut mount_match = false
+        let mut mi: usize = 0usize
+        while mi < sandbox.mount_count {
+            let m = sandbox.mounts[mi]
+            if m.is_active && m.host_path.len > 0usize {
+                if bld_sv_starts_with(norm_path, m.host_path) {
+                    mount_match = true
+                }
+            }
+            mi = mi + 1usize
+        }
+        if !mount_match {
+            diag_buf_free(mut_view(buf))
+            sandbox.violation_count = sandbox.violation_count + 1u32
+            report_sandbox_diag(
+                sink,
+                "sandbox rejected unauthorized absolute host path",
+                "sandbox_fs_violation",
+                "operation",
+                ux2_sv("path_escape"),
+                "requested_path",
+                raw_path,
+                "reason",
+                ux2_sv("unauthorized_host_path")
+            )
+            return false
+        }
+    }
+
+    // Step 3: Check read-only mounts (source, dependencies, sysroot)
+    let is_source_path = bld_sv_starts_with(norm_path, ux2_sv("/source")) ||
+                         bld_sv_starts_with(norm_path, ux2_sv("src/")) ||
+                         ux2_sv_eq(norm_path, ux2_sv("axiom.toml")) ||
+                         ux2_sv_eq(norm_path, ux2_sv("Axiom.toml")) ||
+                         (sandbox.config.source_dir.len > 0usize && bld_sv_starts_with(norm_path, sandbox.config.source_dir))
+
+    if is_source_path {
+        if op == FS_OP_WRITE || op == FS_OP_CREATE || op == FS_OP_DELETE || op == FS_OP_RENAME {
+            diag_buf_free(mut_view(buf))
+            sandbox.violation_count = sandbox.violation_count + 1u32
+            report_sandbox_diag(
+                sink,
+                "sandbox rejected attempt to write to read-only source tree",
+                "sandbox_fs_violation",
+                "operation",
+                ux2_sv("write_readonly_source"),
+                "requested_path",
+                raw_path,
+                "reason",
+                ux2_sv("write_to_readonly_source")
+            )
+            return false
+        }
+        diag_buf_free(mut_view(buf))
+        return true
+    }
+
+    let is_dep_path = bld_sv_starts_with(norm_path, ux2_sv("/dependencies")) ||
+                      bld_sv_starts_with(norm_path, ux2_sv(".axiom/cache/pkg/"))
+
+    if is_dep_path {
+        if op != FS_OP_READ {
+            diag_buf_free(mut_view(buf))
+            sandbox.violation_count = sandbox.violation_count + 1u32
+            report_sandbox_diag(
+                sink,
+                "sandbox rejected attempt to write to read-only dependency tree",
+                "sandbox_fs_violation",
+                "operation",
+                ux2_sv("write_readonly_dependency"),
+                "requested_path",
+                raw_path,
+                "reason",
+                ux2_sv("write_to_readonly_dependency")
+            )
+            return false
+        }
+        diag_buf_free(mut_view(buf))
+        return true
+    }
+
+    let is_sysroot_path = bld_sv_starts_with(norm_path, ux2_sv("@std")) ||
+                          bld_sv_starts_with(norm_path, ux2_sv("std/")) ||
+                          (sandbox.config.sysroot_dir.len > 0usize && bld_sv_starts_with(norm_path, sandbox.config.sysroot_dir))
+
+    if is_sysroot_path {
+        if op != FS_OP_READ {
+            diag_buf_free(mut_view(buf))
+            sandbox.violation_count = sandbox.violation_count + 1u32
+            report_sandbox_diag(
+                sink,
+                "sandbox rejected attempt to write to toolchain sysroot",
+                "sandbox_fs_violation",
+                "operation",
+                ux2_sv("write_readonly_sysroot"),
+                "requested_path",
+                raw_path,
+                "reason",
+                ux2_sv("write_to_readonly_sysroot")
+            )
+            return false
+        }
+        diag_buf_free(mut_view(buf))
+        return true
+    }
+
+    // Step 4: Check writable scratch & output directories
+    let is_output_or_scratch = bld_sv_starts_with(norm_path, ux2_sv("/output")) ||
+                               bld_sv_starts_with(norm_path, ux2_sv("/build")) ||
+                               bld_sv_starts_with(norm_path, ux2_sv(".axiom/target/")) ||
+                               (sandbox.config.output_dir.len > 0usize && bld_sv_starts_with(norm_path, sandbox.config.output_dir)) ||
+                               (sandbox.config.scratch_dir.len > 0usize && bld_sv_starts_with(norm_path, sandbox.config.scratch_dir))
+
+    if is_output_or_scratch {
+        diag_buf_free(mut_view(buf))
+        return true
+    }
+
+    diag_buf_free(mut_view(buf))
+    sandbox.violation_count = sandbox.violation_count + 1u32
+    report_sandbox_diag(
+        sink,
+        "sandbox rejected access to unauthorized root",
+        "sandbox_fs_violation",
+        "operation",
+        ux2_sv("unauthorized_root"),
+        "requested_path",
+        raw_path,
+        "reason",
+        ux2_sv("path_outside_sandbox")
+    )
+    false
+}
+
+// =============================================================================
+// 5. Environment Scrubbing & Allowlist Checking (`AXS-HERM-013`)
+// =============================================================================
+
+pub fn sandbox_get_env(
+    sandbox: mut_view<BuildSandbox>,
+    key: StrView,
+    out_val: mut_view<StrView>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if key.len == 0usize {
+        return false
+    }
+
+    // PATH is always empty inside hermetic build sandbox
+    if ux2_sv_eq(key, ux2_sv("PATH")) {
+        *out_val = ux2_sv_empty()
+        return true
+    }
+
+    // Check canonical compiler-controlled environment variables
+    let mut i: usize = 0usize
+    while i < sandbox.canonical_env_count {
+        if ux2_sv_eq(key, sandbox.canonical_env[i].key) {
+            *out_val = sandbox.canonical_env[i].val
+            return true
+        }
+        i = i + 1usize
+    }
+
+    // Check explicitly allowlisted environment variables
+    let mut j: usize = 0usize
+    while j < sandbox.config.env_allowlist_count {
+        if ux2_sv_eq(key, sandbox.config.env_allowlist[j]) {
+            *out_val = sandbox.config.env_allowlist_values[j]
+            return true
+        }
+        j = j + 1usize
+    }
+
+    // Undeclared environment variable lookup fails closed
+    sandbox.violation_count = sandbox.violation_count + 1u32
+    report_sandbox_diag(
+        sink,
+        "sandbox rejected lookup of undeclared host environment variable",
+        "sandbox_env_violation",
+        "var_name",
+        key,
+        "package",
+        sandbox.config.pkg_name,
+        "reason",
+        ux2_sv("undeclared_host_env")
+    )
+    false
+}
+
+pub fn sandbox_compute_env_digest(sandbox: view<BuildSandbox>) -> Digest256 {
+    let mut d = digest256_domain_init(ux2_sv("AXIOM-SANDBOX-ENV-v1\0"))
+    let mut i: usize = 0usize
+    while i < sandbox.canonical_env_count {
+        d = digest256_mix_sv(d, sandbox.canonical_env[i].key)
+        d = digest256_mix_sv(d, sandbox.canonical_env[i].val)
+        i = i + 1usize
+    }
+    let mut j: usize = 0usize
+    while j < sandbox.config.env_allowlist_count {
+        d = digest256_mix_sv(d, sandbox.config.env_allowlist[j])
+        d = digest256_mix_sv(d, sandbox.config.env_allowlist_values[j])
+        j = j + 1usize
+    }
+    d
+}
+
+// =============================================================================
+// 6. Network & Subprocess Isolation (`AXS-HERM-012`, `015`)
+// =============================================================================
+
+pub fn verify_sandbox_net_access(
+    sandbox: mut_view<BuildSandbox>,
+    endpoint: StrView,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if sandbox.config.network_policy == NET_POLICY_DENIED {
+        sandbox.violation_count = sandbox.violation_count + 1u32
+        report_sandbox_diag(
+            sink,
+            "sandbox rejected network socket/HTTP access during compilation",
+            "sandbox_net_violation",
+            "package",
+            sandbox.config.pkg_name,
+            "endpoint",
+            endpoint,
+            "reason",
+            ux2_sv("network_denied")
+        )
+        return false
+    }
+    true
+}
+
+pub fn verify_sandbox_process_spawn(
+    sandbox: mut_view<BuildSandbox>,
+    executable: StrView,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if sandbox.config.process_policy == PROCESS_POLICY_DENIED {
+        sandbox.violation_count = sandbox.violation_count + 1u32
+        report_sandbox_diag(
+            sink,
+            "sandbox rejected unauthorized child process spawn during compilation",
+            "sandbox_process_violation",
+            "package",
+            sandbox.config.pkg_name,
+            "program",
+            executable,
+            "reason",
+            ux2_sv("subprocess_denied")
+        )
+        return false
+    }
+    true
+}
+
+// =============================================================================
+// 7. Virtual Clock & Deterministic Entropy (`AXS-HERM-014`)
+// =============================================================================
+
+pub fn sandbox_get_time(
+    sandbox: mut_view<BuildSandbox>,
+    is_host_clock: bool,
+    sink: mut_view<DiagSink>,
+    out_timestamp: mut_view<u64>
+) -> bool {
+    if is_host_clock || sandbox.config.clock_policy == CLOCK_POLICY_HOST_TIME || sandbox.config.clock_policy == CLOCK_POLICY_DENIED {
+        sandbox.violation_count = sandbox.violation_count + 1u32
+        report_sandbox_diag(
+            sink,
+            "sandbox rejected unvirtualized host clock query in hermetic build",
+            "sandbox_clock_or_rng_violation",
+            "source",
+            ux2_sv("host_clock"),
+            "package",
+            sandbox.config.pkg_name,
+            "reason",
+            ux2_sv("host_clock_forbidden")
+        )
+        return false
+    }
+
+    if sandbox.config.clock_policy == CLOCK_POLICY_FROZEN {
+        *out_timestamp = sandbox.config.source_date_epoch
+        return true
+    }
+
+    if sandbox.config.clock_policy == CLOCK_POLICY_DETERMINISTIC {
+        sandbox.virtual_clock_ticks = sandbox.virtual_clock_ticks + 1u64
+        *out_timestamp = sandbox.config.source_date_epoch + sandbox.virtual_clock_ticks
+        return true
+    }
+
+    false
+}
+
+pub fn sandbox_next_random_u64(
+    sandbox: mut_view<BuildSandbox>,
+    is_os_entropy: bool,
+    sink: mut_view<DiagSink>,
+    out_val: mut_view<u64>
+) -> bool {
+    if is_os_entropy || sandbox.config.random_policy == RNG_POLICY_OS_ENTROPY || sandbox.config.random_policy == RNG_POLICY_DENIED {
+        sandbox.violation_count = sandbox.violation_count + 1u32
+        report_sandbox_diag(
+            sink,
+            "sandbox rejected non-deterministic OS entropy query in hermetic build",
+            "sandbox_clock_or_rng_violation",
+            "source",
+            ux2_sv("nondeterministic_rng"),
+            "package",
+            sandbox.config.pkg_name,
+            "reason",
+            ux2_sv("os_entropy_forbidden")
+        )
+        return false
+    }
+
+    sandbox.prng_state = ax_hash_u64(sandbox.prng_state ^ 0x9E3779B97F4A7C15u64)
+    *out_val = sandbox.prng_state
+    true
+}

@@ -1,0 +1,369 @@
+// Direct verification probe for `compiler.build.sandbox` and `compiler.build.repro`
+// (T863 / E20.4: SPEC-113 §§2..3, REQ-PKG-022, REQ-PKG-024, INV-HERM-001).
+
+module main
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+use host_intrinsics.stdio
+use host_intrinsics.write
+
+use compiler.kernel.interner.StrView
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.diag_sink_init
+use compiler.diag.emitter.diag_sink_free
+use compiler.diag.emitter.diag_sink_get
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_new
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+use compiler.diag.format.diag_buf_push_u32
+use compiler.diag.format.diag_buf_as_str_view
+use compiler.query.db.CompilerDB
+use compiler.query.db.query_db_empty
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+use compiler.diag.ux2.ux2_sv_contains
+
+use compiler.build.manifest.bld_sv_starts_with
+use compiler.build.manifest.manifest_diag_get_data
+
+use compiler.build.workspace.Digest256
+use compiler.build.workspace.digest256_zero
+use compiler.build.workspace.digest256_eq
+
+use compiler.build.sandbox.SANDBOX_MOUNT_SOURCE
+use compiler.build.sandbox.SANDBOX_MOUNT_OUTPUT
+use compiler.build.sandbox.FS_PERM_READ
+use compiler.build.sandbox.FS_PERM_READ_WRITE
+use compiler.build.sandbox.FS_OP_READ
+use compiler.build.sandbox.FS_OP_WRITE
+use compiler.build.sandbox.NET_POLICY_DENIED
+use compiler.build.sandbox.PROCESS_POLICY_DENIED
+use compiler.build.sandbox.CLOCK_POLICY_FROZEN
+use compiler.build.sandbox.CLOCK_POLICY_DETERMINISTIC
+use compiler.build.sandbox.RNG_POLICY_DETERMINISTIC
+use compiler.build.sandbox.SandboxConfig
+use compiler.build.sandbox.BuildSandbox
+use compiler.build.sandbox.sandbox_config_default
+use compiler.build.sandbox.build_sandbox_new
+use compiler.build.sandbox.sandbox_normalize_path
+use compiler.build.sandbox.verify_sandbox_fs_access
+use compiler.build.sandbox.sandbox_get_env
+use compiler.build.sandbox.sandbox_compute_env_digest
+use compiler.build.sandbox.verify_sandbox_net_access
+use compiler.build.sandbox.verify_sandbox_process_spawn
+use compiler.build.sandbox.sandbox_get_time
+use compiler.build.sandbox.sandbox_next_random_u64
+
+use compiler.build.repro.REPRO_STATUS_REPRODUCED
+use compiler.build.repro.REPRO_STATUS_NOT_REPRODUCED
+use compiler.build.repro.PathRemapRule
+use compiler.build.repro.PathRemapper
+use compiler.build.repro.HermeticBuildInputs
+use compiler.build.repro.ReproArtifactComparison
+use compiler.build.repro.ReproducibilityResult
+use compiler.build.repro.path_remapper_empty
+use compiler.build.repro.path_remapper_add_rule
+use compiler.build.repro.path_remapper_for_workspace
+use compiler.build.repro.path_remapper_remap
+use compiler.build.repro.audit_host_path_leaks
+use compiler.build.repro.hermetic_build_inputs_default
+use compiler.build.repro.compute_hermetic_build_fingerprint
+use compiler.build.repro.compare_build_artifacts
+use compiler.build.repro.report_repro_mismatch_diag
+use compiler.build.repro.verify_reproducible_build
+
+fn out_str(s: str) {
+    let sv = ux2_sv(s)
+    let _ = unsafe { write(stdio(1), sv.ptr, sv.len) }
+}
+
+fn out_sv(sv: StrView) {
+    if sv.len > 0usize && (sv.ptr as usize) != 0usize {
+        let _ = unsafe { write(stdio(1), sv.ptr, sv.len) }
+    }
+}
+
+fn out_bool(b: bool) {
+    if b {
+        out_str("true")
+    } else {
+        out_str("false")
+    }
+}
+
+fn out_u32(n: u32) {
+    let mut b = diag_buf_new()
+    diag_buf_init(mut_view(b))
+    diag_buf_push_u32(mut_view(b), n)
+    out_sv(diag_buf_as_str_view(view(b)))
+    diag_buf_free(mut_view(b))
+}
+
+fn new_diag_sink() -> DiagSink {
+    let mut sink = DiagSink {
+        arena: (query_db_empty()).arena,
+        diags: 0 as *mut compiler.diag.emitter.Diagnostic,
+        len: 0,
+        cap: 0,
+        errors: 0,
+        warnings: 0,
+    }
+    diag_sink_init(mut_view(sink))
+    sink
+}
+
+pub fn main() -> i32 {
+    let mut sink = new_diag_sink()
+
+    // -------------------------------------------------------------------------
+    // 1. Filesystem Sandbox Verification
+    // -------------------------------------------------------------------------
+    let mut cfg = sandbox_config_default(
+        ux2_sv("payment_app"),
+        ux2_sv("D:/work/payment_app"),
+        ux2_sv("D:/work/payment_app/.axiom/target")
+    )
+    cfg.env_allowlist_count = 1usize
+    cfg.env_allowlist[0] = ux2_sv("BUILD_REV")
+    cfg.env_allowlist_values[0] = ux2_sv("42")
+
+    let mut sb = build_sandbox_new(view(cfg))
+
+    // Valid reads & writes
+    let r_src = verify_sandbox_fs_access(mut_view(sb), FS_OP_READ, ux2_sv("/source/src/main.ax"), mut_view(sink))
+    let r_dep = verify_sandbox_fs_access(mut_view(sb), FS_OP_READ, ux2_sv("/dependencies/crypto/lib.ax"), mut_view(sink))
+    let r_std = verify_sandbox_fs_access(mut_view(sb), FS_OP_READ, ux2_sv("@std/core/host.ax"), mut_view(sink))
+    let w_out = verify_sandbox_fs_access(mut_view(sb), FS_OP_WRITE, ux2_sv("/output/bin/app.exe"), mut_view(sink))
+    let w_bld = verify_sandbox_fs_access(mut_view(sb), FS_OP_WRITE, ux2_sv("/build/scratch.obj"), mut_view(sink))
+
+    let valid_reads = r_src && r_dep && r_std
+    let valid_writes = w_out && w_bld
+
+    // Rejections
+    let e_trav = !verify_sandbox_fs_access(mut_view(sb), FS_OP_READ, ux2_sv("../../etc/shadow"), mut_view(sink))
+    let e_host = !verify_sandbox_fs_access(mut_view(sb), FS_OP_READ, ux2_sv("C:/Windows/System32/secret.dll"), mut_view(sink))
+    let e_wsrc = !verify_sandbox_fs_access(mut_view(sb), FS_OP_WRITE, ux2_sv("/source/src/main.ax"), mut_view(sink))
+    let e_wdep = !verify_sandbox_fs_access(mut_view(sb), FS_OP_WRITE, ux2_sv("/dependencies/crypto/lib.ax"), mut_view(sink))
+
+    out_str("probe[sandbox_fs] valid_reads=")
+    out_bool(valid_reads)
+    out_str(" valid_writes=")
+    out_bool(valid_writes)
+    out_str(" traversal_rejected=")
+    out_bool(e_trav)
+    out_str(" host_escape_rejected=")
+    out_bool(e_host)
+    out_str(" source_write_rejected=")
+    out_bool(e_wsrc)
+    out_str(" dep_write_rejected=")
+    out_bool(e_wdep)
+    out_str(" violations=")
+    out_u32(sb.violation_count)
+    out_str("\n")
+
+    // -------------------------------------------------------------------------
+    // 2. Environment, Network, Process & Clock Isolation
+    // -------------------------------------------------------------------------
+    let mut env_pkg = ux2_sv_empty()
+    let mut env_path = ux2_sv_empty()
+    let mut env_rev = ux2_sv_empty()
+    let mut env_bad = ux2_sv_empty()
+
+    let ok_pkg = sandbox_get_env(mut_view(sb), ux2_sv("AXIOM_PKG_NAME"), mut_view(env_pkg), mut_view(sink))
+    let ok_path = sandbox_get_env(mut_view(sb), ux2_sv("PATH"), mut_view(env_path), mut_view(sink))
+    let ok_rev = sandbox_get_env(mut_view(sb), ux2_sv("BUILD_REV"), mut_view(env_rev), mut_view(sink))
+    let ok_bad = !sandbox_get_env(mut_view(sb), ux2_sv("UNDECLARED_SECRET_TOKEN"), mut_view(env_bad), mut_view(sink))
+
+    let canonical_ok = ok_pkg && ux2_sv_eq(env_pkg, ux2_sv("payment_app"))
+    let path_empty = ok_path && env_path.len == 0usize
+    let allowlist_ok = ok_rev && ux2_sv_eq(env_rev, ux2_sv("42"))
+
+    let net_denied = !verify_sandbox_net_access(mut_view(sb), ux2_sv("https://telemetry.example.com"), mut_view(sink))
+    let proc_denied = !verify_sandbox_process_spawn(mut_view(sb), ux2_sv("powershell.exe"), mut_view(sink))
+
+    let mut ts_host: u64 = 0u64
+    let mut ts_frozen: u64 = 0u64
+    let clock_denied = !sandbox_get_time(mut_view(sb), true, mut_view(sink), mut_view(ts_host))
+    let clock_ok = sandbox_get_time(mut_view(sb), false, mut_view(sink), mut_view(ts_frozen)) && ts_frozen == 0u64
+
+    let mut rng_os: u64 = 0u64
+    let mut rng_val: u64 = 0u64
+    let rng_denied = !sandbox_next_random_u64(mut_view(sb), true, mut_view(sink), mut_view(rng_os))
+    let rng_ok = sandbox_next_random_u64(mut_view(sb), false, mut_view(sink), mut_view(rng_val)) && rng_val != 0u64
+
+    let env_digest = sandbox_compute_env_digest(view(sb))
+    let env_digest_ok = env_digest.w0 != 0u64
+
+    out_str("probe[sandbox_env_net_clock] canonical_ok=")
+    out_bool(canonical_ok)
+    out_str(" path_empty=")
+    out_bool(path_empty)
+    out_str(" allowlist_ok=")
+    out_bool(allowlist_ok)
+    out_str(" env_denied=")
+    out_bool(ok_bad)
+    out_str(" net_denied=")
+    out_bool(net_denied)
+    out_str(" process_denied=")
+    out_bool(proc_denied)
+    out_str(" clock_denied=")
+    out_bool(clock_denied && clock_ok)
+    out_str(" rng_denied=")
+    out_bool(rng_denied && rng_ok && env_digest_ok)
+    out_str("\n")
+
+    // -------------------------------------------------------------------------
+    // 3. Path Remapping & Host Path Leak Audit
+    // -------------------------------------------------------------------------
+    let mut remapper = path_remapper_for_workspace(
+        ux2_sv("D:/work/payment_app"),
+        ux2_sv("acme/payment_app"),
+        ux2_sv("1.0.0")
+    )
+    path_remapper_add_rule(mut_view(remapper), ux2_sv("/opt/ci/slot_42"), ux2_sv("@ci"))
+
+    let mut buf_src = diag_buf_new()
+    diag_buf_init(mut_view(buf_src))
+    let mapped_src = path_remapper_remap(view(remapper), ux2_sv("D:/work/payment_app/src/main.ax"), mut_view(buf_src))
+    let remap_src_ok = ux2_sv_eq(mapped_src, ux2_sv("@pkg/acme/payment_app@1.0.0/src/main.ax"))
+
+    let mut buf_gen = diag_buf_new()
+    diag_buf_init(mut_view(buf_gen))
+    let mapped_gen = path_remapper_remap(view(remapper), ux2_sv(".axiom/target/gen/schema.ax"), mut_view(buf_gen))
+    let remap_gen_ok = ux2_sv_eq(mapped_gen, ux2_sv("@gen/acme/payment_app@1.0.0/schema.ax"))
+
+    let mut buf_out = diag_buf_new()
+    diag_buf_init(mut_view(buf_out))
+    let mapped_out = path_remapper_remap(view(remapper), ux2_sv(".axiom/target/deps/lib.axlib"), mut_view(buf_out))
+    let remap_out_ok = ux2_sv_eq(mapped_out, ux2_sv("@out/deps/lib.axlib"))
+
+    let mut buf_std = diag_buf_new()
+    diag_buf_init(mut_view(buf_std))
+    let mapped_std = path_remapper_remap(view(remapper), ux2_sv("std/core/host.ax"), mut_view(buf_std))
+    let remap_std_ok = ux2_sv_eq(mapped_std, ux2_sv("@std/core/host.ax"))
+
+    let mut buf_ci = diag_buf_new()
+    diag_buf_init(mut_view(buf_ci))
+    let mapped_ci = path_remapper_remap(view(remapper), ux2_sv("/opt/ci/slot_42/run.log"), mut_view(buf_ci))
+    let remap_ci_ok = ux2_sv_eq(mapped_ci, ux2_sv("@ci/run.log"))
+
+    // Leak audit
+    let clean_bytes: [16]u8 = [0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    let dirty_bytes: [24]u8 = [
+        0x7f, 0x45, 0x4c, 0x46,
+        0x44, 0x3a, 0x2f, 0x77, 0x6f, 0x72, 0x6b, // "D:/work"
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    ]
+
+    let forbidden_paths: [4]StrView = [ux2_sv("D:/work"), ux2_sv("/home/user"), ux2_sv_empty(), ux2_sv_empty()]
+    let clean_audit = audit_host_path_leaks(ux2_sv("libpayment.axlib"), unsafe { address_of(clean_bytes[0]) }, 16usize, view(forbidden_paths), 2usize, mut_view(sink))
+    let leak_detected = !audit_host_path_leaks(ux2_sv("libpayment.axlib"), unsafe { address_of(dirty_bytes[0]) }, 24usize, view(forbidden_paths), 2usize, mut_view(sink))
+
+    out_str("probe[repro_remap_audit] remap_src_ok=")
+    out_bool(remap_src_ok)
+    out_str(" remap_gen_ok=")
+    out_bool(remap_gen_ok)
+    out_str(" remap_out_ok=")
+    out_bool(remap_out_ok)
+    out_str(" remap_std_ok=")
+    out_bool(remap_std_ok)
+    out_str(" remap_cli_ok=")
+    out_bool(remap_ci_ok)
+    out_str(" clean_audit=")
+    out_bool(clean_audit)
+    out_str(" leak_detected=")
+    out_bool(leak_detected)
+    out_str("\n")
+
+    diag_buf_free(mut_view(buf_src))
+    diag_buf_free(mut_view(buf_gen))
+    diag_buf_free(mut_view(buf_out))
+    diag_buf_free(mut_view(buf_std))
+    diag_buf_free(mut_view(buf_ci))
+
+    // -------------------------------------------------------------------------
+    // 4. Double-Build Differential Reproducibility Verifier
+    // -------------------------------------------------------------------------
+    let mut inp_a = hermetic_build_inputs_default()
+    inp_a.c1_compiler_version = ux2_sv("0.1.0")
+    inp_a.c3_language_edition = ux2_sv("2026")
+    let fp_a = compute_hermetic_build_fingerprint(view(inp_a))
+
+    let mut inp_b = hermetic_build_inputs_default()
+    inp_b.c1_compiler_version = ux2_sv("0.1.0")
+    inp_b.c3_language_edition = ux2_sv("2026")
+    let fp_b = compute_hermetic_build_fingerprint(view(inp_b))
+
+    let fp_eq = digest256_eq(fp_a, fp_b)
+
+    let bin_a: [8]u8 = [0x50u8, 0x4Bu8, 0x03u8, 0x04u8, 0x14u8, 0x00u8, 0x00u8, 0x00u8]
+    let bin_b: [8]u8 = [0x50u8, 0x4Bu8, 0x03u8, 0x04u8, 0x14u8, 0x99u8, 0x00u8, 0x00u8] // diff at offset 5
+
+    let empty_cmp = ReproArtifactComparison {
+        name: ux2_sv_empty(),
+        size_a: 0usize,
+        size_b: 0usize,
+        sha256_a: digest256_zero(),
+        sha256_b: digest256_zero(),
+        identical: false,
+        first_diff_offset: 0usize,
+        diff_byte_a: 0u8,
+        diff_byte_b: 0u8,
+        section_name: ux2_sv_empty(),
+    }
+
+    let mut cmp_clean = empty_cmp
+    let identical_ok = compare_build_artifacts(
+        ux2_sv("bin/app.exe"),
+        unsafe { address_of(bin_a[0]) },
+        8usize,
+        unsafe { address_of(bin_a[0]) },
+        8usize,
+        ux2_sv(".text"),
+        mut_view(cmp_clean)
+    )
+
+    let mut cmp_diff = empty_cmp
+    let diff_detected = !compare_build_artifacts(
+        ux2_sv("bin/app.exe"),
+        unsafe { address_of(bin_a[0]) },
+        8usize,
+        unsafe { address_of(bin_b[0]) },
+        8usize,
+        ux2_sv(".rdata"),
+        mut_view(cmp_diff)
+    )
+
+    let diff_offset_ok = cmp_diff.first_diff_offset == 5usize
+    let section_ok = ux2_sv_eq(cmp_diff.section_name, ux2_sv(".rdata"))
+
+    report_repro_mismatch_diag(view(cmp_diff), mut_view(sink))
+    let diag_reported = sink.len > 0usize
+
+    let repro_res = verify_reproducible_build(ux2_sv("ws_alpha"), ux2_sv("ws_beta"))
+    let verify_repro_ok = repro_res.status == REPRO_STATUS_REPRODUCED && repro_res.is_reproduced
+
+    out_str("probe[repro_diff_verifier] fp_eq=")
+    out_bool(fp_eq)
+    out_str(" identical_ok=")
+    out_bool(identical_ok)
+    out_str(" diff_detected=")
+    out_bool(diff_detected)
+    out_str(" diff_offset=")
+    out_u32(cmp_diff.first_diff_offset as u32)
+    out_str(" section_ok=")
+    out_bool(section_ok)
+    out_str(" diag_reported=")
+    out_bool(diag_reported)
+    out_str(" verify_repro_ok=")
+    out_bool(verify_repro_ok)
+    out_str("\n")
+
+    diag_sink_free(mut_view(sink))
+    out_str("BUILD-HERMETIC-PROBE-PASS\n")
+    0
+}
