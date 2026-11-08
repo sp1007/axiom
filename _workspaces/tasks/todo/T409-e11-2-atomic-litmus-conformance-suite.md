@@ -6,14 +6,15 @@ owner: axiom-qa
 reviewer: axiom-architect
 model: sonnet
 gate_model: sonnet
-depends: [T407, T408]
+depends: [T407, T408, T429]
 priority: 130
-status: blocked
-attempts: 1
+status: todo
+attempts: 0
 paths: [tests/conformance/p11/e11_2_atomics]
 spec: [spec/SPEC-31-atomics.md, 0033, 0092, 0128, 0208, tasks/0328, tasks/0515]
 covers: [REQ-CONC-076, REQ-CONC-077, REQ-CONC-078, REQ-CONC-079, REQ-ATM-028, REQ-ATM-029, REQ-ATM-030]
 started: 2026-11-08 19:20:28
+unblocks: 1
 ---
 # T409 — E11.2 — Atomic & memory-ordering litmus conformance suite
 
@@ -41,3 +42,4 @@ Verify the `E11.2` exit criterion ('litmus tests pass under oracle and native st
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
 - 2026-11-08 19:20:28 started (attempt 1) T409-impl
 - 2026-11-08 21:19:17 block: QA caught sub-64-bit atomic MI size=8 overwrite in compiler/driver/pipeline.ax and struct-embedded Atomic<T> Pass-1a ordering in compiler/types/typeck.ax
+- 2026-11-08 23:19:01 unblocked (cycle 1) 
