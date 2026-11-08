@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T219, T752, T755, T756, T759, T804]
 priority: 195
-status: doing
+status: done
 attempts: 1
 paths: [compiler/fmt/cst, compiler/fmt/printer, tests/run/fmt_engine]
 spec: [spec/SPEC-101-canonical-formatter.md, spec/SPEC-01-lexical.md, spec/SPEC-02-grammar.md, tasks/0476, tasks/0693, tasks/0695]
 covers: [REQ-TOOL-183, REQ-TOOL-298]
 started: 2026-11-08 13:29:57
-agent: T805-impl
+finished: 2026-11-08 16:22:36
 ---
 # T805 — E19.2 Lossless CST trivia attachment, Wadler-Lindig layout engine & canonical AST printer
 
@@ -42,3 +42,4 @@ Implement lossless CST trivia attachment, the Wadler-Lindig pretty-printing layo
 ## Log
 - 2026-11-03 09:50:00 created by T219 (P19 phase planning)
 - 2026-11-08 13:29:57 started (attempt 1) T805-impl
+- 2026-11-08 16:22:36 accepted by QA -> done

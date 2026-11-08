@@ -1,0 +1,1105 @@
+// Lossless Concrete Syntax Tree (CST) Trivia Collection, Normalization, and
+// 5-Slot Deterministic Attachment Engine (T805 / E19.2).
+// Implements SPEC-101 §3 (AXS-FMT-001..004, REQ-TOOL-183, REQ-TOOL-298, INV-FMT-001).
+module compiler.fmt.cst
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.FileId
+use compiler.kernel.id.StrId
+use compiler.kernel.interner.StrView
+use compiler.kernel.interner.StrInterner
+use compiler.kernel.interner.interner_intern_bytes
+use compiler.source.span.Span
+use compiler.diag.emitter.DiagSink
+use compiler.lex.token.Token
+use compiler.lex.token.Comment
+use compiler.lex.token.LexResult
+use compiler.lex.token.COMMENT_LINE
+use compiler.lex.token.COMMENT_DOC
+use compiler.lex.token.COMMENT_BLOCK
+use compiler.lex.token.TOK_EOF
+use compiler.lex.token.TOK_IDENT
+use compiler.lex.token.TOK_KW_SELF_VALUE
+use compiler.lex.token.TOK_KW_SELF_TYPE
+use compiler.lex.token.TOK_KW_USE
+use compiler.lex.token.TOK_KW_AS
+use compiler.lex.token.TOK_LPAREN
+use compiler.lex.token.TOK_RPAREN
+use compiler.lex.token.TOK_LBRACE
+use compiler.lex.token.TOK_RBRACE
+use compiler.lex.token.TOK_LBRACKET
+use compiler.lex.token.TOK_RBRACKET
+use compiler.lex.token.TOK_COMMA
+use compiler.lex.token.TOK_SEMI
+use compiler.lex.token.TOK_DOT
+use compiler.lex.scanner.ax_lex_into
+use compiler.syntax.ast.Ast
+use compiler.syntax.ast.AstItem
+use compiler.syntax.ast.AstUseTree
+use compiler.syntax.ast.AstDottedName
+use compiler.syntax.ast.ParseResult
+use compiler.syntax.ast.ITEM_USE
+use compiler.syntax.ast.ITEM_IMPL
+use compiler.syntax.ast.alloc_use_tree
+use compiler.syntax.ast.ast_set_span
+use compiler.syntax.parse.ax_parse
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+// AXS-FMT-001: Trivia taxonomy.
+pub const TRIVIA_LINE_COMMENT: u8 = 0u8;
+pub const TRIVIA_OUTER_DOC: u8 = 1u8;
+pub const TRIVIA_INNER_DOC: u8 = 2u8;
+pub const TRIVIA_BLOCK_COMMENT: u8 = 3u8;
+pub const TRIVIA_REGION_DIRECTIVE: u8 = 4u8;
+pub const TRIVIA_BLANK_LINE: u8 = 5u8;
+
+// AXS-FMT-003: 5-Slot deterministic comment attachment slots.
+pub const SLOT_HEADER: u8 = 1u8;
+pub const SLOT_TRAILING: u8 = 2u8;
+pub const SLOT_INLINE: u8 = 3u8;
+pub const SLOT_LEADING: u8 = 4u8;
+pub const SLOT_DANGLING: u8 = 5u8;
+
+pub struct CstTrivia {
+    pub kind: u8,
+    pub slot: u8,
+    pub emitted: bool,
+    pub has_blank_before: bool,
+    pub has_blank_after: bool,
+    pub is_region_end: bool,
+    pub raw_span: Span,
+    pub norm_ptr: *const u8,
+    pub norm_len: usize,
+    pub scalar_width: usize,
+    pub prev_tok_idx: i32,
+    pub next_tok_idx: i32,
+    pub anchor_byte: u32,
+    pub trailing_node_end_byte: u32,
+}
+
+pub struct CstFile {
+    pub file_id: FileId,
+    pub src: StrView,
+    pub bom_stripped: bool,
+    pub tokens: *mut Token,
+    pub token_count: usize,
+    pub non_eof_token_count: usize,
+    pub match_close: *mut usize,
+    pub match_open: *mut usize,
+    pub trivia: *mut CstTrivia,
+    pub trivia_count: usize,
+    pub header_count: usize,
+    pub trailing_count: usize,
+    pub inline_count: usize,
+    pub leading_count: usize,
+    pub dangling_count: usize,
+}
+
+pub fn cst_tok_ptr(base: *mut Token, idx: usize) -> *mut Token {
+    unsafe { base + idx }
+}
+
+pub fn cst_comment_ptr(base: *mut Comment, idx: usize) -> *mut Comment {
+    unsafe { base + idx }
+}
+
+pub fn cst_trivia_ptr(base: *mut CstTrivia, idx: usize) -> *mut CstTrivia {
+    unsafe { base + idx }
+}
+
+pub fn cst_usize_ptr(base: *mut usize, idx: usize) -> *mut usize {
+    unsafe { base + idx }
+}
+
+pub fn cst_strid_ptr(base: *mut StrId, idx: usize) -> *mut StrId {
+    unsafe { base + idx }
+}
+
+// AXS-FMT-004: Checks whether `src` begins with a 3-byte UTF-8 BOM (`0xEF 0xBB 0xBF`).
+pub fn cst_has_bom(src: StrView) -> bool {
+    if (src.len) < 3 || (src.ptr as usize) == 0 {
+        return false;
+    }
+    unsafe {
+        *(src.ptr + 0) == 0xEFu8 && *(src.ptr + 1) == 0xBBu8 && *(src.ptr + 2) == 0xBFu8
+    }
+}
+
+// AXS-FMT-004: Strips leading UTF-8 BOM (`0xEF 0xBB 0xBF`) if present.
+pub fn cst_strip_bom(src: StrView) -> StrView {
+    if cst_has_bom(src) {
+        StrView {
+            ptr: unsafe { src.ptr + 3 },
+            len: src.len - 3,
+        }
+    } else {
+        src
+    }
+}
+
+// AXS-FMT-004 / AXS-FMT-014: Counts Unicode scalar values (UTF-8 non-continuation bytes).
+pub fn cst_utf8_scalar_len(ptr: *const u8, byte_len: usize) -> usize {
+    if (ptr as usize) == 0 || byte_len == 0 {
+        return 0;
+    }
+    let mut count: usize = 0;
+    let mut i: usize = 0;
+    while i < byte_len {
+        let b: u8 = unsafe { *(ptr + i) };
+        if (b & 0xC0u8) != 0x80u8 {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    count
+}
+
+// Counts line breaks (`\n`) in `src` over `[start_byte, end_byte)`.
+pub fn cst_count_newlines_between(src: StrView, start_byte: u32, end_byte: u32) -> usize {
+    if (src.ptr as usize) == 0 || end_byte <= start_byte {
+        return 0;
+    }
+    let s: usize = if (start_byte as usize) < src.len { start_byte as usize } else { src.len };
+    let e: usize = if (end_byte as usize) < src.len { end_byte as usize } else { src.len };
+    let mut nls: usize = 0;
+    let mut i: usize = s;
+    while i < e {
+        if unsafe { *(src.ptr + i) } == 10u8 {
+            nls = nls + 1;
+        }
+        i = i + 1;
+    }
+    nls
+}
+
+pub fn cst_has_newline_between(src: StrView, start_byte: u32, end_byte: u32) -> bool {
+    cst_count_newlines_between(src, start_byte, end_byte) > 0
+}
+
+// AXS-FMT-002: True when `[start_byte, end_byte)` contains at least one blank line
+// (two `\n` separated only by spaces/tabs/`\r`).
+pub fn cst_has_blank_line_between(src: StrView, start_byte: u32, end_byte: u32) -> bool {
+    if (src.ptr as usize) == 0 || end_byte <= start_byte {
+        return false;
+    }
+    let s: usize = if (start_byte as usize) < src.len { start_byte as usize } else { src.len };
+    let e: usize = if (end_byte as usize) < src.len { end_byte as usize } else { src.len };
+    let mut seen_nl = false;
+    let mut only_ws_since_nl = false;
+    let mut i: usize = s;
+    while i < e {
+        let b: u8 = unsafe { *(src.ptr + i) };
+        if b == 10u8 {
+            if seen_nl && only_ws_since_nl {
+                return true;
+            }
+            seen_nl = true;
+            only_ws_since_nl = true;
+        } else if b != 32u8 && b != 9u8 && b != 13u8 {
+            only_ws_since_nl = false;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn cst_match_kw_region(ptr: *const u8, byte_len: usize, pos: usize) -> usize {
+    // Matches "#region" (7 bytes) or "#endregion" (10 bytes) at `ptr + pos`,
+    // followed by end-of-slice or space/tab. Returns matched length (7 or 10) or 0.
+    let base: *const u8 = unsafe { ptr + pos };
+    if pos + 7 <= byte_len {
+        let b0: u8 = unsafe { *(base + 0) };
+        let b1: u8 = unsafe { *(base + 1) };
+        let b2: u8 = unsafe { *(base + 2) };
+        let b3: u8 = unsafe { *(base + 3) };
+        let b4: u8 = unsafe { *(base + 4) };
+        let b5: u8 = unsafe { *(base + 5) };
+        let b6: u8 = unsafe { *(base + 6) };
+        if b0 == 35u8 && b1 == 114u8 && b2 == 101u8 && b3 == 103u8 &&
+                b4 == 105u8 && b5 == 111u8 && b6 == 110u8 {
+            if pos + 7 == byte_len {
+                return 7;
+            }
+            let after: u8 = unsafe { *(base + 7) };
+            if after == 32u8 || after == 9u8 {
+                return 7;
+            }
+        }
+    }
+    if pos + 10 <= byte_len {
+        let b0: u8 = unsafe { *(base + 0) };
+        let b1: u8 = unsafe { *(base + 1) };
+        let b2: u8 = unsafe { *(base + 2) };
+        let b3: u8 = unsafe { *(base + 3) };
+        let b4: u8 = unsafe { *(base + 4) };
+        let b5: u8 = unsafe { *(base + 5) };
+        let b6: u8 = unsafe { *(base + 6) };
+        let b7: u8 = unsafe { *(base + 7) };
+        let b8: u8 = unsafe { *(base + 8) };
+        let b9: u8 = unsafe { *(base + 9) };
+        if b0 == 35u8 && b1 == 101u8 && b2 == 110u8 && b3 == 100u8 &&
+                b4 == 114u8 && b5 == 101u8 && b6 == 103u8 && b7 == 105u8 &&
+                b8 == 111u8 && b9 == 110u8 {
+            if pos + 10 == byte_len {
+                return 10;
+            }
+            let after: u8 = unsafe { *(base + 10) };
+            if after == 32u8 || after == 9u8 {
+                return 10;
+            }
+        }
+    }
+    0
+}
+
+// AXS-FMT-002 / AXS-FMT-004: Normalizes comment text, strips trailing spaces/CR,
+// ensures canonical space after `//`, `///`, `//!`, and canonicalizes `#region` / `#endregion`.
+pub fn cst_normalize_comment(
+    arena: mut_view<Arena>,
+    src: StrView,
+    raw_comment: view<Comment>,
+    out_kind: mut_view<u8>,
+    out_is_region_end: mut_view<bool>
+) -> StrView {
+    *out_is_region_end = false;
+    let start_idx: usize = if (raw_comment.span.start as usize) < src.len {
+        raw_comment.span.start as usize
+    } else {
+        src.len
+    };
+    let mut end_idx: usize = if (raw_comment.span.end as usize) < src.len {
+        raw_comment.span.end as usize
+    } else {
+        src.len
+    };
+    if end_idx <= start_idx {
+        *out_kind = TRIVIA_LINE_COMMENT;
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let raw_ptr: *const u8 = unsafe { src.ptr + start_idx };
+    let mut raw_len: usize = end_idx - start_idx;
+
+    if raw_comment.kind == COMMENT_BLOCK {
+        *out_kind = TRIVIA_BLOCK_COMMENT;
+        let dst: *mut u8 = arena_alloc_raw(mut_view(*arena), raw_len + 1, 1);
+        let mut out_len: usize = 0;
+        let mut i: usize = 0;
+        while i < raw_len {
+            let b: u8 = unsafe { *(raw_ptr + i) };
+            if b == 13u8 {
+                // Skip CR; if not followed by LF, emit LF.
+                let next_i: usize = i + 1;
+                if next_i >= raw_len || unsafe { *(raw_ptr + next_i) } != 10u8 {
+                    while out_len > 0 {
+                        let prev_idx: usize = out_len - 1;
+                        let prev: u8 = unsafe { *(dst + prev_idx) };
+                        if prev == 32u8 || prev == 9u8 {
+                            out_len = out_len - 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    unsafe { *(dst + out_len) = 10u8; }
+                    out_len = out_len + 1;
+                }
+            } else if b == 10u8 {
+                while out_len > 0 {
+                    let prev_idx: usize = out_len - 1;
+                    let prev: u8 = unsafe { *(dst + prev_idx) };
+                    if prev == 32u8 || prev == 9u8 {
+                        out_len = out_len - 1;
+                    } else {
+                        break;
+                    }
+                }
+                unsafe { *(dst + out_len) = 10u8; }
+                out_len = out_len + 1;
+            } else {
+                unsafe { *(dst + out_len) = b; }
+                out_len = out_len + 1;
+            }
+            i = i + 1;
+        }
+        return StrView { ptr: dst as *const u8, len: out_len };
+    }
+
+    // Trim trailing CR, LF, space, tab on line/doc comments.
+    while raw_len > 2 {
+        let last_idx: usize = raw_len - 1;
+        let last: u8 = unsafe { *(raw_ptr + last_idx) };
+        if last == 13u8 || last == 10u8 || last == 32u8 || last == 9u8 {
+            raw_len = raw_len - 1;
+        } else {
+            break;
+        }
+    }
+
+    // Check `//!` inner doc comment.
+    if raw_len >= 3 && unsafe { *(raw_ptr + 0) == 47u8 && *(raw_ptr + 1) == 47u8 && *(raw_ptr + 2) == 33u8 } {
+        *out_kind = TRIVIA_INNER_DOC;
+        let need_space: bool = raw_len > 3 && unsafe { *(raw_ptr + 3) != 32u8 && *(raw_ptr + 3) != 9u8 };
+        let out_len: usize = if need_space { raw_len + 1 } else { raw_len };
+        let dst: *mut u8 = arena_alloc_raw(mut_view(*arena), out_len + 1, 1);
+        unsafe {
+            *(dst + 0) = 47u8;
+            *(dst + 1) = 47u8;
+            *(dst + 2) = 33u8;
+        }
+        let mut w: usize = 3;
+        if need_space {
+            unsafe { *(dst + w) = 32u8; }
+            w = w + 1;
+        }
+        let mut r: usize = 3;
+        while r < raw_len {
+            unsafe { *(dst + w) = *(raw_ptr + r); }
+            w = w + 1;
+            r = r + 1;
+        }
+        return StrView { ptr: dst as *const u8, len: out_len };
+    }
+
+    // Check `///` outer doc comment vs `////...` divider banner.
+    if raw_len >= 3 && unsafe { *(raw_ptr + 0) == 47u8 && *(raw_ptr + 1) == 47u8 && *(raw_ptr + 2) == 47u8 } {
+        if raw_len >= 4 && unsafe { *(raw_ptr + 3) == 47u8 } {
+            // 4+ slashes divider banner (`////...`), preserve verbatim.
+            *out_kind = TRIVIA_LINE_COMMENT;
+            let dst: *mut u8 = arena_alloc_raw(mut_view(*arena), raw_len + 1, 1);
+            let mut i: usize = 0;
+            while i < raw_len {
+                unsafe { *(dst + i) = *(raw_ptr + i); }
+                i = i + 1;
+            }
+            return StrView { ptr: dst as *const u8, len: raw_len };
+        }
+        *out_kind = TRIVIA_OUTER_DOC;
+        let need_space: bool = raw_len > 3 && unsafe { *(raw_ptr + 3) != 32u8 && *(raw_ptr + 3) != 9u8 };
+        let out_len: usize = if need_space { raw_len + 1 } else { raw_len };
+        let dst: *mut u8 = arena_alloc_raw(mut_view(*arena), out_len + 1, 1);
+        unsafe {
+            *(dst + 0) = 47u8;
+            *(dst + 1) = 47u8;
+            *(dst + 2) = 47u8;
+        }
+        let mut w: usize = 3;
+        if need_space {
+            unsafe { *(dst + w) = 32u8; }
+            w = w + 1;
+        }
+        let mut r: usize = 3;
+        while r < raw_len {
+            unsafe { *(dst + w) = *(raw_ptr + r); }
+            w = w + 1;
+            r = r + 1;
+        }
+        return StrView { ptr: dst as *const u8, len: out_len };
+    }
+
+    // Standard `//` comment: check for `#region` / `#endregion`.
+    let mut scan: usize = 2;
+    while scan < raw_len {
+        let b: u8 = unsafe { *(raw_ptr + scan) };
+        if b == 32u8 || b == 9u8 {
+            scan = scan + 1;
+        } else {
+            break;
+        }
+    }
+    let reg_kw_len: usize = cst_match_kw_region(raw_ptr, raw_len, scan);
+    if reg_kw_len > 0 {
+        *out_kind = TRIVIA_REGION_DIRECTIVE;
+        *out_is_region_end = reg_kw_len == 10;
+        let mut label_pos: usize = scan + reg_kw_len;
+        while label_pos < raw_len {
+            let b: u8 = unsafe { *(raw_ptr + label_pos) };
+            if b == 32u8 || b == 9u8 {
+                label_pos = label_pos + 1;
+            } else {
+                break;
+            }
+        }
+        let label_len: usize = if label_pos < raw_len { raw_len - label_pos } else { 0 };
+        let out_len: usize = 3 + reg_kw_len + (if label_len > 0 { 1 + label_len } else { 0 });
+        let dst: *mut u8 = arena_alloc_raw(mut_view(*arena), out_len + 1, 1);
+        unsafe {
+            *(dst + 0) = 47u8;
+            *(dst + 1) = 47u8;
+            *(dst + 2) = 32u8;
+        }
+        let mut w: usize = 3;
+        let mut k: usize = 0;
+        while k < reg_kw_len {
+            let r_idx: usize = scan + k;
+            unsafe { *(dst + w) = *(raw_ptr + r_idx); }
+            w = w + 1;
+            k = k + 1;
+        }
+        if label_len > 0 {
+            unsafe { *(dst + w) = 32u8; }
+            w = w + 1;
+            let mut m: usize = 0;
+            while m < label_len {
+                let l_idx: usize = label_pos + m;
+                unsafe { *(dst + w) = *(raw_ptr + l_idx); }
+                w = w + 1;
+                m = m + 1;
+            }
+        }
+        return StrView { ptr: dst as *const u8, len: out_len };
+    }
+
+    *out_kind = TRIVIA_LINE_COMMENT;
+    if raw_len == 2 {
+        let dst: *mut u8 = arena_alloc_raw(mut_view(*arena), 3, 1);
+        unsafe {
+            *(dst + 0) = 47u8;
+            *(dst + 1) = 47u8;
+        }
+        return StrView { ptr: dst as *const u8, len: 2 };
+    }
+    let b2: u8 = unsafe { *(raw_ptr + 2) };
+    // Preserve divider lines `//---...` or `//===...` or already-spaced `// ...`.
+    let is_divider: bool = raw_len >= 5 && (b2 == 45u8 || b2 == 61u8) &&
+        unsafe { *(raw_ptr + 3) == b2 && *(raw_ptr + 4) == b2 };
+    let need_space: bool = b2 != 32u8 && b2 != 9u8 && !is_divider;
+    let out_len: usize = if need_space { raw_len + 1 } else { raw_len };
+    let dst: *mut u8 = arena_alloc_raw(mut_view(*arena), out_len + 1, 1);
+    unsafe {
+        *(dst + 0) = 47u8;
+        *(dst + 1) = 47u8;
+    }
+    let mut w: usize = 2;
+    if need_space {
+        unsafe { *(dst + w) = 32u8; }
+        w = w + 1;
+    }
+    let mut r: usize = 2;
+    while r < raw_len {
+        unsafe { *(dst + w) = *(raw_ptr + r); }
+        w = w + 1;
+        r = r + 1;
+    }
+    StrView { ptr: dst as *const u8, len: out_len }
+}
+
+// Binary search for the first non-EOF token index whose `span.start >= byte_pos`.
+// Returns `cf.non_eof_token_count` if no non-EOF token starts at or after `byte_pos`.
+pub fn cst_find_token_at_or_after(cf: view<CstFile>, byte_pos: u32) -> usize {
+    let n: usize = cf.non_eof_token_count;
+    let mut lo: usize = 0;
+    let mut hi: usize = n;
+    while lo < hi {
+        let mid: usize = lo + ((hi - lo) >> 1);
+        let tok_start: u32 = unsafe { (*(cst_tok_ptr(cf.tokens, mid))).span.start };
+        if tok_start < byte_pos {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+// Binary search for the last non-EOF token index whose `span.end <= byte_pos`.
+// Returns -1 if all non-EOF tokens end after `byte_pos`.
+pub fn cst_find_token_ending_at_or_before(cf: view<CstFile>, byte_pos: u32) -> i32 {
+    let n: usize = cf.non_eof_token_count;
+    if n == 0 {
+        return -1;
+    }
+    let mut lo: usize = 0;
+    let mut hi: usize = n;
+    while lo < hi {
+        let mid: usize = lo + ((hi - lo) >> 1);
+        let tok_end: u32 = unsafe { (*(cst_tok_ptr(cf.tokens, mid))).span.end };
+        if tok_end <= byte_pos {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo == 0 {
+        -1
+    } else {
+        (lo - 1) as i32
+    }
+}
+
+// Detects synthetic `@derive(...)` `ITEM_IMPL` nodes generated by `expand_derives` in `compiler/syntax/parse.ax`.
+pub fn cst_is_synthetic_item(item: *const AstItem, file_id: FileId, is_first: bool) -> bool {
+    if (item as usize) == 0 {
+        return false;
+    }
+    let sp: Span = unsafe { (*item).span };
+    let k: u8 = unsafe { (*item).kind };
+    if file_id.v != 0u32 && sp.file.v == 0u32 {
+        return true;
+    }
+    if !is_first && k == ITEM_IMPL && sp.start == 0u32 {
+        return true;
+    }
+    false
+}
+
+fn cst_token_ident_strid(interner: mut_view<StrInterner>, src_ptr: *const u8, tok: *const Token) -> StrId {
+    let k: u8 = unsafe { (*tok).kind };
+    if k == TOK_IDENT {
+        return unsafe { (*tok).ident_val };
+    }
+    if k == TOK_KW_SELF_VALUE || k == TOK_KW_SELF_TYPE {
+        let st: usize = unsafe { (*tok).span.start as usize };
+        let en: usize = unsafe { (*tok).span.end as usize };
+        if en > st && (src_ptr as usize) != 0 {
+            return interner_intern_bytes(mut_view(*interner), unsafe { src_ptr + st }, en - st);
+        }
+    }
+    StrId { v: 0u32 }
+}
+
+pub fn cst_set_dotted_name(dst: mut_view<AstDottedName>, segs: *mut StrId, count: usize) {
+    dst.segments = segs;
+    dst.count = count;
+}
+
+fn cst_copy_token(dst: *mut Token, src: *const Token) {
+    unsafe {
+        (*dst).kind = (*src).kind;
+        (*dst).suffix = (*src).suffix;
+        (*dst).flags = (*src).flags;
+        (*dst).char_val = (*src).char_val;
+        ast_set_span(mut_view((*dst).span), (*src).span);
+        (*dst).int_val = (*src).int_val;
+        (*dst).str_ptr = (*src).str_ptr;
+        (*dst).str_len = (*src).str_len;
+        (*dst).ident_val = (*src).ident_val;
+    }
+}
+
+fn cst_alloc_use_tree(arena: mut_view<Arena>, span: Span) -> *mut AstUseTree {
+    let raw_sz: usize = size_of<AstUseTree>();
+    let aligned_sz: usize = ((raw_sz + 7) / 8) * 8;
+    let bytes: *mut u8 = arena_alloc_raw(mut_view(*arena), aligned_sz, 8);
+    let mut i: usize = 0;
+    while i < aligned_sz {
+        unsafe { *(bytes + i) = 0u8; }
+        i = i + 1;
+    }
+    let p: *mut AstUseTree = bytes as *mut AstUseTree;
+    ast_set_span(unsafe { mut_view((*p).span) }, span);
+    p
+}
+
+fn cst_parse_use_tree_from_tokens(
+    arena: mut_view<Arena>,
+    interner: mut_view<StrInterner>,
+    src_ptr: *const u8,
+    tokens: *mut Token,
+    pos_ptr: *mut usize,
+    limit: usize
+) -> *mut AstUseTree {
+    let start_pos: usize = unsafe { *pos_ptr };
+    let start_span: Span = if start_pos < limit {
+        unsafe { (*(cst_tok_ptr(tokens, start_pos))).span }
+    } else {
+        Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 }
+    };
+    let tree: *mut AstUseTree = cst_alloc_use_tree(mut_view(*arena), start_span);
+    let segs: *mut StrId = arena_alloc_raw(mut_view(*arena), 32 * size_of<StrId>(), align_of<StrId>()) as *mut StrId;
+    let mut seg_count: usize = 0;
+
+    while (unsafe { *pos_ptr }) < limit && seg_count < 32 {
+        let cur_p: usize = unsafe { *pos_ptr };
+        let tok: *mut Token = cst_tok_ptr(tokens, cur_p);
+        let k: u8 = unsafe { (*tok).kind };
+        if k == TOK_IDENT || k == TOK_KW_SELF_VALUE || k == TOK_KW_SELF_TYPE {
+            let sid: StrId = cst_token_ident_strid(mut_view(*interner), src_ptr, tok as *const Token);
+            unsafe { *(cst_strid_ptr(segs, seg_count)) = sid; }
+            seg_count = seg_count + 1;
+            let next_p: usize = cur_p + 1;
+            unsafe { *pos_ptr = next_p; }
+            if next_p < limit && unsafe { (*(cst_tok_ptr(tokens, next_p))).kind } == TOK_DOT {
+                if next_p + 1 < limit && unsafe { (*(cst_tok_ptr(tokens, next_p + 1))).kind } == TOK_LBRACE {
+                    unsafe { *pos_ptr = next_p + 1; } // advance to TOK_LBRACE
+                    break;
+                }
+                unsafe { *pos_ptr = next_p + 1; }
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    cst_set_dotted_name(unsafe { mut_view((*tree).path) }, segs, seg_count);
+
+    let after_p: usize = unsafe { *pos_ptr };
+    if after_p < limit {
+        let k: u8 = unsafe { (*(cst_tok_ptr(tokens, after_p))).kind };
+        if k == TOK_KW_AS {
+            let alias_p: usize = after_p + 1;
+            unsafe { *pos_ptr = alias_p; }
+            if alias_p < limit {
+                let alias_tok: *mut Token = cst_tok_ptr(tokens, alias_p);
+                let ak: u8 = unsafe { (*alias_tok).kind };
+                if ak == TOK_IDENT || ak == TOK_KW_SELF_VALUE || ak == TOK_KW_SELF_TYPE {
+                    let asid: StrId = cst_token_ident_strid(mut_view(*interner), src_ptr, alias_tok as *const Token);
+                    unsafe {
+                        (*tree).alias = asid;
+                        *pos_ptr = alias_p + 1;
+                    }
+                }
+            }
+        } else if k == TOK_LBRACE {
+            unsafe { *pos_ptr = after_p + 1; }
+            let mut sub_head: *mut AstUseTree = 0 as *mut AstUseTree;
+            let mut sub_tail: *mut AstUseTree = 0 as *mut AstUseTree;
+            while (unsafe { *pos_ptr }) < limit {
+                let cp: usize = unsafe { *pos_ptr };
+                let ck: u8 = unsafe { (*(cst_tok_ptr(tokens, cp))).kind };
+                if ck == TOK_RBRACE {
+                    unsafe { *pos_ptr = cp + 1; }
+                    break;
+                }
+                let sub: *mut AstUseTree = cst_parse_use_tree_from_tokens(mut_view(*arena), mut_view(*interner), src_ptr, tokens, pos_ptr, limit);
+                if (sub_tail as usize) == 0 {
+                    sub_head = sub;
+                } else {
+                    unsafe { (*sub_tail).next = sub; }
+                }
+                sub_tail = sub;
+                let np: usize = unsafe { *pos_ptr };
+                if np < limit && unsafe { (*(cst_tok_ptr(tokens, np))).kind } == TOK_COMMA {
+                    unsafe { *pos_ptr = np + 1; }
+                } else if np == cp {
+                    unsafe { *pos_ptr = np + 1; }
+                }
+            }
+            unsafe { (*tree).subtrees = sub_head; }
+        }
+    }
+    tree
+}
+
+pub fn cst_populate_use_trees(
+    arena: mut_view<Arena>,
+    interner: mut_view<StrInterner>,
+    cf: view<CstFile>,
+    ast: mut_view<Ast>
+) {
+    let pos_cell: *mut usize = arena_alloc_raw(mut_view(*arena), size_of<usize>(), align_of<usize>()) as *mut usize;
+    let mut tok_cursor: usize = 0;
+    let max_tok: usize = cf.non_eof_token_count;
+    let mut cur: *mut AstItem = ast.items;
+    let mut is_first: bool = true;
+    while (cur as usize) != 0 {
+        if cst_is_synthetic_item(cur as *const AstItem, cf.file_id, is_first) {
+            cur = unsafe { (*cur).next };
+            continue;
+        }
+        is_first = false;
+        if unsafe { (*cur).kind } == ITEM_USE {
+            while tok_cursor < max_tok {
+                if unsafe { (*(cst_tok_ptr(cf.tokens, tok_cursor))).kind } == TOK_KW_USE {
+                    tok_cursor = tok_cursor + 1;
+                    break;
+                }
+                tok_cursor = tok_cursor + 1;
+            }
+            if tok_cursor < max_tok {
+                unsafe { *pos_cell = tok_cursor; }
+                let rebuilt: *mut AstUseTree = cst_parse_use_tree_from_tokens(
+                    mut_view(*arena),
+                    mut_view(*interner),
+                    cf.src.ptr,
+                    cf.tokens,
+                    pos_cell,
+                    max_tok
+                );
+                tok_cursor = unsafe { *pos_cell };
+                unsafe { (*cur).use_tree = rebuilt; }
+            }
+        }
+        cur = unsafe { (*cur).next };
+    }
+}
+
+// AXS-FMT-003: Builds `CstFile` and runs the 5-Slot Deterministic Comment Attachment Algorithm in O(T + C).
+pub fn cst_build_file(
+    arena: mut_view<Arena>,
+    interner: mut_view<StrInterner>,
+    src: StrView,
+    lex_res: view<LexResult>,
+    ast: mut_view<Ast>,
+    file_id: FileId
+) -> CstFile {
+    let src_ptr = src.ptr;
+    let src_len = src.len;
+    let had_bom = cst_has_bom(StrView { ptr: src_ptr, len: src_len });
+    let clean_src = cst_strip_bom(StrView { ptr: src_ptr, len: src_len });
+    let tok_cnt = lex_res.token_count;
+    let non_eof_cnt: usize = if tok_cnt > 0 &&
+            unsafe { (*(cst_tok_ptr(lex_res.tokens, tok_cnt - 1))).kind } == TOK_EOF {
+        tok_cnt - 1
+    } else {
+        tok_cnt
+    };
+
+    let alloc_tok_cnt = if tok_cnt > 0 { tok_cnt } else { 1 };
+    let match_close = arena_alloc_raw(mut_view(*arena), alloc_tok_cnt * size_of<usize>(), align_of<usize>()) as *mut usize;
+    let match_open = arena_alloc_raw(mut_view(*arena), alloc_tok_cnt * size_of<usize>(), align_of<usize>()) as *mut usize;
+    let stack = arena_alloc_raw(mut_view(*arena), alloc_tok_cnt * size_of<usize>(), align_of<usize>()) as *mut usize;
+    let mut sp: usize = 0;
+    let mut ti: usize = 0;
+    while ti < tok_cnt {
+        unsafe {
+            *(cst_usize_ptr(match_close, ti)) = ti;
+            *(cst_usize_ptr(match_open, ti)) = ti;
+        }
+        let tk: u8 = unsafe { (*(cst_tok_ptr(lex_res.tokens, ti))).kind };
+        if tk == TOK_LBRACE || tk == TOK_LPAREN || tk == TOK_LBRACKET {
+            unsafe { *(cst_usize_ptr(stack, sp)) = ti; }
+            sp = sp + 1;
+        } else if tk == TOK_RBRACE || tk == TOK_RPAREN || tk == TOK_RBRACKET {
+            if sp > 0 {
+                sp = sp - 1;
+                let open_idx: usize = unsafe { *(cst_usize_ptr(stack, sp)) };
+                unsafe {
+                    *(cst_usize_ptr(match_close, open_idx)) = ti;
+                    *(cst_usize_ptr(match_open, ti)) = open_idx;
+                }
+            }
+        }
+        ti = ti + 1;
+    }
+
+    let c_cnt: usize = lex_res.comment_count;
+    let alloc_c_cnt: usize = if c_cnt > 0 { c_cnt } else { 1 };
+    let trivia_arr: *mut CstTrivia = arena_alloc_raw(mut_view(*arena), alloc_c_cnt * size_of<CstTrivia>(), align_of<CstTrivia>()) as *mut CstTrivia;
+
+    let mut cf: CstFile = CstFile {
+        file_id: file_id,
+        src: clean_src,
+        bom_stripped: had_bom,
+        tokens: lex_res.tokens,
+        token_count: tok_cnt,
+        non_eof_token_count: non_eof_cnt,
+        match_close: match_close,
+        match_open: match_open,
+        trivia: trivia_arr,
+        trivia_count: c_cnt,
+        header_count: 0,
+        trailing_count: 0,
+        inline_count: 0,
+        leading_count: 0,
+        dangling_count: 0,
+    };
+
+    // Determine header banner boundary before the first non-EOF token (Slot 1).
+    let first_tok_start: u32 = if non_eof_cnt > 0 {
+        unsafe { (*(cst_tok_ptr(lex_res.tokens, 0))).span.start }
+    } else {
+        clean_src.len as u32
+    };
+    let mut last_banner_comment_idx: i32 = -1;
+    let mut seen_outer_doc_before_tok0: bool = false;
+    let mut ci: usize = 0;
+    while ci < c_cnt {
+        let raw_c: *mut Comment = cst_comment_ptr(lex_res.comments, ci);
+        let c_start: u32 = unsafe { (*raw_c).span.start };
+        let c_end: u32 = unsafe { (*raw_c).span.end };
+        if c_start >= first_tok_start {
+            break;
+        }
+        let mut kind_tmp: u8 = 0u8;
+        let mut reg_end_tmp: bool = false;
+        let norm_sv: StrView = cst_normalize_comment(mut_view(*arena), clean_src, unsafe { view(*raw_c) }, mut_view(kind_tmp), mut_view(reg_end_tmp));
+        if kind_tmp == TRIVIA_OUTER_DOC {
+            seen_outer_doc_before_tok0 = true;
+        }
+        let next_start: u32 = if ci + 1 < c_cnt && unsafe { (*(cst_comment_ptr(lex_res.comments, ci + 1))).span.start } < first_tok_start {
+            unsafe { (*(cst_comment_ptr(lex_res.comments, ci + 1))).span.start }
+        } else {
+            first_tok_start
+        };
+        if !seen_outer_doc_before_tok0 && non_eof_cnt > 0 && cst_has_blank_line_between(clean_src, c_end, next_start) && norm_sv.len > 0 {
+            last_banner_comment_idx = ci as i32;
+        }
+        ci = ci + 1;
+    }
+
+    // Populate all CstTrivia entries in O(T + C).
+    ci = 0;
+    while ci < c_cnt {
+        let raw_c: *mut Comment = cst_comment_ptr(lex_res.comments, ci);
+        let c_span: Span = unsafe { (*raw_c).span };
+        let mut t_kind: u8 = 0u8;
+        let mut is_reg_end: bool = false;
+        let norm_sv: StrView = cst_normalize_comment(mut_view(*arena), clean_src, unsafe { view(*raw_c) }, mut_view(t_kind), mut_view(is_reg_end));
+        let prev_tok: i32 = cst_find_token_ending_at_or_before(view(cf), c_span.start);
+        let next_tok_u: usize = cst_find_token_at_or_after(view(cf), c_span.end);
+        let next_tok: i32 = if next_tok_u < non_eof_cnt { next_tok_u as i32 } else { -1 };
+
+        let prev_end_byte: u32 = if ci > 0 {
+            let prev_c_end: u32 = unsafe { (*(cst_comment_ptr(lex_res.comments, ci - 1))).span.end };
+            if prev_tok >= 0 {
+                let pt_end: u32 = unsafe { (*(cst_tok_ptr(lex_res.tokens, prev_tok as usize))).span.end };
+                if pt_end > prev_c_end { pt_end } else { prev_c_end }
+            } else {
+                prev_c_end
+            }
+        } else if prev_tok >= 0 {
+            unsafe { (*(cst_tok_ptr(lex_res.tokens, prev_tok as usize))).span.end }
+        } else {
+            0u32
+        };
+
+        let next_start_byte: u32 = if ci + 1 < c_cnt {
+            let next_c_start: u32 = unsafe { (*(cst_comment_ptr(lex_res.comments, ci + 1))).span.start };
+            if next_tok >= 0 {
+                let nt_start: u32 = unsafe { (*(cst_tok_ptr(lex_res.tokens, next_tok as usize))).span.start };
+                if nt_start < next_c_start { nt_start } else { next_c_start }
+            } else {
+                next_c_start
+            }
+        } else if next_tok >= 0 {
+            unsafe { (*(cst_tok_ptr(lex_res.tokens, next_tok as usize))).span.start }
+        } else {
+            clean_src.len as u32
+        };
+
+        let has_blank_before: bool = (ci > 0 || prev_tok >= 0) && cst_has_blank_line_between(clean_src, prev_end_byte, c_span.start);
+        let has_blank_after: bool = cst_has_blank_line_between(clean_src, c_span.end, next_start_byte);
+
+        // 5-Slot Deterministic Attachment Decision:
+        let mut slot: u8 = SLOT_LEADING;
+        let mut anchor_byte: u32 = 0u32;
+        let mut trailing_node_end: u32 = 0u32;
+
+        let is_single_line: bool = !cst_has_newline_between(clean_src, c_span.start, c_span.end);
+        let same_line_as_prev: bool = prev_tok >= 0 &&
+            !cst_has_newline_between(clean_src, unsafe { (*(cst_tok_ptr(lex_res.tokens, prev_tok as usize))).span.end }, c_span.start);
+        let no_tok_after_on_line: bool = next_tok < 0 ||
+            cst_has_newline_between(clean_src, c_span.end, unsafe { (*(cst_tok_ptr(lex_res.tokens, next_tok as usize))).span.start });
+        let same_line_as_next: bool = next_tok >= 0 && !no_tok_after_on_line;
+
+        if prev_tok < 0 && (t_kind == TRIVIA_INNER_DOC || (ci as i32) <= last_banner_comment_idx || non_eof_cnt == 0) {
+            slot = SLOT_HEADER;
+            anchor_byte = 0u32;
+            cf.header_count = cf.header_count + 1;
+        } else if same_line_as_prev && is_single_line && no_tok_after_on_line && t_kind != TRIVIA_OUTER_DOC && t_kind != TRIVIA_INNER_DOC {
+            slot = SLOT_TRAILING;
+            let p_idx: usize = prev_tok as usize;
+            let p_tok: *mut Token = cst_tok_ptr(lex_res.tokens, p_idx);
+            let p_end: u32 = unsafe { (*p_tok).span.end };
+            let p_kind: u8 = unsafe { (*p_tok).kind };
+            anchor_byte = p_end;
+            if (p_kind == TOK_COMMA || p_kind == TOK_SEMI) && p_idx > 0 {
+                trailing_node_end = unsafe { (*(cst_tok_ptr(lex_res.tokens, p_idx - 1))).span.end };
+            } else {
+                trailing_node_end = p_end;
+            }
+            cf.trailing_count = cf.trailing_count + 1;
+        } else if t_kind == TRIVIA_BLOCK_COMMENT && prev_tok >= 0 && same_line_as_next {
+            slot = SLOT_INLINE;
+            anchor_byte = unsafe { (*(cst_tok_ptr(lex_res.tokens, next_tok as usize))).span.start };
+            cf.inline_count = cf.inline_count + 1;
+        } else if next_tok < 0 {
+            slot = SLOT_DANGLING;
+            anchor_byte = clean_src.len as u32;
+            cf.dangling_count = cf.dangling_count + 1;
+        } else {
+            let nt_kind: u8 = unsafe { (*(cst_tok_ptr(lex_res.tokens, next_tok as usize))).kind };
+            if nt_kind == TOK_RBRACE || nt_kind == TOK_RPAREN || nt_kind == TOK_RBRACKET {
+                slot = SLOT_DANGLING;
+                anchor_byte = unsafe { (*(cst_tok_ptr(lex_res.tokens, next_tok as usize))).span.start };
+                cf.dangling_count = cf.dangling_count + 1;
+            } else {
+                slot = SLOT_LEADING;
+                anchor_byte = unsafe { (*(cst_tok_ptr(lex_res.tokens, next_tok as usize))).span.start };
+                cf.leading_count = cf.leading_count + 1;
+            }
+        }
+
+        let tr: *mut CstTrivia = cst_trivia_ptr(trivia_arr, ci);
+        ast_set_span(unsafe { mut_view((*tr).raw_span) }, c_span);
+        unsafe {
+            (*tr).kind = t_kind;
+            (*tr).slot = slot;
+            (*tr).emitted = false;
+            (*tr).has_blank_before = has_blank_before;
+            (*tr).has_blank_after = has_blank_after;
+            (*tr).is_region_end = is_reg_end;
+            (*tr).norm_ptr = norm_sv.ptr;
+            (*tr).norm_len = norm_sv.len;
+            (*tr).scalar_width = cst_utf8_scalar_len(norm_sv.ptr, norm_sv.len);
+            (*tr).prev_tok_idx = prev_tok;
+            (*tr).next_tok_idx = next_tok;
+            (*tr).anchor_byte = anchor_byte;
+            (*tr).trailing_node_end_byte = trailing_node_end;
+        }
+        ci = ci + 1;
+    }
+
+    cst_populate_use_trees(mut_view(*arena), mut_view(*interner), view(cf), mut_view(*ast));
+    cf
+}
+
+// Copies tokens for `ax_parse` while eliding `.{ ... }` use-group suffixes so `ax_parse`
+// never trips on braced `use` trees or `self` inside `use` trees; `cst_build_file` then
+// populates the full `AstUseTree` hierarchy from the original `lex_res.tokens`.
+pub fn cst_parse_and_build(
+    arena: mut_view<Arena>,
+    interner: mut_view<StrInterner>,
+    sink: mut_view<DiagSink>,
+    file_id: FileId,
+    src: StrView,
+    out_lex: mut_view<LexResult>,
+    out_parse: mut_view<ParseResult>
+) -> CstFile {
+    let fid_v = file_id.v;
+    let src_ptr = src.ptr;
+    let src_len = src.len;
+    let clean_src = cst_strip_bom(StrView { ptr: src_ptr, len: src_len });
+    let clean_ptr = clean_src.ptr;
+    out_lex.arena = arena_new();
+    out_lex.tokens = 0 as *mut Token;
+    out_lex.token_count = 0;
+    out_lex.token_cap = 0;
+    out_lex.comments = 0 as *mut Comment;
+    out_lex.comment_count = 0;
+    out_lex.comment_cap = 0;
+    ax_lex_into(FileId { v: fid_v }, clean_src, mut_view(*sink), mut_view(*interner), mut_view(*out_lex));
+
+    let tok_cnt: usize = out_lex.token_count;
+    let alloc_cnt: usize = if tok_cnt > 0 { tok_cnt } else { 1 };
+    let parse_toks: *mut Token = arena_alloc_raw(mut_view(*arena), alloc_cnt * size_of<Token>(), align_of<Token>()) as *mut Token;
+    let mut pt_len: usize = 0;
+    let mut i: usize = 0;
+    while i < tok_cnt {
+        let tk_ptr: *mut Token = cst_tok_ptr(out_lex.tokens, i);
+        let tk_kind: u8 = unsafe { (*tk_ptr).kind };
+        cst_copy_token(cst_tok_ptr(parse_toks, pt_len), tk_ptr as *const Token);
+        pt_len = pt_len + 1;
+        i = i + 1;
+
+        if tk_kind == TOK_KW_USE {
+            // Copy path segments; if `.` is followed by `{ ... }`, elide `.{ ... }` for `ax_parse`.
+            let mut saw_seg: bool = false;
+            while i < tok_cnt {
+                let cur_ptr: *mut Token = cst_tok_ptr(out_lex.tokens, i);
+                let cur_kind: u8 = unsafe { (*cur_ptr).kind };
+                if cur_kind == TOK_DOT && i + 1 < tok_cnt &&
+                        unsafe { (*(cst_tok_ptr(out_lex.tokens, i + 1))).kind } == TOK_LBRACE {
+                    if !saw_seg {
+                        // Ensure at least one identifier before `{...}` for `ax_parse`.
+                        let dst_d: *mut Token = cst_tok_ptr(parse_toks, pt_len);
+                        cst_copy_token(dst_d, cur_ptr as *const Token);
+                        let d_sid: StrId = cst_token_ident_strid(mut_view(*interner), clean_ptr, cur_ptr as *const Token);
+                        unsafe {
+                            (*dst_d).kind = TOK_IDENT;
+                            (*dst_d).ident_val = d_sid;
+                        }
+                        pt_len = pt_len + 1;
+                    }
+                    i = i + 2; // skip `.` and `{`
+                    let mut depth: usize = 1;
+                    while i < tok_cnt && depth > 0 {
+                        let bk: u8 = unsafe { (*(cst_tok_ptr(out_lex.tokens, i))).kind };
+                        if bk == TOK_LBRACE {
+                            depth = depth + 1;
+                        } else if bk == TOK_RBRACE {
+                            depth = depth - 1;
+                        }
+                        i = i + 1;
+                    }
+                    break;
+                } else if cur_kind == TOK_IDENT || cur_kind == TOK_KW_SELF_VALUE || cur_kind == TOK_KW_SELF_TYPE {
+                    let dst_c: *mut Token = cst_tok_ptr(parse_toks, pt_len);
+                    cst_copy_token(dst_c, cur_ptr as *const Token);
+                    if cur_kind != TOK_IDENT {
+                        let c_sid: StrId = cst_token_ident_strid(mut_view(*interner), clean_ptr, cur_ptr as *const Token);
+                        unsafe {
+                            (*dst_c).kind = TOK_IDENT;
+                            (*dst_c).ident_val = c_sid;
+                        }
+                    }
+                    pt_len = pt_len + 1;
+                    saw_seg = true;
+                    i = i + 1;
+                } else if cur_kind == TOK_DOT || cur_kind == TOK_KW_AS {
+                    cst_copy_token(cst_tok_ptr(parse_toks, pt_len), cur_ptr as *const Token);
+                    pt_len = pt_len + 1;
+                    i = i + 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    let pr: ParseResult = ax_parse(mut_view(*arena), parse_toks, pt_len, mut_view(*sink), mut_view(*interner));
+    *out_parse = pr;
+    cst_build_file(mut_view(*arena), mut_view(*interner), StrView { ptr: src_ptr, len: src_len }, view(*out_lex), mut_view(out_parse.ast), FileId { v: fid_v })
+}
+
+// AXS-FMT-004: Returns the number of comments in `cf` that have not yet been emitted.
+pub fn cst_unemitted_count(cf: view<CstFile>) -> usize {
+    let mut rem: usize = 0;
+    let mut i: usize = 0;
+    while i < cf.trivia_count {
+        let tr: *mut CstTrivia = cst_trivia_ptr(cf.trivia, i);
+        if !unsafe { (*tr).emitted } {
+            rem = rem + 1;
+        }
+        i = i + 1;
+    }
+    rem
+}
+
+pub fn cst_mark_emitted(cf: mut_view<CstFile>, idx: usize) {
+    if idx < cf.trivia_count {
+        let tr: *mut CstTrivia = cst_trivia_ptr(cf.trivia, idx);
+        unsafe { (*tr).emitted = true; }
+    }
+}
+
+// Finds an unemitted `SLOT_TRAILING` comment whose `anchor_byte` or `trailing_node_end_byte`
+// falls within `[start_byte, end_byte]`. Returns trivia index or -1.
+pub fn cst_find_trailing_in_range(cf: view<CstFile>, start_byte: u32, end_byte: u32) -> i32 {
+    let mut i: usize = 0;
+    while i < cf.trivia_count {
+        let tr: *mut CstTrivia = cst_trivia_ptr(cf.trivia, i);
+        if !unsafe { (*tr).emitted } && unsafe { (*tr).slot } == SLOT_TRAILING {
+            let ab: u32 = unsafe { (*tr).anchor_byte };
+            let nb: u32 = unsafe { (*tr).trailing_node_end_byte };
+            if (ab >= start_byte && ab <= end_byte) || (nb >= start_byte && nb <= end_byte) {
+                return i as i32;
+            }
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+// Finds the closing delimiter token index for the first `{`, `(`, or `[` token in `[start_tok, limit_tok)`.
+pub fn cst_find_container_close_tok(cf: view<CstFile>, start_tok: usize, open_kind: u8, limit_tok: usize) -> usize {
+    let mut t: usize = start_tok;
+    let max_t: usize = if limit_tok <= cf.non_eof_token_count { limit_tok } else { cf.non_eof_token_count };
+    while t < max_t {
+        let tk: u8 = unsafe { (*(cst_tok_ptr(cf.tokens, t))).kind };
+        if tk == open_kind {
+            let close_t: usize = unsafe { *(cst_usize_ptr(cf.match_close, t)) };
+            if close_t > t && close_t <= cf.non_eof_token_count {
+                return close_t;
+            }
+        }
+        t = t + 1;
+    }
+    max_t
+}
