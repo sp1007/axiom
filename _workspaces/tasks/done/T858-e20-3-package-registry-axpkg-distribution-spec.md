@@ -8,14 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T220, T681, T685, T318]
 priority: 208
-status: doing
+status: done
 attempts: 1
 paths: [spec/SPEC-112-package-registry-distribution.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-111-package-manager-resolution-lockfiles.md, spec/SPEC-24-artifact-format-module-interfaces.md, tasks/0412, tasks/0665, tasks/0739, tasks/0858, tasks/1065]
 covers: [REQ-ECO-8736, REQ-PKG-024]
 started: 2026-11-08 18:42:30
-agent: T858-impl
+finished: 2026-11-08 18:58:58
 ---
 # T858 — E20.3 Canonical package registry protocol, .axpkg content-addressed archive, offline mirror & distribution runtime specification (SPEC-112)
 
@@ -46,3 +46,4 @@ Consolidate the canonical specification for Axiom's Native Application Package R
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
 - 2026-11-08 18:42:30 started (attempt 1) T858-impl
+- 2026-11-08 18:58:58 accepted by QA -> done
