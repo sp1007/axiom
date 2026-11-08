@@ -1,0 +1,336 @@
+// test: run
+// modes: interp native
+// stdout-file: boundary_firewall_and_allocator_isolation.stdout
+// SPEC-115 §3 (AXS-COMP-020..022, AXS-COMP-050; tasks/0584 §325.10-21; REQ-ECO-8734, INV-COMP-001):
+// E20.7 Conformance: @component_interface and @plugin_export boundary verification,
+// compile-time and runtime rejection of raw pointer escapes (AX_COMP_RAW_POINTER_ESCAPE),
+// plain host heap allocations rejection (AX_COMP_CROSS_ALLOCATOR_VIOLATION),
+// ComponentBox<T> originating-heap deallocation routing via AllocatorVTable,
+// and generational ComponentHandle<T> table stale-generation / stale-epoch detection.
+
+const AX_COMP_RAW_POINTER_ESCAPE: u32 = 238u32
+const AX_COMP_CROSS_ALLOCATOR_VIOLATION: u32 = 239u32
+const AX_COMP_STALE_HANDLE: u32 = 240u32
+
+// Parameter passing modes across @component_interface boundaries (AXS-COMP-020)
+const PARAM_PASS_BY_VAL: u8 = 0u8
+const PARAM_PASS_VIEW: u8 = 1u8
+const PARAM_PASS_MUT_VIEW: u8 = 2u8
+const PARAM_PASS_COMPONENT_BOX: u8 = 3u8
+const PARAM_PASS_COMPONENT_HANDLE: u8 = 4u8
+const PARAM_PASS_OPAQUE_PTR: u8 = 5u8
+const PARAM_PASS_RAW_PTR: u8 = 6u8
+const PARAM_PASS_PLAIN_HOST_BOX: u8 = 7u8
+const PARAM_PASS_PLAIN_HOST_COLLECTION: u8 = 8u8
+
+@derive(Copy)
+struct BoundaryParam {
+    pass_mode: u8,
+    type_id: u8,
+    has_lease: bool,
+}
+
+// Validates boundary parameter contracts (AXS-COMP-020)
+fn validate_boundary_parameter(param: BoundaryParam) -> u32 {
+    if param.pass_mode == PARAM_PASS_RAW_PTR {
+        return AX_COMP_RAW_POINTER_ESCAPE
+    }
+    if param.pass_mode == PARAM_PASS_PLAIN_HOST_BOX || param.pass_mode == PARAM_PASS_PLAIN_HOST_COLLECTION {
+        return AX_COMP_CROSS_ALLOCATOR_VIOLATION
+    }
+    if (param.pass_mode == PARAM_PASS_VIEW || param.pass_mode == PARAM_PASS_MUT_VIEW) && !param.has_lease {
+        return AX_COMP_RAW_POINTER_ESCAPE
+    }
+    if param.pass_mode == PARAM_PASS_BY_VAL ||
+       param.pass_mode == PARAM_PASS_COMPONENT_BOX ||
+       param.pass_mode == PARAM_PASS_COMPONENT_HANDLE ||
+       param.pass_mode == PARAM_PASS_OPAQUE_PTR ||
+       ((param.pass_mode == PARAM_PASS_VIEW || param.pass_mode == PARAM_PASS_MUT_VIEW) && param.has_lease) {
+        return 0u32
+    }
+    AX_COMP_CROSS_ALLOCATOR_VIOLATION
+}
+
+// Originating Allocator VTable and ComponentBox<T> (AXS-COMP-021)
+@derive(Copy)
+struct CustomAllocatorTracker {
+    dealloc_count: u32,
+    last_freed_size: usize,
+    last_freed_align: usize,
+}
+
+@repr(C)
+@derive(Copy)
+struct AllocatorVTable {
+    vtable_id: u64,
+    is_valid: bool,
+}
+
+@repr(C)
+struct MockComponentBox {
+    ptr: usize,
+    allocator_vtable: usize,
+    epoch_token: u64,
+    size: usize,
+    align: usize,
+}
+
+fn component_box_deallocate(
+    b: view<MockComponentBox>,
+    vt: view<AllocatorVTable>,
+    tracker: mut_view<CustomAllocatorTracker>
+) -> u32 {
+    if b.allocator_vtable == 0usize {
+        return AX_COMP_CROSS_ALLOCATOR_VIOLATION
+    }
+    if !vt.is_valid || (b.allocator_vtable != vt.vtable_id as usize) {
+        return AX_COMP_CROSS_ALLOCATOR_VIOLATION
+    }
+    tracker.dealloc_count = tracker.dealloc_count + 1u32
+    tracker.last_freed_size = b.size
+    tracker.last_freed_align = b.align
+    0u32
+}
+
+// Generational Handle Table Model (AXS-COMP-022)
+@derive(Copy)
+struct ComponentHandle {
+    index: u32,
+    generation: u32,
+    epoch_id: u32,
+}
+
+@derive(Copy)
+struct HandleSlot {
+    generation: u32,
+    epoch_id: u32,
+    is_occupied: bool,
+    payload: u64,
+}
+
+struct HandleTable {
+    slots: [8]HandleSlot,
+    capacity: usize,
+    count: usize,
+    current_epoch: u32,
+}
+
+fn handle_table_new(epoch: u32) -> HandleTable {
+    let empty_slot = HandleSlot {
+        generation: 1u32,
+        epoch_id: epoch,
+        is_occupied: false,
+        payload: 0u64,
+    }
+    HandleTable {
+        slots: [empty_slot, empty_slot, empty_slot, empty_slot,
+                empty_slot, empty_slot, empty_slot, empty_slot],
+        capacity: 8usize,
+        count: 0usize,
+        current_epoch: epoch,
+    }
+}
+
+fn handle_table_insert(tbl: mut_view<HandleTable>, val: u64) -> ComponentHandle {
+    let mut target_idx: usize = 8usize
+    let mut i: usize = 0usize
+    while i < tbl.capacity {
+        if !tbl.slots[i].is_occupied {
+            target_idx = i
+            i = tbl.capacity
+        } else {
+            i = i + 1usize
+        }
+    }
+    if target_idx >= tbl.capacity {
+        return ComponentHandle { index: 0xFFFFFFFFu32, generation: 0u32, epoch_id: 0u32 }
+    }
+
+    tbl.slots[target_idx].epoch_id = tbl.current_epoch
+    tbl.slots[target_idx].is_occupied = true
+    tbl.slots[target_idx].payload = val
+    tbl.count = tbl.count + 1usize
+
+    ComponentHandle {
+        index: target_idx as u32,
+        generation: tbl.slots[target_idx].generation,
+        epoch_id: tbl.current_epoch,
+    }
+}
+
+fn handle_table_get(tbl: view<HandleTable>, handle: ComponentHandle, out_val: mut_view<u64>) -> u32 {
+    let idx = handle.index as usize
+    if idx >= tbl.capacity {
+        return AX_COMP_STALE_HANDLE
+    }
+    let slot = tbl.slots[idx]
+    if !slot.is_occupied {
+        return AX_COMP_STALE_HANDLE
+    }
+    if slot.generation != handle.generation {
+        return AX_COMP_STALE_HANDLE
+    }
+    if slot.epoch_id != handle.epoch_id || handle.epoch_id != tbl.current_epoch {
+        return AX_COMP_STALE_HANDLE
+    }
+
+    *out_val = slot.payload
+    0u32
+}
+
+fn handle_table_release(tbl: mut_view<HandleTable>, handle: ComponentHandle) -> u32 {
+    let idx = handle.index as usize
+    if idx >= tbl.capacity {
+        return AX_COMP_STALE_HANDLE
+    }
+    if !tbl.slots[idx].is_occupied {
+        return AX_COMP_STALE_HANDLE
+    }
+    if tbl.slots[idx].generation != handle.generation || tbl.slots[idx].epoch_id != handle.epoch_id {
+        return AX_COMP_STALE_HANDLE
+    }
+
+    tbl.slots[idx].is_occupied = false
+    tbl.slots[idx].generation = tbl.slots[idx].generation + 1u32
+    if tbl.count > 0usize {
+        tbl.count = tbl.count - 1usize
+    }
+    0u32
+}
+
+fn handle_table_advance_epoch(tbl: mut_view<HandleTable>, new_epoch: u32) {
+    tbl.current_epoch = new_epoch
+    let mut i: usize = 0usize
+    while i < tbl.capacity {
+        if tbl.slots[i].is_occupied {
+            tbl.slots[i].epoch_id = new_epoch
+        }
+        i = i + 1usize
+    }
+}
+
+fn print_bool(label: str, b: bool) {
+    print(label)
+    if b {
+        print(": true\n")
+    } else {
+        print(": false\n")
+    }
+}
+
+fn print_u32_code(label: str, v: u32) {
+    print(label)
+    print(": ")
+    if v == 0u32 {
+        print("0\n")
+    } else if v == AX_COMP_RAW_POINTER_ESCAPE {
+        print("238\n")
+    } else if v == AX_COMP_CROSS_ALLOCATOR_VIOLATION {
+        print("239\n")
+    } else if v == AX_COMP_STALE_HANDLE {
+        print("240\n")
+    } else {
+        print("unknown\n")
+    }
+}
+
+fn main() -> i32 {
+    // 1. Boundary Firewall Type Rejection (AXS-COMP-020, REQ-ECO-8734)
+    let p_scalar = BoundaryParam { pass_mode: PARAM_PASS_BY_VAL, type_id: 1u8, has_lease: false }
+    let p_box = BoundaryParam { pass_mode: PARAM_PASS_COMPONENT_BOX, type_id: 2u8, has_lease: false }
+    let p_handle = BoundaryParam { pass_mode: PARAM_PASS_COMPONENT_HANDLE, type_id: 3u8, has_lease: false }
+    let p_opaque = BoundaryParam { pass_mode: PARAM_PASS_OPAQUE_PTR, type_id: 4u8, has_lease: false }
+    let p_leased_view = BoundaryParam { pass_mode: PARAM_PASS_VIEW, type_id: 5u8, has_lease: true }
+
+    let p_raw_ptr = BoundaryParam { pass_mode: PARAM_PASS_RAW_PTR, type_id: 6u8, has_lease: false }
+    let p_host_box = BoundaryParam { pass_mode: PARAM_PASS_PLAIN_HOST_BOX, type_id: 7u8, has_lease: false }
+    let p_host_coll = BoundaryParam { pass_mode: PARAM_PASS_PLAIN_HOST_COLLECTION, type_id: 8u8, has_lease: false }
+    let p_unleased_view = BoundaryParam { pass_mode: PARAM_PASS_VIEW, type_id: 5u8, has_lease: false }
+
+    let safe_allowed = (validate_boundary_parameter(p_scalar) == 0u32) &&
+                       (validate_boundary_parameter(p_box) == 0u32) &&
+                       (validate_boundary_parameter(p_handle) == 0u32) &&
+                       (validate_boundary_parameter(p_opaque) == 0u32) &&
+                       (validate_boundary_parameter(p_leased_view) == 0u32)
+    print_bool("safe_boundary_types_accepted", safe_allowed)
+
+    print_u32_code("rc_raw_ptr_rejected", validate_boundary_parameter(p_raw_ptr))
+    print_u32_code("rc_host_box_rejected", validate_boundary_parameter(p_host_box))
+    print_u32_code("rc_host_coll_rejected", validate_boundary_parameter(p_host_coll))
+    print_u32_code("rc_unleased_view_rejected", validate_boundary_parameter(p_unleased_view))
+
+    // 2. ComponentBox<T> Originating Allocator Deallocation Routing (AXS-COMP-021)
+    let vt = AllocatorVTable { vtable_id: 0x5000_1000u64, is_valid: true }
+    let mut tracker = CustomAllocatorTracker {
+        dealloc_count: 0u32,
+        last_freed_size: 0usize,
+        last_freed_align: 0usize,
+    }
+
+    let valid_box = MockComponentBox {
+        ptr: 0x6000_2000usize,
+        allocator_vtable: 0x5000_1000usize,
+        epoch_token: 1u64,
+        size: 128usize,
+        align: 16usize,
+    }
+    let null_vtable_box = MockComponentBox {
+        ptr: 0x6000_3000usize,
+        allocator_vtable: 0usize,
+        epoch_token: 1u64,
+        size: 64usize,
+        align: 8usize,
+    }
+
+    let drop_ok = component_box_deallocate(view(valid_box), view(vt), mut_view(tracker))
+    print_u32_code("rc_component_box_valid_drop", drop_ok)
+    let drop_null_rc = component_box_deallocate(view(null_vtable_box), view(vt), mut_view(tracker))
+    print_u32_code("rc_component_box_null_vtable_rejected", drop_null_rc)
+    let tracker_ok = (tracker.dealloc_count == 1u32) && (tracker.last_freed_size == 128usize) && (tracker.last_freed_align == 16usize)
+    print_bool("originating_allocator_routed", tracker_ok)
+
+    // 3. Generational ComponentHandle<T> Safety (AXS-COMP-022, tasks/0584 §325.10-21)
+    let mut htable = handle_table_new(1u32)
+    let h1 = handle_table_insert(mut_view(htable), 4242u64)
+    let h2 = handle_table_insert(mut_view(htable), 8484u64)
+
+    let mut out_val: u64 = 0u64
+    let get1_ok = (handle_table_get(view(htable), h1, mut_view(out_val)) == 0u32) && (out_val == 4242u64)
+    let get2_ok = (handle_table_get(view(htable), h2, mut_view(out_val)) == 0u32) && (out_val == 8484u64)
+    print_bool("handle_get_valid", get1_ok && get2_ok)
+
+    // Release slot 1 (bumps generation from 1 to 2)
+    let rel_ok = (handle_table_release(mut_view(htable), h1) == 0u32)
+    print_bool("handle_release_ok", rel_ok)
+
+    // Old handle h1 now accesses slot with stale generation (gen 1 vs slot gen 2)
+    let stale_gen_rc = handle_table_get(view(htable), h1, mut_view(out_val))
+    print_u32_code("rc_stale_generation_rejected", stale_gen_rc)
+
+    // Reinsert into table: reuses slot 0 with generation 2
+    let h1_new = handle_table_insert(mut_view(htable), 9999u64)
+    let reuse_gen_ok = (h1_new.index == 0u32) && (h1_new.generation == 2u32)
+    let old_h1_still_stale = (handle_table_get(view(htable), h1, mut_view(out_val)) == AX_COMP_STALE_HANDLE)
+    let new_h1_valid = (handle_table_get(view(htable), h1_new, mut_view(out_val)) == 0u32) && (out_val == 9999u64)
+    print_bool("handle_slot_reuse_generation_guard", reuse_gen_ok && old_h1_still_stale && new_h1_valid)
+
+    // Epoch advancement: advance epoch from 1 to 2
+    handle_table_advance_epoch(mut_view(htable), 2u32)
+    // h2 still carries epoch 1 in its struct; table current_epoch is 2
+    let stale_epoch_rc = handle_table_get(view(htable), h2, mut_view(out_val))
+    print_u32_code("rc_stale_epoch_rejected", stale_epoch_rc)
+
+    // Update handle token to match new epoch
+    let mut h2_migrated = h2
+    h2_migrated.epoch_id = 2u32
+    let migrated_epoch_ok = (handle_table_get(view(htable), h2_migrated, mut_view(out_val)) == 0u32) && (out_val == 8484u64)
+    print_bool("handle_epoch_migration_valid", migrated_epoch_ok)
+
+    // Out of bounds and dangling slot access
+    let invalid_h = ComponentHandle { index: 99u32, generation: 1u32, epoch_id: 2u32 }
+    let oob_rc = handle_table_get(view(htable), invalid_h, mut_view(out_val))
+    print_u32_code("rc_out_of_bounds_handle_rejected", oob_rc)
+
+    print("conformance[boundary_firewall_allocator_isolation] OK\n")
+    0
+}

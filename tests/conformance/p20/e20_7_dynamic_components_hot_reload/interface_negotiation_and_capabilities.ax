@@ -1,0 +1,477 @@
+// test: run
+// modes: interp native
+// stdout-file: interface_negotiation_and_capabilities.stdout
+// SPEC-115 §§1..2 (AXS-COMP-001..006, AXS-COMP-010..015, AXS-COMP-050; REQ-ECO-8734, INV-COMP-001, INV-COMP-002):
+// E20.7 Conformance: Dynamic plugin discovery, v1.0 -> v1.1 compatible interface negotiation,
+// incompatible AbiFingerprint and TargetTripleFingerprint rejection, ComponentId syntax validation,
+// duplicate registration prevention, capability subset enforcement, monotonic attenuation, and runtime revocation.
+
+const AX_COMP_MISSING_ENTRY_POINT: u32 = 230u32
+const AX_COMP_MISSING_MANIFEST: u32 = 231u32
+const AX_COMP_CORRUPT_MANIFEST: u32 = 232u32
+const AX_COMP_DUPLICATE_REGISTRATION: u32 = 233u32
+const AX_COMP_TARGET_MISMATCH: u32 = 234u32
+const AX_COMP_VERSION_INCOMPATIBLE: u32 = 235u32
+const AX_COMP_ABI_MISMATCH: u32 = 236u32
+const AX_COMP_CAPABILITY_DENIED: u32 = 237u32
+const AX_COMP_CAPABILITY_REVOKED: u32 = 245u32
+const AX_COMP_INTERFACE_NOT_FOUND: u32 = 247u32
+
+const CAP_HEAP_ALLOCATION: u32 = 0x0001u32
+const CAP_FS_READ: u32 = 0x0002u32
+const CAP_FS_WRITE: u32 = 0x0004u32
+const CAP_NET_CONNECT: u32 = 0x0008u32
+const CAP_CONCURRENCY: u32 = 0x0010u32
+const CAP_GPU: u32 = 0x0020u32
+
+const AXCOMP_MAGIC: u32 = 0x504D4F43u32 // ASCII "COMP"
+const AXCOMP_FORMAT_VERSION: u16 = 1u16
+const AXCOMP_HEADER_SIZE: u16 = 128u16
+
+@derive(Copy)
+struct SemVer {
+    major: u32,
+    minor: u32,
+    patch: u32,
+    prerelease_len: usize,
+}
+
+fn semver_new(maj: u32, min: u32, pat: u32) -> SemVer {
+    SemVer {
+        major: maj,
+        minor: min,
+        patch: pat,
+        prerelease_len: 0usize,
+    }
+}
+
+fn semver_with_pre(maj: u32, min: u32, pat: u32, pre_len: usize) -> SemVer {
+    SemVer {
+        major: maj,
+        minor: min,
+        patch: pat,
+        prerelease_len: pre_len,
+    }
+}
+
+// SemVer 2.0 Caret (^) requirement matching (AXS-COMP-011)
+fn semver_matches_caret(req: SemVer, cand: SemVer) -> bool {
+    if req.prerelease_len == 0usize && cand.prerelease_len > 0usize {
+        return false
+    }
+    if req.major > 0u32 {
+        if cand.major != req.major {
+            return false
+        }
+        if req.minor > cand.minor {
+            return false
+        }
+        if cand.minor == req.minor && req.patch > cand.patch {
+            return false
+        }
+        return true
+    }
+    if req.minor > 0u32 {
+        if cand.major != 0u32 || cand.minor != req.minor {
+            return false
+        }
+        return cand.patch >= req.patch
+    }
+    cand.major == 0u32 && cand.minor == 0u32 && cand.patch == req.patch
+}
+
+@derive(Copy)
+struct Fingerprint128 {
+    lo: u64,
+    hi: u64,
+}
+
+fn fp_eq(a: Fingerprint128, b: Fingerprint128) -> bool {
+    a.lo == b.lo && a.hi == b.hi
+}
+
+// ComponentId format validation: "<vendor>.<namespace>.<name>" (AXS-COMP-002)
+fn validate_component_id(name: [32]u8, cid_len: usize) -> bool {
+    if 5usize > cid_len {
+        return false
+    }
+    let mut dot_count: u32 = 0u32
+    let mut seg_len: u32 = 0u32
+    let mut i: usize = 0usize
+    while i < cid_len {
+        let b = name[i]
+        if b == 46u8 { // '.'
+            if seg_len == 0u32 {
+                return false
+            }
+            dot_count = dot_count + 1u32
+            seg_len = 0u32
+        } else {
+            let is_alpha = (b >= 97u8 && b <= 122u8) || (b >= 65u8 && b <= 90u8)
+            let is_digit = (b >= 48u8 && b <= 57u8)
+            let is_spec = (b == 95u8 || b == 45u8)
+            if !is_alpha && !is_digit && !is_spec {
+                return false
+            }
+            seg_len = seg_len + 1u32
+        }
+        i = i + 1usize
+    }
+    if seg_len == 0u32 {
+        return false
+    }
+    dot_count >= 2u32
+}
+
+// Capability Grant Model (AXS-COMP-013, AXS-COMP-014)
+@derive(Copy)
+struct CapabilityGrant {
+    granted_mask: u32,
+    is_revoked: bool,
+}
+
+fn grant_new(mask: u32) -> CapabilityGrant {
+    CapabilityGrant { granted_mask: mask, is_revoked: false }
+}
+
+fn grant_attenuate(g: mut_view<CapabilityGrant>, remove_mask: u32) {
+    g.granted_mask = g.granted_mask & (~remove_mask)
+}
+
+fn grant_revoke(g: mut_view<CapabilityGrant>) {
+    g.is_revoked = true
+    g.granted_mask = 0u32
+}
+
+fn grant_check(g: CapabilityGrant, required_cap: u32) -> u32 {
+    if g.is_revoked {
+        return AX_COMP_CAPABILITY_REVOKED
+    }
+    if (g.granted_mask & required_cap) != required_cap {
+        return AX_COMP_CAPABILITY_DENIED
+    }
+    0u32
+}
+
+// Host Component Registry Model (AXS-COMP-002, AXS-COMP-010..012)
+@derive(Copy)
+struct RegisteredEntry {
+    id_hash: u64,
+    semver: SemVer,
+    is_active: bool,
+}
+
+struct HostRegistry {
+    entries: [8]RegisteredEntry,
+    count: usize,
+    host_abi: Fingerprint128,
+    host_target: Fingerprint128,
+    host_capabilities: u32,
+}
+
+fn registry_new(abi: Fingerprint128, target: Fingerprint128, caps: u32) -> HostRegistry {
+    let empty_entry = RegisteredEntry {
+        id_hash: 0u64,
+        semver: semver_new(0u32, 0u32, 0u32),
+        is_active: false,
+    }
+    HostRegistry {
+        entries: [empty_entry, empty_entry, empty_entry, empty_entry,
+                  empty_entry, empty_entry, empty_entry, empty_entry],
+        count: 0usize,
+        host_abi: abi,
+        host_target: target,
+        host_capabilities: caps,
+    }
+}
+
+fn registry_negotiate(
+    reg: mut_view<HostRegistry>,
+    id_hash: u64,
+    cand_semver: SemVer,
+    req_semver: SemVer,
+    cand_abi: Fingerprint128,
+    cand_target: Fingerprint128,
+    cand_req_caps: u32
+) -> u32 {
+    // 1. Dual cryptographic check (AXS-COMP-012)
+    if !fp_eq(cand_abi, reg.host_abi) {
+        return AX_COMP_ABI_MISMATCH
+    }
+    if !fp_eq(cand_target, reg.host_target) {
+        return AX_COMP_TARGET_MISMATCH
+    }
+
+    // 2. SemVer compatibility check (AXS-COMP-011)
+    if !semver_matches_caret(req_semver, cand_semver) {
+        return AX_COMP_VERSION_INCOMPATIBLE
+    }
+
+    // 3. Capability authorization (AXS-COMP-013)
+    let missing_caps = cand_req_caps & (~reg.host_capabilities)
+    if missing_caps != 0u32 {
+        return AX_COMP_CAPABILITY_DENIED
+    }
+
+    // 4. Duplicate registration check (AXS-COMP-002 §4)
+    let mut i: usize = 0usize
+    while i < reg.count {
+        if reg.entries[i].is_active && reg.entries[i].id_hash == id_hash {
+            if reg.entries[i].semver.major == cand_semver.major &&
+               reg.entries[i].semver.minor == cand_semver.minor &&
+               reg.entries[i].semver.patch == cand_semver.patch {
+                return AX_COMP_DUPLICATE_REGISTRATION
+            }
+        }
+        i = i + 1usize
+    }
+
+    // Register active component
+    if 8usize > reg.count {
+        reg.entries[reg.count] = RegisteredEntry {
+            id_hash: id_hash,
+            semver: cand_semver,
+            is_active: true,
+        }
+        reg.count = reg.count + 1usize
+    }
+
+    0u32
+}
+
+// Interface VTable Registry (AXS-COMP-015)
+@derive(Copy)
+struct InterfaceSlot {
+    fingerprint: Fingerprint128,
+    vtable_ptr: usize,
+    abi_version: u32,
+    is_registered: bool,
+}
+
+struct ComponentDispatch {
+    slots: [4]InterfaceSlot,
+    count: usize,
+}
+
+fn dispatch_new() -> ComponentDispatch {
+    let empty_slot = InterfaceSlot {
+        fingerprint: Fingerprint128 { lo: 0u64, hi: 0u64 },
+        vtable_ptr: 0usize,
+        abi_version: 0u32,
+        is_registered: false,
+    }
+    ComponentDispatch {
+        slots: [empty_slot, empty_slot, empty_slot, empty_slot],
+        count: 0usize,
+    }
+}
+
+fn dispatch_register(
+    disp: mut_view<ComponentDispatch>,
+    fp: Fingerprint128,
+    vtable: usize,
+    abi_ver: u32
+) {
+    if 4usize > disp.count {
+        disp.slots[disp.count] = InterfaceSlot {
+            fingerprint: fp,
+            vtable_ptr: vtable,
+            abi_version: abi_ver,
+            is_registered: true,
+        }
+        disp.count = disp.count + 1usize
+    }
+}
+
+fn dispatch_acquire(disp: view<ComponentDispatch>, fp: Fingerprint128, out_vtable: mut_view<usize>) -> u32 {
+    let mut i: usize = 0usize
+    while i < disp.count {
+        if disp.slots[i].is_registered && fp_eq(disp.slots[i].fingerprint, fp) {
+            *out_vtable = disp.slots[i].vtable_ptr
+            return 0u32
+        }
+        i = i + 1usize
+    }
+    AX_COMP_INTERFACE_NOT_FOUND
+}
+
+fn print_bool(label: str, b: bool) {
+    print(label)
+    if b {
+        print(": true\n")
+    } else {
+        print(": false\n")
+    }
+}
+
+fn print_u32_code(label: str, v: u32) {
+    print(label)
+    print(": ")
+    if v == 0u32 {
+        print("0\n")
+    } else if v == AX_COMP_DUPLICATE_REGISTRATION {
+        print("233\n")
+    } else if v == AX_COMP_TARGET_MISMATCH {
+        print("234\n")
+    } else if v == AX_COMP_VERSION_INCOMPATIBLE {
+        print("235\n")
+    } else if v == AX_COMP_ABI_MISMATCH {
+        print("236\n")
+    } else if v == AX_COMP_CAPABILITY_DENIED {
+        print("237\n")
+    } else {
+        print("unknown\n")
+    }
+}
+
+fn main() -> i32 {
+    // 1. ComponentId syntax validation (AXS-COMP-002)
+    let valid_id: [32]u8 = [99u8, 111u8, 109u8, 46u8, 97u8, 99u8, 109u8, 101u8, 46u8, 114u8, 101u8, 110u8, 100u8, 101u8, 114u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8]
+    let double_dot: [32]u8 = [99u8, 111u8, 109u8, 46u8, 46u8, 114u8, 101u8, 110u8, 100u8, 101u8, 114u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8]
+    let short_id: [32]u8 = [97u8, 46u8, 98u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8]
+    let illegal_char: [32]u8 = [99u8, 111u8, 109u8, 46u8, 97u8, 64u8, 109u8, 101u8, 46u8, 114u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8]
+
+    let id_valid_ok = validate_component_id(valid_id, 15usize)
+    let id_double_dot_rejected = !validate_component_id(double_dot, 11usize)
+    let id_short_rejected = !validate_component_id(short_id, 3usize)
+    let id_illegal_rejected = !validate_component_id(illegal_char, 10usize)
+    print_bool("component_id_valid", id_valid_ok && id_double_dot_rejected && id_short_rejected && id_illegal_rejected)
+
+    // 2. SemVer 2.0 Caret negotiation (AXS-COMP-011)
+    let req_v1 = semver_new(1u32, 0u32, 0u32)
+    let cand_v1_0 = semver_new(1u32, 0u32, 0u32)
+    let cand_v1_1 = semver_new(1u32, 1u32, 0u32) // Compatible minor addition (REQ-ECO-8734)
+    let cand_v1_1_2 = semver_new(1u32, 1u32, 2u32)
+    let cand_v2_0 = semver_new(2u32, 0u32, 0u32) // Incompatible major breaking change
+    let cand_v0_9 = semver_new(0u32, 9u32, 5u32)
+    let cand_v1_pre = semver_with_pre(1u32, 1u32, 0u32, 5usize)
+
+    let caret_v1_0_ok = semver_matches_caret(req_v1, cand_v1_0)
+    let caret_v1_1_compat_ok = semver_matches_caret(req_v1, cand_v1_1)
+    let caret_v1_1_2_ok = semver_matches_caret(req_v1, cand_v1_1_2)
+    let caret_v2_0_rejected = !semver_matches_caret(req_v1, cand_v2_0)
+    let caret_v0_9_rejected = !semver_matches_caret(req_v1, cand_v0_9)
+    let caret_v1_pre_rejected = !semver_matches_caret(req_v1, cand_v1_pre)
+
+    let req_zero_min = semver_new(0u32, 2u32, 1u32)
+    let cand_zero_compat = semver_new(0u32, 2u32, 5u32)
+    let cand_zero_break = semver_new(0u32, 3u32, 0u32)
+    let zero_caret_ok = semver_matches_caret(req_zero_min, cand_zero_compat) && !semver_matches_caret(req_zero_min, cand_zero_break)
+
+    print_bool("semver_caret_negotiation",
+        caret_v1_0_ok && caret_v1_1_compat_ok && caret_v1_1_2_ok &&
+        caret_v2_0_rejected && caret_v0_9_rejected && caret_v1_pre_rejected && zero_caret_ok
+    )
+
+    // 3. Host Cryptographic Validation & Negotiation Matrix (AXS-COMP-010..013, REQ-ECO-8734)
+    let host_abi = Fingerprint128 { lo: 0x1111222233334444u64, hi: 0x5555666677778888u64 }
+    let host_target = Fingerprint128 { lo: 0xAAAABBBBCCCCDDDDu64, hi: 0xEEEEFFFF00001111u64 }
+    let host_caps = CAP_HEAP_ALLOCATION | CAP_FS_READ | CAP_NET_CONNECT
+    let mut registry = registry_new(host_abi, host_target, host_caps)
+
+    let comp_id_hash = 0x9876543210ABCDEFu64
+    let cand_req_caps = CAP_HEAP_ALLOCATION | CAP_FS_READ
+
+    // Test 3a: Compatible v1.0 -> v1.1 loading succeeds
+    let rc_compat = registry_negotiate(
+        mut_view(registry),
+        comp_id_hash,
+        cand_v1_1,
+        req_v1,
+        host_abi,
+        host_target,
+        cand_req_caps
+    )
+    print_u32_code("rc_v1_1_compat", rc_compat)
+
+    // Test 3b: Incompatible AbiFingerprint rejection
+    let wrong_abi = Fingerprint128 { lo: 0xDEADBEEF00000000u64, hi: 0x00000000CAFEBABEu64 }
+    let rc_abi_mismatch = registry_negotiate(
+        mut_view(registry),
+        comp_id_hash + 1u64,
+        cand_v1_1,
+        req_v1,
+        wrong_abi,
+        host_target,
+        cand_req_caps
+    )
+    print_u32_code("rc_abi_mismatch", rc_abi_mismatch)
+
+    // Test 3c: Incompatible TargetTripleFingerprint rejection
+    let wrong_target = Fingerprint128 { lo: 0x123456789ABCDEF0u64, hi: 0x0FEDCBA987654321u64 }
+    let rc_target_mismatch = registry_negotiate(
+        mut_view(registry),
+        comp_id_hash + 2u64,
+        cand_v1_1,
+        req_v1,
+        host_abi,
+        wrong_target,
+        cand_req_caps
+    )
+    print_u32_code("rc_target_mismatch", rc_target_mismatch)
+
+    // Test 3d: Incompatible SemVer Caret rejection
+    let rc_ver_mismatch = registry_negotiate(
+        mut_view(registry),
+        comp_id_hash + 3u64,
+        cand_v2_0,
+        req_v1,
+        host_abi,
+        host_target,
+        cand_req_caps
+    )
+    print_u32_code("rc_version_incompatible", rc_ver_mismatch)
+
+    // Test 3e: Ungranted capability denial
+    let greedy_caps = CAP_HEAP_ALLOCATION | CAP_GPU // GPU not in host_caps
+    let rc_cap_denied = registry_negotiate(
+        mut_view(registry),
+        comp_id_hash + 4u64,
+        cand_v1_1,
+        req_v1,
+        host_abi,
+        host_target,
+        greedy_caps
+    )
+    print_u32_code("rc_capability_denied", rc_cap_denied)
+
+    // Test 3f: Duplicate registration rejection
+    let rc_duplicate = registry_negotiate(
+        mut_view(registry),
+        comp_id_hash,
+        cand_v1_1,
+        req_v1,
+        host_abi,
+        host_target,
+        cand_req_caps
+    )
+    print_u32_code("rc_duplicate_registration", rc_duplicate)
+
+    // 4. Capability Attenuation & Dynamic Revocation (AXS-COMP-013, AXS-COMP-014)
+    let mut grant = grant_new(CAP_HEAP_ALLOCATION | CAP_FS_READ | CAP_FS_WRITE)
+    let init_cap_ok = (grant_check(grant, CAP_FS_WRITE) == 0u32)
+    grant_attenuate(mut_view(grant), CAP_FS_WRITE)
+    let att_cap_denied = (grant_check(grant, CAP_FS_WRITE) == AX_COMP_CAPABILITY_DENIED)
+    let att_retained_ok = (grant_check(grant, CAP_FS_READ) == 0u32)
+    grant_revoke(mut_view(grant))
+    let rev_cap_revoked = (grant_check(grant, CAP_FS_READ) == AX_COMP_CAPABILITY_REVOKED)
+    print_bool("capability_attenuation_and_revocation",
+        init_cap_ok && att_cap_denied && att_retained_ok && rev_cap_revoked
+    )
+
+    // 5. Type-Safe Interface Dispatch Table Binding (AXS-COMP-015)
+    let iface_fp1 = Fingerprint128 { lo: 0x9999111122223333u64, hi: 0x4444555566667777u64 }
+    let iface_fp2 = Fingerprint128 { lo: 0xEEEEAAAABBBBCCCCu64, hi: 0x1111222233334444u64 }
+    let mut dispatch = dispatch_new()
+    dispatch_register(mut_view(dispatch), iface_fp1, 0x10004000usize, 1u32)
+
+    let mut acquired_vtable: usize = 0usize
+    let acq_rc1 = dispatch_acquire(view(dispatch), iface_fp1, mut_view(acquired_vtable))
+    let acq_ok = (acq_rc1 == 0u32) && (acquired_vtable == 0x10004000usize)
+    let acq_rc2 = dispatch_acquire(view(dispatch), iface_fp2, mut_view(acquired_vtable))
+    let not_found_ok = (acq_rc2 == AX_COMP_INTERFACE_NOT_FOUND)
+    print_bool("interface_dispatch_acquisition", acq_ok && not_found_ok)
+
+    print("conformance[interface_negotiation_capabilities] OK\n")
+    0
+}

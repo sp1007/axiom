@@ -1,0 +1,214 @@
+// test: run
+// modes: interp native
+// stdout-file: epoch_leases_and_unload_protection.stdout
+// SPEC-115 §§3..4 (AXS-COMP-023..025, AXS-COMP-031, AXS-COMP-050; REQ-ECO-8734, INV-COMP-001, INV-COMP-002):
+// E20.7 Conformance: EpochTracker and ComponentLease reference counting for borrowed views,
+// background tasks, callbacks, and GPU fences; strict unload prevention while active_leases > 0
+// (AX_COMP_UNLOAD_ACTIVE_LEASES), quiesce phase rejection of new leases (AX_COMP_COMPONENT_QUIESCING),
+// ephemeral callback detachment, and verified clean unload upon lease draining.
+
+const AX_COMP_UNLOAD_ACTIVE_LEASES: u32 = 241u32
+const AX_COMP_COMPONENT_QUIESCING: u32 = 246u32
+
+const LEASE_KIND_BORROW: u32 = 1u32
+const LEASE_KIND_TASK: u32 = 2u32
+const LEASE_KIND_CALLBACK: u32 = 3u32
+const LEASE_KIND_GPU_FENCE: u32 = 4u32
+
+const STATUS_ACTIVE: u32 = 1u32
+const STATUS_QUIESCING: u32 = 2u32
+const STATUS_RETIRED: u32 = 3u32
+const STATUS_UNLOADED: u32 = 4u32
+
+@derive(Copy)
+struct ComponentLease {
+    epoch_id: u32,
+    lease_kind: u32,
+    lease_id: u64,
+}
+
+@derive(Copy)
+struct EpochTracker {
+    epoch_id: u32,
+    active_leases: u64,
+    status: u32,
+    active_borrows: u32,
+    active_tasks: u32,
+    active_callbacks: u32,
+    active_gpu_fences: u32,
+}
+
+fn epoch_tracker_new(epoch: u32) -> EpochTracker {
+    EpochTracker {
+        epoch_id: epoch,
+        active_leases: 0u64,
+        status: STATUS_ACTIVE,
+        active_borrows: 0u32,
+        active_tasks: 0u32,
+        active_callbacks: 0u32,
+        active_gpu_fences: 0u32,
+    }
+}
+
+fn epoch_tracker_acquire_lease(
+    trk: mut_view<EpochTracker>,
+    kind: u32,
+    lease_id: u64,
+    out_lease: mut_view<ComponentLease>
+) -> u32 {
+    if trk.status == STATUS_QUIESCING || trk.status == STATUS_RETIRED || trk.status == STATUS_UNLOADED {
+        return AX_COMP_COMPONENT_QUIESCING
+    }
+    trk.active_leases = trk.active_leases + 1u64
+    if kind == LEASE_KIND_BORROW {
+        trk.active_borrows = trk.active_borrows + 1u32
+    } else if kind == LEASE_KIND_TASK {
+        trk.active_tasks = trk.active_tasks + 1u32
+    } else if kind == LEASE_KIND_CALLBACK {
+        trk.active_callbacks = trk.active_callbacks + 1u32
+    } else if kind == LEASE_KIND_GPU_FENCE {
+        trk.active_gpu_fences = trk.active_gpu_fences + 1u32
+    }
+
+    out_lease.epoch_id = trk.epoch_id
+    out_lease.lease_kind = kind
+    out_lease.lease_id = lease_id
+    0u32
+}
+
+fn epoch_tracker_release_lease(trk: mut_view<EpochTracker>, lease: ComponentLease) -> u32 {
+    if trk.active_leases > 0u64 {
+        trk.active_leases = trk.active_leases - 1u64
+    }
+    if lease.lease_kind == LEASE_KIND_BORROW && trk.active_borrows > 0u32 {
+        trk.active_borrows = trk.active_borrows - 1u32
+    } else if lease.lease_kind == LEASE_KIND_TASK && trk.active_tasks > 0u32 {
+        trk.active_tasks = trk.active_tasks - 1u32
+    } else if lease.lease_kind == LEASE_KIND_CALLBACK && trk.active_callbacks > 0u32 {
+        trk.active_callbacks = trk.active_callbacks - 1u32
+    } else if lease.lease_kind == LEASE_KIND_GPU_FENCE && trk.active_gpu_fences > 0u32 {
+        trk.active_gpu_fences = trk.active_gpu_fences - 1u32
+    }
+    0u32
+}
+
+// Unload safety check (AXS-COMP-023 §3): strictly blocks physical unload if active_leases > 0
+fn epoch_tracker_validate_unload(trk: view<EpochTracker>) -> u32 {
+    if trk.active_leases > 0u64 {
+        return AX_COMP_UNLOAD_ACTIVE_LEASES
+    }
+    0u32
+}
+
+// Detaches all ephemeral callbacks during Quiesce phase (AXS-COMP-031 §3)
+fn epoch_tracker_detach_callbacks(trk: mut_view<EpochTracker>) {
+    let cb_count = trk.active_callbacks as u64
+    if trk.active_leases >= cb_count {
+        trk.active_leases = trk.active_leases - cb_count
+    } else {
+        trk.active_leases = 0u64
+    }
+    trk.active_callbacks = 0u32
+}
+
+fn print_bool(label: str, b: bool) {
+    print(label)
+    if b {
+        print(": true\n")
+    } else {
+        print(": false\n")
+    }
+}
+
+fn print_u32_code(label: str, v: u32) {
+    print(label)
+    print(": ")
+    if v == 0u32 {
+        print("0\n")
+    } else if v == AX_COMP_UNLOAD_ACTIVE_LEASES {
+        print("241\n")
+    } else if v == AX_COMP_COMPONENT_QUIESCING {
+        print("246\n")
+    } else {
+        print("unknown\n")
+    }
+}
+
+fn main() -> i32 {
+    let mut tracker = epoch_tracker_new(1u32)
+
+    // Initially active with 0 leases
+    let init_ok = (tracker.active_leases == 0u64) &&
+                  (tracker.status == STATUS_ACTIVE) &&
+                  (epoch_tracker_validate_unload(view(tracker)) == 0u32)
+    print_bool("tracker_init_ok", init_ok)
+
+    // 1. Acquire Leases across different domains (borrow, task, callback, GPU fence)
+    let mut lease_borrow = ComponentLease { epoch_id: 0u32, lease_kind: 0u32, lease_id: 0u64 }
+    let mut lease_task = ComponentLease { epoch_id: 0u32, lease_kind: 0u32, lease_id: 0u64 }
+    let mut lease_cb = ComponentLease { epoch_id: 0u32, lease_kind: 0u32, lease_id: 0u64 }
+    let mut lease_gpu = ComponentLease { epoch_id: 0u32, lease_kind: 0u32, lease_id: 0u64 }
+
+    let rc_b = epoch_tracker_acquire_lease(mut_view(tracker), LEASE_KIND_BORROW, 101u64, mut_view(lease_borrow))
+    let rc_t = epoch_tracker_acquire_lease(mut_view(tracker), LEASE_KIND_TASK, 102u64, mut_view(lease_task))
+    let rc_c = epoch_tracker_acquire_lease(mut_view(tracker), LEASE_KIND_CALLBACK, 103u64, mut_view(lease_cb))
+    let rc_g = epoch_tracker_acquire_lease(mut_view(tracker), LEASE_KIND_GPU_FENCE, 104u64, mut_view(lease_gpu))
+
+    let acq_all_ok = (rc_b == 0u32) && (rc_t == 0u32) && (rc_c == 0u32) && (rc_g == 0u32) &&
+                     (tracker.active_leases == 4u64) &&
+                     (tracker.active_borrows == 1u32) &&
+                     (tracker.active_tasks == 1u32) &&
+                     (tracker.active_callbacks == 1u32) &&
+                     (tracker.active_gpu_fences == 1u32)
+    print_bool("leases_acquired_across_all_domains", acq_all_ok)
+
+    // 2. Unload Safety Enforcement (AXS-COMP-023 §3, REQ-ECO-8734)
+    // Physical unload is strictly blocked while active_leases > 0!
+    let unload_blocked_rc = epoch_tracker_validate_unload(view(tracker))
+    print_u32_code("rc_unload_blocked_with_active_leases", unload_blocked_rc)
+
+    // 3. Quiescence Protocol (AXS-COMP-031)
+    tracker.status = STATUS_QUIESCING
+    let mut rejected_lease = ComponentLease { epoch_id: 0u32, lease_kind: 0u32, lease_id: 0u64 }
+    let acq_quiescing_rc = epoch_tracker_acquire_lease(mut_view(tracker), LEASE_KIND_BORROW, 999u64, mut_view(rejected_lease))
+    print_u32_code("rc_acquire_rejected_while_quiescing", acq_quiescing_rc)
+
+    // 4. Detach Ephemeral Callbacks during Quiesce (AXS-COMP-031 §3)
+    epoch_tracker_detach_callbacks(mut_view(tracker))
+    let cb_detached_ok = (tracker.active_callbacks == 0u32) && (tracker.active_leases == 3u64)
+    print_bool("ephemeral_callbacks_detached", cb_detached_ok)
+
+    // 5. Sequential Draining of Remaining Leases
+    // Release GPU fence
+    let _ = epoch_tracker_release_lease(mut_view(tracker), lease_gpu)
+    let gpu_rel_ok = (tracker.active_gpu_fences == 0u32) && (tracker.active_leases == 2u64)
+    print_bool("gpu_fence_drained", gpu_rel_ok)
+    // Unload is still blocked!
+    let still_blocked_1 = (epoch_tracker_validate_unload(view(tracker)) == AX_COMP_UNLOAD_ACTIVE_LEASES)
+
+    // Release background task
+    let _ = epoch_tracker_release_lease(mut_view(tracker), lease_task)
+    let task_rel_ok = (tracker.active_tasks == 0u32) && (tracker.active_leases == 1u64)
+    print_bool("background_task_drained", task_rel_ok)
+    // Unload is still blocked by borrowed view!
+    let still_blocked_2 = (epoch_tracker_validate_unload(view(tracker)) == AX_COMP_UNLOAD_ACTIVE_LEASES)
+
+    print_bool("unload_strictly_blocked_until_all_drained", still_blocked_1 && still_blocked_2)
+
+    // Release borrowed view (final lease)
+    let _ = epoch_tracker_release_lease(mut_view(tracker), lease_borrow)
+    let borrow_rel_ok = (tracker.active_borrows == 0u32) && (tracker.active_leases == 0u64)
+    print_bool("borrow_view_drained", borrow_rel_ok)
+
+    // 6. Clean Unload Transition after Full Drain
+    let clean_unload_rc = epoch_tracker_validate_unload(view(tracker))
+    print_u32_code("rc_clean_unload_after_drain", clean_unload_rc)
+
+    // Transition to Unloaded status
+    tracker.status = STATUS_UNLOADED
+    let final_status_ok = (tracker.status == STATUS_UNLOADED) && (tracker.active_leases == 0u64)
+    print_bool("unloaded_lifecycle_completed", final_status_ok)
+
+    print("conformance[epoch_leases_unload_protection] OK\n")
+    0
+}

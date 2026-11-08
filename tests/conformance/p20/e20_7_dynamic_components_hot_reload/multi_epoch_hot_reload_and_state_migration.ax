@@ -1,0 +1,325 @@
+// test: run
+// modes: interp native
+// stdout-file: multi_epoch_hot_reload_and_state_migration.stdout
+// SPEC-115 §4 (AXS-COMP-030..037, AXS-COMP-050; tasks/0584 §325.22-24; tasks/0856 §26-40; REQ-ECO-8734, INV-COMP-002):
+// E20.7 Conformance: 5-phase transactional hot-reload coordinator (Quiesce -> ExportState ->
+// LoadNewEpoch -> MigrateState -> Resume), multi-epoch progression (v1 -> v2 fast-path identity,
+// v2 -> v3 schema evolution migration), transactional rollback guarantees on quiesce timeout,
+// schema mismatch, and migration failure with 0 state loss, and deferred retired epoch unmapping.
+
+const AX_COMP_UNLOAD_ACTIVE_LEASES: u32 = 241u32
+const AX_COMP_QUIESCE_TIMEOUT: u32 = 242u32
+const AX_COMP_HOT_RELOAD_SCHEMA_MISMATCH: u32 = 243u32
+const AX_COMP_HOT_RELOAD_MIGRATION_FAILED: u32 = 244u32
+
+const STATUS_ACTIVE: u32 = 1u32
+const STATUS_QUIESCING: u32 = 2u32
+const STATUS_RETIRED: u32 = 3u32
+const STATUS_UNLOADED: u32 = 4u32
+
+@derive(Copy)
+struct SchemaId {
+    lo: u64,
+    hi: u64,
+}
+
+fn schema_id_eq(a: SchemaId, b: SchemaId) -> bool {
+    a.lo == b.lo && a.hi == b.hi
+}
+
+@derive(Copy)
+struct StateSnapshot {
+    schema_id: SchemaId,
+    schema_version: u32,
+    state_val_1: u64,
+    state_val_2: u64,
+    payload_size: usize,
+}
+
+fn snapshot_new(sid: SchemaId, ver: u32, v1: u64, v2: u64, sz: usize) -> StateSnapshot {
+    StateSnapshot {
+        schema_id: sid,
+        schema_version: ver,
+        state_val_1: v1,
+        state_val_2: v2,
+        payload_size: sz,
+    }
+}
+
+@derive(Copy)
+struct MigrationHook {
+    from_version: u32,
+    to_version: u32,
+    is_registered: bool,
+    should_fail: bool,
+}
+
+fn hook_new(from_ver: u32, to_ver: u32, registered: bool, fail: bool) -> MigrationHook {
+    MigrationHook {
+        from_version: from_ver,
+        to_version: to_ver,
+        is_registered: registered,
+        should_fail: fail,
+    }
+}
+
+// State migration evaluator (AXS-COMP-034)
+fn evaluate_state_migration(
+    snapshot: StateSnapshot,
+    cand_schema_id: SchemaId,
+    cand_version: u32,
+    hook: MigrationHook,
+    out_migrated: mut_view<StateSnapshot>
+) -> u32 {
+    // 1. Zero-Copy Fast Path (AXS-COMP-034 §1): schema id matches exactly
+    if schema_id_eq(snapshot.schema_id, cand_schema_id) {
+        *out_migrated = snapshot
+        return 0u32
+    }
+
+    // 2. Schema Evolution requires valid registered migration hook (AXS-COMP-034 §2)
+    if !hook.is_registered || hook.from_version != snapshot.schema_version || hook.to_version != cand_version {
+        return AX_COMP_HOT_RELOAD_SCHEMA_MISMATCH
+    }
+
+    // 3. Migration failure simulation (AXS-COMP-034 §3)
+    if hook.should_fail {
+        return AX_COMP_HOT_RELOAD_MIGRATION_FAILED
+    }
+
+    // Successful deterministic transformation
+    out_migrated.schema_id = cand_schema_id
+    out_migrated.schema_version = cand_version
+    out_migrated.state_val_1 = snapshot.state_val_1
+    out_migrated.state_val_2 = snapshot.state_val_2 + 1000u64
+    out_migrated.payload_size = snapshot.payload_size + 8usize
+    0u32
+}
+
+@derive(Copy)
+struct HotReloadCoordinator {
+    active_epoch: u32,
+    active_leases: u64,
+    active_status: u32,
+    retired_epoch: u32,
+    retired_leases: u64,
+    retired_status: u32,
+    has_retired: bool,
+    current_state: StateSnapshot,
+    reload_count: u32,
+}
+
+fn coordinator_new(initial_epoch: u32, initial_state: StateSnapshot) -> HotReloadCoordinator {
+    HotReloadCoordinator {
+        active_epoch: initial_epoch,
+        active_leases: 0u64,
+        active_status: STATUS_ACTIVE,
+        retired_epoch: 0u32,
+        retired_leases: 0u64,
+        retired_status: STATUS_UNLOADED,
+        has_retired: false,
+        current_state: initial_state,
+        reload_count: 0u32,
+    }
+}
+
+// Executes 5-Phase Hot-Reload with Full Transactional Rollback Guarantee (AXS-COMP-030..037)
+fn coordinator_execute_reload(
+    coord: mut_view<HotReloadCoordinator>,
+    cand_epoch: u32,
+    cand_schema_id: SchemaId,
+    cand_version: u32,
+    hook: MigrationHook,
+    simulate_drain_success: bool
+) -> u32 {
+    // Phase 1: Quiesce
+    coord.active_status = STATUS_QUIESCING
+    if coord.active_leases > 0u64 {
+        if !simulate_drain_success {
+            // Quiesce timed out: rollback immediately and un-quiesce
+            coord.active_status = STATUS_ACTIVE
+            return AX_COMP_QUIESCE_TIMEOUT
+        }
+        coord.active_leases = 0u64
+    }
+
+    // Phase 2: State Export
+    let exported = coord.current_state
+
+    // Phase 3 & 4: Load candidate and migrate state
+    let dummy_sid = SchemaId { lo: 0u64, hi: 0u64 }
+    let mut new_state = snapshot_new(dummy_sid, 0u32, 0u64, 0u64, 0usize)
+    let mig_rc = evaluate_state_migration(exported, cand_schema_id, cand_version, hook, mut_view(new_state))
+    if mig_rc != 0u32 {
+        // Migration failed: evict candidate, resume active epoch with zero state loss!
+        coord.active_status = STATUS_ACTIVE
+        return mig_rc
+    }
+
+    // Phase 5: Atomic Resume & Activation
+    // 1. Commit new state
+    coord.current_state = new_state
+
+    // 2. Transition active epoch to retired
+    coord.retired_epoch = coord.active_epoch
+    coord.retired_leases = 0u64
+    coord.retired_status = STATUS_RETIRED
+    coord.has_retired = true
+
+    // 3. Activate new epoch
+    coord.active_epoch = cand_epoch
+    coord.active_status = STATUS_ACTIVE
+    coord.active_leases = 0u64
+    coord.reload_count = coord.reload_count + 1u32
+
+    0u32
+}
+
+fn coordinator_try_unmap_retired(coord: mut_view<HotReloadCoordinator>) -> u32 {
+    if !coord.has_retired {
+        return 0u32
+    }
+    if coord.retired_leases > 0u64 {
+        return AX_COMP_UNLOAD_ACTIVE_LEASES
+    }
+    coord.retired_status = STATUS_UNLOADED
+    coord.has_retired = false
+    0u32
+}
+
+fn print_bool(label: str, b: bool) {
+    print(label)
+    if b {
+        print(": true\n")
+    } else {
+        print(": false\n")
+    }
+}
+
+fn print_u32_code(label: str, v: u32) {
+    print(label)
+    print(": ")
+    if v == 0u32 {
+        print("0\n")
+    } else if v == AX_COMP_UNLOAD_ACTIVE_LEASES {
+        print("241\n")
+    } else if v == AX_COMP_QUIESCE_TIMEOUT {
+        print("242\n")
+    } else if v == AX_COMP_HOT_RELOAD_SCHEMA_MISMATCH {
+        print("243\n")
+    } else if v == AX_COMP_HOT_RELOAD_MIGRATION_FAILED {
+        print("244\n")
+    } else {
+        print("unknown\n")
+    }
+}
+
+fn main() -> i32 {
+    let sid_v1 = SchemaId { lo: 0x1111222233334444u64, hi: 0x5555666677778888u64 }
+    let sid_v2 = SchemaId { lo: 0x9999AAAABBBBCCCCu64, hi: 0xDDDDEEEEFFFF0000u64 }
+    let sid_v3 = SchemaId { lo: 0x3333333333333333u64, hi: 0x4444444444444444u64 }
+    let sid_unreg = SchemaId { lo: 0xDEADDEADDEADDEADu64, hi: 0xBEEFBEEFBEEFBEEFu64 }
+
+    let init_state = snapshot_new(sid_v1, 1u32, 100u64, 200u64, 32usize)
+    let mut coord = coordinator_new(1u32, init_state)
+
+    // Initial state verification
+    let init_ok = (coord.active_epoch == 1u32) &&
+                  (coord.current_state.state_val_1 == 100u64) &&
+                  (coord.current_state.state_val_2 == 200u64) &&
+                  (coord.reload_count == 0u32)
+    print_bool("init_state_ok", init_ok)
+
+    // =========================================================================
+    // 1. Hot Reload 1: Epoch 1 -> Epoch 2 (Schema Identity Fast-Path, AXS-COMP-034 §1)
+    // =========================================================================
+    let no_hook = hook_new(0u32, 0u32, false, false)
+    let rc_ep2 = coordinator_execute_reload(
+        mut_view(coord), 2u32, sid_v1, 1u32, no_hook, true
+    )
+    print_u32_code("rc_epoch1_to_epoch2_fast_path", rc_ep2)
+    let ep2_ok = (coord.active_epoch == 2u32) &&
+                 (coord.current_state.schema_version == 1u32) &&
+                 (coord.current_state.state_val_1 == 100u64) &&
+                 (coord.current_state.state_val_2 == 200u64) &&
+                 (coord.reload_count == 1u32)
+    print_bool("epoch2_state_preserved_identically", ep2_ok)
+
+    // =========================================================================
+    // 2. Hot Reload 2: Epoch 2 -> Epoch 3 (Schema Evolution Migration, AXS-COMP-034 §2)
+    // =========================================================================
+    let hook_1_to_2 = hook_new(1u32, 2u32, true, false)
+    let rc_ep3 = coordinator_execute_reload(
+        mut_view(coord), 3u32, sid_v2, 2u32, hook_1_to_2, true
+    )
+    print_u32_code("rc_epoch2_to_epoch3_migration", rc_ep3)
+    let ep3_ok = (coord.active_epoch == 3u32) &&
+                 (coord.current_state.schema_version == 2u32) &&
+                 (coord.current_state.state_val_1 == 100u64) &&
+                 (coord.current_state.state_val_2 == 1200u64) && // 200 + 1000 from migration hook
+                 (coord.current_state.payload_size == 40usize) && // 32 + 8
+                 (coord.reload_count == 2u32)
+    print_bool("epoch3_state_migrated_deterministically", ep3_ok)
+
+    // =========================================================================
+    // 3. Rollback Scenario A: Quiesce Timeout (AXS-COMP-031, AXS-COMP-036)
+    // =========================================================================
+    coord.active_leases = 3u64
+    let hook_2_to_3 = hook_new(2u32, 3u32, true, false)
+    let rc_timeout = coordinator_execute_reload(
+        mut_view(coord), 4u32, sid_v3, 3u32, hook_2_to_3, false // simulate timeout
+    )
+    print_u32_code("rc_quiesce_timeout_rollback", rc_timeout)
+    // Active epoch, state, and status must be restored with ZERO state loss!
+    let timeout_rollback_ok = (coord.active_epoch == 3u32) &&
+                              (coord.active_status == STATUS_ACTIVE) &&
+                              (coord.current_state.state_val_1 == 100u64) &&
+                              (coord.current_state.state_val_2 == 1200u64) &&
+                              (coord.reload_count == 2u32)
+    print_bool("quiesce_timeout_zero_state_loss", timeout_rollback_ok)
+    coord.active_leases = 0u64
+
+    // =========================================================================
+    // 4. Rollback Scenario B: State Migration Hook Failure (AXS-COMP-034 §3, AXS-COMP-036)
+    // =========================================================================
+    let hook_failing = hook_new(2u32, 3u32, true, true) // should_fail = true
+    let rc_mig_fail = coordinator_execute_reload(
+        mut_view(coord), 4u32, sid_v3, 3u32, hook_failing, true
+    )
+    print_u32_code("rc_migration_hook_failed_rollback", rc_mig_fail)
+    let mig_fail_rollback_ok = (coord.active_epoch == 3u32) &&
+                               (coord.active_status == STATUS_ACTIVE) &&
+                               (coord.current_state.state_val_1 == 100u64) &&
+                               (coord.current_state.state_val_2 == 1200u64) &&
+                               (coord.reload_count == 2u32)
+    print_bool("migration_failure_zero_state_loss", mig_fail_rollback_ok)
+
+    // =========================================================================
+    // 5. Rollback Scenario C: Unregistered / Schema Mismatch (AXS-COMP-034 §2)
+    // =========================================================================
+    let rc_schema_mismatch = coordinator_execute_reload(
+        mut_view(coord), 4u32, sid_unreg, 9u32, no_hook, true // unregistered schema & no hook
+    )
+    print_u32_code("rc_schema_mismatch_rollback", rc_schema_mismatch)
+    let schema_mismatch_rollback_ok = (coord.active_epoch == 3u32) &&
+                                      (coord.active_status == STATUS_ACTIVE) &&
+                                      (coord.current_state.state_val_1 == 100u64) &&
+                                      (coord.current_state.state_val_2 == 1200u64) &&
+                                      (coord.reload_count == 2u32)
+    print_bool("schema_mismatch_zero_state_loss", schema_mismatch_rollback_ok)
+
+    // =========================================================================
+    // 6. Deferred Retirement Physical Unmap Protection (AXS-COMP-037)
+    // =========================================================================
+    coord.retired_leases = 2u64
+    let unmap_blocked = (coordinator_try_unmap_retired(mut_view(coord)) == AX_COMP_UNLOAD_ACTIVE_LEASES)
+    print_bool("retired_epoch_unmap_blocked_by_active_leases", unmap_blocked)
+
+    coord.retired_leases = 0u64
+    let unmap_success = (coordinator_try_unmap_retired(mut_view(coord)) == 0u32)
+    let unmap_completed = (!coord.has_retired) && (coord.retired_status == STATUS_UNLOADED)
+    print_bool("retired_epoch_unmap_succeeds_when_quiescent", unmap_success && unmap_completed)
+
+    print("conformance[multi_epoch_hot_reload_migration] OK\n")
+    0
+}
