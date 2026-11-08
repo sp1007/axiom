@@ -1,0 +1,433 @@
+// Axiom Compiler — ABI Compatibility Check & SemVer Diff CLI Driver (compiler/driver/abi_cmd/mod.ax)
+// Implements SPEC-114 §5 (AXS-ABI-040..042, AXS-ABI-050; REQ-PKG-022, REQ-PKG-024).
+
+module compiler.driver.abi_cmd
+
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+use compiler.diag.json.write_json_string
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+use compiler.diag.ux2.ux2_sv_contains
+
+use compiler.abi.stability.AX_ABI_BREAKING_CHANGE
+use compiler.abi.stability.AX_ABI_SEMVER_MISMATCH
+use compiler.abi.stability.abi_diag_code_name
+
+use compiler.abi.compat_diff.COMPAT_CLASS_IDENTICAL
+use compiler.abi.compat_diff.COMPAT_CLASS_IMPL_ONLY
+use compiler.abi.compat_diff.COMPAT_CLASS_MINOR_ADDITIVE
+use compiler.abi.compat_diff.COMPAT_CLASS_MAJOR_BREAKING
+use compiler.abi.compat_diff.compat_class_name
+use compiler.abi.compat_diff.SEVERITY_COMPATIBLE
+use compiler.abi.compat_diff.SEVERITY_ADDITIVE
+use compiler.abi.compat_diff.SEVERITY_BREAKING
+use compiler.abi.compat_diff.severity_name
+use compiler.abi.compat_diff.diff_kind_name
+use compiler.abi.compat_diff.ItemDiff
+use compiler.abi.compat_diff.InterfaceDiffResult
+use compiler.abi.compat_diff.interface_diff_result_empty
+use compiler.abi.compat_diff.InterfaceDescriptor
+use compiler.abi.compat_diff.diff_interface_descriptors
+use compiler.abi.compat_diff.render_diff_text
+use compiler.abi.compat_diff.render_diff_json
+
+// =============================================================================
+// 1. SemVer Parser & Version Increment Classifier (AXS-ABI-040, REQ-PKG-022)
+// =============================================================================
+
+pub const BUMP_PATCH: u8 = 0u8
+pub const BUMP_MINOR: u8 = 1u8
+pub const BUMP_MAJOR: u8 = 2u8
+pub const BUMP_DOWNGRADE: u8 = 3u8
+
+pub fn bump_kind_name(b: u8) -> StrView {
+    if b == BUMP_PATCH { return ux2_sv("patch") }
+    if b == BUMP_MINOR { return ux2_sv("minor") }
+    if b == BUMP_MAJOR { return ux2_sv("major") }
+    ux2_sv("downgrade")
+}
+
+@derive(Copy)
+pub struct ParsedSemVer {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+    pub is_valid: bool,
+}
+
+pub fn parse_semver(s: StrView) -> ParsedSemVer {
+    if s.len == 0usize {
+        return ParsedSemVer { major: 0u32, minor: 0u32, patch: 0u32, is_valid: false }
+    }
+
+    let mut part: u32 = 0u32
+    let mut val: u32 = 0u32
+    let mut maj: u32 = 0u32
+    let mut min: u32 = 0u32
+    let mut pat: u32 = 0u32
+    let mut has_digit = false
+
+    let mut i: usize = 0usize
+    while i < s.len {
+        let b = unsafe { *(s.ptr + i) }
+        if b >= 48u8 && b <= 57u8 {
+            val = val * 10u32 + (b - 48u8) as u32
+            has_digit = true
+        } else if b == 46u8 { // '.'
+            if !has_digit {
+                return ParsedSemVer { major: 0u32, minor: 0u32, patch: 0u32, is_valid: false }
+            }
+            if part == 0u32 {
+                maj = val
+            } else if part == 1u32 {
+                min = val
+            } else if part == 2u32 {
+                pat = val
+            }
+            part = part + 1u32
+            val = 0u32
+            has_digit = false
+        } else if b == 45u8 || b == 43u8 { // '-' or '+'
+            break
+        } else {
+            return ParsedSemVer { major: 0u32, minor: 0u32, patch: 0u32, is_valid: false }
+        }
+        i = i + 1usize
+    }
+
+    if has_digit {
+        if part == 0u32 {
+            maj = val
+        } else if part == 1u32 {
+            min = val
+        } else if part == 2u32 {
+            pat = val
+        }
+    }
+
+    ParsedSemVer { major: maj, minor: min, patch: pat, is_valid: true }
+}
+
+pub fn evaluate_semver_bump(old_v: ParsedSemVer, new_v: ParsedSemVer) -> u8 {
+    if !old_v.is_valid || !new_v.is_valid {
+        return BUMP_DOWNGRADE
+    }
+
+    let old_maj = old_v.major
+    let new_maj = new_v.major
+    if new_maj > old_maj {
+        return BUMP_MAJOR
+    }
+    if new_maj < old_maj {
+        return BUMP_DOWNGRADE
+    }
+
+    let old_min = old_v.minor
+    let new_min = new_v.minor
+    if new_min > old_min {
+        return BUMP_MINOR
+    }
+    if new_min < old_min {
+        return BUMP_DOWNGRADE
+    }
+
+    let old_pat = old_v.patch
+    let new_pat = new_v.patch
+    if new_pat > old_pat {
+        return BUMP_PATCH
+    }
+    if new_pat == old_pat {
+        return BUMP_PATCH
+    }
+
+    BUMP_DOWNGRADE
+}
+
+pub fn split_semver_arg(arg: StrView, out_old: mut_view<StrView>, out_new: mut_view<StrView>) -> bool {
+    let mut colon_idx: usize = 0usize
+    let mut found = false
+    let mut i: usize = 0usize
+    while i < arg.len {
+        let b = unsafe { *(arg.ptr + i) }
+        if b == 58u8 { // ':'
+            colon_idx = i
+            found = true
+            break
+        }
+        i = i + 1usize
+    }
+
+    if !found || colon_idx == 0usize || colon_idx + 1usize >= arg.len {
+        return false
+    }
+
+    *out_old = StrView { ptr: arg.ptr, len: colon_idx }
+    *out_new = StrView { ptr: unsafe { arg.ptr + colon_idx + 1usize }, len: arg.len - colon_idx - 1usize }
+    true
+}
+
+// =============================================================================
+// 2. SemVer Policy Enforcer (SPEC-114 §5, AXS-ABI-040..041)
+// =============================================================================
+
+pub fn check_semver_policy(
+    overall_class: u8,
+    bump: u8,
+    has_semver: bool
+) -> i32 {
+    if !has_semver {
+        if overall_class == COMPAT_CLASS_MAJOR_BREAKING {
+            return 1i32 // AX_ABI_BREAKING_CHANGE
+        }
+        return 0i32
+    }
+
+    if bump == BUMP_DOWNGRADE {
+        return 2i32 // AX_ABI_SEMVER_MISMATCH
+    }
+
+    if overall_class == COMPAT_CLASS_IDENTICAL || overall_class == COMPAT_CLASS_IMPL_ONLY {
+        return 0i32
+    }
+
+    if overall_class == COMPAT_CLASS_MINOR_ADDITIVE {
+        if bump == BUMP_PATCH {
+            return 2i32 // AX_ABI_SEMVER_MISMATCH
+        }
+        return 0i32
+    }
+
+    if overall_class == COMPAT_CLASS_MAJOR_BREAKING {
+        if bump == BUMP_MAJOR {
+            return 0i32
+        }
+        return 1i32 // AX_ABI_BREAKING_CHANGE
+    }
+
+    0i32
+}
+
+// =============================================================================
+// 3. CLI Configuration & Options Parser (AXS-ABI-041)
+// =============================================================================
+
+@derive(Copy)
+pub struct AbiCheckCliConfig {
+    pub old_path: StrView,
+    pub new_path: StrView,
+    pub semver_arg: StrView,
+    pub old_version: StrView,
+    pub new_version: StrView,
+    pub has_semver: bool,
+    pub json_mode: bool,
+    pub show_help: bool,
+    pub invalid_option: bool,
+    pub expecting_old: bool,
+    pub expecting_new: bool,
+    pub expecting_semver: bool,
+    pub expecting_format: bool,
+}
+
+pub fn abi_check_cli_default() -> AbiCheckCliConfig {
+    let e = ux2_sv_empty()
+    AbiCheckCliConfig {
+        old_path: e,
+        new_path: e,
+        semver_arg: e,
+        old_version: ux2_sv("1.0.0"),
+        new_version: ux2_sv("1.0.0"),
+        has_semver: false,
+        json_mode: false,
+        show_help: false,
+        invalid_option: false,
+        expecting_old: false,
+        expecting_new: false,
+        expecting_semver: false,
+        expecting_format: false,
+    }
+}
+
+pub fn abi_check_parse_arg(cfg: mut_view<AbiCheckCliConfig>, arg: StrView) -> bool {
+    if cfg.expecting_old {
+        cfg.old_path = arg
+        cfg.expecting_old = false
+        return true
+    }
+    if cfg.expecting_new {
+        cfg.new_path = arg
+        cfg.expecting_new = false
+        return true
+    }
+    if cfg.expecting_semver {
+        cfg.semver_arg = arg
+        cfg.expecting_semver = false
+        let mut old_s = ux2_sv_empty()
+        let mut new_s = ux2_sv_empty()
+        if split_semver_arg(arg, mut_view(old_s), mut_view(new_s)) {
+            cfg.old_version = old_s
+            cfg.new_version = new_s
+            cfg.has_semver = true
+        } else {
+            cfg.invalid_option = true
+        }
+        return true
+    }
+    if cfg.expecting_format {
+        if ux2_sv_eq(arg, ux2_sv("json")) {
+            cfg.json_mode = true
+        }
+        cfg.expecting_format = false
+        return true
+    }
+
+    if ux2_sv_eq(arg, ux2_sv("--old")) {
+        cfg.expecting_old = true
+        return true
+    }
+    if ux2_sv_eq(arg, ux2_sv("--new")) {
+        cfg.expecting_new = true
+        return true
+    }
+    if ux2_sv_eq(arg, ux2_sv("--semver")) {
+        cfg.expecting_semver = true
+        return true
+    }
+    if ux2_sv_eq(arg, ux2_sv("--json")) || ux2_sv_eq(arg, ux2_sv("--format=json")) {
+        cfg.json_mode = true
+        return true
+    }
+    if ux2_sv_eq(arg, ux2_sv("--format=text")) {
+        cfg.json_mode = false
+        return true
+    }
+    if ux2_sv_eq(arg, ux2_sv("--format")) {
+        cfg.expecting_format = true
+        return true
+    }
+    if ux2_sv_eq(arg, ux2_sv("--help")) || ux2_sv_eq(arg, ux2_sv("-h")) {
+        cfg.show_help = true
+        return true
+    }
+
+    if arg.len > 0 && unsafe { *(arg.ptr) } == 45u8 {
+        cfg.invalid_option = true
+        return false
+    }
+
+    cfg.invalid_option = true
+    false
+}
+
+// =============================================================================
+// 4. Command Execution Engine (AXS-ABI-041)
+// =============================================================================
+
+pub fn abi_check_cmd_execute(
+    cfg: view<AbiCheckCliConfig>,
+    old_desc: view<InterfaceDescriptor>,
+    new_desc: view<InterfaceDescriptor>,
+    out_stdout: mut_view<DiagBuffer>,
+    out_stderr: mut_view<DiagBuffer>
+) -> i32 {
+    if cfg.invalid_option || cfg.expecting_old || cfg.expecting_new || cfg.expecting_semver || cfg.expecting_format {
+        diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("error[AX_DRIVER_UNKNOWN_OPTION]: invalid option for `axiomc abi-check`\n"))
+        return 3i32
+    }
+
+    if cfg.show_help {
+        diag_buf_push_sv(mut_view(*out_stdout), ux2_sv("usage: axiomc abi-check --old <base.axmeta> --new <cand.axmeta> [--semver <old_ver>:<new_ver>] [--format text|json]\n"))
+        return 0i32
+    }
+
+    if cfg.old_path.len == 0 || cfg.new_path.len == 0 {
+        diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("error[AX_DRIVER_USAGE]: `axiomc abi-check` requires both `--old` and `--new` inputs\n"))
+        return 3i32
+    }
+
+    let mut diff_res = interface_diff_result_empty()
+    diff_interface_descriptors(old_desc, new_desc, mut_view(diff_res))
+
+    let mut bump: u8 = BUMP_PATCH
+    if cfg.has_semver {
+        let p_old = parse_semver(cfg.old_version)
+        let p_new = parse_semver(cfg.new_version)
+        if !p_old.is_valid || !p_new.is_valid {
+            diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("error[AX_DRIVER_USAGE]: invalid SemVer string in `--semver`\n"))
+            return 3i32
+        }
+        bump = evaluate_semver_bump(p_old, p_new)
+    }
+
+    let rc = check_semver_policy(diff_res.overall_class, bump, cfg.has_semver)
+
+    let mut status_field = ux2_sv("pass")
+    if rc == 1i32 {
+        status_field = ux2_sv("breaking")
+    } else if rc == 2i32 {
+        status_field = ux2_sv("semver_mismatch")
+    } else if diff_res.overall_class == COMPAT_CLASS_MAJOR_BREAKING {
+        status_field = ux2_sv("breaking")
+    } else if diff_res.overall_class == COMPAT_CLASS_MINOR_ADDITIVE {
+        status_field = ux2_sv("minor-additive")
+    }
+
+    if cfg.json_mode {
+        render_diff_json(
+            view(diff_res),
+            status_field,
+            cfg.old_version,
+            cfg.new_version,
+            old_desc.target.arch_name,
+            mut_view(*out_stdout)
+        )
+    } else {
+        render_diff_text(
+            view(diff_res),
+            cfg.old_version,
+            cfg.new_version,
+            old_desc.target.arch_name,
+            mut_view(*out_stdout)
+        )
+
+        if rc == 0i32 {
+            diag_buf_push_sv(mut_view(*out_stdout), ux2_sv("Policy Verdict: PASS\n"))
+        } else if rc == 1i32 {
+            diag_buf_push_sv(
+                mut_view(*out_stderr),
+                ux2_sv("error[AX_ABI_BREAKING_CHANGE]: breaking ABI/API change detected; requires a major SemVer bump\n")
+            )
+        } else if rc == 2i32 {
+            diag_buf_push_sv(
+                mut_view(*out_stderr),
+                ux2_sv("error[AX_ABI_SEMVER_MISMATCH]: additive ABI/API change detected across patch release; requires at least a minor bump\n")
+            )
+        }
+    }
+
+    rc
+}
+
+pub fn abi_check_cmd_run(
+    args: view<[8]StrView>,
+    arg_count: usize,
+    old_desc: view<InterfaceDescriptor>,
+    new_desc: view<InterfaceDescriptor>,
+    out_stdout: mut_view<DiagBuffer>,
+    out_stderr: mut_view<DiagBuffer>
+) -> i32 {
+    let mut cfg = abi_check_cli_default()
+    let mut i: usize = 0usize
+    while i < arg_count && i < 8usize {
+        if !abi_check_parse_arg(mut_view(cfg), (*args)[i]) {
+            break
+        }
+        i = i + 1usize
+    }
+
+    abi_check_cmd_execute(view(cfg), old_desc, new_desc, mut_view(*out_stdout), mut_view(*out_stderr))
+}

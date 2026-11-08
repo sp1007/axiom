@@ -1,0 +1,1153 @@
+// Axiom Compiler — Binary Compatibility Diff Engine & Versioned Symbols (compiler/abi/compat_diff/mod.ax)
+// Implements SPEC-114 §§4..5 (AXS-ABI-030..042, AXS-ABI-050; REQ-ECO-8734, REQ-PKG-022, REQ-PKG-024).
+
+module compiler.abi.compat_diff
+
+use compiler.kernel.hash.ax_hash_bytes
+use compiler.kernel.hash.ax_hash_u64
+use compiler.kernel.hash.ax_hash_combine
+use compiler.kernel.interner.StrView
+use compiler.source.span.span_none
+use compiler.diag.code.DiagCode
+use compiler.diag.code.diag_code
+use compiler.diag.code.DiagDataKind
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.DiagDataEntry
+use compiler.diag.emitter.DiagDataValue
+use compiler.diag.emitter.diag_new
+use compiler.diag.emitter.diag_sink_report
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+use compiler.diag.json.write_json_string
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+use compiler.diag.ux2.ux2_sv_contains
+
+use compiler.abi.stability.AX_ABI_UNSTABLE_TYPE
+use compiler.abi.stability.AX_ABI_EXTENSIBLE_MISSING_HEADER
+use compiler.abi.stability.AX_ABI_OPAQUE_BY_VALUE
+use compiler.abi.stability.AX_ABI_SYMBOL_VERSION_DUPLICATE
+use compiler.abi.stability.AX_ABI_BREAKING_CHANGE
+use compiler.abi.stability.AX_ABI_SEMVER_MISMATCH
+use compiler.abi.stability.AX_FFI_GENERIC_EXPORT
+use compiler.abi.stability.abi_diag_code_name
+use compiler.abi.stability.ABI_TIER_INTERNAL
+use compiler.abi.stability.ABI_TIER_PACKAGE
+use compiler.abi.stability.ABI_TIER_STABLE
+use compiler.abi.stability.CALL_CONV_C
+use compiler.abi.stability.CALL_CONV_WIN64
+use compiler.abi.stability.CALL_CONV_SYSV64
+use compiler.abi.stability.CALL_CONV_AAPCS64
+use compiler.abi.stability.call_conv_name
+use compiler.abi.stability.StableFieldDesc
+use compiler.abi.stability.stable_field_desc_default
+use compiler.abi.stability.StableVariantDesc
+use compiler.abi.stability.stable_variant_desc_default
+use compiler.abi.stability.StableTypeContract
+use compiler.abi.stability.SymbolVersionEntry
+use compiler.abi.stability.symbol_version_entry_new
+use compiler.abi.stability.report_abi_diag_1
+use compiler.abi.stability.report_abi_diag_2
+
+use compiler.abi.fingerprint.ApiFingerprint
+use compiler.abi.fingerprint.SemanticFingerprint
+use compiler.abi.fingerprint.AbiFingerprint
+use compiler.abi.fingerprint.TargetPlatformDesc
+use compiler.abi.fingerprint.api_fingerprint_zero
+use compiler.abi.fingerprint.api_fingerprint_eq
+use compiler.abi.fingerprint.semantic_fingerprint_zero
+use compiler.abi.fingerprint.semantic_fingerprint_eq
+use compiler.abi.fingerprint.abi_fingerprint_zero
+use compiler.abi.fingerprint.abi_fingerprint_eq
+use compiler.abi.fingerprint.target_platform_win64
+use compiler.abi.fingerprint.push_fingerprint_hex
+
+// =============================================================================
+// 1. Classification & Severity Constants (SPEC-114 §5, AXS-ABI-040)
+// =============================================================================
+
+pub const COMPAT_CLASS_IDENTICAL: u8 = 0u8
+pub const COMPAT_CLASS_IMPL_ONLY: u8 = 1u8
+pub const COMPAT_CLASS_MINOR_ADDITIVE: u8 = 2u8
+pub const COMPAT_CLASS_MAJOR_BREAKING: u8 = 3u8
+
+pub fn compat_class_name(c: u8) -> StrView {
+    if c == COMPAT_CLASS_IDENTICAL {
+        return ux2_sv("identical")
+    }
+    if c == COMPAT_CLASS_IMPL_ONLY {
+        return ux2_sv("implementation-only")
+    }
+    if c == COMPAT_CLASS_MINOR_ADDITIVE {
+        return ux2_sv("minor-additive")
+    }
+    if c == COMPAT_CLASS_MAJOR_BREAKING {
+        return ux2_sv("major-breaking")
+    }
+    ux2_sv("unknown")
+}
+
+pub const SEVERITY_COMPATIBLE: u8 = 0u8
+pub const SEVERITY_ADDITIVE: u8 = 1u8
+pub const SEVERITY_BREAKING: u8 = 2u8
+pub const SEVERITY_MINOR_ADDITIVE: u8 = 1u8
+pub const SEVERITY_MAJOR_BREAKING: u8 = 2u8
+
+pub fn severity_name(s: u8) -> StrView {
+    if s == SEVERITY_COMPATIBLE {
+        return ux2_sv("compatible")
+    }
+    if s == SEVERITY_ADDITIVE {
+        return ux2_sv("additive")
+    }
+    if s == SEVERITY_BREAKING {
+        return ux2_sv("breaking")
+    }
+    ux2_sv("unknown")
+}
+
+// Detailed difference kinds (AXS-ABI-040)
+pub const DIFF_KIND_IDENTICAL: u16 = 0u16
+pub const DIFF_KIND_IMPL_ONLY: u16 = 1u16
+pub const DIFF_KIND_FN_ADDED: u16 = 2u16
+pub const DIFF_KIND_FN_REMOVED: u16 = 3u16
+pub const DIFF_KIND_FN_PARAM_COUNT_CHANGED: u16 = 4u16
+pub const DIFF_KIND_FN_PARAM_TYPE_CHANGED: u16 = 5u16
+pub const DIFF_KIND_FN_RET_TYPE_CHANGED: u16 = 6u16
+pub const DIFF_KIND_FN_CALL_CONV_CHANGED: u16 = 7u16
+pub const DIFF_KIND_STRUCT_ADDED: u16 = 8u16
+pub const DIFF_KIND_STRUCT_REMOVED: u16 = 9u16
+pub const DIFF_KIND_STRUCT_FIELD_OFFSET_CHANGED: u16 = 10u16
+pub const DIFF_KIND_STRUCT_FIELD_REMOVED: u16 = 11u16
+pub const DIFF_KIND_STRUCT_SIZE_CHANGED: u16 = 12u16
+pub const DIFF_KIND_STRUCT_ALIGN_CHANGED: u16 = 13u16
+pub const DIFF_KIND_STRUCT_EXTENSIBLE_FIELD_APPENDED: u16 = 14u16
+pub const DIFF_KIND_STRUCT_NON_EXTENSIBLE_FIELD_ADDED: u16 = 15u16
+pub const DIFF_KIND_ENUM_ADDED: u16 = 16u16
+pub const DIFF_KIND_ENUM_REMOVED: u16 = 17u16
+pub const DIFF_KIND_ENUM_DISCRIMINANT_CHANGED: u16 = 18u16
+pub const DIFF_KIND_ENUM_NON_EXHAUSTIVE_VARIANT_ADDED: u16 = 19u16
+pub const DIFF_KIND_ENUM_EXHAUSTIVE_VARIANT_ADDED: u16 = 20u16
+pub const DIFF_KIND_SYMBOL_VERSION_ADDED: u16 = 21u16
+pub const DIFF_KIND_SYMBOL_VERSION_REMOVED: u16 = 22u16
+pub const DIFF_KIND_CAPABILITY_RELAXED: u16 = 23u16
+pub const DIFF_KIND_CAPABILITY_TIGHTENED: u16 = 24u16
+
+pub fn diff_kind_name(kind: u16) -> StrView {
+    if kind == DIFF_KIND_IDENTICAL { return ux2_sv("identical") }
+    if kind == DIFF_KIND_IMPL_ONLY { return ux2_sv("implementation_only") }
+    if kind == DIFF_KIND_FN_ADDED { return ux2_sv("function_added") }
+    if kind == DIFF_KIND_FN_REMOVED { return ux2_sv("function_removed") }
+    if kind == DIFF_KIND_FN_PARAM_COUNT_CHANGED { return ux2_sv("function_param_count_changed") }
+    if kind == DIFF_KIND_FN_PARAM_TYPE_CHANGED { return ux2_sv("function_param_type_changed") }
+    if kind == DIFF_KIND_FN_RET_TYPE_CHANGED { return ux2_sv("function_return_type_changed") }
+    if kind == DIFF_KIND_FN_CALL_CONV_CHANGED { return ux2_sv("function_call_conv_changed") }
+    if kind == DIFF_KIND_STRUCT_ADDED { return ux2_sv("struct_added") }
+    if kind == DIFF_KIND_STRUCT_REMOVED { return ux2_sv("struct_removed") }
+    if kind == DIFF_KIND_STRUCT_FIELD_OFFSET_CHANGED { return ux2_sv("struct_field_offset_changed") }
+    if kind == DIFF_KIND_STRUCT_FIELD_REMOVED { return ux2_sv("struct_field_removed") }
+    if kind == DIFF_KIND_STRUCT_SIZE_CHANGED { return ux2_sv("struct_size_changed") }
+    if kind == DIFF_KIND_STRUCT_ALIGN_CHANGED { return ux2_sv("struct_align_changed") }
+    if kind == DIFF_KIND_STRUCT_EXTENSIBLE_FIELD_APPENDED { return ux2_sv("extensible_struct_field_appended") }
+    if kind == DIFF_KIND_STRUCT_NON_EXTENSIBLE_FIELD_ADDED { return ux2_sv("non_extensible_struct_field_added") }
+    if kind == DIFF_KIND_ENUM_ADDED { return ux2_sv("enum_added") }
+    if kind == DIFF_KIND_ENUM_REMOVED { return ux2_sv("enum_removed") }
+    if kind == DIFF_KIND_ENUM_DISCRIMINANT_CHANGED { return ux2_sv("enum_discriminant_changed") }
+    if kind == DIFF_KIND_ENUM_NON_EXHAUSTIVE_VARIANT_ADDED { return ux2_sv("non_exhaustive_enum_variant_added") }
+    if kind == DIFF_KIND_ENUM_EXHAUSTIVE_VARIANT_ADDED { return ux2_sv("exhaustive_enum_variant_added") }
+    if kind == DIFF_KIND_SYMBOL_VERSION_ADDED { return ux2_sv("symbol_version_added") }
+    if kind == DIFF_KIND_SYMBOL_VERSION_REMOVED { return ux2_sv("symbol_version_removed") }
+    if kind == DIFF_KIND_CAPABILITY_RELAXED { return ux2_sv("capability_relaxed") }
+    if kind == DIFF_KIND_CAPABILITY_TIGHTENED { return ux2_sv("capability_tightened") }
+    ux2_sv("unknown_diff")
+}
+
+// =============================================================================
+// 2. Versioned Symbol Mangling & Export Table Models (REQ-ECO-8734)
+// =============================================================================
+
+fn push_sanitized_name(buf: mut_view<DiagBuffer>, s: StrView) {
+    let mut i: usize = 0usize
+    while i < s.len {
+        let b = unsafe { *(s.ptr + i) }
+        if b == 46u8 { // '.'
+            diag_buf_push_byte(mut_view(*buf), 95u8) // '_'
+        } else {
+            diag_buf_push_byte(mut_view(*buf), b)
+        }
+        i = i + 1usize
+    }
+}
+
+pub fn format_versioned_mangled_name(
+    pkg: StrView,
+    mod_path: StrView,
+    ident: StrView,
+    ver: StrView,
+    is_default: bool,
+    buf: mut_view<DiagBuffer>
+) {
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("axiom_"))
+    push_sanitized_name(mut_view(*buf), pkg)
+    diag_buf_push_byte(mut_view(*buf), 95u8) // '_'
+    push_sanitized_name(mut_view(*buf), mod_path)
+    diag_buf_push_byte(mut_view(*buf), 95u8) // '_'
+    diag_buf_push_sv(mut_view(*buf), ident)
+    if is_default {
+        diag_buf_push_byte(mut_view(*buf), 64u8) // '@'
+        diag_buf_push_byte(mut_view(*buf), 64u8) // '@'
+    } else {
+        diag_buf_push_byte(mut_view(*buf), 64u8) // '@'
+    }
+    diag_buf_push_sv(mut_view(*buf), ver)
+}
+
+pub fn format_pe_export_alias(
+    ident: StrView,
+    ver: StrView,
+    is_default: bool,
+    buf: mut_view<DiagBuffer>
+) {
+    if is_default {
+        diag_buf_push_sv(mut_view(*buf), ident)
+    } else {
+        diag_buf_push_sv(mut_view(*buf), ident)
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("_v"))
+        push_sanitized_name(mut_view(*buf), ver)
+    }
+}
+
+@derive(Copy)
+pub struct VersionedExportDesc {
+    pub package_name: StrView,
+    pub module_path: StrView,
+    pub symbol_name: StrView,
+    pub version: StrView,
+    pub is_default: bool,
+    pub mangled_symbol: StrView,
+    pub pe_alias: StrView,
+    pub call_conv: u8,
+    pub is_abi_stable: bool,
+}
+
+pub fn versioned_export_desc_new(
+    pkg: StrView,
+    mod_path: StrView,
+    sym: StrView,
+    ver: StrView,
+    is_def: bool,
+    mangled: StrView,
+    pe_alias: StrView
+) -> VersionedExportDesc {
+    VersionedExportDesc {
+        package_name: pkg,
+        module_path: mod_path,
+        symbol_name: sym,
+        version: ver,
+        is_default: is_def,
+        mangled_symbol: mangled,
+        pe_alias: pe_alias,
+        call_conv: CALL_CONV_WIN64,
+        is_abi_stable: true,
+    }
+}
+
+pub fn validate_versioned_export_coexistence(
+    exports: view<[16]VersionedExportDesc>,
+    count: usize,
+    sink: mut_view<DiagSink>
+) -> bool {
+    let mut valid = true
+    let mut i: usize = 0usize
+    while i < count && i < 16usize {
+        let a = (*exports)[i]
+        let mut j: usize = i + 1usize
+        while j < count && j < 16usize {
+            let b = (*exports)[j]
+            let same_ident = ux2_sv_eq(a.symbol_name, b.symbol_name) && ux2_sv_eq(a.module_path, b.module_path)
+            if same_ident {
+                if ux2_sv_eq(a.version, b.version) {
+                    report_abi_diag_2(
+                        mut_view(*sink),
+                        AX_ABI_SYMBOL_VERSION_DUPLICATE,
+                        "duplicate @symbol_version in exported symbol table",
+                        "symbol",
+                        a.symbol_name,
+                        "version",
+                        a.version
+                    )
+                    valid = false
+                }
+                if a.is_default && b.is_default {
+                    report_abi_diag_1(
+                        mut_view(*sink),
+                        AX_ABI_SYMBOL_VERSION_DUPLICATE,
+                        "multiple @symbol_version exports marked default = true in the same symbol group",
+                        "symbol",
+                        a.symbol_name
+                    )
+                    valid = false
+                }
+            }
+
+            if a.mangled_symbol.len > 0 && b.mangled_symbol.len > 0 {
+                if ux2_sv_eq(a.mangled_symbol, b.mangled_symbol) {
+                    report_abi_diag_2(
+                        mut_view(*sink),
+                        AX_ABI_SYMBOL_VERSION_DUPLICATE,
+                        "symbol collision: identical mangled names in export table",
+                        "mangled_a",
+                        a.mangled_symbol,
+                        "mangled_b",
+                        b.mangled_symbol
+                    )
+                    valid = false
+                }
+            }
+
+            if a.pe_alias.len > 0 && b.pe_alias.len > 0 {
+                if ux2_sv_eq(a.pe_alias, b.pe_alias) {
+                    report_abi_diag_2(
+                        mut_view(*sink),
+                        AX_ABI_SYMBOL_VERSION_DUPLICATE,
+                        "export table collision: identical PE export alias",
+                        "alias",
+                        a.pe_alias,
+                        "symbol",
+                        a.symbol_name
+                    )
+                    valid = false
+                }
+            }
+
+            j = j + 1usize
+        }
+        i = i + 1usize
+    }
+    valid
+}
+
+// =============================================================================
+// 3. Interface Descriptors (.axmeta) & Item Models
+// =============================================================================
+
+@derive(Copy)
+pub struct ItemDiff {
+    pub diff_kind: u16,
+    pub severity: u8,
+    pub item_name: StrView,
+    pub member_name: StrView,
+    pub old_val: u64,
+    pub new_val: u64,
+    pub message: StrView,
+}
+
+pub fn item_diff_new(
+    kind: u16,
+    sev: u8,
+    item: StrView,
+    member: StrView,
+    old_v: u64,
+    new_v: u64,
+    msg: StrView
+) -> ItemDiff {
+    ItemDiff {
+        diff_kind: kind,
+        severity: sev,
+        item_name: item,
+        member_name: member,
+        old_val: old_v,
+        new_val: new_v,
+        message: msg,
+    }
+}
+
+pub const MAX_DIFFS: usize = 32usize
+
+@derive(Copy)
+pub struct InterfaceDiffResult {
+    pub overall_class: u8,
+    pub status_name: StrView,
+    pub diff_count: usize,
+    pub diffs: [32]ItemDiff,
+}
+
+pub fn interface_diff_result_empty() -> InterfaceDiffResult {
+    let e = ux2_sv_empty()
+    let dummy = item_diff_new(0u16, 0u8, e, e, 0u64, 0u64, e)
+    InterfaceDiffResult {
+        overall_class: COMPAT_CLASS_IDENTICAL,
+        status_name: ux2_sv("identical"),
+        diff_count: 0usize,
+        diffs: [dummy; 32],
+    }
+}
+
+pub fn diff_result_push(res: mut_view<InterfaceDiffResult>, diff: ItemDiff) {
+    let cur_count = res.diff_count
+    if cur_count < 32usize {
+        res.diffs[cur_count] = diff
+        res.diff_count = cur_count + 1usize
+    }
+}
+
+@derive(Copy)
+pub struct InterfaceFnDesc {
+    pub name: StrView,
+    pub module_path: StrView,
+    pub call_conv: u8,
+    pub symbol_version: StrView,
+    pub is_default_version: bool,
+    pub param_count: u32,
+    pub param_types_hash: u64,
+    pub ret_type_name: StrView,
+    pub ret_type_size: u32,
+    pub ret_type_align: u32,
+    pub capability_mask: u64,
+    pub is_pure: bool,
+    pub is_pub: bool,
+}
+
+pub fn interface_fn_desc_default(name: StrView, mod_path: StrView) -> InterfaceFnDesc {
+    InterfaceFnDesc {
+        name: name,
+        module_path: mod_path,
+        call_conv: CALL_CONV_WIN64,
+        symbol_version: ux2_sv("1.0"),
+        is_default_version: true,
+        param_count: 0u32,
+        param_types_hash: 0u64,
+        ret_type_name: ux2_sv("u32"),
+        ret_type_size: 4u32,
+        ret_type_align: 4u32,
+        capability_mask: 0u64,
+        is_pure: false,
+        is_pub: true,
+    }
+}
+
+@derive(Copy)
+pub struct InterfaceStructDesc {
+    pub name: StrView,
+    pub module_path: StrView,
+    pub size: u32,
+    pub align: u32,
+    pub is_extensible: bool,
+    pub has_abi_header: bool,
+    pub header_version: u32,
+    pub header_struct_size: u32,
+    pub is_opaque: bool,
+    pub is_pub: bool,
+    pub field_count: u32,
+    pub fields: [16]StableFieldDesc,
+}
+
+pub fn interface_struct_desc_default(name: StrView, mod_path: StrView) -> InterfaceStructDesc {
+    let dummy_field = stable_field_desc_default(ux2_sv_empty(), ux2_sv_empty(), 0u8, 0u32, 1u32)
+    InterfaceStructDesc {
+        name: name,
+        module_path: mod_path,
+        size: 0u32,
+        align: 1u32,
+        is_extensible: false,
+        has_abi_header: false,
+        header_version: 1u32,
+        header_struct_size: 0u32,
+        is_opaque: false,
+        is_pub: true,
+        field_count: 0u32,
+        fields: [dummy_field; 16],
+    }
+}
+
+@derive(Copy)
+pub struct InterfaceEnumDesc {
+    pub name: StrView,
+    pub module_path: StrView,
+    pub repr_kind: u8,
+    pub is_non_exhaustive: bool,
+    pub is_pub: bool,
+    pub variant_count: u32,
+    pub variants: [16]StableVariantDesc,
+}
+
+pub fn interface_enum_desc_default(name: StrView, mod_path: StrView) -> InterfaceEnumDesc {
+    let dummy_var = stable_variant_desc_default(ux2_sv_empty(), 0u64)
+    InterfaceEnumDesc {
+        name: name,
+        module_path: mod_path,
+        repr_kind: 5u8, // STABLE_TYPE_U32
+        is_non_exhaustive: false,
+        is_pub: true,
+        variant_count: 0u32,
+        variants: [dummy_var; 16],
+    }
+}
+
+@derive(Copy)
+pub struct InterfaceDescriptor {
+    pub package_name: StrView,
+    pub module_path: StrView,
+    pub target: TargetPlatformDesc,
+    pub api_fingerprint: ApiFingerprint,
+    pub semantic_fingerprint: SemanticFingerprint,
+    pub abi_fingerprint: AbiFingerprint,
+    pub impl_hash: u64,
+    pub fn_count: usize,
+    pub fns: [16]InterfaceFnDesc,
+    pub struct_count: usize,
+    pub structs: [16]InterfaceStructDesc,
+    pub enum_count: usize,
+    pub enums: [16]InterfaceEnumDesc,
+    pub version_count: usize,
+    pub versions: [16]SymbolVersionEntry,
+}
+
+pub fn interface_descriptor_empty() -> InterfaceDescriptor {
+    let e = ux2_sv_empty()
+    let dummy_fn = interface_fn_desc_default(e, e)
+    let dummy_struct = interface_struct_desc_default(e, e)
+    let dummy_enum = interface_enum_desc_default(e, e)
+    let dummy_ver = symbol_version_entry_new(e, e, e, false)
+    InterfaceDescriptor {
+        package_name: e,
+        module_path: e,
+        target: target_platform_win64(),
+        api_fingerprint: api_fingerprint_zero(),
+        semantic_fingerprint: semantic_fingerprint_zero(),
+        abi_fingerprint: abi_fingerprint_zero(),
+        impl_hash: 0u64,
+        fn_count: 0usize,
+        fns: [dummy_fn; 16],
+        struct_count: 0usize,
+        structs: [dummy_struct; 16],
+        enum_count: 0usize,
+        enums: [dummy_enum; 16],
+        version_count: 0usize,
+        versions: [dummy_ver; 16],
+    }
+}
+
+// =============================================================================
+// 4. Binary & API Compatibility Diff Engine (AXS-ABI-040)
+// =============================================================================
+
+pub fn diff_interface_descriptors(
+    old_desc: view<InterfaceDescriptor>,
+    new_desc: view<InterfaceDescriptor>,
+    res: mut_view<InterfaceDiffResult>
+) {
+    *res = interface_diff_result_empty()
+
+    let api_eq = api_fingerprint_eq(old_desc.api_fingerprint, new_desc.api_fingerprint)
+    let abi_eq = abi_fingerprint_eq(old_desc.abi_fingerprint, new_desc.abi_fingerprint)
+
+    if api_eq && abi_eq {
+        if old_desc.impl_hash == new_desc.impl_hash {
+            diff_result_push(mut_view(*res), item_diff_new(
+                DIFF_KIND_IDENTICAL,
+                SEVERITY_COMPATIBLE,
+                old_desc.module_path,
+                ux2_sv_empty(),
+                0u64,
+                0u64,
+                ux2_sv("interface and implementation are identical")
+            ))
+            res.overall_class = COMPAT_CLASS_IDENTICAL
+            res.status_name = ux2_sv("identical")
+            return
+        } else {
+            diff_result_push(mut_view(*res), item_diff_new(
+                DIFF_KIND_IMPL_ONLY,
+                SEVERITY_COMPATIBLE,
+                old_desc.module_path,
+                ux2_sv_empty(),
+                old_desc.impl_hash,
+                new_desc.impl_hash,
+                ux2_sv("implementation changed; public API and ABI are identical")
+            ))
+            res.overall_class = COMPAT_CLASS_IMPL_ONLY
+            res.status_name = ux2_sv("implementation-only")
+            return
+        }
+    }
+
+    // 1. Functions diff
+    let mut i: usize = 0usize
+    while i < old_desc.fn_count && i < 16usize {
+        let f_old = old_desc.fns[i]
+        let mut found = false
+        let mut j: usize = 0usize
+        while j < new_desc.fn_count && j < 16usize {
+            let f_new = new_desc.fns[j]
+            if ux2_sv_eq(f_old.name, f_new.name) && ux2_sv_eq(f_old.module_path, f_new.module_path) {
+                found = true
+                if f_old.call_conv != f_new.call_conv {
+                    diff_result_push(mut_view(*res), item_diff_new(
+                        DIFF_KIND_FN_CALL_CONV_CHANGED,
+                        SEVERITY_MAJOR_BREAKING,
+                        f_old.name,
+                        ux2_sv("call_conv"),
+                        f_old.call_conv as u64,
+                        f_new.call_conv as u64,
+                        ux2_sv("calling convention altered")
+                    ))
+                }
+                if f_old.param_count != f_new.param_count {
+                    diff_result_push(mut_view(*res), item_diff_new(
+                        DIFF_KIND_FN_PARAM_COUNT_CHANGED,
+                        SEVERITY_MAJOR_BREAKING,
+                        f_old.name,
+                        ux2_sv("param_count"),
+                        f_old.param_count as u64,
+                        f_new.param_count as u64,
+                        ux2_sv("parameter count altered")
+                    ))
+                }
+                if f_old.param_types_hash != f_new.param_types_hash {
+                    diff_result_push(mut_view(*res), item_diff_new(
+                        DIFF_KIND_FN_PARAM_TYPE_CHANGED,
+                        SEVERITY_MAJOR_BREAKING,
+                        f_old.name,
+                        ux2_sv("param_types"),
+                        f_old.param_types_hash,
+                        f_new.param_types_hash,
+                        ux2_sv("parameter types modified")
+                    ))
+                }
+                if !ux2_sv_eq(f_old.ret_type_name, f_new.ret_type_name) || f_old.ret_type_size != f_new.ret_type_size {
+                    diff_result_push(mut_view(*res), item_diff_new(
+                        DIFF_KIND_FN_RET_TYPE_CHANGED,
+                        SEVERITY_MAJOR_BREAKING,
+                        f_old.name,
+                        ux2_sv("ret_type"),
+                        f_old.ret_type_size as u64,
+                        f_new.ret_type_size as u64,
+                        ux2_sv("return type modified")
+                    ))
+                }
+                let tightened = (f_old.capability_mask & f_new.capability_mask) != f_new.capability_mask
+                if tightened {
+                    diff_result_push(mut_view(*res), item_diff_new(
+                        DIFF_KIND_CAPABILITY_TIGHTENED,
+                        SEVERITY_MAJOR_BREAKING,
+                        f_old.name,
+                        ux2_sv("capability"),
+                        f_old.capability_mask,
+                        f_new.capability_mask,
+                        ux2_sv("capability requirement tightened")
+                    ))
+                } else if f_old.capability_mask != f_new.capability_mask {
+                    diff_result_push(mut_view(*res), item_diff_new(
+                        DIFF_KIND_CAPABILITY_RELAXED,
+                        SEVERITY_MINOR_ADDITIVE,
+                        f_old.name,
+                        ux2_sv("capability"),
+                        f_old.capability_mask,
+                        f_new.capability_mask,
+                        ux2_sv("capability requirement relaxed")
+                    ))
+                }
+            }
+            j = j + 1usize
+        }
+
+        if !found {
+            diff_result_push(mut_view(*res), item_diff_new(
+                DIFF_KIND_FN_REMOVED,
+                SEVERITY_MAJOR_BREAKING,
+                f_old.name,
+                ux2_sv_empty(),
+                0u64,
+                0u64,
+                ux2_sv("exported function removed")
+            ))
+        }
+        i = i + 1usize
+    }
+
+    let mut k: usize = 0usize
+    while k < new_desc.fn_count && k < 16usize {
+        let f_new = new_desc.fns[k]
+        let mut found = false
+        let mut m: usize = 0usize
+        while m < old_desc.fn_count && m < 16usize {
+            let f_old = old_desc.fns[m]
+            if ux2_sv_eq(f_old.name, f_new.name) && ux2_sv_eq(f_old.module_path, f_new.module_path) {
+                found = true
+            }
+            m = m + 1usize
+        }
+        if !found {
+            diff_result_push(mut_view(*res), item_diff_new(
+                DIFF_KIND_FN_ADDED,
+                SEVERITY_MINOR_ADDITIVE,
+                f_new.name,
+                ux2_sv_empty(),
+                0u64,
+                0u64,
+                ux2_sv("new exported function added")
+            ))
+        }
+        k = k + 1usize
+    }
+
+    // 2. Structs diff
+    let mut si: usize = 0usize
+    while si < old_desc.struct_count && si < 16usize {
+        let s_old = old_desc.structs[si]
+        let mut found = false
+        let mut sj: usize = 0usize
+        while sj < new_desc.struct_count && sj < 16usize {
+            let s_new = new_desc.structs[sj]
+            if ux2_sv_eq(s_old.name, s_new.name) && ux2_sv_eq(s_old.module_path, s_new.module_path) {
+                found = true
+
+                if !s_old.is_opaque {
+                    let mut fi: usize = 0usize
+                    while fi < (s_old.field_count as usize) && fi < 16usize {
+                        let f_old = s_old.fields[fi]
+                        let mut field_found = false
+                        let mut fj: usize = 0usize
+                        while fj < (s_new.field_count as usize) && fj < 16usize {
+                            let f_new = s_new.fields[fj]
+                            if ux2_sv_eq(f_old.name, f_new.name) {
+                                field_found = true
+                                if f_old.offset != f_new.offset {
+                                    diff_result_push(mut_view(*res), item_diff_new(
+                                        DIFF_KIND_STRUCT_FIELD_OFFSET_CHANGED,
+                                        SEVERITY_MAJOR_BREAKING,
+                                        s_old.name,
+                                        f_old.name,
+                                        f_old.offset as u64,
+                                        f_new.offset as u64,
+                                        ux2_sv("struct field offset altered")
+                                    ))
+                                }
+                                if f_old.size != f_new.size || f_old.align != f_new.align {
+                                    diff_result_push(mut_view(*res), item_diff_new(
+                                        DIFF_KIND_STRUCT_SIZE_CHANGED,
+                                        SEVERITY_MAJOR_BREAKING,
+                                        s_old.name,
+                                        f_old.name,
+                                        f_old.size as u64,
+                                        f_new.size as u64,
+                                        ux2_sv("struct field size/align altered")
+                                    ))
+                                }
+                            }
+                            fj = fj + 1usize
+                        }
+                        if !field_found {
+                            diff_result_push(mut_view(*res), item_diff_new(
+                                DIFF_KIND_STRUCT_FIELD_REMOVED,
+                                SEVERITY_MAJOR_BREAKING,
+                                s_old.name,
+                                f_old.name,
+                                0u64,
+                                0u64,
+                                ux2_sv("struct field removed")
+                            ))
+                        }
+                        fi = fi + 1usize
+                    }
+
+                    if s_new.field_count > s_old.field_count {
+                        if s_old.is_extensible && s_new.is_extensible && s_new.has_abi_header && s_new.header_version > s_old.header_version {
+                            diff_result_push(mut_view(*res), item_diff_new(
+                                DIFF_KIND_STRUCT_EXTENSIBLE_FIELD_APPENDED,
+                                SEVERITY_MINOR_ADDITIVE,
+                                s_old.name,
+                                ux2_sv("fields"),
+                                s_old.field_count as u64,
+                                s_new.field_count as u64,
+                                ux2_sv("field appended to extensible struct with version bump")
+                            ))
+                        } else {
+                            diff_result_push(mut_view(*res), item_diff_new(
+                                DIFF_KIND_STRUCT_NON_EXTENSIBLE_FIELD_ADDED,
+                                SEVERITY_MAJOR_BREAKING,
+                                s_old.name,
+                                ux2_sv("fields"),
+                                s_old.field_count as u64,
+                                s_new.field_count as u64,
+                                ux2_sv("field added to non-extensible struct (alters size)")
+                            ))
+                        }
+                    }
+
+                    if s_old.align != s_new.align {
+                        diff_result_push(mut_view(*res), item_diff_new(
+                            DIFF_KIND_STRUCT_ALIGN_CHANGED,
+                            SEVERITY_MAJOR_BREAKING,
+                            s_old.name,
+                            ux2_sv("align"),
+                            s_old.align as u64,
+                            s_new.align as u64,
+                            ux2_sv("struct alignment modified")
+                        ))
+                    }
+
+                    if !s_old.is_extensible && s_old.size != s_new.size {
+                        diff_result_push(mut_view(*res), item_diff_new(
+                            DIFF_KIND_STRUCT_SIZE_CHANGED,
+                            SEVERITY_MAJOR_BREAKING,
+                            s_old.name,
+                            ux2_sv("size"),
+                            s_old.size as u64,
+                            s_new.size as u64,
+                            ux2_sv("non-extensible struct size altered")
+                        ))
+                    }
+                }
+            }
+            sj = sj + 1usize
+        }
+
+        if !found {
+            diff_result_push(mut_view(*res), item_diff_new(
+                DIFF_KIND_STRUCT_REMOVED,
+                SEVERITY_MAJOR_BREAKING,
+                s_old.name,
+                ux2_sv_empty(),
+                0u64,
+                0u64,
+                ux2_sv("exported struct removed")
+            ))
+        }
+        si = si + 1usize
+    }
+
+    let mut sk: usize = 0usize
+    while sk < new_desc.struct_count && sk < 16usize {
+        let s_new = new_desc.structs[sk]
+        let mut found = false
+        let mut sm: usize = 0usize
+        while sm < old_desc.struct_count && sm < 16usize {
+            let s_old = old_desc.structs[sm]
+            if ux2_sv_eq(s_old.name, s_new.name) && ux2_sv_eq(s_old.module_path, s_new.module_path) {
+                found = true
+            }
+            sm = sm + 1usize
+        }
+        if !found {
+            diff_result_push(mut_view(*res), item_diff_new(
+                DIFF_KIND_STRUCT_ADDED,
+                SEVERITY_MINOR_ADDITIVE,
+                s_new.name,
+                ux2_sv_empty(),
+                0u64,
+                0u64,
+                ux2_sv("new exported struct added")
+            ))
+        }
+        sk = sk + 1usize
+    }
+
+    // 3. Enums diff
+    let mut ei: usize = 0usize
+    while ei < old_desc.enum_count && ei < 16usize {
+        let e_old = old_desc.enums[ei]
+        let mut found = false
+        let mut ej: usize = 0usize
+        while ej < new_desc.enum_count && ej < 16usize {
+            let e_new = new_desc.enums[ej]
+            if ux2_sv_eq(e_old.name, e_new.name) && ux2_sv_eq(e_old.module_path, e_new.module_path) {
+                found = true
+                let mut vi: usize = 0usize
+                while vi < (e_old.variant_count as usize) && vi < 16usize {
+                    let v_old = e_old.variants[vi]
+                    let mut var_found = false
+                    let mut vj: usize = 0usize
+                    while vj < (e_new.variant_count as usize) && vj < 16usize {
+                        let v_new = e_new.variants[vj]
+                        if ux2_sv_eq(v_old.name, v_new.name) {
+                            var_found = true
+                            if v_old.tag != v_new.tag {
+                                diff_result_push(mut_view(*res), item_diff_new(
+                                    DIFF_KIND_ENUM_DISCRIMINANT_CHANGED,
+                                    SEVERITY_MAJOR_BREAKING,
+                                    e_old.name,
+                                    v_old.name,
+                                    v_old.tag,
+                                    v_new.tag,
+                                    ux2_sv("enum discriminant tag value changed")
+                                ))
+                            }
+                        }
+                        vj = vj + 1usize
+                    }
+                    if !var_found {
+                        diff_result_push(mut_view(*res), item_diff_new(
+                            DIFF_KIND_ENUM_REMOVED,
+                            SEVERITY_MAJOR_BREAKING,
+                            e_old.name,
+                            v_old.name,
+                            0u64,
+                            0u64,
+                            ux2_sv("enum variant removed")
+                        ))
+                    }
+                    vi = vi + 1usize
+                }
+
+                let mut vk: usize = 0usize
+                while vk < (e_new.variant_count as usize) && vk < 16usize {
+                    let v_new = e_new.variants[vk]
+                    let mut var_found = false
+                    let mut vm: usize = 0usize
+                    while vm < (e_old.variant_count as usize) && vm < 16usize {
+                        let v_old = e_old.variants[vm]
+                        if ux2_sv_eq(v_old.name, v_new.name) {
+                            var_found = true
+                        }
+                        vm = vm + 1usize
+                    }
+                    if !var_found {
+                        if e_old.is_non_exhaustive {
+                            diff_result_push(mut_view(*res), item_diff_new(
+                                DIFF_KIND_ENUM_NON_EXHAUSTIVE_VARIANT_ADDED,
+                                SEVERITY_MINOR_ADDITIVE,
+                                e_old.name,
+                                v_new.name,
+                                0u64,
+                                0u64,
+                                ux2_sv("variant added to @non_exhaustive enum")
+                            ))
+                        } else {
+                            diff_result_push(mut_view(*res), item_diff_new(
+                                DIFF_KIND_ENUM_EXHAUSTIVE_VARIANT_ADDED,
+                                SEVERITY_MAJOR_BREAKING,
+                                e_old.name,
+                                v_new.name,
+                                0u64,
+                                0u64,
+                                ux2_sv("variant added to exhaustive enum")
+                            ))
+                        }
+                    }
+                    vk = vk + 1usize
+                }
+            }
+            ej = ej + 1usize
+        }
+        if !found {
+            diff_result_push(mut_view(*res), item_diff_new(
+                DIFF_KIND_ENUM_REMOVED,
+                SEVERITY_MAJOR_BREAKING,
+                e_old.name,
+                ux2_sv_empty(),
+                0u64,
+                0u64,
+                ux2_sv("exported enum removed")
+            ))
+        }
+        ei = ei + 1usize
+    }
+
+    let mut ek: usize = 0usize
+    while ek < new_desc.enum_count && ek < 16usize {
+        let e_new = new_desc.enums[ek]
+        let mut found = false
+        let mut em: usize = 0usize
+        while em < old_desc.enum_count && em < 16usize {
+            let e_old = old_desc.enums[em]
+            if ux2_sv_eq(e_old.name, e_new.name) && ux2_sv_eq(e_old.module_path, e_new.module_path) {
+                found = true
+            }
+            em = em + 1usize
+        }
+        if !found {
+            diff_result_push(mut_view(*res), item_diff_new(
+                DIFF_KIND_ENUM_ADDED,
+                SEVERITY_MINOR_ADDITIVE,
+                e_new.name,
+                ux2_sv_empty(),
+                0u64,
+                0u64,
+                ux2_sv("new exported enum added")
+            ))
+        }
+        ek = ek + 1usize
+    }
+
+    // 4. Symbol versions diff
+    let mut vi: usize = 0usize
+    while vi < old_desc.version_count && vi < 16usize {
+        let v_old = old_desc.versions[vi]
+        let mut found = false
+        let mut vj: usize = 0usize
+        while vj < new_desc.version_count && vj < 16usize {
+            let v_new = new_desc.versions[vj]
+            if ux2_sv_eq(v_old.name, v_new.name) && ux2_sv_eq(v_old.version, v_new.version) {
+                found = true
+            }
+            vj = vj + 1usize
+        }
+        if !found {
+            diff_result_push(mut_view(*res), item_diff_new(
+                DIFF_KIND_SYMBOL_VERSION_REMOVED,
+                SEVERITY_MAJOR_BREAKING,
+                v_old.name,
+                v_old.version,
+                0u64,
+                0u64,
+                ux2_sv("@symbol_version removed")
+            ))
+        }
+        vi = vi + 1usize
+    }
+
+    let mut vk: usize = 0usize
+    while vk < new_desc.version_count && vk < 16usize {
+        let v_new = new_desc.versions[vk]
+        let mut found = false
+        let mut vm: usize = 0usize
+        while vm < old_desc.version_count && vm < 16usize {
+            let v_old = old_desc.versions[vm]
+            if ux2_sv_eq(v_old.name, v_new.name) && ux2_sv_eq(v_old.version, v_new.version) {
+                found = true
+            }
+            vm = vm + 1usize
+        }
+        if !found {
+            diff_result_push(mut_view(*res), item_diff_new(
+                DIFF_KIND_SYMBOL_VERSION_ADDED,
+                SEVERITY_MINOR_ADDITIVE,
+                v_new.name,
+                v_new.version,
+                0u64,
+                0u64,
+                ux2_sv("new @symbol_version added")
+            ))
+        }
+        vk = vk + 1usize
+    }
+
+    // Overall classification computation
+    let mut has_breaking = false
+    let mut has_additive = false
+    let mut di: usize = 0usize
+    while di < res.diff_count {
+        let d = res.diffs[di]
+        if d.severity == SEVERITY_MAJOR_BREAKING {
+            has_breaking = true
+        } else if d.severity == SEVERITY_ADDITIVE {
+            has_additive = true
+        }
+        di = di + 1usize
+    }
+
+    if has_breaking {
+        res.overall_class = COMPAT_CLASS_MAJOR_BREAKING
+        res.status_name = ux2_sv("major-breaking")
+    } else if has_additive {
+        res.overall_class = COMPAT_CLASS_MINOR_ADDITIVE
+        res.status_name = ux2_sv("minor-additive")
+    } else {
+        res.overall_class = COMPAT_CLASS_IMPL_ONLY
+        res.status_name = ux2_sv("compatible")
+    }
+}
+
+// =============================================================================
+// 5. Output Formatters (Text & JSON)
+// =============================================================================
+
+pub fn render_diff_text(
+    res: view<InterfaceDiffResult>,
+    old_ver: StrView,
+    new_ver: StrView,
+    target_name: StrView,
+    buf: mut_view<DiagBuffer>
+) {
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("--- axiomc abi-check report ---\n"))
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("Baseline version: "))
+    diag_buf_push_sv(mut_view(*buf), old_ver)
+    diag_buf_push_byte(mut_view(*buf), 10u8)
+
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("Candidate version: "))
+    diag_buf_push_sv(mut_view(*buf), new_ver)
+    diag_buf_push_byte(mut_view(*buf), 10u8)
+
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("Target: "))
+    diag_buf_push_sv(mut_view(*buf), target_name)
+    diag_buf_push_byte(mut_view(*buf), 10u8)
+
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("Classification: "))
+    diag_buf_push_sv(mut_view(*buf), res.status_name)
+    diag_buf_push_byte(mut_view(*buf), 10u8)
+
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("Differences ("))
+    diag_buf_push_u32(mut_view(*buf), res.diff_count as u32)
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("):\n"))
+
+    let mut i: usize = 0usize
+    while i < res.diff_count {
+        let d = res.diffs[i]
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("  ["))
+        diag_buf_push_sv(mut_view(*buf), severity_name(d.severity))
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("] "))
+        diag_buf_push_sv(mut_view(*buf), diff_kind_name(d.diff_kind))
+        diag_buf_push_sv(mut_view(*buf), ux2_sv(": "))
+        diag_buf_push_sv(mut_view(*buf), d.item_name)
+        if d.member_name.len > 0 {
+            diag_buf_push_byte(mut_view(*buf), 46u8) // '.'
+            diag_buf_push_sv(mut_view(*buf), d.member_name)
+        }
+        diag_buf_push_sv(mut_view(*buf), ux2_sv(" ("))
+        diag_buf_push_sv(mut_view(*buf), d.message)
+        diag_buf_push_sv(mut_view(*buf), ux2_sv(")\n"))
+        i = i + 1usize
+    }
+}
+
+pub fn render_diff_json(
+    res: view<InterfaceDiffResult>,
+    status_field: StrView,
+    old_ver: StrView,
+    new_ver: StrView,
+    target_fp_str: StrView,
+    buf: mut_view<DiagBuffer>
+) {
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("{\n  \"status\": "))
+    write_json_string(mut_view(*buf), status_field)
+    diag_buf_push_sv(mut_view(*buf), ux2_sv(",\n  \"old_version\": "))
+    write_json_string(mut_view(*buf), old_ver)
+    diag_buf_push_sv(mut_view(*buf), ux2_sv(",\n  \"new_version\": "))
+    write_json_string(mut_view(*buf), new_ver)
+    diag_buf_push_sv(mut_view(*buf), ux2_sv(",\n  \"target_fingerprint\": "))
+    write_json_string(mut_view(*buf), target_fp_str)
+    diag_buf_push_sv(mut_view(*buf), ux2_sv(",\n  \"classification\": "))
+    write_json_string(mut_view(*buf), res.status_name)
+    diag_buf_push_sv(mut_view(*buf), ux2_sv(",\n  \"differences\": [\n"))
+
+    let mut i: usize = 0usize
+    while i < res.diff_count {
+        let d = res.diffs[i]
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("    {\n      \"kind\": "))
+        write_json_string(mut_view(*buf), diff_kind_name(d.diff_kind))
+        diag_buf_push_sv(mut_view(*buf), ux2_sv(",\n      \"item\": "))
+        write_json_string(mut_view(*buf), d.item_name)
+        diag_buf_push_sv(mut_view(*buf), ux2_sv(",\n      \"field\": "))
+        write_json_string(mut_view(*buf), d.member_name)
+        diag_buf_push_sv(mut_view(*buf), ux2_sv(",\n      \"old_value\": "))
+        diag_buf_push_u32(mut_view(*buf), d.old_val as u32)
+        diag_buf_push_sv(mut_view(*buf), ux2_sv(",\n      \"new_value\": "))
+        diag_buf_push_u32(mut_view(*buf), d.new_val as u32)
+        diag_buf_push_sv(mut_view(*buf), ux2_sv(",\n      \"severity\": "))
+        write_json_string(mut_view(*buf), severity_name(d.severity))
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("\n    }"))
+        if i + 1usize < res.diff_count {
+            diag_buf_push_byte(mut_view(*buf), 44u8) // ','
+        }
+        diag_buf_push_byte(mut_view(*buf), 10u8)
+        i = i + 1usize
+    }
+
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("  ]\n}\n"))
+}

@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T220, T681, T685, T318, T866, T867]
 priority: 218
-status: doing
+status: done
 attempts: 1
 paths: [compiler/abi/compat_diff, compiler/driver/abi_cmd, tests/run/abi_compat_diff]
 spec: [spec/SPEC-114-abi-stability-versioning-binary-compat.md, spec/SPEC-24-artifact-format-module-interfaces.md, 0104, tasks/0452, tasks/0583, tasks/0739]
 covers: [REQ-ECO-8734, REQ-PKG-022, REQ-PKG-024]
 started: 2026-11-08 21:29:37
-agent: T868-impl
+finished: 2026-11-08 22:17:17
 ---
 # T868 — E20.5 Versioned symbol mangling/export tables, .axmeta binary compatibility checker & axiomc abi-check SemVer diff CLI
 
@@ -44,3 +44,4 @@ Implement versioned symbol export emission, `.axmeta` binary compatibility verif
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
 - 2026-11-08 21:29:37 started (attempt 1) T868-impl
+- 2026-11-08 22:17:17 accepted by QA -> done

@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T220, T681, T685, T318, T867, T870]
 priority: 221
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/component/interface, compiler/component/verify, tests/run/component_interface]
 spec: [spec/SPEC-115-dynamic-components-plugins-hot-reload.md, spec/SPEC-114-abi-stability-versioning-binary-compat.md, 0104, tasks/0583, tasks/0584, tasks/0739, tasks/0856]
 covers: [REQ-ECO-8734]
+started: 2026-11-08 21:49:56
+agent: T871-impl
 ---
 # T871 — E20.7 @component_interface & @plugin_export boundary verifier, cross-component ownership/capability/allocator guard & .axcomp emitter
 
@@ -40,3 +42,4 @@ Implement the `@component_interface` and `@plugin_export` semantic verifier, cro
 
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
+- 2026-11-08 21:49:56 started (attempt 1) T871-impl
