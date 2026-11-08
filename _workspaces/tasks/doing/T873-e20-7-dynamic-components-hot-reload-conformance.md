@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T220, T681, T685, T318, T872]
 priority: 223
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tests/conformance/p20/e20_7_dynamic_components_hot_reload]
 spec: [spec/SPEC-115-dynamic-components-plugins-hot-reload.md, 0104, tasks/0583, tasks/0584, tasks/0739, tasks/0856]
 covers: [REQ-ECO-8734]
+started: 2026-11-08 23:41:21
+agent: T873-impl
 ---
 # T873 — E20.7 Dynamic components, plugin discovery, cross-boundary ownership/capability isolation & hot-reload state migration conformance suite
 
@@ -42,3 +44,4 @@ Certify E20.7 exit criteria with an end-to-end conformance suite covering Axiom-
 
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
+- 2026-11-08 23:41:21 started (attempt 1) T873-impl

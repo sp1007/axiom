@@ -8,13 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T220, T681, T685, T318, T851, T854]
 priority: 205
-status: doing
+status: done
 attempts: 1
 paths: [compiler/pkg/semver, compiler/pkg/resolver, tests/run/pkg_resolver]
 spec: [spec/SPEC-111-package-manager-resolution-lockfiles.md, 0098, tasks/0412, tasks/0446, tasks/0661, tasks/1065]
 covers: [REQ-ECO-8736, REQ-PKG-022, REQ-PKG-024, REQ-PKG-025]
 started: 2026-11-08 19:10:35
-agent: T855-impl
+finished: 2026-11-08 23:42:10
 ---
 # T855 — E20.2 Deterministic SemVer 2.0 constraint solver, monotonic feature unifier & side-by-side package version isolation
 
@@ -44,3 +44,4 @@ Implement the SemVer 2.0 version parser/comparator, PubGrub-style deterministic 
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
 - 2026-11-08 19:10:35 started (attempt 1) T855-impl
+- 2026-11-08 23:42:10 accepted by QA -> done

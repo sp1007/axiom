@@ -1,0 +1,1351 @@
+// Deterministic SemVer 2.0 Parser, Precedence Comparator, Compatibility Track
+// Classifier, and Version Constraint Evaluator (`compiler/pkg/semver/mod.ax`, T855 / E20.2).
+//
+// Implements SPEC-111 §1 (`AXS-PKG-004`, `AXS-PKG-005`, `AXS-PKG-011 §1`, `AXS-PKG-050`;
+// `REQ-PKG-022`, `REQ-PKG-024`, `REQ-ECO-8736`, `INV-PKG-001`).
+
+module compiler.pkg.semver
+
+use compiler.kernel.interner.StrView
+use compiler.source.span.span_none
+use compiler.diag.code.DiagDataKind
+use compiler.diag.code.diag_code
+use compiler.diag.code.AX_DRIVER_BAD_MANIFEST
+use compiler.diag.emitter.DiagDataEntry
+use compiler.diag.emitter.DiagDataValue
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.diag_new
+use compiler.diag.emitter.diag_sink_report
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+
+use compiler.build.manifest.SemVer
+use compiler.build.manifest.bld_sv_byte
+use compiler.build.manifest.bld_sv_slice
+use compiler.build.manifest.bld_sv_trim
+use compiler.build.manifest.bld_sv_starts_with
+use compiler.build.manifest.bld_sv_cmp
+use compiler.build.manifest.bld_is_ws
+
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+// =============================================================================
+// 1. Structured Diagnostic Helpers (`AXS-PKG-050`)
+// =============================================================================
+
+fn make_sv_entry(key: StrView, val: StrView) -> DiagDataEntry {
+    DiagDataEntry {
+        key: key,
+        value: DiagDataValue {
+            kind: DiagDataKind.String,
+            str_val: val,
+            int_val: 0i64,
+            bool_val: false,
+            list_items: 0 as *mut StrView,
+            list_count: 0usize,
+        },
+    }
+}
+
+pub fn report_semver_diag(
+    sink: mut_view<DiagSink>,
+    msg: str,
+    field_key: str,
+    field_val: StrView
+) {
+    let mut d = diag_new(diag_code(AX_DRIVER_BAD_MANIFEST), span_none(), ux2_sv(msg))
+    let mut entries: [2]DiagDataEntry = [
+        make_sv_entry(ux2_sv("kind"), ux2_sv("semver")),
+        make_sv_entry(ux2_sv(field_key), field_val),
+    ]
+    d.data = unsafe { address_of_mut(entries[0]) }
+    d.data_count = 2usize
+    diag_sink_report(mut_view(*sink), view(d))
+}
+
+// =============================================================================
+// 2. SemVer 2.0 Data Model & Grammar Parser (`AXS-PKG-004`, `REQ-PKG-022`)
+// =============================================================================
+
+@derive(Copy)
+pub struct SemVer2 {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+    pub prerelease: StrView,
+    pub pre_tokens: [4]StrView,
+    pub pre_token_is_num: [4]bool,
+    pub pre_token_num: [4]u64,
+    pub pre_token_count: usize,
+    pub build_meta: StrView,
+    pub build_token_count: usize,
+    pub raw: StrView,
+}
+
+pub fn semver2_zero() -> SemVer2 {
+    let e = ux2_sv_empty()
+    SemVer2 {
+        major: 0u64,
+        minor: 0u64,
+        patch: 0u64,
+        prerelease: e,
+        pre_tokens: [e; 4],
+        pre_token_is_num: [false; 4],
+        pre_token_num: [0u64; 4],
+        pre_token_count: 0usize,
+        build_meta: e,
+        build_token_count: 0usize,
+        raw: e,
+    }
+}
+
+pub fn semver2_from_u32(major: u32, minor: u32, patch: u32) -> SemVer2 {
+    let mut v = semver2_zero()
+    v.major = major as u64
+    v.minor = minor as u64
+    v.patch = patch as u64
+    v
+}
+
+pub fn semver2_from_manifest_semver(sv: view<SemVer>) -> SemVer2 {
+    let mut out = semver2_zero()
+    if sv.raw.len > 0usize && semver2_parse(sv.raw, mut_view(out)) {
+        return out
+    }
+    out.major = sv.major as u64
+    out.minor = sv.minor as u64
+    out.patch = sv.patch as u64
+    out.prerelease = sv.prerelease
+    out.build_meta = sv.build_meta
+    out.raw = sv.raw
+    out
+}
+
+pub fn semver2_to_manifest_semver(v: view<SemVer2>) -> SemVer {
+    SemVer {
+        major: v.major as u32,
+        minor: v.minor as u32,
+        patch: v.patch as u32,
+        prerelease: v.prerelease,
+        build_meta: v.build_meta,
+        raw: v.raw,
+    }
+}
+
+pub fn semver2_is_prerelease(v: view<SemVer2>) -> bool {
+    v.pre_token_count > 0usize || v.prerelease.len > 0usize
+}
+
+// Parses a non-negative integer matching `"0" | [1-9][0-9]*` into `u64` without overflow.
+fn parse_semver_u64_strict(part: StrView, out_val: mut_view<u64>) -> bool {
+    if part.len == 0usize || part.len > 20usize {
+        return false
+    }
+    if part.len > 1usize && bld_sv_byte(part, 0usize) == 48u8 {
+        return false
+    }
+    let mut acc: u64 = 0u64
+    let mut i: usize = 0usize
+    while i < part.len {
+        let ch = bld_sv_byte(part, i)
+        if ch < 48u8 || ch > 57u8 {
+            return false
+        }
+        let digit = (ch - 48u8) as u64
+        if acc > 1844674407370955161u64 {
+            return false
+        }
+        if acc == 1844674407370955161u64 && digit > 5u64 {
+            return false
+        }
+        acc = acc * 10u64 + digit
+        i = i + 1usize
+    }
+    *out_val = acc
+    true
+}
+
+fn is_ident_char(b: u8) -> bool {
+    (b >= 48u8 && b <= 57u8) ||
+        (b >= 65u8 && b <= 90u8) ||
+        (b >= 97u8 && b <= 122u8) ||
+        b == 45u8
+}
+
+fn is_all_digits(s: StrView) -> bool {
+    if s.len == 0usize {
+        return false
+    }
+    let mut i: usize = 0usize
+    while i < s.len {
+        let b = bld_sv_byte(s, i)
+        if b < 48u8 || b > 57u8 {
+            return false
+        }
+        i = i + 1usize
+    }
+    true
+}
+
+// Parses `PreRelease ::= PreIdent ("." PreIdent)*` (`AXS-PKG-004 §1`).
+// Purely numeric `PreIdent` tokens MUST NOT have leading zeroes (`01` is rejected).
+fn parse_prerelease_tokens(
+    pre: StrView,
+    out_tokens: mut_view<[4]StrView>,
+    out_is_num: mut_view<[4]bool>,
+    out_num: mut_view<[4]u64>,
+    out_count: mut_view<usize>
+) -> bool {
+    *out_count = 0usize
+    if pre.len == 0usize {
+        return false
+    }
+    let mut seg_start: usize = 0usize
+    let mut i: usize = 0usize
+    while i <= pre.len {
+        let at_end = i == pre.len
+        let b = if at_end { 46u8 } else { bld_sv_byte(pre, i) }
+        if !at_end && b != 46u8 && !is_ident_char(b) {
+            return false
+        }
+        if at_end || b == 46u8 {
+            let tok = bld_sv_slice(pre, seg_start, i)
+            if tok.len == 0usize {
+                return false
+            }
+            if *out_count >= 4usize {
+                return false
+            }
+            let numeric = is_all_digits(tok)
+            let mut nval: u64 = 0u64
+            if numeric {
+                if !parse_semver_u64_strict(tok, mut_view(nval)) {
+                    return false
+                }
+            }
+            let idx = *out_count
+            (*out_tokens)[idx] = tok
+            (*out_is_num)[idx] = numeric
+            (*out_num)[idx] = nval
+            *out_count = idx + 1usize
+            seg_start = i + 1usize
+        }
+        i = i + 1usize
+    }
+    *out_count > 0usize
+}
+
+// Parses `BuildMeta ::= MetaIdent ("." MetaIdent)*` (`AXS-PKG-004 §1`).
+// Leading zeroes ARE allowed on `MetaIdent` (`[0-9A-Za-z-]+`).
+fn parse_build_meta_tokens(
+    meta: StrView,
+    out_tokens: mut_view<[4]StrView>,
+    out_count: mut_view<usize>
+) -> bool {
+    *out_count = 0usize
+    if meta.len == 0usize {
+        return false
+    }
+    let mut seg_start: usize = 0usize
+    let mut i: usize = 0usize
+    while i <= meta.len {
+        let at_end = i == meta.len
+        let b = if at_end { 46u8 } else { bld_sv_byte(meta, i) }
+        if !at_end && b != 46u8 && !is_ident_char(b) {
+            return false
+        }
+        if at_end || b == 46u8 {
+            let tok = bld_sv_slice(meta, seg_start, i)
+            if tok.len == 0usize {
+                return false
+            }
+            if *out_count >= 4usize {
+                return false
+            }
+            (*out_tokens)[*out_count] = tok
+            *out_count = *out_count + 1usize
+            seg_start = i + 1usize
+        }
+        i = i + 1usize
+    }
+    *out_count > 0usize
+}
+
+pub fn semver2_parse(s: StrView, out: mut_view<SemVer2>) -> bool {
+    *out = semver2_zero()
+    if (s.len) < 5usize {
+        return false
+    }
+    // Reject leading/trailing whitespace on strict SemVer literals
+    if bld_sv_trim(s).len != s.len {
+        return false
+    }
+    let mut plus_pos: usize = s.len
+    let mut i: usize = 0usize
+    while i < s.len {
+        if bld_sv_byte(s, i) == 43u8 {
+            plus_pos = i
+            break
+        }
+        i = i + 1usize
+    }
+    let e = ux2_sv_empty()
+    let mut b_tokens: [4]StrView = [e; 4]
+    let mut b_count: usize = 0usize
+    let mut build_sv = e
+    if plus_pos < s.len {
+        build_sv = bld_sv_slice(s, plus_pos + 1usize, s.len)
+        if !parse_build_meta_tokens(build_sv, mut_view(b_tokens), mut_view(b_count)) {
+            return false
+        }
+    }
+
+    let core_and_pre = bld_sv_slice(s, 0usize, plus_pos)
+    let mut dash_pos: usize = core_and_pre.len
+    i = 0usize
+    while i < core_and_pre.len {
+        if bld_sv_byte(core_and_pre, i) == 45u8 {
+            dash_pos = i
+            break
+        }
+        i = i + 1usize
+    }
+    let mut p_tokens: [4]StrView = [e; 4]
+    let mut p_is_num: [4]bool = [false; 4]
+    let mut p_num: [4]u64 = [0u64; 4]
+    let mut p_count: usize = 0usize
+    let mut pre_sv = e
+    if dash_pos < core_and_pre.len {
+        pre_sv = bld_sv_slice(core_and_pre, dash_pos + 1usize, core_and_pre.len)
+        if !parse_prerelease_tokens(
+            pre_sv,
+            mut_view(p_tokens),
+            mut_view(p_is_num),
+            mut_view(p_num),
+            mut_view(p_count)
+        ) {
+            return false
+        }
+    }
+
+    let core_sv = bld_sv_slice(core_and_pre, 0usize, dash_pos)
+    let mut dot1: usize = core_sv.len
+    let mut dot2: usize = core_sv.len
+    let mut dot_count: usize = 0usize
+    i = 0usize
+    while i < core_sv.len {
+        if bld_sv_byte(core_sv, i) == 46u8 {
+            if dot_count == 0usize {
+                dot1 = i
+            } else if dot_count == 1usize {
+                dot2 = i
+            }
+            dot_count = dot_count + 1usize
+        }
+        i = i + 1usize
+    }
+    if dot_count != 2usize {
+        return false
+    }
+    let maj_sv = bld_sv_slice(core_sv, 0usize, dot1)
+    let min_sv = bld_sv_slice(core_sv, dot1 + 1usize, dot2)
+    let pat_sv = bld_sv_slice(core_sv, dot2 + 1usize, core_sv.len)
+    let mut maj: u64 = 0u64
+    let mut min: u64 = 0u64
+    let mut pat: u64 = 0u64
+    if !parse_semver_u64_strict(maj_sv, mut_view(maj)) {
+        return false
+    }
+    if !parse_semver_u64_strict(min_sv, mut_view(min)) {
+        return false
+    }
+    if !parse_semver_u64_strict(pat_sv, mut_view(pat)) {
+        return false
+    }
+
+    *out = SemVer2 {
+        major: maj,
+        minor: min,
+        patch: pat,
+        prerelease: pre_sv,
+        pre_tokens: p_tokens,
+        pre_token_is_num: p_is_num,
+        pre_token_num: p_num,
+        pre_token_count: p_count,
+        build_meta: build_sv,
+        build_token_count: b_count,
+        raw: s,
+    }
+    true
+}
+
+pub fn semver2_parse_checked(
+    s: StrView,
+    out: mut_view<SemVer2>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if !semver2_parse(s, out) {
+        report_semver_diag(
+            mut_view(*sink),
+            "malformed SemVer 2.0 version literal (`AXS-PKG-004`)",
+            "version",
+            s
+        )
+        return false
+    }
+    true
+}
+
+pub fn push_u64_dec(buf: mut_view<DiagBuffer>, val: u64) {
+    if val <= 0xFFFFFFFFu64 {
+        diag_buf_push_u32(mut_view(*buf), val as u32)
+        return
+    }
+    let mut digits: [20]u8 = [0u8; 20]
+    let mut len: usize = 0usize
+    let mut v = val
+    while v > 0u64 && len < 20usize {
+        digits[len] = (48u64 + (v % 10u64)) as u8
+        v = v / 10u64
+        len = len + 1usize
+    }
+    let mut i: usize = len
+    while i > 0usize {
+        i = i - 1usize
+        diag_buf_push_byte(mut_view(*buf), digits[i])
+    }
+}
+
+pub fn semver2_format(v: view<SemVer2>, buf: mut_view<DiagBuffer>) {
+    push_u64_dec(mut_view(*buf), v.major)
+    diag_buf_push_byte(mut_view(*buf), 46u8)
+    push_u64_dec(mut_view(*buf), v.minor)
+    diag_buf_push_byte(mut_view(*buf), 46u8)
+    push_u64_dec(mut_view(*buf), v.patch)
+    if v.prerelease.len > 0usize {
+        diag_buf_push_byte(mut_view(*buf), 45u8)
+        diag_buf_push_sv(mut_view(*buf), v.prerelease)
+    }
+    if v.build_meta.len > 0usize {
+        diag_buf_push_byte(mut_view(*buf), 43u8)
+        diag_buf_push_sv(mut_view(*buf), v.build_meta)
+    }
+}
+
+// =============================================================================
+// 3. SemVer 2.0 Total Precedence Ordering & Compatibility Tracks (`AXS-PKG-004`, `AXS-PKG-011`)
+// =============================================================================
+
+// Compares two SemVer 2.0 versions strictly by SemVer 2.0.0 §11 precedence (`AXS-PKG-004 §2`):
+// - `(major, minor, patch)` compared numerically.
+// - Normal version > pre-release version with equal `(major, minor, patch)`.
+// - Pre-release tokens compared left-to-right:
+//   * numeric vs numeric: unsigned integer comparison (`2 < 10`)
+//   * non-numeric vs non-numeric: ASCII byte order (`"alpha" < "beta"`)
+//   * numeric vs non-numeric: numeric < non-numeric (`1 < "alpha"`)
+//   * prefix equality: fewer tokens < more tokens (`1.0.0-alpha < 1.0.0-alpha.1`)
+// - Build metadata (`+build`) is invariant (returns 0 when `(major, minor, patch, prerelease)` match).
+pub fn semver2_cmp_precedence(a: view<SemVer2>, b: view<SemVer2>) -> i32 {
+    if (a.major) < (b.major) {
+        return -1i32
+    }
+    if (a.major) > (b.major) {
+        return 1i32
+    }
+    if (a.minor) < (b.minor) {
+        return -1i32
+    }
+    if (a.minor) > (b.minor) {
+        return 1i32
+    }
+    if (a.patch) < (b.patch) {
+        return -1i32
+    }
+    if (a.patch) > (b.patch) {
+        return 1i32
+    }
+
+    let a_has_pre = a.pre_token_count > 0usize
+    let b_has_pre = b.pre_token_count > 0usize
+    if !a_has_pre && !b_has_pre {
+        return 0i32
+    }
+    if !a_has_pre && b_has_pre {
+        return 1i32
+    }
+    if a_has_pre && !b_has_pre {
+        return -1i32
+    }
+
+    let min_toks = if (a.pre_token_count) < (b.pre_token_count) {
+        a.pre_token_count
+    } else {
+        b.pre_token_count
+    }
+    let mut i: usize = 0usize
+    while i < min_toks {
+        let a_num = a.pre_token_is_num[i]
+        let b_num = b.pre_token_is_num[i]
+        if a_num && b_num {
+            let av = a.pre_token_num[i]
+            let bv = b.pre_token_num[i]
+            if av < bv {
+                return -1i32
+            }
+            if av > bv {
+                return 1i32
+            }
+        } else if a_num && !b_num {
+            return -1i32
+        } else if !a_num && b_num {
+            return 1i32
+        } else {
+            let c = bld_sv_cmp(a.pre_tokens[i], b.pre_tokens[i])
+            if c != 0i32 {
+                return c
+            }
+        }
+        i = i + 1usize
+    }
+
+    if (a.pre_token_count) < (b.pre_token_count) {
+        return -1i32
+    }
+    if (a.pre_token_count) > (b.pre_token_count) {
+        return 1i32
+    }
+    0i32
+}
+
+pub fn semver2_eq_precedence(a: view<SemVer2>, b: view<SemVer2>) -> bool {
+    semver2_cmp_precedence(a, b) == 0i32
+}
+
+// Total deterministic ordering with `+build` metadata tie-breaking (`AXS-PKG-004 §2`):
+// Used by the resolver and lockfile serializer when two candidates share identical SemVer precedence.
+pub fn semver2_cmp_total_tiebreak(a: view<SemVer2>, b: view<SemVer2>) -> i32 {
+    let p = semver2_cmp_precedence(a, b)
+    if p != 0i32 {
+        return p
+    }
+    bld_sv_cmp(a.build_meta, b.build_meta)
+}
+
+// Canonical compatibility tracks (`AXS-PKG-011 §1`):
+// - `M >= 1`       -> `COMPAT_TRACK_MAJOR` (`major = M`)
+// - `M == 0, m>=1` -> `COMPAT_TRACK_ZERO_MINOR` (`minor = m`)
+// - `M == 0, m==0` -> `COMPAT_TRACK_ZERO_PATCH` (`patch = p`)
+pub const COMPAT_TRACK_MAJOR: u8 = 0u8
+pub const COMPAT_TRACK_ZERO_MINOR: u8 = 1u8
+pub const COMPAT_TRACK_ZERO_PATCH: u8 = 2u8
+pub const COMPAT_TRACK_ANY: u8 = 3u8
+
+@derive(Copy)
+pub struct CompatTrack {
+    pub kind: u8,
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+}
+
+pub fn compat_track_for_values(major: u64, minor: u64, patch: u64) -> CompatTrack {
+    if major >= 1u64 {
+        return CompatTrack {
+            kind: COMPAT_TRACK_MAJOR,
+            major: major,
+            minor: 0u64,
+            patch: 0u64,
+        }
+    }
+    if minor >= 1u64 {
+        return CompatTrack {
+            kind: COMPAT_TRACK_ZERO_MINOR,
+            major: 0u64,
+            minor: minor,
+            patch: 0u64,
+        }
+    }
+    CompatTrack {
+        kind: COMPAT_TRACK_ZERO_PATCH,
+        major: 0u64,
+        minor: 0u64,
+        patch: patch,
+    }
+}
+
+pub fn semver2_compat_track(v: view<SemVer2>) -> CompatTrack {
+    compat_track_for_values(v.major, v.minor, v.patch)
+}
+
+pub fn compat_track_eq(a: CompatTrack, b: CompatTrack) -> bool {
+    a.kind == b.kind && a.major == b.major && a.minor == b.minor && a.patch == b.patch
+}
+
+pub fn compat_track_cmp(a: CompatTrack, b: CompatTrack) -> i32 {
+    if (a.major) < (b.major) {
+        return -1i32
+    }
+    if (a.major) > (b.major) {
+        return 1i32
+    }
+    if (a.minor) < (b.minor) {
+        return -1i32
+    }
+    if (a.minor) > (b.minor) {
+        return 1i32
+    }
+    if (a.patch) < (b.patch) {
+        return -1i32
+    }
+    if (a.patch) > (b.patch) {
+        return 1i32
+    }
+    if (a.kind) < (b.kind) {
+        return -1i32
+    }
+    if (a.kind) > (b.kind) {
+        return 1i32
+    }
+    0i32
+}
+
+pub fn compat_track_format(t: CompatTrack, buf: mut_view<DiagBuffer>) {
+    if t.kind == COMPAT_TRACK_MAJOR {
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("MajorTrack("))
+        push_u64_dec(mut_view(*buf), t.major)
+        diag_buf_push_byte(mut_view(*buf), 41u8)
+    } else if t.kind == COMPAT_TRACK_ZERO_MINOR {
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("ZeroMinorTrack(0."))
+        push_u64_dec(mut_view(*buf), t.minor)
+        diag_buf_push_byte(mut_view(*buf), 41u8)
+    } else if t.kind == COMPAT_TRACK_ZERO_PATCH {
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("ZeroPatchTrack(0.0."))
+        push_u64_dec(mut_view(*buf), t.patch)
+        diag_buf_push_byte(mut_view(*buf), 41u8)
+    } else {
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("AnyTrack(*)"))
+    }
+}
+
+// =============================================================================
+// 4. SemVer 2.0 Version Constraint Grammar, AST & Parser (`AXS-PKG-005`)
+// =============================================================================
+
+pub const CMP_OP_EQ: u8 = 0u8
+pub const CMP_OP_NE: u8 = 1u8
+pub const CMP_OP_LT: u8 = 2u8
+pub const CMP_OP_LE: u8 = 3u8
+pub const CMP_OP_GT: u8 = 4u8
+pub const CMP_OP_GE: u8 = 5u8
+pub const CMP_OP_LT_UPPER_TRACK: u8 = 6u8
+
+@derive(Copy)
+pub struct SemVerComparator {
+    pub op: u8,
+    pub target: SemVer2,
+    pub explicit_prerelease: bool,
+}
+
+@derive(Copy)
+pub struct SemVerConjunctionClause {
+    pub comparators: [8]SemVerComparator,
+    pub comparator_count: usize,
+    pub is_wildcard_any: bool,
+    pub inferred_track: CompatTrack,
+}
+
+@derive(Copy)
+pub struct SemVerConstraint {
+    pub clauses: [4]SemVerConjunctionClause,
+    pub clause_count: usize,
+    pub raw: StrView,
+    pub valid: bool,
+}
+
+pub fn semver_comparator_empty() -> SemVerComparator {
+    SemVerComparator {
+        op: CMP_OP_EQ,
+        target: semver2_zero(),
+        explicit_prerelease: false,
+    }
+}
+
+pub fn semver_clause_empty() -> SemVerConjunctionClause {
+    let c = semver_comparator_empty()
+    SemVerConjunctionClause {
+        comparators: [c; 8],
+        comparator_count: 0usize,
+        is_wildcard_any: false,
+        inferred_track: CompatTrack {
+            kind: COMPAT_TRACK_ANY,
+            major: 0u64,
+            minor: 0u64,
+            patch: 0u64,
+        },
+    }
+}
+
+pub fn semver_constraint_empty() -> SemVerConstraint {
+    let cl = semver_clause_empty()
+    SemVerConstraint {
+        clauses: [cl; 4],
+        clause_count: 0usize,
+        raw: ux2_sv_empty(),
+        valid: false,
+    }
+}
+
+fn clause_push_cmp(
+    cl: mut_view<SemVerConjunctionClause>,
+    op: u8,
+    target: view<SemVer2>,
+    explicit_pre: bool
+) -> bool {
+    let p = unsafe { address_of_mut(*cl) }
+    let cnt = unsafe { (*p).comparator_count }
+    if cnt >= 8usize {
+        return false
+    }
+    unsafe {
+        (*p).comparators[cnt].op = op
+        (*p).comparators[cnt].target = *target
+        (*p).comparators[cnt].explicit_prerelease = explicit_pre
+        (*p).comparator_count = cnt + 1usize
+    }
+    true
+}
+
+fn is_wildcard_tok(s: StrView) -> bool {
+    ux2_sv_eq(s, ux2_sv("*")) || ux2_sv_eq(s, ux2_sv("x")) || ux2_sv_eq(s, ux2_sv("X"))
+}
+
+@derive(Copy)
+pub struct ParsedVerSpec {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    comp_count: u8,       // 0 = `*`, 1 = `M` or `M.*`, 2 = `M.m` or `M.m.*`, 3 = `M.m.p`
+    has_wildcard: bool,
+    full_ver: SemVer2,
+}
+
+// Parses a version operand that may be full SemVer (`1.2.3-alpha.1+b2`), partial (`1.2`, `1`),
+// or wildcard (`*`, `1.*`, `1.x`, `1.2.*`, `1.2.x`).
+pub fn parse_constraint_version_spec(s: StrView, out: mut_view<ParsedVerSpec>) -> bool {
+    let t = bld_sv_trim(s)
+    if t.len == 0usize || t.len != s.len {
+        return false
+    }
+    if is_wildcard_tok(t) {
+        *out = ParsedVerSpec {
+            major: 0u64,
+            minor: 0u64,
+            patch: 0u64,
+            comp_count: 0u8,
+            has_wildcard: true,
+            full_ver: semver2_zero(),
+        }
+        return true
+    }
+
+    // If it contains `-` or `+`, it must be a full 3-component SemVer 2.0 string
+    let mut has_dash_or_plus: bool = false
+    let mut dot_count: usize = 0usize
+    let mut dot1: usize = t.len
+    let mut dot2: usize = t.len
+    let mut i: usize = 0usize
+    while i < t.len {
+        let b = bld_sv_byte(t, i)
+        if b == 45u8 || b == 43u8 {
+            has_dash_or_plus = true
+            break
+        }
+        if b == 46u8 {
+            if dot_count == 0usize {
+                dot1 = i
+            } else if dot_count == 1usize {
+                dot2 = i
+            }
+            dot_count = dot_count + 1usize
+        }
+        i = i + 1usize
+    }
+
+    if has_dash_or_plus {
+        let mut fv = semver2_zero()
+        if !semver2_parse(t, mut_view(fv)) {
+            return false
+        }
+        *out = ParsedVerSpec {
+            major: fv.major,
+            minor: fv.minor,
+            patch: fv.patch,
+            comp_count: 3u8,
+            has_wildcard: false,
+            full_ver: fv,
+        }
+        return true
+    }
+
+    if dot_count == 0usize {
+        let mut maj: u64 = 0u64
+        if !parse_semver_u64_strict(t, mut_view(maj)) {
+            return false
+        }
+        let mut fv = semver2_zero()
+        fv.major = maj
+        fv.raw = t
+        *out = ParsedVerSpec {
+            major: maj,
+            minor: 0u64,
+            patch: 0u64,
+            comp_count: 1u8,
+            has_wildcard: false,
+            full_ver: fv,
+        }
+        return true
+    }
+
+    if dot_count == 1usize {
+        let maj_sv = bld_sv_slice(t, 0usize, dot1)
+        let min_sv = bld_sv_slice(t, dot1 + 1usize, t.len)
+        let mut maj: u64 = 0u64
+        if !parse_semver_u64_strict(maj_sv, mut_view(maj)) {
+            return false
+        }
+        if is_wildcard_tok(min_sv) {
+            let mut fv = semver2_zero()
+            fv.major = maj
+            fv.raw = t
+            *out = ParsedVerSpec {
+                major: maj,
+                minor: 0u64,
+                patch: 0u64,
+                comp_count: 1u8,
+                has_wildcard: true,
+                full_ver: fv,
+            }
+            return true
+        }
+        let mut min: u64 = 0u64
+        if !parse_semver_u64_strict(min_sv, mut_view(min)) {
+            return false
+        }
+        let mut fv = semver2_zero()
+        fv.major = maj
+        fv.minor = min
+        fv.raw = t
+        *out = ParsedVerSpec {
+            major: maj,
+            minor: min,
+            patch: 0u64,
+            comp_count: 2u8,
+            has_wildcard: false,
+            full_ver: fv,
+        }
+        return true
+    }
+
+    if dot_count == 2usize {
+        let maj_sv = bld_sv_slice(t, 0usize, dot1)
+        let min_sv = bld_sv_slice(t, dot1 + 1usize, dot2)
+        let pat_sv = bld_sv_slice(t, dot2 + 1usize, t.len)
+        let mut maj: u64 = 0u64
+        let mut min: u64 = 0u64
+        if !parse_semver_u64_strict(maj_sv, mut_view(maj)) {
+            return false
+        }
+        if !parse_semver_u64_strict(min_sv, mut_view(min)) {
+            return false
+        }
+        if is_wildcard_tok(pat_sv) {
+            let mut fv = semver2_zero()
+            fv.major = maj
+            fv.minor = min
+            fv.raw = t
+            *out = ParsedVerSpec {
+                major: maj,
+                minor: min,
+                patch: 0u64,
+                comp_count: 2u8,
+                has_wildcard: true,
+                full_ver: fv,
+            }
+            return true
+        }
+        let mut fv = semver2_zero()
+        if !semver2_parse(t, mut_view(fv)) {
+            return false
+        }
+        *out = ParsedVerSpec {
+            major: fv.major,
+            minor: fv.minor,
+            patch: fv.patch,
+            comp_count: 3u8,
+            has_wildcard: false,
+            full_ver: fv,
+        }
+        return true
+    }
+
+    false
+}
+
+pub fn make_upper_bound_ver(major: u64, minor: u64, patch: u64) -> SemVer2 {
+    let mut v = semver2_zero()
+    v.major = major
+    v.minor = minor
+    v.patch = patch
+    v
+}
+
+// Expands one `(op_kind, ver_spec)` pair into primitive comparators on `cl` (`AXS-PKG-005`).
+// `op_kind`: 0=bare/caret(`^`), 1=tilde(`~`), 2=`=`, 3=`!=`, 4=`<`, 5=`<=`, 6=`>`, 7=`>=`
+fn apply_comparator_to_clause(
+    cl: mut_view<SemVerConjunctionClause>,
+    op_kind: u8,
+    spec: view<ParsedVerSpec>
+) -> bool {
+    let has_pre = semver2_is_prerelease(view(spec.full_ver))
+
+    // Wildcard forms (`*`, `M.*`, `M.x`, `M.m.*`, `M.m.x`)
+    if spec.has_wildcard {
+        if op_kind != 0u8 && op_kind != 2u8 {
+            return false
+        }
+        if spec.comp_count == 0u8 {
+            cl.is_wildcard_any = true
+            let z = semver2_zero()
+            return clause_push_cmp(mut_view(*cl), CMP_OP_GE, view(z), false)
+        }
+        if spec.comp_count == 1u8 {
+            let lo = make_upper_bound_ver(spec.major, 0u64, 0u64)
+            let hi = make_upper_bound_ver(spec.major + 1u64, 0u64, 0u64)
+            if cl.inferred_track.kind == COMPAT_TRACK_ANY && spec.major >= 1u64 {
+                cl.inferred_track = compat_track_for_values(spec.major, 0u64, 0u64)
+            }
+            return clause_push_cmp(mut_view(*cl), CMP_OP_GE, view(lo), false) &&
+                clause_push_cmp(mut_view(*cl), CMP_OP_LT_UPPER_TRACK, view(hi), false)
+        }
+        let lo = make_upper_bound_ver(spec.major, spec.minor, 0u64)
+        let hi = make_upper_bound_ver(spec.major, spec.minor + 1u64, 0u64)
+        if cl.inferred_track.kind == COMPAT_TRACK_ANY {
+            cl.inferred_track = compat_track_for_values(spec.major, spec.minor, 0u64)
+        }
+        return clause_push_cmp(mut_view(*cl), CMP_OP_GE, view(lo), false) &&
+            clause_push_cmp(mut_view(*cl), CMP_OP_LT_UPPER_TRACK, view(hi), false)
+    }
+
+    // 1. Caret (`^M.m.p`, `^M.m`, `^M`, `^0`, or bare `"M.m.p"` / `"M.m"` / `"M"`) (`AXS-PKG-005 §1`)
+    if op_kind == 0u8 {
+        if spec.comp_count == 1u8 && spec.major == 0u64 {
+            // `^0` === `>=0.0.0, <1.0.0-0`
+            let lo = make_upper_bound_ver(0u64, 0u64, 0u64)
+            let hi = make_upper_bound_ver(1u64, 0u64, 0u64)
+            return clause_push_cmp(mut_view(*cl), CMP_OP_GE, view(lo), false) &&
+                clause_push_cmp(mut_view(*cl), CMP_OP_LT_UPPER_TRACK, view(hi), false)
+        }
+        let lo = spec.full_ver
+        let mut hi = semver2_zero()
+        if spec.major > 0u64 {
+            hi = make_upper_bound_ver(spec.major + 1u64, 0u64, 0u64)
+        } else if spec.minor > 0u64 || spec.comp_count == 2u8 {
+            hi = make_upper_bound_ver(0u64, spec.minor + 1u64, 0u64)
+        } else {
+            hi = make_upper_bound_ver(0u64, 0u64, spec.patch + 1u64)
+        }
+        if cl.inferred_track.kind == COMPAT_TRACK_ANY {
+            cl.inferred_track = compat_track_for_values(spec.major, spec.minor, spec.patch)
+        }
+        return clause_push_cmp(mut_view(*cl), CMP_OP_GE, view(lo), has_pre) &&
+            clause_push_cmp(mut_view(*cl), CMP_OP_LT_UPPER_TRACK, view(hi), false)
+    }
+
+    // 2. Tilde (`~M.m.p`, `~M.m`, `~M`) (`AXS-PKG-005 §2`)
+    if op_kind == 1u8 {
+        let lo = spec.full_ver
+        let hi = if spec.comp_count == 1u8 {
+            make_upper_bound_ver(spec.major + 1u64, 0u64, 0u64)
+        } else {
+            make_upper_bound_ver(spec.major, spec.minor + 1u64, 0u64)
+        }
+        if cl.inferred_track.kind == COMPAT_TRACK_ANY {
+            cl.inferred_track = compat_track_for_values(spec.major, spec.minor, spec.patch)
+        }
+        return clause_push_cmp(mut_view(*cl), CMP_OP_GE, view(lo), has_pre) &&
+            clause_push_cmp(mut_view(*cl), CMP_OP_LT_UPPER_TRACK, view(hi), false)
+    }
+
+    // For `=`, `!=`, `<`, `<=`, `>`, `>=`, require full 3-component SemVer (`M.m.p`)
+    if spec.comp_count != 3u8 {
+        return false
+    }
+
+    if op_kind == 2u8 {
+        if cl.inferred_track.kind == COMPAT_TRACK_ANY {
+            cl.inferred_track = semver2_compat_track(view(spec.full_ver))
+        }
+        return clause_push_cmp(mut_view(*cl), CMP_OP_EQ, view(spec.full_ver), has_pre)
+    }
+    if op_kind == 3u8 {
+        return clause_push_cmp(mut_view(*cl), CMP_OP_NE, view(spec.full_ver), has_pre)
+    }
+    if op_kind == 4u8 {
+        // Notice: `<2.0.0-0` is equivalent to `CMP_OP_LT_UPPER_TRACK` at `2.0.0`
+        return clause_push_cmp(mut_view(*cl), CMP_OP_LT, view(spec.full_ver), has_pre)
+    }
+    if op_kind == 5u8 {
+        if cl.inferred_track.kind == COMPAT_TRACK_ANY {
+            cl.inferred_track = semver2_compat_track(view(spec.full_ver))
+        }
+        return clause_push_cmp(mut_view(*cl), CMP_OP_LE, view(spec.full_ver), has_pre)
+    }
+    if op_kind == 6u8 {
+        if cl.inferred_track.kind == COMPAT_TRACK_ANY {
+            cl.inferred_track = semver2_compat_track(view(spec.full_ver))
+        }
+        return clause_push_cmp(mut_view(*cl), CMP_OP_GT, view(spec.full_ver), has_pre)
+    }
+    if op_kind == 7u8 {
+        if cl.inferred_track.kind == COMPAT_TRACK_ANY {
+            cl.inferred_track = semver2_compat_track(view(spec.full_ver))
+        }
+        return clause_push_cmp(mut_view(*cl), CMP_OP_GE, view(spec.full_ver), has_pre)
+    }
+    false
+}
+
+pub fn parse_conjunction_clause(
+    clause_raw: StrView,
+    out_cl: mut_view<SemVerConjunctionClause>
+) -> bool {
+    *out_cl = semver_clause_empty()
+    let t = bld_sv_trim(clause_raw)
+    if t.len == 0usize {
+        return false
+    }
+    if bld_sv_byte(t, 0usize) == 44u8 || bld_sv_byte(t, t.len - 1usize) == 44u8 {
+        return false
+    }
+
+    let mut pos: usize = 0usize
+    while pos < t.len {
+        while pos < t.len && bld_is_ws(bld_sv_byte(t, pos)) {
+            pos = pos + 1usize
+        }
+        if pos >= t.len {
+            break
+        }
+        if bld_sv_byte(t, pos) == 44u8 {
+            return false
+        }
+
+        // Parse operator prefix (`^`, `~`, `=`, `!=`, `<=`, `<`, `>=`, `>`)
+        let mut op_kind: u8 = 0u8
+        let b0 = bld_sv_byte(t, pos)
+        if b0 == 94u8 {
+            op_kind = 0u8
+            pos = pos + 1usize
+        } else if b0 == 126u8 {
+            op_kind = 1u8
+            pos = pos + 1usize
+        } else if b0 == 61u8 {
+            op_kind = 2u8
+            pos = pos + 1usize
+        } else if b0 == 33u8 {
+            if (pos + 1usize) >= t.len || bld_sv_byte(t, pos + 1usize) != 61u8 {
+                return false
+            }
+            op_kind = 3u8
+            pos = pos + 2usize
+        } else if b0 == 60u8 {
+            if (pos + 1usize) < t.len && bld_sv_byte(t, pos + 1usize) == 61u8 {
+                op_kind = 5u8
+                pos = pos + 2usize
+            } else {
+                op_kind = 4u8
+                pos = pos + 1usize
+            }
+        } else if b0 == 62u8 {
+            if (pos + 1usize) < t.len && bld_sv_byte(t, pos + 1usize) == 61u8 {
+                op_kind = 7u8
+                pos = pos + 2usize
+            } else {
+                op_kind = 6u8
+                pos = pos + 1usize
+            }
+        }
+
+        while pos < t.len && bld_is_ws(bld_sv_byte(t, pos)) {
+            pos = pos + 1usize
+        }
+        if pos >= t.len {
+            return false
+        }
+
+        let ver_start = pos
+        while pos < t.len {
+            let b = bld_sv_byte(t, pos)
+            if b == 44u8 || bld_is_ws(b) {
+                break
+            }
+            pos = pos + 1usize
+        }
+        let ver_tok = bld_sv_slice(t, ver_start, pos)
+        let mut spec = ParsedVerSpec {
+            major: 0u64,
+            minor: 0u64,
+            patch: 0u64,
+            comp_count: 0u8,
+            has_wildcard: false,
+            full_ver: semver2_zero(),
+        }
+        if !parse_constraint_version_spec(ver_tok, mut_view(spec)) {
+            return false
+        }
+        if !apply_comparator_to_clause(mut_view(*out_cl), op_kind, view(spec)) {
+            return false
+        }
+
+        while pos < t.len && bld_is_ws(bld_sv_byte(t, pos)) {
+            pos = pos + 1usize
+        }
+        if pos < t.len && bld_sv_byte(t, pos) == 44u8 {
+            pos = pos + 1usize
+            while pos < t.len && bld_is_ws(bld_sv_byte(t, pos)) {
+                pos = pos + 1usize
+            }
+            if pos >= t.len || bld_sv_byte(t, pos) == 44u8 {
+                return false
+            }
+        }
+    }
+
+    out_cl.comparator_count > 0usize
+}
+
+pub fn semver_constraint_parse(raw: StrView, out: mut_view<SemVerConstraint>) -> bool {
+    *out = semver_constraint_empty()
+    out.raw = raw
+    let t = bld_sv_trim(raw)
+    if t.len == 0usize {
+        return false
+    }
+
+    // Split by `||` into disjunction clauses (`AXS-PKG-005 §5`)
+    let mut seg_start: usize = 0usize
+    let mut i: usize = 0usize
+    while i <= t.len {
+        let is_end = i == t.len
+        let is_or = if !is_end && (i + 1usize) < t.len {
+            bld_sv_byte(t, i) == 124u8 && bld_sv_byte(t, i + 1usize) == 124u8
+        } else {
+            false
+        }
+        if !is_end && !is_or && bld_sv_byte(t, i) == 124u8 {
+            // Single `|` is invalid
+            return false
+        }
+        if is_end || is_or {
+            let clause_sv = bld_sv_trim(bld_sv_slice(t, seg_start, i))
+            if clause_sv.len == 0usize || out.clause_count >= 4usize {
+                return false
+            }
+            let mut cl = semver_clause_empty()
+            if !parse_conjunction_clause(clause_sv, mut_view(cl)) {
+                return false
+            }
+            let p_out = unsafe { address_of_mut(*out) }
+            let c_cnt = unsafe { (*p_out).clause_count }
+            unsafe {
+                (*p_out).clauses[c_cnt] = cl
+                (*p_out).clause_count = c_cnt + 1usize
+            }
+            if is_or {
+                i = i + 2usize
+                seg_start = i
+                if seg_start >= t.len {
+                    return false
+                }
+                continue
+            }
+        }
+        i = i + 1usize
+    }
+
+    out.valid = out.clause_count > 0usize
+    out.valid
+}
+
+pub fn semver_constraint_parse_checked(
+    raw: StrView,
+    out: mut_view<SemVerConstraint>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if !semver_constraint_parse(raw, out) {
+        report_semver_diag(
+            mut_view(*sink),
+            "invalid SemVer 2.0 version constraint expression (`AXS-PKG-005`)",
+            "constraint",
+            raw
+        )
+        return false
+    }
+    true
+}
+
+// =============================================================================
+// 5. Constraint Evaluation, Pre-Release Isolation & Candidate Sorting (`AXS-PKG-005 §6`, `AXS-PKG-011`)
+// =============================================================================
+
+fn cmp_ver_tuple_lt(a: view<SemVer2>, b: view<SemVer2>) -> bool {
+    if (a.major) < (b.major) {
+        return true
+    }
+    if (a.major) > (b.major) {
+        return false
+    }
+    if (a.minor) < (b.minor) {
+        return true
+    }
+    if (a.minor) > (b.minor) {
+        return false
+    }
+    (a.patch) < (b.patch)
+}
+
+pub fn semver_comparator_matches(cmp: view<SemVerComparator>, cand: view<SemVer2>) -> bool {
+    if cmp.op == CMP_OP_LT_UPPER_TRACK {
+        // `< M.m.p-0`: satisfied iff `(cand.major, cand.minor, cand.patch) < (target.major, target.minor, target.patch)`
+        return cmp_ver_tuple_lt(cand, view(cmp.target))
+    }
+    let rel = semver2_cmp_precedence(cand, view(cmp.target))
+    if cmp.op == CMP_OP_EQ {
+        return rel == 0i32
+    }
+    if cmp.op == CMP_OP_NE {
+        return rel != 0i32
+    }
+    if cmp.op == CMP_OP_LT {
+        return rel < 0i32
+    }
+    if cmp.op == CMP_OP_LE {
+        return rel <= 0i32
+    }
+    if cmp.op == CMP_OP_GT {
+        return rel > 0i32
+    }
+    if cmp.op == CMP_OP_GE {
+        return rel >= 0i32
+    }
+    false
+}
+
+// Evaluates a single conjunction clause (`C_1 && C_2 && ...`) on candidate `cand`,
+// enforcing the Pre-Release Isolation Rule (`AXS-PKG-005 §6`, `1065 §9`):
+// A candidate with a non-empty `prerelease` tag (`X.Y.Z-pre`) matches a conjunction clause
+// iff every comparator in the clause is satisfied AND at least one comparator in that clause
+// explicitly specifies a pre-release tag on the exact same `(X, Y, Z)` tuple.
+pub fn semver_clause_matches(clause: view<SemVerConjunctionClause>, cand: view<SemVer2>) -> bool {
+    if clause.comparator_count == 0usize {
+        return false
+    }
+    let mut i: usize = 0usize
+    while i < clause.comparator_count {
+        if !semver_comparator_matches(view(clause.comparators[i]), cand) {
+            return false
+        }
+        i = i + 1usize
+    }
+
+    if semver2_is_prerelease(cand) {
+        let mut allowed_pre: bool = false
+        let mut k: usize = 0usize
+        while k < clause.comparator_count {
+            let cmp = clause.comparators[k]
+            if cmp.explicit_prerelease &&
+                cmp.target.major == cand.major &&
+                cmp.target.minor == cand.minor &&
+                cmp.target.patch == cand.patch {
+                allowed_pre = true
+                break
+            }
+            k = k + 1usize
+        }
+        if !allowed_pre {
+            return false
+        }
+    }
+
+    true
+}
+
+pub fn semver_constraint_matches(constraint: view<SemVerConstraint>, cand: view<SemVer2>) -> bool {
+    if !constraint.valid || constraint.clause_count == 0usize {
+        return false
+    }
+    let mut i: usize = 0usize
+    while i < constraint.clause_count {
+        if semver_clause_matches(view(constraint.clauses[i]), cand) {
+            return true
+        }
+        i = i + 1usize
+    }
+    false
+}
+
+pub fn semver_constraint_primary_track(constraint: view<SemVerConstraint>) -> CompatTrack {
+    if constraint.clause_count > 0usize {
+        return constraint.clauses[0].inferred_track
+    }
+    CompatTrack {
+        kind: COMPAT_TRACK_ANY,
+        major: 0u64,
+        minor: 0u64,
+        patch: 0u64,
+    }
+}
+
+pub fn semver_constraint_matches_track(
+    constraint: view<SemVerConstraint>,
+    track: CompatTrack
+) -> bool {
+    let mut i: usize = 0usize
+    while i < constraint.clause_count {
+        let ct = constraint.clauses[i].inferred_track
+        if ct.kind == COMPAT_TRACK_ANY || compat_track_eq(ct, track) {
+            return true
+        }
+        i = i + 1usize
+    }
+    false
+}
+
+// Sorts an array of `SemVer2` candidates in deterministic descending order
+// (`highest compatible version first`), or ascending order when `minimal_versions == true` (`AXS-PKG-011 §3`).
+pub fn sort_semver2_candidates(
+    candidates: mut_view<[16]SemVer2>,
+    count: usize,
+    minimal_versions: bool
+) {
+    let mut i: usize = 0usize
+    while i < count && i < 16usize {
+        let mut j: usize = i + 1usize
+        while j < count && j < 16usize {
+            let cmp = semver2_cmp_total_tiebreak(view((*candidates)[i]), view((*candidates)[j]))
+            let should_swap = if minimal_versions { cmp > 0i32 } else { cmp < 0i32 }
+            if should_swap {
+                let tmp = (*candidates)[i]
+                (*candidates)[i] = (*candidates)[j]
+                (*candidates)[j] = tmp
+            }
+            j = j + 1usize
+        }
+        i = i + 1usize
+    }
+}
