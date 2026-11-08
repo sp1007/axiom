@@ -1,0 +1,1286 @@
+// OptIR vector operation to LIR Vec128/Vec256 instruction lowering, target SIMD legalization,
+// narrow 64-bit MOVQ/MOVSD promotion, 256-bit -> 2x128-bit splitting, and VZEROUPPER insertion (T618 / E15.5).
+// Implements SPEC-74 §6.5 (AXS-VEC-048, REQ-OPT-216, REQ-OPT-217) and SPEC-43 (AXS-SBE-001..022).
+module compiler.lir.vec_lower
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.SymbolId
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_u32
+use compiler.mir.mir.MIR_BINOP_ADD
+use compiler.mir.mir.MIR_BINOP_BIT_AND
+use compiler.mir.mir.MIR_BINOP_BIT_OR
+use compiler.mir.mir.MIR_BINOP_BIT_XOR
+use compiler.mir.mir.MIR_BINOP_DIV
+use compiler.mir.mir.MIR_BINOP_MUL
+use compiler.mir.mir.MIR_BINOP_REM
+use compiler.mir.mir.MIR_BINOP_SHL
+use compiler.mir.mir.MIR_BINOP_SHR
+use compiler.mir.mir.MIR_BINOP_SUB
+use compiler.mir.mir.MIR_BINOP_WRAPPING_ADD
+use compiler.mir.mir.MIR_BINOP_WRAPPING_MUL
+use compiler.mir.mir.MIR_BINOP_WRAPPING_SUB
+use compiler.opt.optir.OPT_INST_BINOP
+use compiler.opt.optir.OPT_INST_CAST
+use compiler.opt.optir.OPT_INST_CHECKED_BINOP
+use compiler.opt.optir.OPT_INST_LOAD
+use compiler.opt.optir.OPT_INST_STORE
+use compiler.opt.optir.OPT_INST_WRAPPING_BINOP
+use compiler.opt.optir.OPT_TERM_CALL
+use compiler.opt.optir.OPT_TERM_RETURN
+use compiler.opt.optir.OptBlock
+use compiler.opt.optir.OptBody
+use compiler.opt.optir.OptInst
+use compiler.opt.optir.opt_block_at
+use compiler.opt.optir.opt_inst_at
+use compiler.opt.vectorize.LoopVecRecord
+use compiler.opt.vectorize.OPT_INST_VBINOP
+use compiler.opt.vectorize.OPT_INST_VCAST
+use compiler.opt.vectorize.OPT_INST_VCMP
+use compiler.opt.vectorize.OPT_INST_VEXTRACT
+use compiler.opt.vectorize.OPT_INST_VFMA
+use compiler.opt.vectorize.OPT_INST_VINSERT
+use compiler.opt.vectorize.OPT_INST_VLOAD
+use compiler.opt.vectorize.OPT_INST_VLOAD_MASKED
+use compiler.opt.vectorize.OPT_INST_VREDUCE
+use compiler.opt.vectorize.OPT_INST_VSELECT
+use compiler.opt.vectorize.OPT_INST_VSHUFFLE
+use compiler.opt.vectorize.OPT_INST_VSPLAT
+use compiler.opt.vectorize.OPT_INST_VSTEP
+use compiler.opt.vectorize.OPT_INST_VSTORE
+use compiler.opt.vectorize.OPT_INST_VSTORE_MASKED
+use compiler.opt.vectorize.TARGET_ISA_AVX
+use compiler.opt.vectorize.TARGET_ISA_AVX2
+use compiler.opt.vectorize.TARGET_ISA_SCALAR_ONLY
+use compiler.opt.vectorize.TargetSimdCaps
+use compiler.opt.vectorize.VEC_ELEM_NONE
+use compiler.opt.vectorize.VREDUCE_ADD
+use compiler.opt.vectorize.VREDUCE_NONE
+use compiler.opt.vectorize.vec_classify_type_elem
+use compiler.opt.vectorize.vec_elem_bit_width
+use compiler.opt.vectorize.vec_elem_is_float
+use compiler.opt.vectorize.vec_elem_is_signed_int
+use compiler.opt.slp.SLP_NODE_BROADCAST
+use compiler.opt.slp.SLP_NODE_GATHER_PACK
+use compiler.opt.slp.SLP_NODE_REDUCTION_ROOT
+use compiler.opt.slp.SLP_NODE_VECTORIZABLE
+use compiler.opt.slp.SlpNode
+use compiler.opt.slp.SlpTree
+use compiler.opt.slp.slp_node_at
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+// --- 1. LIR Vector Type, Register Class, Memory Flag & Opcode Taxonomy (SPEC-74 §6.5, SPEC-43 §2..§3) ---
+
+pub const LIR_VEC_TY_NONE: u8 = 0u8;
+pub const LIR_VEC_TY_V128: u8 = 1u8;
+pub const LIR_VEC_TY_V256: u8 = 2u8;
+pub const LIR_VEC_TY_V512: u8 = 3u8;
+pub const LIR_VEC_TY_MASK: u8 = 4u8;
+
+pub const REG_CLASS_GPR: u8 = 0u8;
+pub const REG_CLASS_XMM: u8 = 1u8;
+pub const REG_CLASS_VEC128: u8 = 2u8;
+pub const REG_CLASS_VEC256: u8 = 3u8;
+pub const REG_CLASS_VEC512: u8 = 4u8;
+pub const REG_CLASS_MASK: u8 = 5u8;
+
+pub const ALIGN_UNKNOWN: u8 = 0u8;
+pub const ALIGN_KNOWN_UNALIGNED: u8 = 1u8;
+pub const ALIGN_KNOWN_ALIGNED: u8 = 2u8;
+
+pub const LIR_MEM_FLAG_NONE: u8 = 0u8;
+pub const LIR_MEM_FLAG_VOLATILE: u8 = 1u8;
+pub const LIR_MEM_FLAG_NONTEMPORAL: u8 = 2u8;
+pub const LIR_MEM_FLAG_ALIGNED: u8 = 4u8;
+
+pub const LIR_INST_VLOAD: u8 = 64u8;
+pub const LIR_INST_VSTORE: u8 = 65u8;
+pub const LIR_INST_VLOAD_MASKED: u8 = 66u8;
+pub const LIR_INST_VSTORE_MASKED: u8 = 67u8;
+pub const LIR_INST_VSPLAT: u8 = 68u8;
+pub const LIR_INST_VEXTRACT: u8 = 69u8;
+pub const LIR_INST_VINSERT: u8 = 70u8;
+pub const LIR_INST_VSHUFFLE: u8 = 71u8;
+pub const LIR_INST_VADD: u8 = 72u8;
+pub const LIR_INST_VSUB: u8 = 73u8;
+pub const LIR_INST_VMUL: u8 = 74u8;
+pub const LIR_INST_VDIV: u8 = 75u8;
+pub const LIR_INST_VAND: u8 = 76u8;
+pub const LIR_INST_VOR: u8 = 77u8;
+pub const LIR_INST_VXOR: u8 = 78u8;
+pub const LIR_INST_VSHL: u8 = 79u8;
+pub const LIR_INST_VSHR: u8 = 80u8;
+pub const LIR_INST_VSAR: u8 = 81u8;
+pub const LIR_INST_VFMA: u8 = 82u8;
+pub const LIR_INST_VCMP: u8 = 83u8;
+pub const LIR_INST_VSELECT: u8 = 84u8;
+pub const LIR_INST_VCAST: u8 = 85u8;
+pub const LIR_INST_VREDUCE: u8 = 86u8;
+pub const LIR_INST_VZEROUPPER: u8 = 87u8;
+pub const LIR_INST_VMOVQ_64: u8 = 88u8;
+pub const LIR_INST_SCALAR_LANE_OP: u8 = 89u8;
+
+pub const VREG_NONE: u32 = 0xFFFFFFFFu32;
+
+@derive(Copy)
+pub struct LirVectorType {
+    pub vec_kind: u8,
+    pub reg_class: u8,
+    pub elem_kind: u8,
+    pub elem_bits: u16,
+    pub lane_count: u8,
+    pub total_bits: u16,
+    pub alloc_bits: u16,
+    pub split_count: u8,
+}
+
+@derive(Copy)
+pub struct LirVecInst {
+    pub id: u32,
+    pub opcode: u8,
+    pub sub_op: u8,
+    pub vec_ty: LirVectorType,
+    pub dst_vreg: u32,
+    pub lhs_vreg: u32,
+    pub rhs_vreg: u32,
+    pub acc_vreg: u32,
+    pub base_slot: u32,
+    pub disp_bytes: i32,
+    pub lane_imm: u8,
+    pub mem_flags: u8,
+    pub align_bytes: u16,
+    pub is_split_hi: bool,
+}
+
+@derive(Copy)
+pub struct LirVecFrame {
+    pub uses_xmm: bool,
+    pub uses_ymm: bool,
+    pub requires_32_byte_alignment: bool,
+    pub vzeroupper_before_ret: bool,
+    pub vzeroupper_before_calls: u32,
+    pub vec128_vreg_count: u32,
+    pub vec256_vreg_count: u32,
+    pub stack_vec_slot_align: u16,
+}
+
+@derive(Copy)
+pub struct LirVecBody {
+    pub fn_sym: SymbolId,
+    pub isa_level: u8,
+    pub frame: LirVecFrame,
+    pub next_vreg: u32,
+    pub insts: *mut LirVecInst,
+    pub inst_count: usize,
+    pub inst_cap: usize,
+}
+
+@derive(Copy)
+pub struct VecLowerStats {
+    pub bodies_lowered: u32,
+    pub opt_vec_insts_lowered: u32,
+    pub loop_records_lowered: u32,
+    pub slp_trees_lowered: u32,
+    pub vec128_ops_emitted: u32,
+    pub vec256_ops_emitted: u32,
+    pub narrow_64_movq_emitted: u32,
+    pub split_256_to_128_pairs: u32,
+    pub aligned_mem_ops: u32,
+    pub unaligned_mem_ops: u32,
+    pub vzeroupper_emitted: u32,
+    pub scalarized_ops_emitted: u32,
+    pub verify_errors: u32,
+}
+
+// --- 2. Initialization, VReg Allocation & Target SIMD Type Legalization (SPEC-74 §6.5, SPEC-43 §2.3) ---
+
+pub fn vec_lower_stats_zero(stats: mut_view<VecLowerStats>) {
+    stats.bodies_lowered = 0u32;
+    stats.opt_vec_insts_lowered = 0u32;
+    stats.loop_records_lowered = 0u32;
+    stats.slp_trees_lowered = 0u32;
+    stats.vec128_ops_emitted = 0u32;
+    stats.vec256_ops_emitted = 0u32;
+    stats.narrow_64_movq_emitted = 0u32;
+    stats.split_256_to_128_pairs = 0u32;
+    stats.aligned_mem_ops = 0u32;
+    stats.unaligned_mem_ops = 0u32;
+    stats.vzeroupper_emitted = 0u32;
+    stats.scalarized_ops_emitted = 0u32;
+    stats.verify_errors = 0u32;
+}
+
+pub fn vec_lower_body_init(vbody: mut_view<LirVecBody>, fn_sym: SymbolId, isa_level: u8) {
+    vbody.fn_sym = fn_sym;
+    vbody.isa_level = isa_level;
+    vbody.frame = LirVecFrame {
+        uses_xmm: false,
+        uses_ymm: false,
+        requires_32_byte_alignment: false,
+        vzeroupper_before_ret: false,
+        vzeroupper_before_calls: 0u32,
+        vec128_vreg_count: 0u32,
+        vec256_vreg_count: 0u32,
+        stack_vec_slot_align: 8u16,
+    };
+    vbody.next_vreg = 100u32;
+    vbody.insts = 0 as *mut LirVecInst;
+    vbody.inst_count = 0;
+    vbody.inst_cap = 0;
+}
+
+pub unsafe fn lir_vec_inst_at(base: *mut LirVecInst, idx: usize) -> *mut LirVecInst {
+    let off = idx * size_of<LirVecInst>();
+    ((base as usize) + off) as *mut LirVecInst
+}
+
+fn vlow_mul_usize(a: usize, b: usize) -> usize {
+    let mut res: usize = 0;
+    let mut i: usize = 0;
+    while i < b {
+        res = res + a;
+        i = i + 1;
+    }
+    res
+}
+
+pub fn vec_lower_alloc_vreg(vbody: mut_view<LirVecBody>, reg_class: u8) -> u32 {
+    let vr = vbody.next_vreg;
+    vbody.next_vreg = vr + 1u32;
+    if reg_class == REG_CLASS_VEC256 {
+        vbody.frame.uses_xmm = true;
+        vbody.frame.uses_ymm = true;
+        vbody.frame.requires_32_byte_alignment = true;
+        vbody.frame.vec256_vreg_count = vbody.frame.vec256_vreg_count + 1u32;
+        if (vbody.frame.stack_vec_slot_align) < 32u16 {
+            vbody.frame.stack_vec_slot_align = 32u16;
+        }
+    } else if reg_class == REG_CLASS_VEC128 || reg_class == REG_CLASS_XMM {
+        vbody.frame.uses_xmm = true;
+        vbody.frame.vec128_vreg_count = vbody.frame.vec128_vreg_count + 1u32;
+        if (vbody.frame.stack_vec_slot_align) < 16u16 {
+            vbody.frame.stack_vec_slot_align = 16u16;
+        }
+    }
+    vr
+}
+
+pub fn vec_lower_push_inst(
+    vbody: mut_view<LirVecBody>,
+    inst: view<LirVecInst>,
+    stats: mut_view<VecLowerStats>,
+    arena: mut_view<Arena>
+) -> u32 {
+    if vbody.inst_count >= vbody.inst_cap {
+        let new_cap: usize = if vbody.inst_cap == 0 { 32 } else { vbody.inst_cap + vbody.inst_cap };
+        let new_bytes = vlow_mul_usize(new_cap, size_of<LirVecInst>());
+        let new_arr = arena_alloc_raw(mut_view(*arena), new_bytes, align_of<LirVecInst>()) as *mut LirVecInst;
+        if vbody.inst_count > 0 && (vbody.insts as usize) != 0 {
+            let old_bytes = vlow_mul_usize(vbody.inst_count, size_of<LirVecInst>());
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(vbody.insts as *const u8, new_arr as *mut u8, old_bytes);
+            }
+        }
+        vbody.insts = new_arr;
+        vbody.inst_cap = new_cap;
+    }
+    let idx = vbody.inst_count;
+    vbody.inst_count = idx + 1;
+    let dst = unsafe { lir_vec_inst_at(vbody.insts, idx) };
+    unsafe {
+        *dst = *inst;
+        (*dst).id = idx as u32;
+    }
+
+    if inst.opcode == LIR_INST_VZEROUPPER {
+        stats.vzeroupper_emitted = stats.vzeroupper_emitted + 1u32;
+    } else if inst.opcode == LIR_INST_VMOVQ_64 {
+        stats.narrow_64_movq_emitted = stats.narrow_64_movq_emitted + 1u32;
+        stats.vec128_ops_emitted = stats.vec128_ops_emitted + 1u32;
+    } else if inst.opcode == LIR_INST_SCALAR_LANE_OP {
+        stats.scalarized_ops_emitted = stats.scalarized_ops_emitted + 1u32;
+    } else if inst.vec_ty.vec_kind == LIR_VEC_TY_V256 {
+        stats.vec256_ops_emitted = stats.vec256_ops_emitted + 1u32;
+    } else if inst.vec_ty.vec_kind == LIR_VEC_TY_V128 {
+        stats.vec128_ops_emitted = stats.vec128_ops_emitted + 1u32;
+    }
+
+    if inst.opcode == LIR_INST_VLOAD || inst.opcode == LIR_INST_VSTORE ||
+       inst.opcode == LIR_INST_VLOAD_MASKED || inst.opcode == LIR_INST_VSTORE_MASKED ||
+       inst.opcode == LIR_INST_VMOVQ_64 {
+        if (inst.mem_flags & LIR_MEM_FLAG_ALIGNED) != 0u8 {
+            stats.aligned_mem_ops = stats.aligned_mem_ops + 1u32;
+        } else {
+            stats.unaligned_mem_ops = stats.unaligned_mem_ops + 1u32;
+        }
+    }
+    idx as u32
+}
+
+pub fn vec_lower_legalize_type(
+    caps: view<TargetSimdCaps>,
+    elem_kind: u8,
+    lane_count: u8
+) -> LirVectorType {
+    let ebits = vec_elem_bit_width(elem_kind);
+    if ebits == 0u16 || lane_count < 2u8 || caps.isa_level == TARGET_ISA_SCALAR_ONLY {
+        return LirVectorType {
+            vec_kind: LIR_VEC_TY_NONE,
+            reg_class: REG_CLASS_GPR,
+            elem_kind: elem_kind,
+            elem_bits: ebits,
+            lane_count: lane_count,
+            total_bits: (lane_count as u16) * ebits,
+            alloc_bits: ebits,
+            split_count: lane_count,
+        };
+    }
+
+    let total_bits: u16 = (lane_count as u16) * ebits;
+    let is_fp = vec_elem_is_float(elem_kind);
+    let max_target_bits: u16 = if is_fp { caps.max_fp_vec_bits } else { caps.max_int_vec_bits };
+
+    // Rule 3 (AXS-VEC-048, AXS-SBE-012): Sub-128-bit 64-bit packs promoted into low 64 bits of Vec128
+    if total_bits == 64u16 {
+        return LirVectorType {
+            vec_kind: LIR_VEC_TY_V128,
+            reg_class: REG_CLASS_VEC128,
+            elem_kind: elem_kind,
+            elem_bits: ebits,
+            lane_count: lane_count,
+            total_bits: 64u16,
+            alloc_bits: 128u16,
+            split_count: 1u8,
+        };
+    }
+
+    // Rule 1 (AXS-VEC-048): 128-bit vector operations lower to Vec128 (XMM)
+    if total_bits == 128u16 {
+        return LirVectorType {
+            vec_kind: LIR_VEC_TY_V128,
+            reg_class: REG_CLASS_VEC128,
+            elem_kind: elem_kind,
+            elem_bits: ebits,
+            lane_count: lane_count,
+            total_bits: 128u16,
+            alloc_bits: 128u16,
+            split_count: 1u8,
+        };
+    }
+
+    // Rule 2 (AXS-VEC-048, AXS-SBE-011): 256-bit vector operations lower to Vec256 (YMM) if supported,
+    // or split deterministically into 2 x Vec128 (lo, hi) on 128-bit targets.
+    if total_bits == 256u16 {
+        if max_target_bits >= 256u16 {
+            return LirVectorType {
+                vec_kind: LIR_VEC_TY_V256,
+                reg_class: REG_CLASS_VEC256,
+                elem_kind: elem_kind,
+                elem_bits: ebits,
+                lane_count: lane_count,
+                total_bits: 256u16,
+                alloc_bits: 256u16,
+                split_count: 1u8,
+            };
+        }
+        return LirVectorType {
+            vec_kind: LIR_VEC_TY_V128,
+            reg_class: REG_CLASS_VEC128,
+            elem_kind: elem_kind,
+            elem_bits: ebits,
+            lane_count: lane_count / 2u8,
+            total_bits: 128u16,
+            alloc_bits: 128u16,
+            split_count: 2u8,
+        };
+    }
+
+    LirVectorType {
+        vec_kind: LIR_VEC_TY_V128,
+        reg_class: REG_CLASS_VEC128,
+        elem_kind: elem_kind,
+        elem_bits: ebits,
+        lane_count: lane_count,
+        total_bits: total_bits,
+        alloc_bits: 128u16,
+        split_count: 1u8,
+    }
+}
+
+pub fn vec_lower_select_mem_flags(
+    align_status: u8,
+    known_align_bytes: u16,
+    vec_ty: view<LirVectorType>,
+    is_volatile: bool,
+    is_nontemporal: bool
+) -> u8 {
+    let mut flags: u8 = LIR_MEM_FLAG_NONE;
+    if is_volatile {
+        flags = flags | LIR_MEM_FLAG_VOLATILE;
+    }
+    if is_nontemporal {
+        flags = flags | LIR_MEM_FLAG_NONTEMPORAL;
+    }
+    let req_bytes: u16 = vec_ty.total_bits / 8u16;
+    if align_status == ALIGN_KNOWN_ALIGNED && known_align_bytes >= req_bytes && req_bytes >= 16u16 {
+        flags = flags | LIR_MEM_FLAG_ALIGNED;
+    }
+    flags
+}
+
+pub fn vec_lower_map_binop(sub_op: u8, elem_kind: u8) -> u8 {
+    if sub_op == MIR_BINOP_ADD || sub_op == MIR_BINOP_WRAPPING_ADD {
+        return LIR_INST_VADD;
+    }
+    if sub_op == MIR_BINOP_SUB || sub_op == MIR_BINOP_WRAPPING_SUB {
+        return LIR_INST_VSUB;
+    }
+    if sub_op == MIR_BINOP_MUL || sub_op == MIR_BINOP_WRAPPING_MUL {
+        return LIR_INST_VMUL;
+    }
+    if sub_op == MIR_BINOP_DIV {
+        if vec_elem_is_float(elem_kind) {
+            return LIR_INST_VDIV;
+        }
+        return LIR_INST_SCALAR_LANE_OP;
+    }
+    if sub_op == MIR_BINOP_REM {
+        return LIR_INST_SCALAR_LANE_OP;
+    }
+    if sub_op == MIR_BINOP_BIT_AND {
+        return LIR_INST_VAND;
+    }
+    if sub_op == MIR_BINOP_BIT_OR {
+        return LIR_INST_VOR;
+    }
+    if sub_op == MIR_BINOP_BIT_XOR {
+        return LIR_INST_VXOR;
+    }
+    if sub_op == MIR_BINOP_SHL {
+        return LIR_INST_VSHL;
+    }
+    if sub_op == MIR_BINOP_SHR {
+        if vec_elem_is_signed_int(elem_kind) {
+            return LIR_INST_VSAR;
+        }
+        return LIR_INST_VSHR;
+    }
+    LIR_INST_VADD
+}
+
+// --- 3. Vector Instruction Emitters & Legalization Splitters (SPEC-74 §6.5, SPEC-43 §3) ---
+
+fn vec_lower_make_inst(
+    opcode: u8,
+    sub_op: u8,
+    vec_ty: view<LirVectorType>,
+    dst_vreg: u32,
+    lhs_vreg: u32,
+    rhs_vreg: u32,
+    acc_vreg: u32,
+    base_slot: u32,
+    disp_bytes: i32,
+    lane_imm: u8,
+    mem_flags: u8,
+    align_bytes: u16,
+    is_split_hi: bool
+) -> LirVecInst {
+    LirVecInst {
+        id: 0u32,
+        opcode: opcode,
+        sub_op: sub_op,
+        vec_ty: *vec_ty,
+        dst_vreg: dst_vreg,
+        lhs_vreg: lhs_vreg,
+        rhs_vreg: rhs_vreg,
+        acc_vreg: acc_vreg,
+        base_slot: base_slot,
+        disp_bytes: disp_bytes,
+        lane_imm: lane_imm,
+        mem_flags: mem_flags,
+        align_bytes: align_bytes,
+        is_split_hi: is_split_hi,
+    }
+}
+
+pub fn vec_lower_emit_load(
+    vbody: mut_view<LirVecBody>,
+    caps: view<TargetSimdCaps>,
+    elem_kind: u8,
+    lane_count: u8,
+    base_slot: u32,
+    disp_bytes: i32,
+    align_status: u8,
+    known_align_bytes: u16,
+    stats: mut_view<VecLowerStats>,
+    arena: mut_view<Arena>
+) -> u32 {
+    let vty = vec_lower_legalize_type(caps, elem_kind, lane_count);
+    let mflags = vec_lower_select_mem_flags(align_status, known_align_bytes, view(vty), false, false);
+    let req_align: u16 = if (mflags & LIR_MEM_FLAG_ALIGNED) != 0u8 { vty.total_bits / 8u16 } else { vty.elem_bits / 8u16 };
+
+    // Narrow 64-bit vector load uses exact 64-bit MOVQ/MOVSD into low 64 bits of Vec128 (AXS-VEC-048 rule 3, AXS-SBE-012)
+    if vty.total_bits == 64u16 && vty.vec_kind == LIR_VEC_TY_V128 {
+        let dst = vec_lower_alloc_vreg(mut_view(*vbody), REG_CLASS_VEC128);
+        let inst = vec_lower_make_inst(
+            LIR_INST_VMOVQ_64, 0u8, view(vty), dst, VREG_NONE, VREG_NONE, VREG_NONE,
+            base_slot, disp_bytes, 0u8, mflags, 8u16, false
+        );
+        let _ = vec_lower_push_inst(mut_view(*vbody), view(inst), mut_view(*stats), mut_view(*arena));
+        return dst;
+    }
+
+    // 256-bit load split into 2 x 128-bit loads on 128-bit targets (AXS-SBE-011)
+    if vty.split_count == 2u8 && vty.vec_kind == LIR_VEC_TY_V128 {
+        stats.split_256_to_128_pairs = stats.split_256_to_128_pairs + 1u32;
+        let dst_lo = vec_lower_alloc_vreg(mut_view(*vbody), REG_CLASS_VEC128);
+        let dst_hi = vec_lower_alloc_vreg(mut_view(*vbody), REG_CLASS_VEC128);
+        let inst_lo = vec_lower_make_inst(
+            LIR_INST_VLOAD, 0u8, view(vty), dst_lo, VREG_NONE, VREG_NONE, VREG_NONE,
+            base_slot, disp_bytes, 0u8, mflags, req_align, false
+        );
+        let inst_hi = vec_lower_make_inst(
+            LIR_INST_VLOAD, 0u8, view(vty), dst_hi, VREG_NONE, VREG_NONE, VREG_NONE,
+            base_slot, disp_bytes + 16i32, 0u8, mflags, req_align, true
+        );
+        let _ = vec_lower_push_inst(mut_view(*vbody), view(inst_lo), mut_view(*stats), mut_view(*arena));
+        let _ = vec_lower_push_inst(mut_view(*vbody), view(inst_hi), mut_view(*stats), mut_view(*arena));
+        return dst_lo;
+    }
+
+    let dst = vec_lower_alloc_vreg(mut_view(*vbody), vty.reg_class);
+    let inst = vec_lower_make_inst(
+        LIR_INST_VLOAD, 0u8, view(vty), dst, VREG_NONE, VREG_NONE, VREG_NONE,
+        base_slot, disp_bytes, 0u8, mflags, req_align, false
+    );
+    let _ = vec_lower_push_inst(mut_view(*vbody), view(inst), mut_view(*stats), mut_view(*arena));
+    dst
+}
+
+pub fn vec_lower_emit_store(
+    vbody: mut_view<LirVecBody>,
+    caps: view<TargetSimdCaps>,
+    elem_kind: u8,
+    lane_count: u8,
+    src_vreg: u32,
+    base_slot: u32,
+    disp_bytes: i32,
+    align_status: u8,
+    known_align_bytes: u16,
+    stats: mut_view<VecLowerStats>,
+    arena: mut_view<Arena>
+) {
+    let vty = vec_lower_legalize_type(caps, elem_kind, lane_count);
+    let mflags = vec_lower_select_mem_flags(align_status, known_align_bytes, view(vty), false, false);
+    let req_align: u16 = if (mflags & LIR_MEM_FLAG_ALIGNED) != 0u8 { vty.total_bits / 8u16 } else { vty.elem_bits / 8u16 };
+
+    if vty.total_bits == 64u16 && vty.vec_kind == LIR_VEC_TY_V128 {
+        let inst = vec_lower_make_inst(
+            LIR_INST_VMOVQ_64, 1u8, view(vty), VREG_NONE, src_vreg, VREG_NONE, VREG_NONE,
+            base_slot, disp_bytes, 0u8, mflags, 8u16, false
+        );
+        let _ = vec_lower_push_inst(mut_view(*vbody), view(inst), mut_view(*stats), mut_view(*arena));
+        return;
+    }
+
+    if vty.split_count == 2u8 && vty.vec_kind == LIR_VEC_TY_V128 {
+        stats.split_256_to_128_pairs = stats.split_256_to_128_pairs + 1u32;
+        let inst_lo = vec_lower_make_inst(
+            LIR_INST_VSTORE, 0u8, view(vty), VREG_NONE, src_vreg, VREG_NONE, VREG_NONE,
+            base_slot, disp_bytes, 0u8, mflags, req_align, false
+        );
+        let inst_hi = vec_lower_make_inst(
+            LIR_INST_VSTORE, 0u8, view(vty), VREG_NONE, src_vreg + 1u32, VREG_NONE, VREG_NONE,
+            base_slot, disp_bytes + 16i32, 0u8, mflags, req_align, true
+        );
+        let _ = vec_lower_push_inst(mut_view(*vbody), view(inst_lo), mut_view(*stats), mut_view(*arena));
+        let _ = vec_lower_push_inst(mut_view(*vbody), view(inst_hi), mut_view(*stats), mut_view(*arena));
+        return;
+    }
+
+    let inst = vec_lower_make_inst(
+        LIR_INST_VSTORE, 0u8, view(vty), VREG_NONE, src_vreg, VREG_NONE, VREG_NONE,
+        base_slot, disp_bytes, 0u8, mflags, req_align, false
+    );
+    let _ = vec_lower_push_inst(mut_view(*vbody), view(inst), mut_view(*stats), mut_view(*arena));
+}
+
+pub fn vec_lower_emit_splat(
+    vbody: mut_view<LirVecBody>,
+    caps: view<TargetSimdCaps>,
+    elem_kind: u8,
+    lane_count: u8,
+    scalar_vreg: u32,
+    stats: mut_view<VecLowerStats>,
+    arena: mut_view<Arena>
+) -> u32 {
+    let vty = vec_lower_legalize_type(caps, elem_kind, lane_count);
+    if vty.split_count == 2u8 && vty.vec_kind == LIR_VEC_TY_V128 {
+        stats.split_256_to_128_pairs = stats.split_256_to_128_pairs + 1u32;
+        let dst_lo = vec_lower_alloc_vreg(mut_view(*vbody), REG_CLASS_VEC128);
+        let dst_hi = vec_lower_alloc_vreg(mut_view(*vbody), REG_CLASS_VEC128);
+        let inst_lo = vec_lower_make_inst(
+            LIR_INST_VSPLAT, 0u8, view(vty), dst_lo, scalar_vreg, VREG_NONE, VREG_NONE,
+            0u32, 0i32, 0u8, LIR_MEM_FLAG_NONE, 0u16, false
+        );
+        let inst_hi = vec_lower_make_inst(
+            LIR_INST_VSPLAT, 0u8, view(vty), dst_hi, scalar_vreg, VREG_NONE, VREG_NONE,
+            0u32, 0i32, 0u8, LIR_MEM_FLAG_NONE, 0u16, true
+        );
+        let _ = vec_lower_push_inst(mut_view(*vbody), view(inst_lo), mut_view(*stats), mut_view(*arena));
+        let _ = vec_lower_push_inst(mut_view(*vbody), view(inst_hi), mut_view(*stats), mut_view(*arena));
+        return dst_lo;
+    }
+    let dst = vec_lower_alloc_vreg(mut_view(*vbody), vty.reg_class);
+    let inst = vec_lower_make_inst(
+        LIR_INST_VSPLAT, 0u8, view(vty), dst, scalar_vreg, VREG_NONE, VREG_NONE,
+        0u32, 0i32, 0u8, LIR_MEM_FLAG_NONE, 0u16, false
+    );
+    let _ = vec_lower_push_inst(mut_view(*vbody), view(inst), mut_view(*stats), mut_view(*arena));
+    dst
+}
+
+pub fn vec_lower_emit_binop(
+    vbody: mut_view<LirVecBody>,
+    caps: view<TargetSimdCaps>,
+    elem_kind: u8,
+    lane_count: u8,
+    sub_op: u8,
+    lhs_vreg: u32,
+    rhs_vreg: u32,
+    stats: mut_view<VecLowerStats>,
+    arena: mut_view<Arena>
+) -> u32 {
+    let vty = vec_lower_legalize_type(caps, elem_kind, lane_count);
+    let lir_op = vec_lower_map_binop(sub_op, elem_kind);
+
+    // Deterministic lane-by-lane scalarization for integer DIV/REM or scalar-only fallback (AXS-SBE-013)
+    if lir_op == LIR_INST_SCALAR_LANE_OP || vty.vec_kind == LIR_VEC_TY_NONE {
+        let dst = vec_lower_alloc_vreg(mut_view(*vbody), vty.reg_class);
+        let mut l: u8 = 0u8;
+        while l < lane_count {
+            let sinst = vec_lower_make_inst(
+                LIR_INST_SCALAR_LANE_OP, sub_op, view(vty), dst, lhs_vreg, rhs_vreg, VREG_NONE,
+                0u32, 0i32, l, LIR_MEM_FLAG_NONE, 0u16, false
+            );
+            let _ = vec_lower_push_inst(mut_view(*vbody), view(sinst), mut_view(*stats), mut_view(*arena));
+            l = l + 1u8;
+        }
+        return dst;
+    }
+
+    if vty.split_count == 2u8 && vty.vec_kind == LIR_VEC_TY_V128 {
+        stats.split_256_to_128_pairs = stats.split_256_to_128_pairs + 1u32;
+        let dst_lo = vec_lower_alloc_vreg(mut_view(*vbody), REG_CLASS_VEC128);
+        let dst_hi = vec_lower_alloc_vreg(mut_view(*vbody), REG_CLASS_VEC128);
+        let inst_lo = vec_lower_make_inst(
+            lir_op, sub_op, view(vty), dst_lo, lhs_vreg, rhs_vreg, VREG_NONE,
+            0u32, 0i32, 0u8, LIR_MEM_FLAG_NONE, 0u16, false
+        );
+        let inst_hi = vec_lower_make_inst(
+            lir_op, sub_op, view(vty), dst_hi, lhs_vreg + 1u32, rhs_vreg + 1u32, VREG_NONE,
+            0u32, 0i32, 0u8, LIR_MEM_FLAG_NONE, 0u16, true
+        );
+        let _ = vec_lower_push_inst(mut_view(*vbody), view(inst_lo), mut_view(*stats), mut_view(*arena));
+        let _ = vec_lower_push_inst(mut_view(*vbody), view(inst_hi), mut_view(*stats), mut_view(*arena));
+        return dst_lo;
+    }
+
+    let dst = vec_lower_alloc_vreg(mut_view(*vbody), vty.reg_class);
+    let inst = vec_lower_make_inst(
+        lir_op, sub_op, view(vty), dst, lhs_vreg, rhs_vreg, VREG_NONE,
+        0u32, 0i32, 0u8, LIR_MEM_FLAG_NONE, 0u16, false
+    );
+    let _ = vec_lower_push_inst(mut_view(*vbody), view(inst), mut_view(*stats), mut_view(*arena));
+    dst
+}
+
+pub fn vec_lower_emit_reduce(
+    vbody: mut_view<LirVecBody>,
+    caps: view<TargetSimdCaps>,
+    elem_kind: u8,
+    lane_count: u8,
+    vreduce_op: u8,
+    src_vreg: u32,
+    stats: mut_view<VecLowerStats>,
+    arena: mut_view<Arena>
+) -> u32 {
+    let vty = vec_lower_legalize_type(caps, elem_kind, lane_count);
+    let dst = vec_lower_alloc_vreg(mut_view(*vbody), REG_CLASS_GPR);
+    let inst = vec_lower_make_inst(
+        LIR_INST_VREDUCE, vreduce_op, view(vty), dst, src_vreg, VREG_NONE, VREG_NONE,
+        0u32, 0i32, 0u8, LIR_MEM_FLAG_NONE, 0u16, false
+    );
+    let _ = vec_lower_push_inst(mut_view(*vbody), view(inst), mut_view(*stats), mut_view(*arena));
+    dst
+}
+
+pub fn vec_lower_emit_vzeroupper(
+    vbody: mut_view<LirVecBody>,
+    before_ret: bool,
+    stats: mut_view<VecLowerStats>,
+    arena: mut_view<Arena>
+) {
+    let vty = LirVectorType {
+        vec_kind: LIR_VEC_TY_V256,
+        reg_class: REG_CLASS_VEC256,
+        elem_kind: VEC_ELEM_NONE,
+        elem_bits: 0u16,
+        lane_count: 0u8,
+        total_bits: 256u16,
+        alloc_bits: 256u16,
+        split_count: 1u8,
+    };
+    let inst = vec_lower_make_inst(
+        LIR_INST_VZEROUPPER, if before_ret { 1u8 } else { 0u8 }, view(vty),
+        VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, 0u32, 0i32, 0u8, LIR_MEM_FLAG_NONE, 0u16, false
+    );
+    let _ = vec_lower_push_inst(mut_view(*vbody), view(inst), mut_view(*stats), mut_view(*arena));
+    if before_ret {
+        vbody.frame.vzeroupper_before_ret = true;
+    } else {
+        vbody.frame.vzeroupper_before_calls = vbody.frame.vzeroupper_before_calls + 1u32;
+    }
+}
+
+// --- 4. OptIR Vector Instruction, LoopVecRecord & SlpTree Lowering (SPEC-74 §6.5, AXS-VEC-048) ---
+
+pub fn vec_lower_opt_inst(
+    vbody: mut_view<LirVecBody>,
+    caps: view<TargetSimdCaps>,
+    inst: view<OptInst>,
+    elem_kind: u8,
+    lane_count: u8,
+    align_status: u8,
+    known_align_bytes: u16,
+    stats: mut_view<VecLowerStats>,
+    arena: mut_view<Arena>
+) -> u32 {
+    let opc = inst.opcode;
+    if opc < OPT_INST_VLOAD || opc > OPT_INST_VREDUCE {
+        return VREG_NONE;
+    }
+    stats.opt_vec_insts_lowered = stats.opt_vec_insts_lowered + 1u32;
+    let vty = vec_lower_legalize_type(caps, elem_kind, lane_count);
+
+    if opc == OPT_INST_VLOAD {
+        return vec_lower_emit_load(
+            mut_view(*vbody), caps, elem_kind, lane_count,
+            inst.rhs_place.local.v, 0i32, align_status, known_align_bytes,
+            mut_view(*stats), mut_view(*arena)
+        );
+    }
+    if opc == OPT_INST_VSTORE {
+        vec_lower_emit_store(
+            mut_view(*vbody), caps, elem_kind, lane_count,
+            inst.lhs.v, inst.place.local.v, 0i32, align_status, known_align_bytes,
+            mut_view(*stats), mut_view(*arena)
+        );
+        return VREG_NONE;
+    }
+    if opc == OPT_INST_VLOAD_MASKED {
+        let mflags = vec_lower_select_mem_flags(align_status, known_align_bytes, view(vty), false, false);
+        let dst = vec_lower_alloc_vreg(mut_view(*vbody), vty.reg_class);
+        let linst = vec_lower_make_inst(
+            LIR_INST_VLOAD_MASKED, 0u8, view(vty), dst, inst.lhs.v, inst.rhs.v, VREG_NONE,
+            inst.rhs_place.local.v, 0i32, 0u8, mflags, vty.elem_bits / 8u16, false
+        );
+        let _ = vec_lower_push_inst(mut_view(*vbody), view(linst), mut_view(*stats), mut_view(*arena));
+        return dst;
+    }
+    if opc == OPT_INST_VSTORE_MASKED {
+        let mflags = vec_lower_select_mem_flags(align_status, known_align_bytes, view(vty), false, false);
+        let sinst = vec_lower_make_inst(
+            LIR_INST_VSTORE_MASKED, 0u8, view(vty), VREG_NONE, inst.lhs.v, inst.rhs.v, VREG_NONE,
+            inst.place.local.v, 0i32, 0u8, mflags, vty.elem_bits / 8u16, false
+        );
+        let _ = vec_lower_push_inst(mut_view(*vbody), view(sinst), mut_view(*stats), mut_view(*arena));
+        return VREG_NONE;
+    }
+    if opc == OPT_INST_VSPLAT || opc == OPT_INST_VSTEP {
+        return vec_lower_emit_splat(
+            mut_view(*vbody), caps, elem_kind, lane_count, inst.lhs.v, mut_view(*stats), mut_view(*arena)
+        );
+    }
+    if opc == OPT_INST_VEXTRACT {
+        let dst = vec_lower_alloc_vreg(mut_view(*vbody), REG_CLASS_GPR);
+        let einst = vec_lower_make_inst(
+            LIR_INST_VEXTRACT, 0u8, view(vty), dst, inst.lhs.v, VREG_NONE, VREG_NONE,
+            0u32, 0i32, inst.sub_op, LIR_MEM_FLAG_NONE, 0u16, false
+        );
+        let _ = vec_lower_push_inst(mut_view(*vbody), view(einst), mut_view(*stats), mut_view(*arena));
+        return dst;
+    }
+    if opc == OPT_INST_VINSERT {
+        let dst = vec_lower_alloc_vreg(mut_view(*vbody), vty.reg_class);
+        let iinst = vec_lower_make_inst(
+            LIR_INST_VINSERT, 0u8, view(vty), dst, inst.lhs.v, inst.rhs.v, VREG_NONE,
+            0u32, 0i32, inst.sub_op, LIR_MEM_FLAG_NONE, 0u16, false
+        );
+        let _ = vec_lower_push_inst(mut_view(*vbody), view(iinst), mut_view(*stats), mut_view(*arena));
+        return dst;
+    }
+    if opc == OPT_INST_VSHUFFLE {
+        let dst = vec_lower_alloc_vreg(mut_view(*vbody), vty.reg_class);
+        let shinst = vec_lower_make_inst(
+            LIR_INST_VSHUFFLE, inst.sub_op, view(vty), dst, inst.lhs.v, inst.rhs.v, VREG_NONE,
+            0u32, 0i32, inst.sub_op, LIR_MEM_FLAG_NONE, 0u16, false
+        );
+        let _ = vec_lower_push_inst(mut_view(*vbody), view(shinst), mut_view(*stats), mut_view(*arena));
+        return dst;
+    }
+    if opc == OPT_INST_VBINOP {
+        return vec_lower_emit_binop(
+            mut_view(*vbody), caps, elem_kind, lane_count, inst.sub_op,
+            inst.lhs.v, inst.rhs.v, mut_view(*stats), mut_view(*arena)
+        );
+    }
+    if opc == OPT_INST_VFMA {
+        let dst = vec_lower_alloc_vreg(mut_view(*vbody), vty.reg_class);
+        let finst = vec_lower_make_inst(
+            LIR_INST_VFMA, inst.sub_op, view(vty), dst, inst.lhs.v, inst.rhs.v, inst.result.v,
+            0u32, 0i32, 0u8, LIR_MEM_FLAG_NONE, 0u16, false
+        );
+        let _ = vec_lower_push_inst(mut_view(*vbody), view(finst), mut_view(*stats), mut_view(*arena));
+        return dst;
+    }
+    if opc == OPT_INST_VCMP {
+        let dst = vec_lower_alloc_vreg(mut_view(*vbody), vty.reg_class);
+        let cinst = vec_lower_make_inst(
+            LIR_INST_VCMP, inst.sub_op, view(vty), dst, inst.lhs.v, inst.rhs.v, VREG_NONE,
+            0u32, 0i32, 0u8, LIR_MEM_FLAG_NONE, 0u16, false
+        );
+        let _ = vec_lower_push_inst(mut_view(*vbody), view(cinst), mut_view(*stats), mut_view(*arena));
+        return dst;
+    }
+    if opc == OPT_INST_VSELECT {
+        let dst = vec_lower_alloc_vreg(mut_view(*vbody), vty.reg_class);
+        let selinst = vec_lower_make_inst(
+            LIR_INST_VSELECT, inst.sub_op, view(vty), dst, inst.lhs.v, inst.rhs.v, inst.result.v,
+            0u32, 0i32, 0u8, LIR_MEM_FLAG_NONE, 0u16, false
+        );
+        let _ = vec_lower_push_inst(mut_view(*vbody), view(selinst), mut_view(*stats), mut_view(*arena));
+        return dst;
+    }
+    if opc == OPT_INST_VCAST {
+        let dst = vec_lower_alloc_vreg(mut_view(*vbody), vty.reg_class);
+        let cstinst = vec_lower_make_inst(
+            LIR_INST_VCAST, inst.sub_op, view(vty), dst, inst.lhs.v, VREG_NONE, VREG_NONE,
+            0u32, 0i32, 0u8, LIR_MEM_FLAG_NONE, 0u16, false
+        );
+        let _ = vec_lower_push_inst(mut_view(*vbody), view(cstinst), mut_view(*stats), mut_view(*arena));
+        return dst;
+    }
+    if opc == OPT_INST_VREDUCE {
+        return vec_lower_emit_reduce(
+            mut_view(*vbody), caps, elem_kind, lane_count, inst.sub_op, inst.lhs.v, mut_view(*stats), mut_view(*arena)
+        );
+    }
+    VREG_NONE
+}
+
+pub fn vec_lower_loop_record(
+    vbody: mut_view<LirVecBody>,
+    caps: view<TargetSimdCaps>,
+    rec: view<LoopVecRecord>,
+    align_status: u8,
+    known_align_bytes: u16,
+    stats: mut_view<VecLowerStats>,
+    arena: mut_view<Arena>
+) -> bool {
+    if !rec.applied || (rec.vf) < 2u8 || rec.elem_kind == VEC_ELEM_NONE {
+        return false;
+    }
+    stats.loop_records_lowered = stats.loop_records_lowered + 1u32;
+    let ek = rec.elem_kind;
+    let vf = rec.vf;
+
+    let mut last_vec_vr: u32 = VREG_NONE;
+    let mut i: u8 = 0u8;
+    while i < rec.vload_count {
+        last_vec_vr = vec_lower_emit_load(
+            mut_view(*vbody), caps, ek, vf, (i as u32) + 1u32, 0i32,
+            align_status, known_align_bytes, mut_view(*stats), mut_view(*arena)
+        );
+        i = i + 1u8;
+    }
+
+    i = 0u8;
+    while i < (rec.vsplat_count + rec.vstep_count) {
+        let svr = vec_lower_emit_splat(mut_view(*vbody), caps, ek, vf, (i as u32) + 10u32, mut_view(*stats), mut_view(*arena));
+        if last_vec_vr == VREG_NONE {
+            last_vec_vr = svr;
+        }
+        i = i + 1u8;
+    }
+
+    i = 0u8;
+    while i < rec.vbinop_count {
+        let lhs_use = if last_vec_vr != VREG_NONE { last_vec_vr } else { 100u32 };
+        last_vec_vr = vec_lower_emit_binop(
+            mut_view(*vbody), caps, ek, vf, MIR_BINOP_ADD, lhs_use, lhs_use, mut_view(*stats), mut_view(*arena)
+        );
+        i = i + 1u8;
+    }
+
+    i = 0u8;
+    while i < rec.vselect_count {
+        let vty = vec_lower_legalize_type(caps, ek, vf);
+        let dst = vec_lower_alloc_vreg(mut_view(*vbody), vty.reg_class);
+        let sel = vec_lower_make_inst(
+            LIR_INST_VSELECT, 0u8, view(vty), dst, last_vec_vr, last_vec_vr, last_vec_vr,
+            0u32, 0i32, 0u8, LIR_MEM_FLAG_NONE, 0u16, false
+        );
+        let _ = vec_lower_push_inst(mut_view(*vbody), view(sel), mut_view(*stats), mut_view(*arena));
+        last_vec_vr = dst;
+        i = i + 1u8;
+    }
+
+    i = 0u8;
+    while i < rec.vstore_count {
+        let src_use = if last_vec_vr != VREG_NONE { last_vec_vr } else { 100u32 };
+        vec_lower_emit_store(
+            mut_view(*vbody), caps, ek, vf, src_use, (i as u32) + 1u32, 0i32,
+            align_status, known_align_bytes, mut_view(*stats), mut_view(*arena)
+        );
+        i = i + 1u8;
+    }
+
+    if rec.vreduce_count > 0u8 || rec.reduction_op != VREDUCE_NONE {
+        let red_op = if rec.reduction_op != VREDUCE_NONE { rec.reduction_op } else { VREDUCE_ADD };
+        let src_use = if last_vec_vr != VREG_NONE { last_vec_vr } else { 100u32 };
+        let _ = vec_lower_emit_reduce(
+            mut_view(*vbody), caps, ek, vf, red_op, src_use, mut_view(*stats), mut_view(*arena)
+        );
+    }
+
+    if vbody.frame.uses_ymm && !vbody.frame.vzeroupper_before_ret {
+        vec_lower_emit_vzeroupper(mut_view(*vbody), true, mut_view(*stats), mut_view(*arena));
+    }
+    true
+}
+
+pub fn vec_lower_slp_tree(
+    vbody: mut_view<LirVecBody>,
+    caps: view<TargetSimdCaps>,
+    tree: view<SlpTree>,
+    align_status: u8,
+    known_align_bytes: u16,
+    stats: mut_view<VecLowerStats>,
+    arena: mut_view<Arena>
+) -> bool {
+    if !tree.is_valid || !tree.cost.profitable || tree.node_count == 0 || (tree.nodes as usize) == 0 {
+        return false;
+    }
+    stats.slp_trees_lowered = stats.slp_trees_lowered + 1u32;
+    let ek = tree.elem_kind;
+    let lanes = tree.lane_count;
+    let ebytes: i32 = ((vec_elem_bit_width(ek) / 8u16) as i32);
+    let vty = vec_lower_legalize_type(caps, ek, lanes);
+
+    let mut node_vregs: [64]u32 = [
+        VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE,
+        VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE,
+        VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE,
+        VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE,
+        VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE,
+        VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE,
+        VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE,
+        VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE, VREG_NONE
+    ];
+
+    let mut n: usize = 0;
+    while n < tree.node_count && n < 64 {
+        let nd = unsafe { slp_node_at(tree.nodes, n) };
+        let nk = unsafe { (*nd).kind };
+        let vopc = unsafe { (*nd).vec_opcode };
+        let lch = unsafe { (*nd).left_child };
+        let rch = unsafe { (*nd).right_child };
+        let disp: i32 = ((unsafe { (*nd).start_offset }) as i32) * ebytes;
+
+        if nk == SLP_NODE_BROADCAST {
+            let s_val = (unsafe { (*nd).lane_vals[0].v });
+            node_vregs[n] = vec_lower_emit_splat(mut_view(*vbody), caps, ek, lanes, s_val, mut_view(*stats), mut_view(*arena));
+        } else if nk == SLP_NODE_GATHER_PACK {
+            let mut cur_vr = vec_lower_alloc_vreg(mut_view(*vbody), vty.reg_class);
+            let mut l: u8 = 0u8;
+            while l < lanes {
+                let lval = unsafe { (*nd).lane_vals[l as usize].v };
+                let iinst = vec_lower_make_inst(
+                    LIR_INST_VINSERT, 0u8, view(vty), cur_vr, cur_vr, lval, VREG_NONE,
+                    0u32, 0i32, l, LIR_MEM_FLAG_NONE, 0u16, false
+                );
+                let _ = vec_lower_push_inst(mut_view(*vbody), view(iinst), mut_view(*stats), mut_view(*arena));
+                l = l + 1u8;
+            }
+            node_vregs[n] = cur_vr;
+        } else if nk == SLP_NODE_VECTORIZABLE {
+            if vopc == OPT_INST_VLOAD {
+                node_vregs[n] = vec_lower_emit_load(
+                    mut_view(*vbody), caps, ek, lanes, unsafe { (*nd).base_local.v }, disp,
+                    align_status, known_align_bytes, mut_view(*stats), mut_view(*arena)
+                );
+            } else if vopc == OPT_INST_VSTORE {
+                let src_vr = if (lch as usize) < n { node_vregs[lch as usize] } else { 100u32 };
+                vec_lower_emit_store(
+                    mut_view(*vbody), caps, ek, lanes, src_vr, unsafe { (*nd).base_local.v }, disp,
+                    align_status, known_align_bytes, mut_view(*stats), mut_view(*arena)
+                );
+                node_vregs[n] = src_vr;
+            } else if vopc == OPT_INST_VCAST {
+                let lhs_vr = if (lch as usize) < n { node_vregs[lch as usize] } else { 100u32 };
+                let dst = vec_lower_alloc_vreg(mut_view(*vbody), vty.reg_class);
+                let cinst = vec_lower_make_inst(
+                    LIR_INST_VCAST, unsafe { (*nd).sub_op }, view(vty), dst, lhs_vr, VREG_NONE, VREG_NONE,
+                    0u32, 0i32, 0u8, LIR_MEM_FLAG_NONE, 0u16, false
+                );
+                let _ = vec_lower_push_inst(mut_view(*vbody), view(cinst), mut_view(*stats), mut_view(*arena));
+                node_vregs[n] = dst;
+            } else {
+                let lhs_vr = if (lch as usize) < n { node_vregs[lch as usize] } else { 100u32 };
+                let rhs_vr = if (rch as usize) < n { node_vregs[rch as usize] } else { lhs_vr };
+                node_vregs[n] = vec_lower_emit_binop(
+                    mut_view(*vbody), caps, ek, lanes, unsafe { (*nd).sub_op },
+                    lhs_vr, rhs_vr, mut_view(*stats), mut_view(*arena)
+                );
+            }
+        } else if nk == SLP_NODE_REDUCTION_ROOT {
+            let src_vr = if (lch as usize) < n { node_vregs[lch as usize] } else { 100u32 };
+            node_vregs[n] = vec_lower_emit_reduce(
+                mut_view(*vbody), caps, ek, lanes, unsafe { (*nd).sub_op }, src_vr, mut_view(*stats), mut_view(*arena)
+            );
+        }
+        n = n + 1;
+    }
+
+    let mut e: u16 = 0u16;
+    while e < tree.cost.external_extracts {
+        let dst = vec_lower_alloc_vreg(mut_view(*vbody), REG_CLASS_GPR);
+        let src_vr = if tree.node_count > 0 { node_vregs[0] } else { 100u32 };
+        let einst = vec_lower_make_inst(
+            LIR_INST_VEXTRACT, 0u8, view(vty), dst, src_vr, VREG_NONE, VREG_NONE,
+            0u32, 0i32, (e as u8) & (lanes - 1u8), LIR_MEM_FLAG_NONE, 0u16, false
+        );
+        let _ = vec_lower_push_inst(mut_view(*vbody), view(einst), mut_view(*stats), mut_view(*arena));
+        e = e + 1u16;
+    }
+
+    if vbody.frame.uses_ymm && !vbody.frame.vzeroupper_before_ret {
+        vec_lower_emit_vzeroupper(mut_view(*vbody), true, mut_view(*stats), mut_view(*arena));
+    }
+    true
+}
+
+pub fn vec_lower_opt_body(
+    obody: view<OptBody>,
+    caps: view<TargetSimdCaps>,
+    default_lanes: u8,
+    align_status: u8,
+    known_align_bytes: u16,
+    vbody: mut_view<LirVecBody>,
+    stats: mut_view<VecLowerStats>,
+    arena: mut_view<Arena>
+) -> bool {
+    vec_lower_body_init(mut_view(*vbody), obody.fn_sym, caps.isa_level);
+    stats.bodies_lowered = stats.bodies_lowered + 1u32;
+
+    let lanes_use: u8 = if default_lanes >= 2u8 { default_lanes } else { 4u8 };
+    let mut b: usize = 0;
+    while b < obody.bb_count {
+        let bb = unsafe { opt_block_at(obody.blocks, b) };
+        if unsafe { (*bb).is_reachable } {
+            let icnt = unsafe { (*bb).inst_count };
+            let mut i: usize = 0;
+            while i < icnt {
+                let inst = unsafe { opt_inst_at((*bb).insts, i) };
+                let opc = unsafe { (*inst).opcode };
+                if opc >= OPT_INST_VLOAD && opc <= OPT_INST_VREDUCE {
+                    let mut ek = vec_classify_type_elem(obody.thir, unsafe { (*inst).ty });
+                    if ek == VEC_ELEM_NONE {
+                        ek = 5u8; // default VEC_ELEM_I32 when untyped synthetic vector inst
+                    }
+                    let _ = vec_lower_opt_inst(
+                        mut_view(*vbody), caps, unsafe { view(*inst) }, ek, lanes_use,
+                        align_status, known_align_bytes, mut_view(*stats), mut_view(*arena)
+                    );
+                }
+                i = i + 1;
+            }
+            if unsafe { (*bb).has_term } {
+                let tk = unsafe { (*bb).term.kind };
+                if tk == OPT_TERM_CALL && vbody.frame.uses_ymm {
+                    vec_lower_emit_vzeroupper(mut_view(*vbody), false, mut_view(*stats), mut_view(*arena));
+                } else if tk == OPT_TERM_RETURN && vbody.frame.uses_ymm && !vbody.frame.vzeroupper_before_ret {
+                    vec_lower_emit_vzeroupper(mut_view(*vbody), true, mut_view(*stats), mut_view(*arena));
+                }
+            }
+        }
+        b = b + 1;
+    }
+
+    if vbody.frame.uses_ymm && !vbody.frame.vzeroupper_before_ret {
+        vec_lower_emit_vzeroupper(mut_view(*vbody), true, mut_view(*stats), mut_view(*arena));
+    }
+    true
+}
+
+// --- 5. LIR Vector Lowering Verifier & Deterministic Formatter (SPEC-74 §6.5, SPEC-43 §7) ---
+
+pub fn vec_lower_verify_body(
+    vbody: view<LirVecBody>,
+    caps: view<TargetSimdCaps>,
+    stats: mut_view<VecLowerStats>
+) -> bool {
+    if vbody.frame.uses_ymm {
+        if !vbody.frame.requires_32_byte_alignment || (vbody.frame.stack_vec_slot_align) < 32u16 || !vbody.frame.vzeroupper_before_ret {
+            stats.verify_errors = stats.verify_errors + 1u32;
+            return false;
+        }
+    }
+    let mut i: usize = 0;
+    while i < vbody.inst_count && (vbody.insts as usize) != 0 {
+        let inst = unsafe { lir_vec_inst_at(vbody.insts, i) };
+        let opc = unsafe { (*inst).opcode };
+        let vk = unsafe { (*inst).vec_ty.vec_kind };
+        let tbits = unsafe { (*inst).vec_ty.total_bits };
+        let ek = unsafe { (*inst).vec_ty.elem_kind };
+        let is_fp = vec_elem_is_float(ek);
+        let max_bits: u16 = if is_fp { caps.max_fp_vec_bits } else { caps.max_int_vec_bits };
+
+        if opc != LIR_INST_VZEROUPPER {
+            // A 128-bit-only target must never emit unsplit LIR_VEC_TY_V256 instructions
+            if vk == LIR_VEC_TY_V256 && max_bits < 256u16 {
+                stats.verify_errors = stats.verify_errors + 1u32;
+                return false;
+            }
+            // Sub-128-bit 64-bit memory transfers must use LIR_INST_VMOVQ_64, never full 128-bit VLOAD/VSTORE
+            if tbits == 64u16 && (opc == LIR_INST_VLOAD || opc == LIR_INST_VSTORE) {
+                stats.verify_errors = stats.verify_errors + 1u32;
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    true
+}
+
+const VLOW_STR_DATA: [187]u8 = [
+    // 0: "lir_vec_lower {\n" (16)
+    108u8, 105u8, 114u8, 95u8, 118u8, 101u8, 99u8, 95u8, 108u8, 111u8, 119u8, 101u8, 114u8, 32u8, 123u8, 10u8,
+    // 1: "  isa=" (6)
+    32u8, 32u8, 105u8, 115u8, 97u8, 61u8,
+    // 2: " insts=" (7)
+    32u8, 105u8, 110u8, 115u8, 116u8, 115u8, 61u8,
+    // 3: " uses_xmm=" (10)
+    32u8, 117u8, 115u8, 101u8, 115u8, 95u8, 120u8, 109u8, 109u8, 61u8,
+    // 4: " uses_ymm=" (10)
+    32u8, 117u8, 115u8, 101u8, 115u8, 95u8, 121u8, 109u8, 109u8, 61u8,
+    // 5: " align32=" (9)
+    32u8, 97u8, 108u8, 105u8, 103u8, 110u8, 51u8, 50u8, 61u8,
+    // 6: " vzeroupper=" (12)
+    32u8, 118u8, 122u8, 101u8, 114u8, 111u8, 117u8, 112u8, 112u8, 101u8, 114u8, 61u8,
+    // 7: "\n  ops: v128=" (13)
+    10u8, 32u8, 32u8, 111u8, 112u8, 115u8, 58u8, 32u8, 118u8, 49u8, 50u8, 56u8, 61u8,
+    // 8: " v256=" (6)
+    32u8, 118u8, 50u8, 53u8, 54u8, 61u8,
+    // 9: " movq64=" (8)
+    32u8, 109u8, 111u8, 118u8, 113u8, 54u8, 52u8, 61u8,
+    // 10: " split256=" (10)
+    32u8, 115u8, 112u8, 108u8, 105u8, 116u8, 50u8, 53u8, 54u8, 61u8,
+    // 11: " aligned=" (9)
+    32u8, 97u8, 108u8, 105u8, 103u8, 110u8, 101u8, 100u8, 61u8,
+    // 12: " unaligned=" (11)
+    32u8, 117u8, 110u8, 97u8, 108u8, 105u8, 103u8, 110u8, 101u8, 100u8, 61u8,
+    // 13: " scalarized=" (12)
+    32u8, 115u8, 99u8, 97u8, 108u8, 97u8, 114u8, 105u8, 122u8, 101u8, 100u8, 61u8,
+    // 14: "\n  inst[" (8)
+    10u8, 32u8, 32u8, 105u8, 110u8, 115u8, 116u8, 91u8,
+    // 15: "]: op=" (6)
+    93u8, 58u8, 32u8, 111u8, 112u8, 61u8,
+    // 16: " vty=" (5)
+    32u8, 118u8, 116u8, 121u8, 61u8,
+    // 17: " lanes=" (7)
+    32u8, 108u8, 97u8, 110u8, 101u8, 115u8, 61u8,
+    // 18: " bits=" (6)
+    32u8, 98u8, 105u8, 116u8, 115u8, 61u8,
+    // 19: " dst=" (5)
+    32u8, 100u8, 115u8, 116u8, 61u8,
+    // 20: " mflags=" (8)
+    32u8, 109u8, 102u8, 108u8, 97u8, 103u8, 115u8, 61u8,
+    // 21: "\n}\n" (3)
+    10u8, 125u8, 10u8
+];
+
+const VLOW_STR_OFF: [23]u32 = [
+    0u32, 16u32, 22u32, 29u32, 39u32, 49u32, 58u32, 70u32,
+    83u32, 89u32, 97u32, 107u32, 116u32, 127u32, 139u32, 147u32,
+    153u32, 158u32, 165u32, 171u32, 176u32, 184u32, 187u32
+];
+
+fn vlow_push_str(buf: mut_view<DiagBuffer>, idx: usize) {
+    let start = VLOW_STR_OFF[idx] as usize;
+    let end = VLOW_STR_OFF[idx + 1] as usize;
+    let mut i = start;
+    while i < end {
+        diag_buf_push_byte(mut_view(*buf), VLOW_STR_DATA[i]);
+        i = i + 1;
+    }
+}
+
+pub fn vec_lower_print(vbody: view<LirVecBody>, stats: view<VecLowerStats>, buf: mut_view<DiagBuffer>) {
+    vlow_push_str(mut_view(*buf), 0);
+    vlow_push_str(mut_view(*buf), 1);
+    diag_buf_push_u32(mut_view(*buf), vbody.isa_level as u32);
+    vlow_push_str(mut_view(*buf), 2);
+    diag_buf_push_u32(mut_view(*buf), vbody.inst_count as u32);
+    vlow_push_str(mut_view(*buf), 3);
+    diag_buf_push_u32(mut_view(*buf), if vbody.frame.uses_xmm { 1u32 } else { 0u32 });
+    vlow_push_str(mut_view(*buf), 4);
+    diag_buf_push_u32(mut_view(*buf), if vbody.frame.uses_ymm { 1u32 } else { 0u32 });
+    vlow_push_str(mut_view(*buf), 5);
+    diag_buf_push_u32(mut_view(*buf), if vbody.frame.requires_32_byte_alignment { 1u32 } else { 0u32 });
+    vlow_push_str(mut_view(*buf), 6);
+    diag_buf_push_u32(mut_view(*buf), stats.vzeroupper_emitted);
+
+    vlow_push_str(mut_view(*buf), 7);
+    diag_buf_push_u32(mut_view(*buf), stats.vec128_ops_emitted);
+    vlow_push_str(mut_view(*buf), 8);
+    diag_buf_push_u32(mut_view(*buf), stats.vec256_ops_emitted);
+    vlow_push_str(mut_view(*buf), 9);
+    diag_buf_push_u32(mut_view(*buf), stats.narrow_64_movq_emitted);
+    vlow_push_str(mut_view(*buf), 10);
+    diag_buf_push_u32(mut_view(*buf), stats.split_256_to_128_pairs);
+    vlow_push_str(mut_view(*buf), 11);
+    diag_buf_push_u32(mut_view(*buf), stats.aligned_mem_ops);
+    vlow_push_str(mut_view(*buf), 12);
+    diag_buf_push_u32(mut_view(*buf), stats.unaligned_mem_ops);
+    vlow_push_str(mut_view(*buf), 13);
+    diag_buf_push_u32(mut_view(*buf), stats.scalarized_ops_emitted);
+
+    let mut i: usize = 0;
+    while i < vbody.inst_count && (vbody.insts as usize) != 0 {
+        let inst = unsafe { lir_vec_inst_at(vbody.insts, i) };
+        vlow_push_str(mut_view(*buf), 14);
+        diag_buf_push_u32(mut_view(*buf), i as u32);
+        vlow_push_str(mut_view(*buf), 15);
+        diag_buf_push_u32(mut_view(*buf), (unsafe { (*inst).opcode }) as u32);
+        vlow_push_str(mut_view(*buf), 16);
+        diag_buf_push_u32(mut_view(*buf), (unsafe { (*inst).vec_ty.vec_kind }) as u32);
+        vlow_push_str(mut_view(*buf), 17);
+        diag_buf_push_u32(mut_view(*buf), (unsafe { (*inst).vec_ty.lane_count }) as u32);
+        vlow_push_str(mut_view(*buf), 18);
+        diag_buf_push_u32(mut_view(*buf), (unsafe { (*inst).vec_ty.total_bits }) as u32);
+        vlow_push_str(mut_view(*buf), 19);
+        diag_buf_push_u32(mut_view(*buf), unsafe { (*inst).dst_vreg });
+        vlow_push_str(mut_view(*buf), 20);
+        diag_buf_push_u32(mut_view(*buf), (unsafe { (*inst).mem_flags }) as u32);
+        i = i + 1;
+    }
+
+    vlow_push_str(mut_view(*buf), 21);
+}

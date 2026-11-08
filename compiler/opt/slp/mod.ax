@@ -1,0 +1,2903 @@
+// Straight-line Superword-Level Parallelism (SLP) basic-block vectorization, isomorphic DAG
+// tree construction, MemorySSA/AliasInfo scheduling verification, and target SIMD cost model (T618 / E15.5).
+// Implements SPEC-74 §5..§10 (AXS-VEC-036..053, REQ-OPT-213..215, REQ-OPT-219..222).
+module compiler.opt.slp
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.FileId
+use compiler.kernel.id.TypeId
+use compiler.source.span.Span
+use compiler.diag.emitter.DiagSink
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_u32
+use compiler.hir.hir.HirItem
+use compiler.types.types.TY_ARRAY
+use compiler.types.types.TY_MUT_VIEW
+use compiler.types.types.TY_PTR
+use compiler.types.types.TY_SLICE
+use compiler.types.types.TY_STRUCT
+use compiler.types.types.TY_TUPLE
+use compiler.types.types.TY_VIEW
+use compiler.types.types.Thir
+use compiler.types.types.type_get
+use compiler.types.types.typeid_at
+use compiler.mir.mir.MIR_BINOP_ADD
+use compiler.mir.mir.MIR_BINOP_BIT_AND
+use compiler.mir.mir.MIR_BINOP_BIT_OR
+use compiler.mir.mir.MIR_BINOP_BIT_XOR
+use compiler.mir.mir.MIR_BINOP_DIV
+use compiler.mir.mir.MIR_BINOP_MUL
+use compiler.mir.mir.MIR_BINOP_REM
+use compiler.mir.mir.MIR_BINOP_SHL
+use compiler.mir.mir.MIR_BINOP_SHR
+use compiler.mir.mir.MIR_BINOP_SUB
+use compiler.mir.mir.MIR_BINOP_WRAPPING_ADD
+use compiler.mir.mir.MIR_BINOP_WRAPPING_MUL
+use compiler.mir.mir.MIR_BINOP_WRAPPING_SUB
+use compiler.mir.mir.MIR_DROP_FLAG_NONE
+use compiler.mir.mir.MIR_PROJ_DEREF
+use compiler.mir.mir.MIR_PROJ_FIELD
+use compiler.mir.mir.MIR_PROJ_INDEX
+use compiler.mir.mir.MIR_STMT_ATOMIC
+use compiler.mir.mir.MIR_STMT_DROP
+use compiler.mir.mir.MIR_UNOP_NEG
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.MirLocalId
+use compiler.mir.mir.MirPlace
+use compiler.mir.mir.mir_local_place
+use compiler.mir.mir.mir_proj_at
+use compiler.verify.verifier.verify_mir
+use compiler.opt.optir.ANALYSIS_ALIAS_INFO
+use compiler.opt.optir.ANALYSIS_MEMORY_SSA
+use compiler.opt.optir.ANALYSIS_RANGE_INFO
+use compiler.opt.optir.CERTAINTY_POSSIBLE
+use compiler.opt.optir.CERTAINTY_PROVEN
+use compiler.opt.optir.CERTAINTY_UNKNOWN
+use compiler.opt.optir.OPT_BB_NONE
+use compiler.opt.optir.OPT_FLAG_BARRIER
+use compiler.opt.optir.OPT_FLAG_MAY_TRAP
+use compiler.opt.optir.OPT_FLAG_STORAGE_DEAD
+use compiler.opt.optir.OPT_FLAG_STORAGE_LIVE
+use compiler.opt.optir.OPT_INST_ATOMIC
+use compiler.opt.optir.OPT_INST_BINOP
+use compiler.opt.optir.OPT_INST_BLACK_BOX
+use compiler.opt.optir.OPT_INST_CAST
+use compiler.opt.optir.OPT_INST_CHECKED_BINOP
+use compiler.opt.optir.OPT_INST_CONST
+use compiler.opt.optir.OPT_INST_COPY
+use compiler.opt.optir.OPT_INST_DROP_FLAG
+use compiler.opt.optir.OPT_INST_EXTRACT_FIELD
+use compiler.opt.optir.OPT_INST_INSERT_FIELD
+use compiler.opt.optir.OPT_INST_LOAD
+use compiler.opt.optir.OPT_INST_NONE
+use compiler.opt.optir.OPT_INST_NOP
+use compiler.opt.optir.OPT_INST_STORE
+use compiler.opt.optir.OPT_INST_UNOP
+use compiler.opt.optir.OPT_INST_VOLATILE_LOAD
+use compiler.opt.optir.OPT_INST_VOLATILE_STORE
+use compiler.opt.optir.OPT_INST_WRAPPING_BINOP
+use compiler.opt.optir.OPT_INST_ZEROIZE
+use compiler.opt.optir.OPT_PROJ_NONE
+use compiler.opt.optir.OPT_TERM_CALL
+use compiler.opt.optir.OPT_TERM_DROP
+use compiler.opt.optir.OPT_VALUE_NONE
+use compiler.opt.optir.OPT_VAL_CONST
+use compiler.opt.optir.OPT_VAL_INST
+use compiler.opt.optir.OPT_VAL_PARAM
+use compiler.opt.optir.OPT_VAL_PHI
+use compiler.opt.optir.OptBbId
+use compiler.opt.optir.OptBlock
+use compiler.opt.optir.OptBody
+use compiler.opt.optir.OptInst
+use compiler.opt.optir.OptInstId
+use compiler.opt.optir.OptValueId
+use compiler.opt.optir.PROP_IN_BOUNDS
+use compiler.opt.optir.PROP_NO_ALIAS
+use compiler.opt.optir.PROP_NO_OVERFLOW
+use compiler.opt.optir.opt_block_at
+use compiler.opt.optir.opt_inst_at
+use compiler.opt.optir.opt_prov_at
+use compiler.opt.optir.opt_typeid_at
+use compiler.opt.optir.opt_val_at
+use compiler.opt.optir.optir_build_from_mir
+use compiler.opt.optir.optir_reconstruct_mir
+use compiler.opt.optir.optir_record_provenance
+use compiler.opt.optir.optir_verify_contract
+use compiler.opt.effects.EffectCallTable
+use compiler.opt.alias.AliasInfo
+use compiler.opt.alias.DOMAIN_FIXED_MMIO
+use compiler.opt.alias.alias_build_info
+use compiler.opt.alias.alias_extract_region
+use compiler.opt.alias.alias_is_no_alias_proven
+use compiler.opt.alias.alias_make_prog_pt
+use compiler.opt.alias.alias_query_regions
+use compiler.opt.passmgr.ANALYSIS_MASK_ALIAS_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_CFG
+use compiler.opt.passmgr.ANALYSIS_MASK_DOMINATORS
+use compiler.opt.passmgr.ANALYSIS_MASK_EFFECT_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_LOOP_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_MEMORY_SSA
+use compiler.opt.passmgr.ANALYSIS_MASK_RANGE_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_SSA
+use compiler.opt.passmgr.OPT_PROFILE_DEBUG_O0
+use compiler.opt.passmgr.OPT_PROFILE_SIZE_OS
+use compiler.opt.passmgr.POSTCOND_ALL
+use compiler.opt.passmgr.PROP_MASK_IN_BOUNDS
+use compiler.opt.passmgr.PROP_MASK_NO_ALIAS
+use compiler.opt.passmgr.PROP_MASK_NO_OVERFLOW
+use compiler.opt.passmgr.PassManager
+use compiler.opt.passmgr.TransformationContract
+use compiler.opt.passmgr.opt_budget_for_profile
+use compiler.opt.passmgr.passmgr_ensure_analyses
+use compiler.opt.passmgr.passmgr_init
+use compiler.opt.passmgr.passmgr_invalidate_analyses
+use compiler.opt.passmgr.passmgr_mark_all_valid_from_lowering
+use compiler.opt.passmgr.passmgr_rollback_body
+use compiler.opt.passmgr.passmgr_snapshot_body
+use compiler.opt.bce.BceSiteRecord
+use compiler.opt.bce.BceStats
+use compiler.opt.bce.bce_stats_zero
+use compiler.opt.bce.opt_bce
+use compiler.opt.loops.loops_stamp_valid_analysis_revs
+use compiler.opt.loops.loops_verify_pass_postconditions
+use compiler.opt.loops.lp_peel_copy
+use compiler.opt.loops.lp_val_const_int
+use compiler.opt.vectorize.COST_CONF_HIGH
+use compiler.opt.vectorize.COST_CONF_LOW
+use compiler.opt.vectorize.COST_CONF_MEDIUM
+use compiler.opt.vectorize.FP_MODE_RELAXED
+use compiler.opt.vectorize.OPT_INST_VBINOP
+use compiler.opt.vectorize.OPT_INST_VCAST
+use compiler.opt.vectorize.OPT_INST_VEXTRACT
+use compiler.opt.vectorize.OPT_INST_VINSERT
+use compiler.opt.vectorize.OPT_INST_VLOAD
+use compiler.opt.vectorize.OPT_INST_VREDUCE
+use compiler.opt.vectorize.OPT_INST_VSPLAT
+use compiler.opt.vectorize.OPT_INST_VSTORE
+use compiler.opt.vectorize.REASON_ATOMIC_BARRIER
+use compiler.opt.vectorize.REASON_CHECKED_OVERFLOW_TRAP
+use compiler.opt.vectorize.REASON_COST_NOT_PROFITABLE
+use compiler.opt.vectorize.REASON_INTERIOR_CALL_OR_DROP
+use compiler.opt.vectorize.REASON_LOOP_CARRIED_DEP
+use compiler.opt.vectorize.REASON_NON_ASSOC_REDUCTION
+use compiler.opt.vectorize.REASON_NONE
+use compiler.opt.vectorize.REASON_SIZE_PROFILE_GROWTH
+use compiler.opt.vectorize.REASON_STRICT_FP_REDUCTION
+use compiler.opt.vectorize.REASON_UNKNOWN_ALIAS
+use compiler.opt.vectorize.REASON_UNPROVEN_BOUNDS
+use compiler.opt.vectorize.REASON_VOLATILE_BARRIER
+use compiler.opt.vectorize.TARGET_ISA_SCALAR_ONLY
+use compiler.opt.vectorize.TargetSimdCaps
+use compiler.opt.vectorize.VEC_ALIAS_CAP_DISJOINT
+use compiler.opt.vectorize.VEC_ALIAS_NONE
+use compiler.opt.vectorize.VEC_ALIAS_REJECTED_MAY_ALIAS
+use compiler.opt.vectorize.VEC_ALIAS_SCEV_DISJOINT
+use compiler.opt.vectorize.VEC_ELEM_NONE
+use compiler.opt.vectorize.VREDUCE_ADD
+use compiler.opt.vectorize.VREDUCE_BIT_AND
+use compiler.opt.vectorize.VREDUCE_BIT_OR
+use compiler.opt.vectorize.VREDUCE_BIT_XOR
+use compiler.opt.vectorize.VREDUCE_MUL
+use compiler.opt.vectorize.VREDUCE_NONE
+use compiler.opt.vectorize.vec_classify_type_elem
+use compiler.opt.vectorize.vec_default_target_caps
+use compiler.opt.vectorize.vec_elem_bit_width
+use compiler.opt.vectorize.vec_elem_is_float
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+// --- Pass Identity, SLP Node Kinds, Seed Kinds & Access Taxonomy (SPEC-74 §5, §9, AXS-VEC-036..043) ---
+
+pub const PASS_SLP_VEC: u16 = 19u16;
+
+pub const SLP_MAX_LANES: usize = 8;
+pub const SLP_MAX_TREE_DEPTH: u8 = 16u8;
+pub const SLP_MAX_NODES: usize = 64;
+pub const SLP_NODE_INVALID: u16 = 0xFFFFu16;
+
+pub const SLP_NODE_NONE: u8 = 0u8;
+pub const SLP_NODE_VECTORIZABLE: u8 = 1u8;
+pub const SLP_NODE_BROADCAST: u8 = 2u8;
+pub const SLP_NODE_GATHER_PACK: u8 = 3u8;
+pub const SLP_NODE_REDUCTION_ROOT: u8 = 4u8;
+
+pub const SLP_SEED_NONE: u8 = 0u8;
+pub const SLP_SEED_ADJACENT_STORES: u8 = 1u8;
+pub const SLP_SEED_HORIZ_REDUCTION: u8 = 2u8;
+
+pub const SLP_ACC_NONE: u8 = 0u8;
+pub const SLP_ACC_STRUCT_FIELD: u8 = 1u8;
+pub const SLP_ACC_ARRAY_INDEX: u8 = 2u8;
+pub const SLP_ACC_DEREF_FIELD: u8 = 3u8;
+pub const SLP_ACC_DEREF_INDEX: u8 = 4u8;
+
+@derive(Copy)
+pub struct SlpMemAccess {
+    pub is_valid: bool,
+    pub access_kind: u8,
+    pub is_write: bool,
+    pub base_local: MirLocalId,
+    pub anchor_local: MirLocalId,
+    pub offset: i64,
+    pub elem_kind: u8,
+    pub elem_bits: u16,
+    pub inst_idx: u32,
+    pub val_id: OptValueId,
+}
+
+@derive(Copy)
+pub struct SlpNode {
+    pub node_idx: u16,
+    pub kind: u8,
+    pub lane_count: u8,
+    pub elem_kind: u8,
+    pub opcode: u8,
+    pub sub_op: u8,
+    pub vec_opcode: u8,
+    pub depth: u8,
+    pub bb_id: OptBbId,
+    pub left_child: u16,
+    pub right_child: u16,
+    pub lane_insts: [8]u32,
+    pub lane_vals: [8]OptValueId,
+    pub base_local: MirLocalId,
+    pub anchor_local: MirLocalId,
+    pub start_offset: i64,
+    pub scalar_cost: u32,
+    pub vec_cost: u32,
+    pub pack_cost: u32,
+}
+
+@derive(Copy)
+pub struct SlpCostEstimate {
+    pub bb_id: OptBbId,
+    pub seed_kind: u8,
+    pub lane_count: u8,
+    pub elem_kind: u8,
+    pub node_count: u16,
+    pub vectorizable_nodes: u16,
+    pub broadcast_nodes: u16,
+    pub gather_pack_nodes: u16,
+    pub external_extracts: u16,
+    pub scalar_cost: u32,
+    pub vec_inst_cost: u32,
+    pub pack_cost: u32,
+    pub extract_cost: u32,
+    pub spill_penalty: u32,
+    pub total_vec_cost: u32,
+    pub net_benefit: i32,
+    pub est_vec_regs: u8,
+    pub confidence: u8,
+    pub profitable: bool,
+    pub reject_reason: u8,
+}
+
+@derive(Copy)
+pub struct SlpTree {
+    pub is_valid: bool,
+    pub bb_id: OptBbId,
+    pub seed_kind: u8,
+    pub lane_count: u8,
+    pub elem_kind: u8,
+    pub elem_bits: u16,
+    pub reduction_op: u8,
+    pub reduction_root_inst: u32,
+    pub alias_proof: u8,
+    pub reject_reason: u8,
+    pub certainty: u8,
+    pub nodes: *mut SlpNode,
+    pub node_count: usize,
+    pub node_cap: usize,
+    pub cost: SlpCostEstimate,
+}
+
+@derive(Copy)
+pub struct SlpVecRecord {
+    pub pass_id: u16,
+    pub bb_id: OptBbId,
+    pub seed_kind: u8,
+    pub applied: bool,
+    pub lane_count: u8,
+    pub elem_kind: u8,
+    pub isa_level: u8,
+    pub alias_proof: u8,
+    pub reduction_op: u8,
+    pub reason: u8,
+    pub certainty: u8,
+    pub node_count: u16,
+    pub vectorizable_nodes: u16,
+    pub broadcast_nodes: u16,
+    pub gather_pack_nodes: u16,
+    pub external_extracts: u16,
+    pub vload_count: u8,
+    pub vstore_count: u8,
+    pub vsplat_count: u8,
+    pub vinsert_count: u8,
+    pub vextract_count: u8,
+    pub vbinop_count: u8,
+    pub vreduce_count: u8,
+    pub scalar_cost: u32,
+    pub vec_cost: u32,
+    pub net_benefit: i32,
+    pub confidence: u8,
+}
+
+@derive(Copy)
+pub struct SlpVecStats {
+    pub pass_runs: u32,
+    pub pass_changes: u32,
+    pub pass_rollbacks: u32,
+    pub blocks_analyzed: u32,
+    pub seeds_discovered: u32,
+    pub trees_vectorized: u32,
+    pub trees_rejected: u32,
+    pub store_chains_vectorized: u32,
+    pub reductions_vectorized: u32,
+    pub lanes_packed_total: u32,
+    pub vectorizable_nodes_emitted: u32,
+    pub broadcast_nodes_emitted: u32,
+    pub gather_packs_emitted: u32,
+    pub external_extracts_emitted: u32,
+    pub rejected_atomic: u32,
+    pub rejected_volatile: u32,
+    pub rejected_unknown_alias: u32,
+    pub rejected_dep_cycle: u32,
+    pub rejected_strict_fp: u32,
+    pub rejected_checked_overflow: u32,
+    pub rejected_unproven_bounds: u32,
+    pub rejected_cost: u32,
+    pub rejected_size_profile: u32,
+    pub records: *mut SlpVecRecord,
+    pub record_count: usize,
+    pub record_cap: usize,
+}
+
+// --- Contract, Stats & Record Helpers (SPEC-74 §5, §9, AXS-VEC-049) ---
+
+pub fn slp_vec_contract() -> TransformationContract {
+    TransformationContract {
+        pass_id: PASS_SLP_VEC,
+        required_analyses: ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS | ANALYSIS_MASK_SSA |
+                           ANALYSIS_MASK_MEMORY_SSA | ANALYSIS_MASK_ALIAS_INFO |
+                           ANALYSIS_MASK_EFFECT_INFO | ANALYSIS_MASK_RANGE_INFO,
+        required_proofs: PROP_MASK_IN_BOUNDS | PROP_MASK_NO_ALIAS | PROP_MASK_NO_OVERFLOW,
+        preserved_analyses: ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS | ANALYSIS_MASK_LOOP_INFO,
+        invalidated_analyses: ANALYSIS_MASK_SSA | ANALYSIS_MASK_MEMORY_SSA | ANALYSIS_MASK_RANGE_INFO,
+        preserved_properties: PROP_MASK_IN_BOUNDS | PROP_MASK_NO_ALIAS | PROP_MASK_NO_OVERFLOW,
+        postconditions: POSTCOND_ALL,
+    }
+}
+
+pub fn slp_vec_stats_zero(stats: mut_view<SlpVecStats>) {
+    stats.pass_runs = 0u32;
+    stats.pass_changes = 0u32;
+    stats.pass_rollbacks = 0u32;
+    stats.blocks_analyzed = 0u32;
+    stats.seeds_discovered = 0u32;
+    stats.trees_vectorized = 0u32;
+    stats.trees_rejected = 0u32;
+    stats.store_chains_vectorized = 0u32;
+    stats.reductions_vectorized = 0u32;
+    stats.lanes_packed_total = 0u32;
+    stats.vectorizable_nodes_emitted = 0u32;
+    stats.broadcast_nodes_emitted = 0u32;
+    stats.gather_packs_emitted = 0u32;
+    stats.external_extracts_emitted = 0u32;
+    stats.rejected_atomic = 0u32;
+    stats.rejected_volatile = 0u32;
+    stats.rejected_unknown_alias = 0u32;
+    stats.rejected_dep_cycle = 0u32;
+    stats.rejected_strict_fp = 0u32;
+    stats.rejected_checked_overflow = 0u32;
+    stats.rejected_unproven_bounds = 0u32;
+    stats.rejected_cost = 0u32;
+    stats.rejected_size_profile = 0u32;
+    stats.records = 0 as *mut SlpVecRecord;
+    stats.record_count = 0;
+    stats.record_cap = 0;
+}
+
+pub unsafe fn slp_node_at(base: *mut SlpNode, idx: usize) -> *mut SlpNode {
+    let off = idx * size_of<SlpNode>();
+    ((base as usize) + off) as *mut SlpNode
+}
+
+pub unsafe fn slp_vec_record_at(base: *mut SlpVecRecord, idx: usize) -> *mut SlpVecRecord {
+    let off = idx * size_of<SlpVecRecord>();
+    ((base as usize) + off) as *mut SlpVecRecord
+}
+
+pub unsafe fn slp_acc_at(base: *mut SlpMemAccess, idx: usize) -> *mut SlpMemAccess {
+    let off = idx * size_of<SlpMemAccess>();
+    ((base as usize) + off) as *mut SlpMemAccess
+}
+
+pub unsafe fn slp_u32_at(base: *mut u32, idx: usize) -> *mut u32 {
+    let off = idx * size_of<u32>();
+    ((base as usize) + off) as *mut u32
+}
+
+pub unsafe fn slp_val_id_at(base: *mut OptValueId, idx: usize) -> *mut OptValueId {
+    let off = idx * size_of<OptValueId>();
+    ((base as usize) + off) as *mut OptValueId
+}
+
+fn slp_mul_usize(a: usize, b: usize) -> usize {
+    let mut res: usize = 0;
+    let mut i: usize = 0;
+    while i < b {
+        res = res + a;
+        i = i + 1;
+    }
+    res
+}
+
+fn slp_push_record(stats: mut_view<SlpVecStats>, arena: mut_view<Arena>, rec: view<SlpVecRecord>) {
+    if stats.record_count >= stats.record_cap {
+        let new_cap: usize = if stats.record_cap == 0 { 16 } else { stats.record_cap + stats.record_cap };
+        let new_bytes = slp_mul_usize(new_cap, size_of<SlpVecRecord>());
+        let new_arr = arena_alloc_raw(mut_view(*arena), new_bytes, align_of<SlpVecRecord>()) as *mut SlpVecRecord;
+        if stats.record_count > 0 && (stats.records as usize) != 0 {
+            let old_bytes = slp_mul_usize(stats.record_count, size_of<SlpVecRecord>());
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(stats.records as *const u8, new_arr as *mut u8, old_bytes);
+            }
+        }
+        stats.records = new_arr;
+        stats.record_cap = new_cap;
+    }
+    let idx = stats.record_count;
+    stats.record_count = idx + 1;
+    unsafe {
+        *slp_vec_record_at(stats.records, idx) = *rec;
+    }
+}
+
+fn slp_bump_reject_stat(stats: mut_view<SlpVecStats>, reason: u8) {
+    stats.trees_rejected = stats.trees_rejected + 1u32;
+    if reason == REASON_ATOMIC_BARRIER {
+        stats.rejected_atomic = stats.rejected_atomic + 1u32;
+    } else if reason == REASON_VOLATILE_BARRIER {
+        stats.rejected_volatile = stats.rejected_volatile + 1u32;
+    } else if reason == REASON_UNKNOWN_ALIAS {
+        stats.rejected_unknown_alias = stats.rejected_unknown_alias + 1u32;
+    } else if reason == REASON_LOOP_CARRIED_DEP || reason == REASON_INTERIOR_CALL_OR_DROP {
+        stats.rejected_dep_cycle = stats.rejected_dep_cycle + 1u32;
+    } else if reason == REASON_STRICT_FP_REDUCTION || reason == REASON_NON_ASSOC_REDUCTION {
+        stats.rejected_strict_fp = stats.rejected_strict_fp + 1u32;
+    } else if reason == REASON_CHECKED_OVERFLOW_TRAP {
+        stats.rejected_checked_overflow = stats.rejected_checked_overflow + 1u32;
+    } else if reason == REASON_UNPROVEN_BOUNDS {
+        stats.rejected_unproven_bounds = stats.rejected_unproven_bounds + 1u32;
+    } else if reason == REASON_COST_NOT_PROFITABLE {
+        stats.rejected_cost = stats.rejected_cost + 1u32;
+    } else if reason == REASON_SIZE_PROFILE_GROWTH {
+        stats.rejected_size_profile = stats.rejected_size_profile + 1u32;
+    }
+}
+
+// --- 1. Target Bundle Width & Contiguous Access Analyzer (SPEC-74 §5.1, §5.4, AXS-VEC-036, AXS-VEC-039) ---
+
+pub fn slp_is_legal_bundle_width(caps: view<TargetSimdCaps>, elem_kind: u8, lanes: u8) -> bool {
+    if caps.isa_level == TARGET_ISA_SCALAR_ONLY {
+        return false;
+    }
+    if lanes != 2u8 && lanes != 4u8 && lanes != 8u8 {
+        return false;
+    }
+    let ebits = vec_elem_bit_width(elem_kind);
+    if ebits == 0u16 {
+        return false;
+    }
+    let is_fp = vec_elem_is_float(elem_kind);
+    let max_bits: u16 = if is_fp { caps.max_fp_vec_bits } else { caps.max_int_vec_bits };
+    let total_bits: u16 = (lanes as u16) * ebits;
+    // Allow 64-bit sub-128-bit packs (promoted via MOVQ/MOVSD into Vec128) up to target max_bits (128 or 256).
+    total_bits >= 64u16 && total_bits <= max_bits
+}
+
+fn slp_field_elem_kind(thir: *const Thir, base_ty: TypeId, field_idx: u32) -> u8 {
+    let mut cur_v = base_ty.v;
+    if (thir as usize) == 0 || cur_v == 0u32 {
+        return VEC_ELEM_NONE;
+    }
+    let ax0 = type_get(unsafe { view((*thir).interner) }, TypeId { v: cur_v });
+    if (ax0 as usize) == 0 {
+        return VEC_ELEM_NONE;
+    }
+    let tk0 = unsafe { (*ax0).kind };
+    if tk0 == TY_VIEW || tk0 == TY_MUT_VIEW || tk0 == TY_PTR {
+        cur_v = unsafe { (*ax0).pointee.v };
+    }
+    let ax = type_get(unsafe { view((*thir).interner) }, TypeId { v: cur_v });
+    if (ax as usize) == 0 {
+        return VEC_ELEM_NONE;
+    }
+    let tk = unsafe { (*ax).kind };
+    if tk == TY_STRUCT || tk == TY_TUPLE {
+        let fc = unsafe { (*ax).field_count };
+        let flds = unsafe { (*ax).fields };
+        if (field_idx as usize) < fc && (flds as usize) != 0 {
+            let fty = unsafe { *typeid_at(flds, field_idx as usize) };
+            return vec_classify_type_elem(thir, fty);
+        }
+        return VEC_ELEM_NONE;
+    }
+    if tk == TY_ARRAY || tk == TY_SLICE {
+        return vec_classify_type_elem(thir, unsafe { (*ax).elem });
+    }
+    vec_classify_type_elem(thir, TypeId { v: cur_v })
+}
+
+fn slp_resolve_index_local_offset(
+    body: view<OptBody>,
+    bb: view<OptBlock>,
+    max_inst_idx: usize,
+    idx_loc: u32,
+    out_anchor: mut_view<u32>,
+    out_off: mut_view<i64>
+) -> bool {
+    *out_anchor = 0u32;
+    *out_off = 0i64;
+    if idx_loc == 0u32 {
+        return false;
+    }
+    // Search backward in `bb` up to `max_inst_idx` for the defining assignment to `idx_loc`
+    let limit: usize = if max_inst_idx < bb.inst_count { max_inst_idx } else { bb.inst_count };
+    let mut k: usize = limit;
+    while k > 0 {
+        k = k - 1;
+        let inst = unsafe { opt_inst_at(bb.insts, k) };
+        let opc = unsafe { (*inst).opcode };
+        let flg = unsafe { (*inst).flags };
+        if opc != OPT_INST_NOP && (flg & (OPT_FLAG_STORAGE_LIVE | OPT_FLAG_STORAGE_DEAD)) == 0u16 &&
+           (unsafe { (*inst).place.local.v }) == idx_loc && (unsafe { (*inst).place.proj_count }) == 0 {
+            if opc == OPT_INST_CONST {
+                let mut cu: u64 = 0u64;
+                let mut ci: i64 = 0i64;
+                if lp_val_const_int(body, unsafe { (*inst).lhs }, mut_view(cu), mut_view(ci)) {
+                    *out_anchor = 0u32;
+                    *out_off = ci;
+                    return true;
+                }
+            } else if opc == OPT_INST_COPY {
+                let lv = lp_peel_copy(body, unsafe { (*inst).lhs });
+                let mut cu: u64 = 0u64;
+                let mut ci: i64 = 0i64;
+                if lp_val_const_int(body, lv, mut_view(cu), mut_view(ci)) {
+                    *out_anchor = 0u32;
+                    *out_off = ci;
+                    return true;
+                }
+                if lv.v != OPT_VALUE_NONE && (lv.v as usize) <= body.value_count {
+                    let sloc = (unsafe { (*opt_val_at(body.values, lv.v as usize)).src_local.v });
+                    if sloc != 0u32 {
+                        *out_anchor = sloc;
+                        *out_off = 0i64;
+                        return true;
+                    }
+                }
+            } else if opc == OPT_INST_BINOP || opc == OPT_INST_WRAPPING_BINOP || opc == OPT_INST_CHECKED_BINOP {
+                let bop = unsafe { (*inst).sub_op };
+                let lv = lp_peel_copy(body, unsafe { (*inst).lhs });
+                let rv = lp_peel_copy(body, unsafe { (*inst).rhs });
+                let mut cu: u64 = 0u64;
+                let mut ci: i64 = 0i64;
+                if lv.v != OPT_VALUE_NONE && (lv.v as usize) <= body.value_count &&
+                   lp_val_const_int(body, rv, mut_view(cu), mut_view(ci)) {
+                    let sloc = (unsafe { (*opt_val_at(body.values, lv.v as usize)).src_local.v });
+                    if sloc != 0u32 {
+                        if bop == MIR_BINOP_ADD || bop == MIR_BINOP_WRAPPING_ADD {
+                            *out_anchor = sloc;
+                            *out_off = ci;
+                            return true;
+                        }
+                        if bop == MIR_BINOP_SUB || bop == MIR_BINOP_WRAPPING_SUB {
+                            *out_anchor = sloc;
+                            *out_off = 0i64 - ci;
+                            return true;
+                        }
+                    }
+                } else if rv.v != OPT_VALUE_NONE && (rv.v as usize) <= body.value_count &&
+                          lp_val_const_int(body, lv, mut_view(cu), mut_view(ci)) {
+                    let sloc = (unsafe { (*opt_val_at(body.values, rv.v as usize)).src_local.v });
+                    if sloc != 0u32 && (bop == MIR_BINOP_ADD || bop == MIR_BINOP_WRAPPING_ADD) {
+                        *out_anchor = sloc;
+                        *out_off = ci;
+                        return true;
+                    }
+                }
+            }
+            *out_anchor = idx_loc;
+            *out_off = 0i64;
+            return true;
+        }
+    }
+    *out_anchor = idx_loc;
+    *out_off = 0i64;
+    true
+}
+
+pub fn slp_extract_place_access(
+    body: view<OptBody>,
+    bb: view<OptBlock>,
+    inst_idx: usize,
+    place: view<MirPlace>,
+    is_write: bool,
+    val_id: OptValueId
+) -> SlpMemAccess {
+    let mut invalid = SlpMemAccess {
+        is_valid: false,
+        access_kind: SLP_ACC_NONE,
+        is_write: is_write,
+        base_local: MirLocalId { v: 0u32 },
+        anchor_local: MirLocalId { v: 0u32 },
+        offset: 0i64,
+        elem_kind: VEC_ELEM_NONE,
+        elem_bits: 0u16,
+        inst_idx: inst_idx as u32,
+        val_id: val_id,
+    };
+    let loc_v = place.local.v;
+    if loc_v == 0u32 || (loc_v as usize) >= body.local_count || place.proj_count == 0 || (place.projs as usize) == 0 {
+        return invalid;
+    }
+    let base_ty = unsafe { *opt_typeid_at(body.local_tys, loc_v as usize) };
+    if place.proj_count == 1 {
+        let p0 = unsafe { mir_proj_at(place.projs, 0) };
+        let pk0 = unsafe { (*p0).kind };
+        if pk0 == MIR_PROJ_FIELD {
+            let fidx = unsafe { (*p0).field_idx };
+            let ek = slp_field_elem_kind(body.thir, base_ty, fidx);
+            let ebits = vec_elem_bit_width(ek);
+            if ek != VEC_ELEM_NONE && ebits > 0u16 {
+                invalid.is_valid = true;
+                invalid.access_kind = SLP_ACC_STRUCT_FIELD;
+                invalid.base_local = MirLocalId { v: loc_v };
+                invalid.anchor_local = MirLocalId { v: 0u32 };
+                invalid.offset = fidx as i64;
+                invalid.elem_kind = ek;
+                invalid.elem_bits = ebits;
+                return invalid;
+            }
+        } else if pk0 == MIR_PROJ_INDEX {
+            let idx_loc = unsafe { (*p0).index_local.v };
+            let mut anchor: u32 = 0u32;
+            let mut off: i64 = 0i64;
+            if slp_resolve_index_local_offset(body, bb, inst_idx, idx_loc, mut_view(anchor), mut_view(off)) {
+                let ek = vec_classify_type_elem(body.thir, base_ty);
+                let ebits = vec_elem_bit_width(ek);
+                if ek != VEC_ELEM_NONE && ebits > 0u16 {
+                    invalid.is_valid = true;
+                    invalid.access_kind = SLP_ACC_ARRAY_INDEX;
+                    invalid.base_local = MirLocalId { v: loc_v };
+                    invalid.anchor_local = MirLocalId { v: anchor };
+                    invalid.offset = off;
+                    invalid.elem_kind = ek;
+                    invalid.elem_bits = ebits;
+                    return invalid;
+                }
+            }
+        }
+    } else if place.proj_count == 2 {
+        let p0 = unsafe { mir_proj_at(place.projs, 0) };
+        let p1 = unsafe { mir_proj_at(place.projs, 1) };
+        if (unsafe { (*p0).kind }) == MIR_PROJ_DEREF {
+            let pk1 = unsafe { (*p1).kind };
+            if pk1 == MIR_PROJ_FIELD {
+                let fidx = unsafe { (*p1).field_idx };
+                let ek = slp_field_elem_kind(body.thir, base_ty, fidx);
+                let ebits = vec_elem_bit_width(ek);
+                if ek != VEC_ELEM_NONE && ebits > 0u16 {
+                    invalid.is_valid = true;
+                    invalid.access_kind = SLP_ACC_DEREF_FIELD;
+                    invalid.base_local = MirLocalId { v: loc_v };
+                    invalid.anchor_local = MirLocalId { v: 0u32 };
+                    invalid.offset = fidx as i64;
+                    invalid.elem_kind = ek;
+                    invalid.elem_bits = ebits;
+                    return invalid;
+                }
+            } else if pk1 == MIR_PROJ_INDEX {
+                let idx_loc = unsafe { (*p1).index_local.v };
+                let mut anchor: u32 = 0u32;
+                let mut off: i64 = 0i64;
+                if slp_resolve_index_local_offset(body, bb, inst_idx, idx_loc, mut_view(anchor), mut_view(off)) {
+                    let ek = vec_classify_type_elem(body.thir, base_ty);
+                    let ebits = vec_elem_bit_width(ek);
+                    if ek != VEC_ELEM_NONE && ebits > 0u16 {
+                        invalid.is_valid = true;
+                        invalid.access_kind = SLP_ACC_DEREF_INDEX;
+                        invalid.base_local = MirLocalId { v: loc_v };
+                        invalid.anchor_local = MirLocalId { v: anchor };
+                        invalid.offset = off;
+                        invalid.elem_kind = ek;
+                        invalid.elem_bits = ebits;
+                        return invalid;
+                    }
+                }
+            }
+        }
+    }
+    invalid
+}
+
+pub fn slp_extract_inst_write_access(
+    body: view<OptBody>,
+    bb: view<OptBlock>,
+    inst_idx: usize
+) -> SlpMemAccess {
+    let inst = unsafe { opt_inst_at(bb.insts, inst_idx) };
+    let opc = unsafe { (*inst).opcode };
+    let flg = unsafe { (*inst).flags };
+    if opc == OPT_INST_NOP || (flg & (OPT_FLAG_STORAGE_LIVE | OPT_FLAG_STORAGE_DEAD)) != 0u16 {
+        return SlpMemAccess {
+            is_valid: false, access_kind: SLP_ACC_NONE, is_write: true,
+            base_local: MirLocalId { v: 0u32 }, anchor_local: MirLocalId { v: 0u32 },
+            offset: 0i64, elem_kind: VEC_ELEM_NONE, elem_bits: 0u16,
+            inst_idx: inst_idx as u32, val_id: OptValueId { v: OPT_VALUE_NONE },
+        };
+    }
+    if opc == OPT_INST_STORE || opc == OPT_INST_INSERT_FIELD ||
+       opc == OPT_INST_COPY || opc == OPT_INST_CONST ||
+       opc == OPT_INST_BINOP || opc == OPT_INST_WRAPPING_BINOP ||
+       opc == OPT_INST_CHECKED_BINOP || opc == OPT_INST_UNOP || opc == OPT_INST_CAST {
+        let rhs_val: OptValueId = if opc == OPT_INST_STORE || opc == OPT_INST_INSERT_FIELD ||
+                                     opc == OPT_INST_COPY || opc == OPT_INST_CONST {
+            unsafe { (*inst).lhs }
+        } else {
+            unsafe { (*inst).result }
+        };
+        return slp_extract_place_access(body, bb, inst_idx, unsafe { view((*inst).place) }, true, rhs_val);
+    }
+    SlpMemAccess {
+        is_valid: false, access_kind: SLP_ACC_NONE, is_write: true,
+        base_local: MirLocalId { v: 0u32 }, anchor_local: MirLocalId { v: 0u32 },
+        offset: 0i64, elem_kind: VEC_ELEM_NONE, elem_bits: 0u16,
+        inst_idx: inst_idx as u32, val_id: OptValueId { v: OPT_VALUE_NONE },
+    }
+}
+
+fn slp_find_def_inst_in_bb(bb: view<OptBlock>, val_id: OptValueId, out_idx: mut_view<usize>) -> bool {
+    if val_id.v == OPT_VALUE_NONE {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < bb.inst_count {
+        let inst = unsafe { opt_inst_at(bb.insts, i) };
+        if (unsafe { (*inst).result.v }) == val_id.v && (unsafe { (*inst).opcode }) != OPT_INST_NOP {
+            *out_idx = i;
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+pub fn slp_extract_val_read_access(
+    body: view<OptBody>,
+    bb: view<OptBlock>,
+    val_id: OptValueId
+) -> SlpMemAccess {
+    let mut invalid = SlpMemAccess {
+        is_valid: false, access_kind: SLP_ACC_NONE, is_write: false,
+        base_local: MirLocalId { v: 0u32 }, anchor_local: MirLocalId { v: 0u32 },
+        offset: 0i64, elem_kind: VEC_ELEM_NONE, elem_bits: 0u16,
+        inst_idx: OPT_INST_NONE, val_id: val_id,
+    };
+    if val_id.v == OPT_VALUE_NONE || (val_id.v as usize) > body.value_count {
+        return invalid;
+    }
+    // Check if defined by an instruction in `bb` with `rhs_place` projection
+    let mut def_idx: usize = 0;
+    if slp_find_def_inst_in_bb(bb, val_id, mut_view(def_idx)) {
+        let inst = unsafe { opt_inst_at(bb.insts, def_idx) };
+        let opc = unsafe { (*inst).opcode };
+        if opc == OPT_INST_LOAD || opc == OPT_INST_EXTRACT_FIELD || opc == OPT_INST_COPY {
+            let acc = slp_extract_place_access(body, bb, def_idx, unsafe { view((*inst).rhs_place) }, false, val_id);
+            if acc.is_valid {
+                return acc;
+            }
+            if opc == OPT_INST_COPY && (unsafe { (*inst).lhs.v }) != val_id.v {
+                let peeled = slp_extract_val_read_access(body, bb, unsafe { (*inst).lhs });
+                if peeled.is_valid {
+                    return peeled;
+                }
+            }
+        }
+    }
+    // Check if the OptValue itself is an SROA field value (`src_local != 0`, `proj_field != OPT_PROJ_NONE`)
+    let vnode = unsafe { opt_val_at(body.values, val_id.v as usize) };
+    let sloc = unsafe { (*vnode).src_local.v };
+    let pfld = unsafe { (*vnode).proj_field };
+    if sloc != 0u32 && (sloc as usize) < body.local_count && pfld != OPT_PROJ_NONE {
+        let base_ty = unsafe { *opt_typeid_at(body.local_tys, sloc as usize) };
+        let ek = slp_field_elem_kind(body.thir, base_ty, pfld);
+        let ebits = vec_elem_bit_width(ek);
+        if ek != VEC_ELEM_NONE && ebits > 0u16 {
+            invalid.is_valid = true;
+            invalid.access_kind = SLP_ACC_STRUCT_FIELD;
+            invalid.base_local = MirLocalId { v: sloc };
+            invalid.anchor_local = MirLocalId { v: 0u32 };
+            invalid.offset = pfld as i64;
+            invalid.elem_kind = ek;
+            invalid.elem_bits = ebits;
+            invalid.inst_idx = if slp_find_def_inst_in_bb(bb, val_id, mut_view(def_idx)) { def_idx as u32 } else { 0u32 };
+            return invalid;
+        }
+    }
+    invalid
+}
+
+pub fn slp_are_accesses_contiguous(accs: *const SlpMemAccess, lane_count: usize) -> bool {
+    if (accs as usize) == 0 || lane_count < 2 {
+        return false;
+    }
+    let a0 = unsafe { *((accs as usize) as *const SlpMemAccess) };
+    if !a0.is_valid || a0.base_local.v == 0u32 || a0.elem_kind == VEC_ELEM_NONE {
+        return false;
+    }
+    let mut k: usize = 1;
+    while k < lane_count {
+        let ak = unsafe { *(((accs as usize) + k * size_of<SlpMemAccess>()) as *const SlpMemAccess) };
+        if !ak.is_valid {
+            return false;
+        }
+        if ak.access_kind != a0.access_kind ||
+           ak.base_local.v != a0.base_local.v ||
+           ak.anchor_local.v != a0.anchor_local.v ||
+           ak.elem_kind != a0.elem_kind ||
+           ak.offset != a0.offset + (k as i64) {
+            return false;
+        }
+        k = k + 1;
+    }
+    true
+}
+
+// --- 2. Barrier Classification, Provenance & Intra-Block MemorySSA/Alias Verification (AXS-VEC-038, AXS-VEC-043) ---
+
+fn slp_has_proven_prop(
+    body: view<OptBody>,
+    prop_kind: u8,
+    bb_v: u32,
+    inst_id_v: u32,
+    val_v: u32
+) -> bool {
+    if (body.provenance as usize) == 0 || body.provenance_count == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < body.provenance_count {
+        let pr = unsafe { opt_prov_at(body.provenance, i) };
+        if (unsafe { (*pr).prop_kind }) == prop_kind &&
+           (unsafe { (*pr).certainty }) == CERTAINTY_PROVEN {
+            let p_bb = unsafe { (*pr).at_bb.v };
+            let p_inst = unsafe { (*pr).at_inst.v };
+            let p_sub = unsafe { (*pr).subject_val.v };
+            if (inst_id_v != OPT_INST_NONE && p_inst == inst_id_v) ||
+               (val_v != OPT_VALUE_NONE && p_sub == val_v) ||
+               (p_bb == bb_v && p_inst == OPT_INST_NONE && p_sub == OPT_VALUE_NONE) {
+                return true;
+            }
+        }
+        i = i + 1;
+    }
+    false
+}
+
+pub fn slp_inst_barrier_reason(body: view<OptBody>, bb_v: u32, inst: view<OptInst>) -> u8 {
+    let opc = inst.opcode;
+    let flg = inst.flags;
+    if opc == OPT_INST_ATOMIC || inst.orig_stmt.kind == MIR_STMT_ATOMIC {
+        return REASON_ATOMIC_BARRIER;
+    }
+    if opc == OPT_INST_VOLATILE_LOAD || opc == OPT_INST_VOLATILE_STORE {
+        return REASON_VOLATILE_BARRIER;
+    }
+    if opc == OPT_INST_DROP_FLAG || opc == OPT_INST_BLACK_BOX || opc == OPT_INST_ZEROIZE ||
+       inst.orig_stmt.kind == MIR_STMT_DROP || (flg & OPT_FLAG_BARRIER) != 0u16 ||
+       inst.place.drop_flag != MIR_DROP_FLAG_NONE || inst.rhs_place.drop_flag != MIR_DROP_FLAG_NONE {
+        return REASON_INTERIOR_CALL_OR_DROP;
+    }
+    if opc == OPT_INST_CHECKED_BINOP {
+        if !slp_has_proven_prop(body, PROP_NO_OVERFLOW, bb_v, inst.id.v, inst.result.v) {
+            return REASON_CHECKED_OVERFLOW_TRAP;
+        }
+    }
+    if opc == OPT_INST_BINOP {
+        let bop = inst.sub_op;
+        if bop == MIR_BINOP_DIV || bop == MIR_BINOP_REM {
+            return REASON_CHECKED_OVERFLOW_TRAP;
+        }
+        if bop == MIR_BINOP_SHL || bop == MIR_BINOP_SHR {
+            let mut cu: u64 = 0u64;
+            let mut ci: i64 = 0i64;
+            let ek = vec_classify_type_elem(body.thir, inst.ty);
+            let ebits = vec_elem_bit_width(ek);
+            let valid_const_shift = lp_val_const_int(body, inst.rhs, mut_view(cu), mut_view(ci)) &&
+                                    ci >= 0i64 && ebits > 0u16 && (cu < (ebits as u64));
+            if !valid_const_shift && !slp_has_proven_prop(body, PROP_NO_OVERFLOW, bb_v, inst.id.v, inst.result.v) {
+                return REASON_CHECKED_OVERFLOW_TRAP;
+            }
+        }
+    }
+    if opc == OPT_INST_UNOP && inst.sub_op == MIR_UNOP_NEG && (flg & OPT_FLAG_MAY_TRAP) != 0u16 {
+        let ek = vec_classify_type_elem(body.thir, inst.ty);
+        if !vec_elem_is_float(ek) && !slp_has_proven_prop(body, PROP_NO_OVERFLOW, bb_v, inst.id.v, inst.result.v) {
+            return REASON_CHECKED_OVERFLOW_TRAP;
+        }
+    }
+    REASON_NONE
+}
+
+fn slp_val_depends_on_inst(
+    body: view<OptBody>,
+    bb: view<OptBlock>,
+    val_id: OptValueId,
+    target_inst_idx: u32,
+    depth: u8
+) -> bool {
+    if depth > 16u8 || val_id.v == OPT_VALUE_NONE || target_inst_idx == OPT_INST_NONE {
+        return false;
+    }
+    let mut def_idx: usize = 0;
+    if !slp_find_def_inst_in_bb(bb, val_id, mut_view(def_idx)) {
+        return false;
+    }
+    if (def_idx as u32) == target_inst_idx {
+        return true;
+    }
+    let inst = unsafe { opt_inst_at(bb.insts, def_idx) };
+    let lhs = unsafe { (*inst).lhs };
+    let rhs = unsafe { (*inst).rhs };
+    if slp_val_depends_on_inst(body, bb, lhs, target_inst_idx, depth + 1u8) {
+        return true;
+    }
+    if slp_val_depends_on_inst(body, bb, rhs, target_inst_idx, depth + 1u8) {
+        return true;
+    }
+    false
+}
+
+pub fn slp_verify_bundle_independent(
+    body: view<OptBody>,
+    bb: view<OptBlock>,
+    lane_insts: *const u32,
+    lane_vals: *const OptValueId,
+    lane_count: usize
+) -> bool {
+    let mut a: usize = 0;
+    while a < lane_count {
+        let ia = unsafe { *(((lane_insts as usize) + a * size_of<u32>()) as *const u32) };
+        let va = unsafe { *(((lane_vals as usize) + a * size_of<OptValueId>()) as *const OptValueId) };
+        if ia == OPT_INST_NONE || (ia as usize) >= bb.inst_count {
+            return false;
+        }
+        let mut b: usize = 0;
+        while b < lane_count {
+            if a != b {
+                let ib = unsafe { *(((lane_insts as usize) + b * size_of<u32>()) as *const u32) };
+                if ia == ib {
+                    return false;
+                }
+                if slp_val_depends_on_inst(body, bb, va, ib, 0u8) {
+                    return false;
+                }
+                let inst_a = unsafe { opt_inst_at(bb.insts, ia as usize) };
+                if slp_val_depends_on_inst(body, bb, unsafe { (*inst_a).lhs }, ib, 0u8) ||
+                   slp_val_depends_on_inst(body, bb, unsafe { (*inst_a).rhs }, ib, 0u8) {
+                    return false;
+                }
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    true
+}
+
+fn slp_inst_in_set(inst_idx: u32, set_ptr: *const u32, count: usize) -> bool {
+    let mut i: usize = 0;
+    while i < count {
+        let v = unsafe { *(((set_ptr as usize) + i * size_of<u32>()) as *const u32) };
+        if v == inst_idx {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn slp_access_ranges_disjoint(
+    acc_a: view<SlpMemAccess>,
+    lanes_a: usize,
+    acc_b: view<SlpMemAccess>,
+    lanes_b: usize
+) -> bool {
+    if !acc_a.is_valid || !acc_b.is_valid {
+        return false;
+    }
+    if acc_a.access_kind == acc_b.access_kind &&
+       acc_a.base_local.v == acc_b.base_local.v &&
+       acc_a.anchor_local.v == acc_b.anchor_local.v &&
+       acc_a.base_local.v != 0u32 {
+        let end_a = acc_a.offset + (lanes_a as i64) - 1i64;
+        let end_b = acc_b.offset + (lanes_b as i64) - 1i64;
+        if end_a < acc_b.offset || end_b < acc_a.offset {
+            return true;
+        }
+    }
+    // Distinct stack struct/array locals (not deref views/pointers) are disjoint storage objects
+    if (acc_a.access_kind == SLP_ACC_STRUCT_FIELD || acc_a.access_kind == SLP_ACC_ARRAY_INDEX) &&
+       (acc_b.access_kind == SLP_ACC_STRUCT_FIELD || acc_b.access_kind == SLP_ACC_ARRAY_INDEX) &&
+       acc_a.base_local.v != acc_b.base_local.v &&
+       acc_a.base_local.v != 0u32 && acc_b.base_local.v != 0u32 {
+        return true;
+    }
+    false
+}
+
+pub fn slp_verify_bundle_memory_safety(
+    body: view<OptBody>,
+    bb: view<OptBlock>,
+    info: *const AliasInfo,
+    accs: *const SlpMemAccess,
+    lane_count: usize,
+    out_alias_proof: mut_view<u8>,
+    arena: mut_view<Arena>
+) -> u8 {
+    if (accs as usize) == 0 || lane_count == 0 {
+        return REASON_UNKNOWN_ALIAS;
+    }
+    let a0 = unsafe { *((accs as usize) as *const SlpMemAccess) };
+    let mut min_idx: u32 = a0.inst_idx;
+    let mut max_idx: u32 = a0.inst_idx;
+    let lane_insts = arena_alloc_raw(mut_view(*arena), slp_mul_usize(SLP_MAX_LANES, size_of<u32>()), align_of<u32>()) as *mut u32;
+    let mut k: usize = 0;
+    while k < lane_count && k < SLP_MAX_LANES {
+        let ak = unsafe { *(((accs as usize) + k * size_of<SlpMemAccess>()) as *const SlpMemAccess) };
+        unsafe { *slp_u32_at(lane_insts, k) = ak.inst_idx; }
+        if ak.inst_idx != OPT_INST_NONE {
+            if min_idx == OPT_INST_NONE || (ak.inst_idx) < min_idx {
+                min_idx = ak.inst_idx;
+            }
+            if max_idx == OPT_INST_NONE || ak.inst_idx > max_idx {
+                max_idx = ak.inst_idx;
+            }
+        }
+        k = k + 1;
+    }
+    if min_idx == OPT_INST_NONE || max_idx == OPT_INST_NONE || (max_idx as usize) >= bb.inst_count {
+        if a0.access_kind == SLP_ACC_STRUCT_FIELD && !a0.is_write {
+            *out_alias_proof = VEC_ALIAS_SCEV_DISJOINT;
+            return REASON_NONE;
+        }
+        return REASON_UNKNOWN_ALIAS;
+    }
+
+    let inst_ref = unsafe { opt_inst_at(bb.insts, a0.inst_idx as usize) };
+    let ref_place: MirPlace = if a0.is_write {
+        unsafe { (*inst_ref).place }
+    } else {
+        unsafe { (*inst_ref).rhs_place }
+    };
+    if (info as usize) != 0 {
+        let ainfo = unsafe { view(*info) };
+        let reg_bundle = alias_extract_region(ainfo, body, view(ref_place), OptValueId { v: OPT_VALUE_NONE }, mut_view(*arena));
+        if reg_bundle.domain == DOMAIN_FIXED_MMIO {
+            return REASON_VOLATILE_BARRIER;
+        }
+    }
+
+    let mut m: u32 = min_idx;
+    while m <= max_idx {
+        let minst = unsafe { opt_inst_at(bb.insts, m as usize) };
+        let br = slp_inst_barrier_reason(body, bb.id.v, unsafe { view(*minst) });
+        if br != REASON_NONE {
+            return br;
+        }
+        if !slp_inst_in_set(m, lane_insts as *const u32, lane_count) {
+            let mopc = unsafe { (*minst).opcode };
+            let m_acc = slp_extract_inst_write_access(body, bb, m as usize);
+            let is_mem_write = mopc == OPT_INST_STORE || mopc == OPT_INST_INSERT_FIELD || m_acc.is_valid;
+            let is_mem_read = mopc == OPT_INST_LOAD || mopc == OPT_INST_EXTRACT_FIELD;
+            if is_mem_write || (a0.is_write && is_mem_read) {
+                let mut proven_disjoint = false;
+                if m_acc.is_valid && slp_access_ranges_disjoint(view(a0), lane_count, view(m_acc), 1) {
+                    proven_disjoint = true;
+                } else if is_mem_read {
+                    let r_acc = slp_extract_place_access(body, bb, m as usize, unsafe { view((*minst).rhs_place) }, false, unsafe { (*minst).result });
+                    if r_acc.is_valid && slp_access_ranges_disjoint(view(a0), lane_count, view(r_acc), 1) {
+                        proven_disjoint = true;
+                    }
+                }
+                if !proven_disjoint {
+                    if (info as usize) == 0 {
+                        *out_alias_proof = VEC_ALIAS_REJECTED_MAY_ALIAS;
+                        return REASON_UNKNOWN_ALIAS;
+                    }
+                    let ainfo = unsafe { view(*info) };
+                    let other_place: MirPlace = if is_mem_write {
+                        unsafe { (*minst).place }
+                    } else {
+                        unsafe { (*minst).rhs_place }
+                    };
+                    let reg_a = alias_extract_region(ainfo, body, view(ref_place), OptValueId { v: OPT_VALUE_NONE }, mut_view(*arena));
+                    let reg_b = alias_extract_region(ainfo, body, view(other_place), OptValueId { v: OPT_VALUE_NONE }, mut_view(*arena));
+                    let pt_a = alias_make_prog_pt(bb.id.v, a0.inst_idx);
+                    let pt_b = alias_make_prog_pt(bb.id.v, m);
+                    let qpt: u32 = if pt_a >= pt_b { pt_a } else { pt_b };
+                    let q = alias_query_regions(ainfo, body, mut_view(*arena), view(reg_a), view(reg_b), qpt);
+                    if !alias_is_no_alias_proven(view(q)) {
+                        *out_alias_proof = VEC_ALIAS_REJECTED_MAY_ALIAS;
+                        return REASON_UNKNOWN_ALIAS;
+                    }
+                    *out_alias_proof = VEC_ALIAS_CAP_DISJOINT;
+                }
+            }
+        }
+        m = m + 1u32;
+    }
+    if *out_alias_proof == VEC_ALIAS_NONE {
+        *out_alias_proof = VEC_ALIAS_SCEV_DISJOINT;
+    }
+    REASON_NONE
+}
+
+// --- 3. Bottom-Up Isomorphic SlpTree Builder (SPEC-74 §5.2, AXS-VEC-037) ---
+
+fn slp_alloc_node(tree: mut_view<SlpTree>, arena: mut_view<Arena>) -> u16 {
+    if tree.node_count >= tree.node_cap {
+        let new_cap: usize = if tree.node_cap == 0 { 16 } else { tree.node_cap + tree.node_cap };
+        let new_bytes = slp_mul_usize(new_cap, size_of<SlpNode>());
+        let new_arr = arena_alloc_raw(mut_view(*arena), new_bytes, align_of<SlpNode>()) as *mut SlpNode;
+        if tree.node_count > 0 && (tree.nodes as usize) != 0 {
+            let old_bytes = slp_mul_usize(tree.node_count, size_of<SlpNode>());
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(tree.nodes as *const u8, new_arr as *mut u8, old_bytes);
+            }
+        }
+        tree.nodes = new_arr;
+        tree.node_cap = new_cap;
+    }
+    let idx = tree.node_count;
+    tree.node_count = idx + 1;
+    let nd = unsafe { slp_node_at(tree.nodes, idx) };
+    unsafe {
+        (*nd).node_idx = idx as u16;
+        (*nd).kind = SLP_NODE_NONE;
+        (*nd).lane_count = tree.lane_count;
+        (*nd).elem_kind = tree.elem_kind;
+        (*nd).opcode = OPT_INST_NOP;
+        (*nd).sub_op = 0u8;
+        (*nd).vec_opcode = OPT_INST_NOP;
+        (*nd).depth = 0u8;
+        (*nd).bb_id = tree.bb_id;
+        (*nd).left_child = SLP_NODE_INVALID;
+        (*nd).right_child = SLP_NODE_INVALID;
+        let mut l: usize = 0;
+        while l < SLP_MAX_LANES {
+            (*nd).lane_insts[l] = OPT_INST_NONE;
+            (*nd).lane_vals[l] = OptValueId { v: OPT_VALUE_NONE };
+            l = l + 1;
+        }
+        (*nd).base_local = MirLocalId { v: 0u32 };
+        (*nd).anchor_local = MirLocalId { v: 0u32 };
+        (*nd).start_offset = 0i64;
+        (*nd).scalar_cost = 0u32;
+        (*nd).vec_cost = 0u32;
+        (*nd).pack_cost = 0u32;
+    }
+    idx as u16
+}
+
+fn slp_are_vals_broadcast(body: view<OptBody>, vals: *const OptValueId, lane_count: usize) -> bool {
+    if (vals as usize) == 0 || lane_count < 2 {
+        return false;
+    }
+    let v0 = lp_peel_copy(body, unsafe { *((vals as usize) as *const OptValueId) });
+    if v0.v == OPT_VALUE_NONE {
+        return false;
+    }
+    let mut cu0: u64 = 0u64;
+    let mut ci0: i64 = 0i64;
+    let is_c0 = lp_val_const_int(body, v0, mut_view(cu0), mut_view(ci0));
+    let mut k: usize = 1;
+    while k < lane_count {
+        let vk = lp_peel_copy(body, unsafe { *(((vals as usize) + k * size_of<OptValueId>()) as *const OptValueId) });
+        if vk.v != v0.v {
+            if !is_c0 {
+                return false;
+            }
+            let mut cuk: u64 = 0u64;
+            let mut cik: i64 = 0i64;
+            if !lp_val_const_int(body, vk, mut_view(cuk), mut_view(cik)) || cuk != cu0 {
+                return false;
+            }
+        }
+        k = k + 1;
+    }
+    true
+}
+
+fn slp_is_compatible_binop(opc_a: u8, sub_a: u8, opc_b: u8, sub_b: u8) -> bool {
+    let is_bin_a = opc_a == OPT_INST_BINOP || opc_a == OPT_INST_WRAPPING_BINOP || opc_a == OPT_INST_CHECKED_BINOP;
+    let is_bin_b = opc_b == OPT_INST_BINOP || opc_b == OPT_INST_WRAPPING_BINOP || opc_b == OPT_INST_CHECKED_BINOP;
+    if !is_bin_a || !is_bin_b {
+        return false;
+    }
+    if sub_a == sub_b {
+        return true;
+    }
+    if (sub_a == MIR_BINOP_ADD || sub_a == MIR_BINOP_WRAPPING_ADD) &&
+       (sub_b == MIR_BINOP_ADD || sub_b == MIR_BINOP_WRAPPING_ADD) {
+        return true;
+    }
+    if (sub_a == MIR_BINOP_SUB || sub_a == MIR_BINOP_WRAPPING_SUB) &&
+       (sub_b == MIR_BINOP_SUB || sub_b == MIR_BINOP_WRAPPING_SUB) {
+        return true;
+    }
+    if (sub_a == MIR_BINOP_MUL || sub_a == MIR_BINOP_WRAPPING_MUL) &&
+       (sub_b == MIR_BINOP_MUL || sub_b == MIR_BINOP_WRAPPING_MUL) {
+        return true;
+    }
+    false
+}
+
+fn slp_is_commutative_binop(sub_op: u8) -> bool {
+    sub_op == MIR_BINOP_ADD || sub_op == MIR_BINOP_WRAPPING_ADD ||
+    sub_op == MIR_BINOP_MUL || sub_op == MIR_BINOP_WRAPPING_MUL ||
+    sub_op == MIR_BINOP_BIT_AND || sub_op == MIR_BINOP_BIT_OR || sub_op == MIR_BINOP_BIT_XOR
+}
+
+fn slp_resolve_arith_def_inst(body: view<OptBody>, bb: view<OptBlock>, val_id: OptValueId, out_idx: mut_view<usize>) -> bool {
+    let mut cur = val_id;
+    let mut depth: u8 = 0u8;
+    while depth < 8u8 && cur.v != OPT_VALUE_NONE {
+        let mut idx: usize = 0;
+        if !slp_find_def_inst_in_bb(bb, cur, mut_view(idx)) {
+            return false;
+        }
+        let inst = unsafe { opt_inst_at(bb.insts, idx) };
+        let opc = unsafe { (*inst).opcode };
+        if opc == OPT_INST_COPY {
+            let r_acc = slp_extract_place_access(body, bb, idx, unsafe { view((*inst).rhs_place) }, false, cur);
+            if r_acc.is_valid {
+                *out_idx = idx;
+                return true;
+            }
+            cur = unsafe { (*inst).lhs };
+            depth = depth + 1u8;
+        } else {
+            *out_idx = idx;
+            return true;
+        }
+    }
+    false
+}
+
+fn slp_build_tree_rec(
+    tree: mut_view<SlpTree>,
+    body: view<OptBody>,
+    bb: view<OptBlock>,
+    info: *const AliasInfo,
+    vals: *const OptValueId,
+    lane_count: usize,
+    elem_kind: u8,
+    depth: u8,
+    arena: mut_view<Arena>
+) -> u16 {
+    if !tree.is_valid || (vals as usize) == 0 || lane_count < 2 || lane_count > SLP_MAX_LANES {
+        return SLP_NODE_INVALID;
+    }
+
+    // 1. Check broadcast (all lanes reference the exact same SSA value or identical constant)
+    if slp_are_vals_broadcast(body, vals, lane_count) {
+        let nidx = slp_alloc_node(mut_view(*tree), mut_view(*arena));
+        let nd = unsafe { slp_node_at(tree.nodes, nidx as usize) };
+        unsafe {
+            (*nd).kind = SLP_NODE_BROADCAST;
+            (*nd).opcode = OPT_INST_COPY;
+            (*nd).vec_opcode = OPT_INST_VSPLAT;
+            (*nd).depth = depth;
+            let mut k: usize = 0;
+            while k < lane_count {
+                let vk = *(((vals as usize) + k * size_of<OptValueId>()) as *const OptValueId);
+                (*nd).lane_vals[k] = vk;
+                k = k + 1;
+            }
+            (*nd).scalar_cost = 0u32;
+            (*nd).vec_cost = 1u32;
+            (*nd).pack_cost = 1u32;
+        }
+        return nidx;
+    }
+
+    // 2. Check contiguous load / struct field read bundle
+    let read_accs = arena_alloc_raw(mut_view(*arena), slp_mul_usize(SLP_MAX_LANES, size_of<SlpMemAccess>()), align_of<SlpMemAccess>()) as *mut SlpMemAccess;
+    let mut all_reads_valid = true;
+    let mut k: usize = 0;
+    while k < lane_count {
+        let vk = unsafe { *(((vals as usize) + k * size_of<OptValueId>()) as *const OptValueId) };
+        let r_acc_k = slp_extract_val_read_access(body, bb, vk);
+        unsafe { *slp_acc_at(read_accs, k) = r_acc_k; }
+        if !r_acc_k.is_valid {
+            all_reads_valid = false;
+        }
+        k = k + 1;
+    }
+    if all_reads_valid && slp_are_accesses_contiguous(read_accs as *const SlpMemAccess, lane_count) {
+        let mut load_alias_proof: u8 = tree.alias_proof;
+        let mem_reason = slp_verify_bundle_memory_safety(
+            body,
+            bb,
+            info,
+            read_accs as *const SlpMemAccess,
+            lane_count,
+            mut_view(load_alias_proof),
+            mut_view(*arena)
+        );
+        if mem_reason == REASON_NONE {
+            if tree.alias_proof == VEC_ALIAS_NONE {
+                tree.alias_proof = load_alias_proof;
+            }
+            let nidx = slp_alloc_node(mut_view(*tree), mut_view(*arena));
+            let nd = unsafe { slp_node_at(tree.nodes, nidx as usize) };
+            let ra0 = unsafe { *slp_acc_at(read_accs, 0) };
+            unsafe {
+                (*nd).kind = SLP_NODE_VECTORIZABLE;
+                (*nd).opcode = OPT_INST_LOAD;
+                (*nd).vec_opcode = OPT_INST_VLOAD;
+                (*nd).depth = depth;
+                (*nd).base_local = ra0.base_local;
+                (*nd).anchor_local = ra0.anchor_local;
+                (*nd).start_offset = ra0.offset;
+                let mut l: usize = 0;
+                while l < lane_count {
+                    let ral = *slp_acc_at(read_accs, l);
+                    (*nd).lane_insts[l] = ral.inst_idx;
+                    (*nd).lane_vals[l] = ral.val_id;
+                    l = l + 1;
+                }
+                (*nd).scalar_cost = (lane_count as u32) * 2u32;
+                (*nd).vec_cost = 2u32;
+                (*nd).pack_cost = 0u32;
+            }
+            return nidx;
+        } else if mem_reason == REASON_ATOMIC_BARRIER || mem_reason == REASON_VOLATILE_BARRIER || mem_reason == REASON_UNKNOWN_ALIAS {
+            tree.is_valid = false;
+            tree.reject_reason = mem_reason;
+            return SLP_NODE_INVALID;
+        }
+    }
+
+    // 3. Check depth limit before expanding internal arithmetic nodes
+    if depth < SLP_MAX_TREE_DEPTH && (tree.node_count) < SLP_MAX_NODES {
+        let def_insts = arena_alloc_raw(mut_view(*arena), slp_mul_usize(SLP_MAX_LANES, size_of<u32>()), align_of<u32>()) as *mut u32;
+        let peeled_vals = arena_alloc_raw(mut_view(*arena), slp_mul_usize(SLP_MAX_LANES, size_of<OptValueId>()), align_of<OptValueId>()) as *mut OptValueId;
+        let mut all_in_bb = true;
+        k = 0;
+        while k < lane_count {
+            let vk = unsafe { *(((vals as usize) + k * size_of<OptValueId>()) as *const OptValueId) };
+            let mut didx: usize = 0;
+            if slp_resolve_arith_def_inst(body, bb, vk, mut_view(didx)) {
+                unsafe { *slp_u32_at(def_insts, k) = didx as u32; }
+                let dinst = unsafe { opt_inst_at(bb.insts, didx) };
+                unsafe { *slp_val_id_at(peeled_vals, k) = (*dinst).result; }
+                let br = slp_inst_barrier_reason(body, bb.id.v, unsafe { view(*dinst) });
+                if br != REASON_NONE {
+                    tree.is_valid = false;
+                    tree.reject_reason = br;
+                    return SLP_NODE_INVALID;
+                }
+            } else {
+                all_in_bb = false;
+            }
+            k = k + 1;
+        }
+
+        if all_in_bb {
+            let d0 = unsafe { *slp_u32_at(def_insts, 0) } as usize;
+            let inst0 = unsafe { opt_inst_at(bb.insts, d0) };
+            let opc0 = unsafe { (*inst0).opcode };
+            let sub0 = unsafe { (*inst0).sub_op };
+            let is_bin0 = opc0 == OPT_INST_BINOP || opc0 == OPT_INST_WRAPPING_BINOP || opc0 == OPT_INST_CHECKED_BINOP;
+            let is_un0 = opc0 == OPT_INST_UNOP || opc0 == OPT_INST_CAST;
+
+            if is_bin0 || is_un0 {
+                let mut iso = true;
+                k = 1;
+                while k < lane_count {
+                    let dk = unsafe { *slp_u32_at(def_insts, k) } as usize;
+                    let instk = unsafe { opt_inst_at(bb.insts, dk) };
+                    let opck = unsafe { (*instk).opcode };
+                    let subk = unsafe { (*instk).sub_op };
+                    if is_bin0 {
+                        if !slp_is_compatible_binop(opc0, sub0, opck, subk) {
+                            iso = false;
+                        }
+                    } else if opck != opc0 || subk != sub0 {
+                        iso = false;
+                    }
+                    k = k + 1;
+                }
+
+                if iso && slp_verify_bundle_independent(
+                    body,
+                    bb,
+                    def_insts as *const u32,
+                    peeled_vals as *const OptValueId,
+                    lane_count
+                ) {
+                    let lhs_vals = arena_alloc_raw(mut_view(*arena), slp_mul_usize(SLP_MAX_LANES, size_of<OptValueId>()), align_of<OptValueId>()) as *mut OptValueId;
+                    let rhs_vals = arena_alloc_raw(mut_view(*arena), slp_mul_usize(SLP_MAX_LANES, size_of<OptValueId>()), align_of<OptValueId>()) as *mut OptValueId;
+                    let lhs0_acc = slp_extract_val_read_access(body, bb, unsafe { (*inst0).lhs });
+                    let rhs0_acc = slp_extract_val_read_access(body, bb, unsafe { (*inst0).rhs });
+                    let can_commute = is_bin0 && slp_is_commutative_binop(sub0) && lhs0_acc.is_valid && rhs0_acc.is_valid &&
+                                      lhs0_acc.base_local.v != rhs0_acc.base_local.v;
+
+                    k = 0;
+                    while k < lane_count {
+                        let dk = unsafe { *slp_u32_at(def_insts, k) } as usize;
+                        let instk = unsafe { opt_inst_at(bb.insts, dk) };
+                        let mut lv = unsafe { (*instk).lhs };
+                        let mut rv = unsafe { (*instk).rhs };
+                        if can_commute && k > 0 {
+                            let lk_acc = slp_extract_val_read_access(body, bb, lv);
+                            let rk_acc = slp_extract_val_read_access(body, bb, rv);
+                            if lk_acc.is_valid && rk_acc.is_valid &&
+                               lk_acc.base_local.v == rhs0_acc.base_local.v &&
+                               rk_acc.base_local.v == lhs0_acc.base_local.v {
+                                let tmp = lv;
+                                lv = rv;
+                                rv = tmp;
+                            }
+                        }
+                        unsafe {
+                            *slp_val_id_at(lhs_vals, k) = lv;
+                            *slp_val_id_at(rhs_vals, k) = rv;
+                        }
+                        k = k + 1;
+                    }
+
+                    let left_idx = slp_build_tree_rec(
+                        mut_view(*tree),
+                        body,
+                        bb,
+                        info,
+                        lhs_vals as *const OptValueId,
+                        lane_count,
+                        elem_kind,
+                        depth + 1u8,
+                        mut_view(*arena)
+                    );
+                    if !tree.is_valid || left_idx == SLP_NODE_INVALID {
+                        return SLP_NODE_INVALID;
+                    }
+                    let mut right_idx: u16 = SLP_NODE_INVALID;
+                    if is_bin0 {
+                        right_idx = slp_build_tree_rec(
+                            mut_view(*tree),
+                            body,
+                            bb,
+                            info,
+                            rhs_vals as *const OptValueId,
+                            lane_count,
+                            elem_kind,
+                            depth + 1u8,
+                            mut_view(*arena)
+                        );
+                        if !tree.is_valid || right_idx == SLP_NODE_INVALID {
+                            return SLP_NODE_INVALID;
+                        }
+                    }
+
+                    let nidx = slp_alloc_node(mut_view(*tree), mut_view(*arena));
+                    let nd = unsafe { slp_node_at(tree.nodes, nidx as usize) };
+                    let op_unit_cost: u32 = if is_bin0 && (sub0 == MIR_BINOP_MUL || sub0 == MIR_BINOP_WRAPPING_MUL) { 2u32 } else { 1u32 };
+                    unsafe {
+                        (*nd).kind = SLP_NODE_VECTORIZABLE;
+                        (*nd).opcode = opc0;
+                        (*nd).sub_op = sub0;
+                        (*nd).vec_opcode = if opc0 == OPT_INST_CAST { OPT_INST_VCAST } else { OPT_INST_VBINOP };
+                        (*nd).depth = depth;
+                        (*nd).left_child = left_idx;
+                        (*nd).right_child = right_idx;
+                        let mut l: usize = 0;
+                        while l < lane_count {
+                            (*nd).lane_insts[l] = *slp_u32_at(def_insts, l);
+                            (*nd).lane_vals[l] = *slp_val_id_at(peeled_vals, l);
+                            l = l + 1;
+                        }
+                        (*nd).scalar_cost = (lane_count as u32) * op_unit_cost;
+                        (*nd).vec_cost = op_unit_cost;
+                        (*nd).pack_cost = 0u32;
+                    }
+                    return nidx;
+                }
+            }
+        }
+    }
+
+    // 4. Fallback: Gather / Pack leaf (`SLP_NODE_GATHER_PACK` via `OPT_INST_VINSERT`)
+    let nidx = slp_alloc_node(mut_view(*tree), mut_view(*arena));
+    let nd = unsafe { slp_node_at(tree.nodes, nidx as usize) };
+    unsafe {
+        (*nd).kind = SLP_NODE_GATHER_PACK;
+        (*nd).opcode = OPT_INST_COPY;
+        (*nd).vec_opcode = OPT_INST_VINSERT;
+        (*nd).depth = depth;
+        let mut l: usize = 0;
+        while l < lane_count {
+            let vk = *(((vals as usize) + l * size_of<OptValueId>()) as *const OptValueId);
+            (*nd).lane_vals[l] = vk;
+            let mut didx: usize = 0;
+            if slp_find_def_inst_in_bb(bb, vk, mut_view(didx)) {
+                (*nd).lane_insts[l] = didx as u32;
+            }
+            l = l + 1;
+        }
+        (*nd).scalar_cost = 0u32;
+        (*nd).vec_cost = 0u32;
+        (*nd).pack_cost = (lane_count as u32) * 3u32;
+    }
+    nidx
+}
+
+fn slp_verify_tree_store_load_disjoint(
+    tree: mut_view<SlpTree>,
+    body: view<OptBody>,
+    bb: view<OptBlock>,
+    info: *const AliasInfo,
+    store_accs: *const SlpMemAccess,
+    lane_count: usize,
+    arena: mut_view<Arena>
+) -> bool {
+    if !tree.is_valid || (store_accs as usize) == 0 || lane_count == 0 {
+        return false;
+    }
+    let s0 = unsafe { *((store_accs as usize) as *const SlpMemAccess) };
+    let mut min_store_idx: u32 = s0.inst_idx;
+    let mut k: usize = 1;
+    while k < lane_count {
+        let sk = unsafe { *(((store_accs as usize) + k * size_of<SlpMemAccess>()) as *const SlpMemAccess) };
+        if (sk.inst_idx) < min_store_idx {
+            min_store_idx = sk.inst_idx;
+        }
+        k = k + 1;
+    }
+
+    let mut n: usize = 0;
+    while n < tree.node_count {
+        let nd = unsafe { slp_node_at(tree.nodes, n) };
+        if (unsafe { (*nd).kind }) == SLP_NODE_VECTORIZABLE && (unsafe { (*nd).opcode }) == OPT_INST_LOAD {
+            let mut max_load_idx: u32 = 0u32;
+            let mut first_load_idx: u32 = OPT_INST_NONE;
+            let mut l: usize = 0;
+            while l < lane_count {
+                let li = unsafe { (*nd).lane_insts[l] };
+                if li != OPT_INST_NONE {
+                    if first_load_idx == OPT_INST_NONE {
+                        first_load_idx = li;
+                    }
+                    if li > max_load_idx {
+                        max_load_idx = li;
+                    }
+                }
+                l = l + 1;
+            }
+            // If any load lane occurs after the earliest store lane in program order, prove NoAlias
+            if first_load_idx != OPT_INST_NONE && max_load_idx > min_store_idx {
+                let linst = unsafe { opt_inst_at(bb.insts, first_load_idx as usize) };
+                let l_acc = slp_extract_place_access(body, bb, first_load_idx as usize, unsafe { view((*linst).rhs_place) }, false, unsafe { (*linst).result });
+                let mut disjoint = slp_access_ranges_disjoint(view(s0), lane_count, view(l_acc), lane_count);
+                if !disjoint && (info as usize) != 0 {
+                    let ainfo = unsafe { view(*info) };
+                    let sinst = unsafe { opt_inst_at(bb.insts, s0.inst_idx as usize) };
+                    let reg_s = alias_extract_region(ainfo, body, unsafe { view((*sinst).place) }, OptValueId { v: OPT_VALUE_NONE }, mut_view(*arena));
+                    let reg_l = alias_extract_region(ainfo, body, unsafe { view((*linst).rhs_place) }, OptValueId { v: OPT_VALUE_NONE }, mut_view(*arena));
+                    let pt_s = alias_make_prog_pt(bb.id.v, s0.inst_idx);
+                    let pt_l = alias_make_prog_pt(bb.id.v, first_load_idx);
+                    let qpt: u32 = if pt_s >= pt_l { pt_s } else { pt_l };
+                    let q = alias_query_regions(ainfo, body, mut_view(*arena), view(reg_s), view(reg_l), qpt);
+                    if alias_is_no_alias_proven(view(q)) {
+                        disjoint = true;
+                        tree.alias_proof = VEC_ALIAS_CAP_DISJOINT;
+                    }
+                }
+                if !disjoint {
+                    tree.is_valid = false;
+                    tree.reject_reason = REASON_UNKNOWN_ALIAS;
+                    tree.alias_proof = VEC_ALIAS_REJECTED_MAY_ALIAS;
+                    return false;
+                }
+            }
+        }
+        n = n + 1;
+    }
+    true
+}
+
+// --- 4. External Use Extraction & Target-Aware SLP Cost Model (SPEC-74 §5.5..§5.6, AXS-VEC-040..041) ---
+
+fn slp_inst_in_tree(tree: view<SlpTree>, inst_idx: u32) -> bool {
+    if inst_idx == OPT_INST_NONE || (tree.nodes as usize) == 0 {
+        return false;
+    }
+    let lanes = tree.lane_count as usize;
+    let mut n: usize = 0;
+    while n < tree.node_count {
+        let nd = unsafe { slp_node_at(tree.nodes, n) };
+        if (unsafe { (*nd).kind }) == SLP_NODE_VECTORIZABLE || (unsafe { (*nd).kind }) == SLP_NODE_REDUCTION_ROOT {
+            let mut l: usize = 0;
+            while l < lanes && l < SLP_MAX_LANES {
+                if (unsafe { (*nd).lane_insts[l] }) == inst_idx {
+                    return true;
+                }
+                l = l + 1;
+            }
+        }
+        n = n + 1;
+    }
+    false
+}
+
+fn slp_val_used_outside_tree_in_bb(
+    tree: view<SlpTree>,
+    bb: view<OptBlock>,
+    val_id: OptValueId,
+    def_inst_idx: u32
+) -> bool {
+    if val_id.v == OPT_VALUE_NONE {
+        return false;
+    }
+    let mut i: usize = (def_inst_idx as usize) + 1;
+    while i < bb.inst_count {
+        if !slp_inst_in_tree(tree, i as u32) {
+            let inst = unsafe { opt_inst_at(bb.insts, i) };
+            let opc = unsafe { (*inst).opcode };
+            if opc != OPT_INST_NOP {
+                if (unsafe { (*inst).lhs.v }) == val_id.v || (unsafe { (*inst).rhs.v }) == val_id.v {
+                    // If this instruction is an intermediate copy whose result is ONLY used inside the tree, don't count it as external
+                    if opc == OPT_INST_COPY && (unsafe { (*inst).place.proj_count }) == 0 {
+                        let copy_res = unsafe { (*inst).result };
+                        if slp_val_used_outside_tree_in_bb(tree, bb, copy_res, i as u32) {
+                            return true;
+                        }
+                    } else {
+                        return true;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if bb.has_term {
+        if bb.term.cond.v == val_id.v {
+            return true;
+        }
+        if bb.term.kind == OPT_TERM_CALL {
+            let mut a: usize = 0;
+            while a < bb.term.call_arg_count {
+                let arg_v = unsafe { *(((bb.term.call_args as usize) + a * size_of<OptValueId>()) as *const OptValueId) };
+                if arg_v.v == val_id.v {
+                    return true;
+                }
+                a = a + 1;
+            }
+        }
+    }
+    false
+}
+
+pub fn slp_count_external_uses(tree: view<SlpTree>, bb: view<OptBlock>) -> u16 {
+    if !tree.is_valid || (tree.nodes as usize) == 0 || tree.node_count == 0 {
+        return 0u16;
+    }
+    let mut ext_count: u16 = 0u16;
+    let lanes = tree.lane_count as usize;
+    // Exclude the root node (node_count - 1) since its outputs are the store or reduction root itself
+    let limit: usize = if tree.node_count > 1 { tree.node_count - 1 } else { 0 };
+    let mut n: usize = 0;
+    while n < limit {
+        let nd = unsafe { slp_node_at(tree.nodes, n) };
+        if (unsafe { (*nd).kind }) == SLP_NODE_VECTORIZABLE && (unsafe { (*nd).opcode }) != OPT_INST_LOAD {
+            let mut l: usize = 0;
+            while l < lanes && l < SLP_MAX_LANES {
+                let lval = unsafe { (*nd).lane_vals[l] };
+                let linst = unsafe { (*nd).lane_insts[l] };
+                if lval.v != OPT_VALUE_NONE && linst != OPT_INST_NONE {
+                    if slp_val_used_outside_tree_in_bb(tree, bb, lval, linst) {
+                        ext_count = ext_count + 1u16;
+                    }
+                }
+                l = l + 1;
+            }
+        }
+        n = n + 1;
+    }
+    ext_count
+}
+
+pub fn slp_estimate_tree_cost(
+    tree: mut_view<SlpTree>,
+    bb: view<OptBlock>,
+    caps: view<TargetSimdCaps>,
+    profile: u8
+) {
+    let mut est = SlpCostEstimate {
+        bb_id: tree.bb_id,
+        seed_kind: tree.seed_kind,
+        lane_count: tree.lane_count,
+        elem_kind: tree.elem_kind,
+        node_count: tree.node_count as u16,
+        vectorizable_nodes: 0u16,
+        broadcast_nodes: 0u16,
+        gather_pack_nodes: 0u16,
+        external_extracts: 0u16,
+        scalar_cost: 0u32,
+        vec_inst_cost: 0u32,
+        pack_cost: 0u32,
+        extract_cost: 0u32,
+        spill_penalty: 0u32,
+        total_vec_cost: 0u32,
+        net_benefit: 0i32,
+        est_vec_regs: 0u8,
+        confidence: COST_CONF_HIGH,
+        profitable: false,
+        reject_reason: tree.reject_reason,
+    };
+
+    if !tree.is_valid || tree.reject_reason != REASON_NONE {
+        tree.cost = est;
+        return;
+    }
+
+    let mut arith_or_load_vec_nodes: u16 = 0u16;
+    let mut n: usize = 0;
+    while n < tree.node_count {
+        let nd = unsafe { slp_node_at(tree.nodes, n) };
+        let nk = unsafe { (*nd).kind };
+        let nopc = unsafe { (*nd).opcode };
+        est.scalar_cost = est.scalar_cost + (unsafe { (*nd).scalar_cost });
+        est.vec_inst_cost = est.vec_inst_cost + (unsafe { (*nd).vec_cost });
+        est.pack_cost = est.pack_cost + (unsafe { (*nd).pack_cost });
+        if nk == SLP_NODE_VECTORIZABLE || nk == SLP_NODE_REDUCTION_ROOT {
+            est.vectorizable_nodes = est.vectorizable_nodes + 1u16;
+            if nopc != OPT_INST_STORE {
+                arith_or_load_vec_nodes = arith_or_load_vec_nodes + 1u16;
+            }
+        } else if nk == SLP_NODE_BROADCAST {
+            est.broadcast_nodes = est.broadcast_nodes + 1u16;
+        } else if nk == SLP_NODE_GATHER_PACK {
+            est.gather_pack_nodes = est.gather_pack_nodes + 1u16;
+        }
+        n = n + 1;
+    }
+
+    est.external_extracts = slp_count_external_uses(view(*tree), bb);
+    est.extract_cost = (est.external_extracts as u32) * 2u32;
+
+    let live_regs_u16: u16 = 1u16 + est.vectorizable_nodes + est.broadcast_nodes;
+    est.est_vec_regs = if live_regs_u16 > 16u16 { 16u8 } else { live_regs_u16 as u8 };
+    if est.est_vec_regs > caps.reg_pressure_budget {
+        est.spill_penalty = ((est.est_vec_regs - caps.reg_pressure_budget) as u32) * 8u32;
+    }
+
+    if est.gather_pack_nodes > 0u16 || est.external_extracts > 0u16 {
+        est.confidence = COST_CONF_MEDIUM;
+    }
+    if est.gather_pack_nodes >= est.vectorizable_nodes {
+        est.confidence = COST_CONF_LOW;
+    }
+
+    est.total_vec_cost = est.vec_inst_cost + est.pack_cost + est.extract_cost + est.spill_penalty;
+    est.net_benefit = (est.scalar_cost as i32) - (est.total_vec_cost as i32);
+
+    if profile == OPT_PROFILE_DEBUG_O0 {
+        est.profitable = false;
+        est.reject_reason = REASON_COST_NOT_PROFITABLE;
+        tree.reject_reason = REASON_COST_NOT_PROFITABLE;
+        tree.cost = est;
+        return;
+    }
+
+    if profile == OPT_PROFILE_SIZE_OS && (est.gather_pack_nodes > 0u16 || est.total_vec_cost > est.scalar_cost) {
+        est.profitable = false;
+        est.reject_reason = REASON_SIZE_PROFILE_GROWTH;
+        tree.reject_reason = REASON_SIZE_PROFILE_GROWTH;
+        tree.cost = est;
+        return;
+    }
+
+    if arith_or_load_vec_nodes == 0u16 || est.total_vec_cost >= est.scalar_cost {
+        est.profitable = false;
+        est.reject_reason = REASON_COST_NOT_PROFITABLE;
+        tree.reject_reason = REASON_COST_NOT_PROFITABLE;
+        tree.cost = est;
+        return;
+    }
+
+    if est.confidence == COST_CONF_LOW && (est.total_vec_cost * 5u32) > (est.scalar_cost * 4u32) {
+        est.profitable = false;
+        est.reject_reason = REASON_COST_NOT_PROFITABLE;
+        tree.reject_reason = REASON_COST_NOT_PROFITABLE;
+        tree.cost = est;
+        return;
+    }
+
+    est.profitable = true;
+    est.reject_reason = REASON_NONE;
+    tree.cost = est;
+}
+
+// --- 5. Store-Chain & Horizontal-Reduction Seed Tree Builders (SPEC-74 §5.1..§5.6, AXS-VEC-036..042) ---
+
+fn slp_make_empty_tree(bb_id: OptBbId, seed_kind: u8, lane_count: u8, elem_kind: u8) -> SlpTree {
+    SlpTree {
+        is_valid: true,
+        bb_id: bb_id,
+        seed_kind: seed_kind,
+        lane_count: lane_count,
+        elem_kind: elem_kind,
+        elem_bits: vec_elem_bit_width(elem_kind),
+        reduction_op: VREDUCE_NONE,
+        reduction_root_inst: OPT_INST_NONE,
+        alias_proof: VEC_ALIAS_NONE,
+        reject_reason: REASON_NONE,
+        certainty: CERTAINTY_PROVEN,
+        nodes: 0 as *mut SlpNode,
+        node_count: 0,
+        node_cap: 0,
+        cost: SlpCostEstimate {
+            bb_id: bb_id,
+            seed_kind: seed_kind,
+            lane_count: lane_count,
+            elem_kind: elem_kind,
+            node_count: 0u16,
+            vectorizable_nodes: 0u16,
+            broadcast_nodes: 0u16,
+            gather_pack_nodes: 0u16,
+            external_extracts: 0u16,
+            scalar_cost: 0u32,
+            vec_inst_cost: 0u32,
+            pack_cost: 0u32,
+            extract_cost: 0u32,
+            spill_penalty: 0u32,
+            total_vec_cost: 0u32,
+            net_benefit: 0i32,
+            est_vec_regs: 0u8,
+            confidence: COST_CONF_HIGH,
+            profitable: false,
+            reject_reason: REASON_NONE,
+        },
+    }
+}
+
+pub fn slp_build_store_seed_tree(
+    body: view<OptBody>,
+    bb: view<OptBlock>,
+    info: *const AliasInfo,
+    caps: view<TargetSimdCaps>,
+    profile: u8,
+    store_accs: *const SlpMemAccess,
+    lane_count: usize,
+    arena: mut_view<Arena>
+) -> SlpTree {
+    let a0 = unsafe { *((store_accs as usize) as *const SlpMemAccess) };
+    let mut tree = slp_make_empty_tree(bb.id, SLP_SEED_ADJACENT_STORES, lane_count as u8, a0.elem_kind);
+    if !slp_is_legal_bundle_width(caps, a0.elem_kind, lane_count as u8) ||
+       !slp_are_accesses_contiguous(store_accs, lane_count) {
+        tree.is_valid = false;
+        tree.reject_reason = REASON_COST_NOT_PROFITABLE;
+        slp_estimate_tree_cost(mut_view(tree), bb, caps, profile);
+        return tree;
+    }
+
+    let mut store_alias_proof: u8 = VEC_ALIAS_NONE;
+    let mem_reason = slp_verify_bundle_memory_safety(
+        body,
+        bb,
+        info,
+        store_accs,
+        lane_count,
+        mut_view(store_alias_proof),
+        mut_view(*arena)
+    );
+    tree.alias_proof = store_alias_proof;
+    if mem_reason != REASON_NONE {
+        tree.is_valid = false;
+        tree.reject_reason = mem_reason;
+        tree.certainty = if mem_reason == REASON_UNKNOWN_ALIAS { CERTAINTY_UNKNOWN } else { CERTAINTY_POSSIBLE };
+        slp_estimate_tree_cost(mut_view(tree), bb, caps, profile);
+        return tree;
+    }
+
+    let rhs_vals = arena_alloc_raw(mut_view(*arena), slp_mul_usize(SLP_MAX_LANES, size_of<OptValueId>()), align_of<OptValueId>()) as *mut OptValueId;
+    let store_insts = arena_alloc_raw(mut_view(*arena), slp_mul_usize(SLP_MAX_LANES, size_of<u32>()), align_of<u32>()) as *mut u32;
+    let mut direct_arith_stores = true;
+    let mut k: usize = 0;
+    while k < lane_count {
+        let ak = unsafe { *(((store_accs as usize) + k * size_of<SlpMemAccess>()) as *const SlpMemAccess) };
+        unsafe {
+            *slp_u32_at(store_insts, k) = ak.inst_idx;
+            *slp_val_id_at(rhs_vals, k) = ak.val_id;
+        }
+        let sinst = unsafe { opt_inst_at(bb.insts, ak.inst_idx as usize) };
+        let br = slp_inst_barrier_reason(body, bb.id.v, unsafe { view(*sinst) });
+        if br != REASON_NONE {
+            tree.is_valid = false;
+            tree.reject_reason = br;
+            slp_estimate_tree_cost(mut_view(tree), bb, caps, profile);
+            return tree;
+        }
+        let sopc = unsafe { (*sinst).opcode };
+        if sopc == OPT_INST_STORE || sopc == OPT_INST_INSERT_FIELD || sopc == OPT_INST_COPY || sopc == OPT_INST_CONST {
+            direct_arith_stores = false;
+        }
+        k = k + 1;
+    }
+
+    let child_idx = slp_build_tree_rec(
+        mut_view(tree),
+        body,
+        bb,
+        info,
+        rhs_vals as *const OptValueId,
+        lane_count,
+        a0.elem_kind,
+        1u8,
+        mut_view(*arena)
+    );
+    if !tree.is_valid || child_idx == SLP_NODE_INVALID {
+        if tree.reject_reason == REASON_NONE {
+            tree.reject_reason = REASON_COST_NOT_PROFITABLE;
+        }
+        slp_estimate_tree_cost(mut_view(tree), bb, caps, profile);
+        return tree;
+    }
+
+    // If the store instructions themselves were direct in-place binops (`p.x = a.x + b.x`), don't double-count store insts in child
+    let root_idx = slp_alloc_node(mut_view(tree), mut_view(*arena));
+    let rnd = unsafe { slp_node_at(tree.nodes, root_idx as usize) };
+    unsafe {
+        (*rnd).kind = SLP_NODE_VECTORIZABLE;
+        (*rnd).opcode = OPT_INST_STORE;
+        (*rnd).vec_opcode = OPT_INST_VSTORE;
+        (*rnd).depth = 0u8;
+        (*rnd).left_child = child_idx;
+        (*rnd).base_local = a0.base_local;
+        (*rnd).anchor_local = a0.anchor_local;
+        (*rnd).start_offset = a0.offset;
+        let mut l: usize = 0;
+        while l < lane_count {
+            (*rnd).lane_insts[l] = if direct_arith_stores { OPT_INST_NONE } else { *slp_u32_at(store_insts, l) };
+            (*rnd).lane_vals[l] = *slp_val_id_at(rhs_vals, l);
+            l = l + 1;
+        }
+        (*rnd).scalar_cost = (lane_count as u32) * 2u32;
+        (*rnd).vec_cost = 2u32;
+        (*rnd).pack_cost = 0u32;
+    }
+
+    if !slp_verify_tree_store_load_disjoint(mut_view(tree), body, bb, info, store_accs, lane_count, mut_view(*arena)) {
+        slp_estimate_tree_cost(mut_view(tree), bb, caps, profile);
+        return tree;
+    }
+
+    slp_estimate_tree_cost(mut_view(tree), bb, caps, profile);
+    tree
+}
+
+fn slp_classify_reduction_op(
+    body: view<OptBody>,
+    bb_v: u32,
+    inst: view<OptInst>,
+    elem_kind: u8,
+    caps: view<TargetSimdCaps>,
+    out_vred: mut_view<u8>,
+    out_reason: mut_view<u8>
+) -> bool {
+    *out_vred = VREDUCE_NONE;
+    *out_reason = REASON_NONE;
+    let opc = inst.opcode;
+    let bop = inst.sub_op;
+    if opc != OPT_INST_BINOP && opc != OPT_INST_WRAPPING_BINOP && opc != OPT_INST_CHECKED_BINOP {
+        return false;
+    }
+    let br = slp_inst_barrier_reason(body, bb_v, inst);
+    if br != REASON_NONE {
+        *out_reason = br;
+        return false;
+    }
+    if vec_elem_is_float(elem_kind) {
+        if bop == MIR_BINOP_ADD || bop == MIR_BINOP_MUL {
+            if caps.fp_mode != FP_MODE_RELAXED {
+                *out_reason = REASON_STRICT_FP_REDUCTION;
+                return false;
+            }
+            *out_vred = if bop == MIR_BINOP_ADD { VREDUCE_ADD } else { VREDUCE_MUL };
+            return true;
+        }
+        *out_reason = REASON_NON_ASSOC_REDUCTION;
+        return false;
+    }
+    if bop == MIR_BINOP_ADD || bop == MIR_BINOP_WRAPPING_ADD {
+        *out_vred = VREDUCE_ADD;
+        return true;
+    }
+    if bop == MIR_BINOP_MUL || bop == MIR_BINOP_WRAPPING_MUL {
+        *out_vred = VREDUCE_MUL;
+        return true;
+    }
+    if bop == MIR_BINOP_BIT_AND {
+        *out_vred = VREDUCE_BIT_AND;
+        return true;
+    }
+    if bop == MIR_BINOP_BIT_OR {
+        *out_vred = VREDUCE_BIT_OR;
+        return true;
+    }
+    if bop == MIR_BINOP_BIT_XOR {
+        *out_vred = VREDUCE_BIT_XOR;
+        return true;
+    }
+    false
+}
+
+pub fn slp_build_reduction_seed_tree(
+    body: view<OptBody>,
+    bb: view<OptBlock>,
+    info: *const AliasInfo,
+    caps: view<TargetSimdCaps>,
+    profile: u8,
+    root_inst_idx: usize,
+    arena: mut_view<Arena>
+) -> SlpTree {
+    let rinst = unsafe { opt_inst_at(bb.insts, root_inst_idx) };
+    let ek = vec_classify_type_elem(body.thir, unsafe { (*rinst).ty });
+    let mut tree = slp_make_empty_tree(bb.id, SLP_SEED_HORIZ_REDUCTION, 4u8, ek);
+    tree.reduction_root_inst = root_inst_idx as u32;
+
+    if ek == VEC_ELEM_NONE {
+        tree.is_valid = false;
+        tree.reject_reason = REASON_COST_NOT_PROFITABLE;
+        return tree;
+    }
+
+    let mut vred_op: u8 = VREDUCE_NONE;
+    let mut red_reason: u8 = REASON_NONE;
+    if !slp_classify_reduction_op(body, bb.id.v, unsafe { view(*rinst) }, ek, caps, mut_view(vred_op), mut_view(red_reason)) {
+        tree.is_valid = false;
+        tree.reject_reason = if red_reason != REASON_NONE { red_reason } else { REASON_NON_ASSOC_REDUCTION };
+        slp_estimate_tree_cost(mut_view(tree), bb, caps, profile);
+        return tree;
+    }
+    tree.reduction_op = vred_op;
+
+    let root_opc = unsafe { (*rinst).opcode };
+    let root_sub = unsafe { (*rinst).sub_op };
+    let leaf_vals = arena_alloc_raw(mut_view(*arena), slp_mul_usize(SLP_MAX_LANES, size_of<OptValueId>()), align_of<OptValueId>()) as *mut OptValueId;
+    let mut red_insts: [8]u32 = [OPT_INST_NONE, OPT_INST_NONE, OPT_INST_NONE, OPT_INST_NONE, OPT_INST_NONE, OPT_INST_NONE, OPT_INST_NONE, OPT_INST_NONE];
+    let mut lanes: usize = 0;
+
+    // Pattern A: Balanced 4-lane tree `(s0 op s1) op (s2 op s3)`
+    let mut l_idx: usize = 0;
+    let mut r_idx: usize = 0;
+    if slp_resolve_arith_def_inst(body, bb, unsafe { (*rinst).lhs }, mut_view(l_idx)) &&
+       slp_resolve_arith_def_inst(body, bb, unsafe { (*rinst).rhs }, mut_view(r_idx)) &&
+       l_idx != r_idx {
+        let linst = unsafe { opt_inst_at(bb.insts, l_idx) };
+        let rinst2 = unsafe { opt_inst_at(bb.insts, r_idx) };
+        let br_l = slp_inst_barrier_reason(body, bb.id.v, unsafe { view(*linst) });
+        let br_r = slp_inst_barrier_reason(body, bb.id.v, unsafe { view(*rinst2) });
+        if br_l != REASON_NONE || br_r != REASON_NONE {
+            tree.is_valid = false;
+            tree.reject_reason = if br_l != REASON_NONE { br_l } else { br_r };
+            slp_estimate_tree_cost(mut_view(tree), bb, caps, profile);
+            return tree;
+        }
+        if slp_is_compatible_binop(root_opc, root_sub, unsafe { (*linst).opcode }, unsafe { (*linst).sub_op }) &&
+           slp_is_compatible_binop(root_opc, root_sub, unsafe { (*rinst2).opcode }, unsafe { (*rinst2).sub_op }) {
+            unsafe {
+                *slp_val_id_at(leaf_vals, 0) = (*linst).lhs;
+                *slp_val_id_at(leaf_vals, 1) = (*linst).rhs;
+                *slp_val_id_at(leaf_vals, 2) = (*rinst2).lhs;
+                *slp_val_id_at(leaf_vals, 3) = (*rinst2).rhs;
+            }
+            red_insts[0] = l_idx as u32;
+            red_insts[1] = r_idx as u32;
+            red_insts[2] = root_inst_idx as u32;
+            lanes = 4;
+        }
+    }
+
+    // Pattern B: Left-leaning 4-lane chain `((s0 op s1) op s2) op s3`
+    if lanes == 0 && slp_resolve_arith_def_inst(body, bb, unsafe { (*rinst).lhs }, mut_view(l_idx)) {
+        let linst1 = unsafe { opt_inst_at(bb.insts, l_idx) };
+        let br1 = slp_inst_barrier_reason(body, bb.id.v, unsafe { view(*linst1) });
+        if br1 != REASON_NONE {
+            tree.is_valid = false;
+            tree.reject_reason = br1;
+            slp_estimate_tree_cost(mut_view(tree), bb, caps, profile);
+            return tree;
+        }
+        let mut ll_idx: usize = 0;
+        if slp_is_compatible_binop(root_opc, root_sub, unsafe { (*linst1).opcode }, unsafe { (*linst1).sub_op }) &&
+           slp_resolve_arith_def_inst(body, bb, unsafe { (*linst1).lhs }, mut_view(ll_idx)) {
+            let linst0 = unsafe { opt_inst_at(bb.insts, ll_idx) };
+            let br0 = slp_inst_barrier_reason(body, bb.id.v, unsafe { view(*linst0) });
+            if br0 != REASON_NONE {
+                tree.is_valid = false;
+                tree.reject_reason = br0;
+                slp_estimate_tree_cost(mut_view(tree), bb, caps, profile);
+                return tree;
+            }
+            if slp_is_compatible_binop(root_opc, root_sub, unsafe { (*linst0).opcode }, unsafe { (*linst0).sub_op }) {
+                unsafe {
+                    *slp_val_id_at(leaf_vals, 0) = (*linst0).lhs;
+                    *slp_val_id_at(leaf_vals, 1) = (*linst0).rhs;
+                    *slp_val_id_at(leaf_vals, 2) = (*linst1).rhs;
+                    *slp_val_id_at(leaf_vals, 3) = (*rinst).rhs;
+                }
+                red_insts[0] = ll_idx as u32;
+                red_insts[1] = l_idx as u32;
+                red_insts[2] = root_inst_idx as u32;
+                lanes = 4;
+            }
+        }
+    }
+
+    if lanes == 0 || !slp_is_legal_bundle_width(caps, ek, lanes as u8) {
+        tree.is_valid = false;
+        tree.reject_reason = REASON_COST_NOT_PROFITABLE;
+        slp_estimate_tree_cost(mut_view(tree), bb, caps, profile);
+        return tree;
+    }
+    tree.lane_count = lanes as u8;
+
+    let child_idx = slp_build_tree_rec(
+        mut_view(tree),
+        body,
+        bb,
+        info,
+        leaf_vals as *const OptValueId,
+        lanes,
+        ek,
+        1u8,
+        mut_view(*arena)
+    );
+    if !tree.is_valid || child_idx == SLP_NODE_INVALID {
+        if tree.reject_reason == REASON_NONE {
+            tree.reject_reason = REASON_COST_NOT_PROFITABLE;
+        }
+        slp_estimate_tree_cost(mut_view(tree), bb, caps, profile);
+        return tree;
+    }
+
+    let root_idx = slp_alloc_node(mut_view(tree), mut_view(*arena));
+    let rnd = unsafe { slp_node_at(tree.nodes, root_idx as usize) };
+    unsafe {
+        (*rnd).kind = SLP_NODE_REDUCTION_ROOT;
+        (*rnd).opcode = root_opc;
+        (*rnd).sub_op = vred_op;
+        (*rnd).vec_opcode = OPT_INST_VREDUCE;
+        (*rnd).depth = 0u8;
+        (*rnd).left_child = child_idx;
+        (*rnd).lane_insts[0] = red_insts[0];
+        (*rnd).lane_insts[1] = red_insts[1];
+        (*rnd).lane_insts[2] = red_insts[2];
+        (*rnd).lane_vals[0] = (*rinst).result;
+        (*rnd).scalar_cost = (lanes as u32) - 1u32;
+        (*rnd).vec_cost = 2u32;
+        (*rnd).pack_cost = 0u32;
+    }
+
+    slp_estimate_tree_cost(mut_view(tree), bb, caps, profile);
+    tree
+}
+
+// --- 6. Basic-Block Seed Discovery, Materialization & Pass Entry Points (SPEC-74 §5, §8, AXS-VEC-036..053) ---
+
+fn slp_make_record_from_tree(tree: view<SlpTree>, caps: view<TargetSimdCaps>, applied: bool) -> SlpVecRecord {
+    let mut vload_cnt: u8 = 0u8;
+    let mut vstore_cnt: u8 = 0u8;
+    let mut vsplat_cnt: u8 = 0u8;
+    let mut vinsert_cnt: u8 = 0u8;
+    let mut vbinop_cnt: u8 = 0u8;
+    let mut vreduce_cnt: u8 = 0u8;
+    let mut n: usize = 0;
+    while n < tree.node_count && (tree.nodes as usize) != 0 {
+        let nd = unsafe { slp_node_at(tree.nodes, n) };
+        let vopc = unsafe { (*nd).vec_opcode };
+        if vopc == OPT_INST_VLOAD {
+            vload_cnt = vload_cnt + 1u8;
+        } else if vopc == OPT_INST_VSTORE {
+            vstore_cnt = vstore_cnt + 1u8;
+        } else if vopc == OPT_INST_VSPLAT {
+            vsplat_cnt = vsplat_cnt + 1u8;
+        } else if vopc == OPT_INST_VINSERT {
+            vinsert_cnt = vinsert_cnt + (tree.lane_count);
+        } else if vopc == OPT_INST_VBINOP || vopc == OPT_INST_VCAST {
+            vbinop_cnt = vbinop_cnt + 1u8;
+        } else if vopc == OPT_INST_VREDUCE {
+            vreduce_cnt = vreduce_cnt + 1u8;
+        }
+        n = n + 1;
+    }
+    SlpVecRecord {
+        pass_id: PASS_SLP_VEC,
+        bb_id: tree.bb_id,
+        seed_kind: tree.seed_kind,
+        applied: applied,
+        lane_count: tree.lane_count,
+        elem_kind: tree.elem_kind,
+        isa_level: caps.isa_level,
+        alias_proof: tree.alias_proof,
+        reduction_op: tree.reduction_op,
+        reason: if applied { REASON_NONE } else { tree.reject_reason },
+        certainty: tree.certainty,
+        node_count: tree.cost.node_count,
+        vectorizable_nodes: tree.cost.vectorizable_nodes,
+        broadcast_nodes: tree.cost.broadcast_nodes,
+        gather_pack_nodes: tree.cost.gather_pack_nodes,
+        external_extracts: tree.cost.external_extracts,
+        vload_count: vload_cnt,
+        vstore_count: vstore_cnt,
+        vsplat_count: vsplat_cnt,
+        vinsert_count: vinsert_cnt,
+        vextract_count: tree.cost.external_extracts as u8,
+        vbinop_count: vbinop_cnt,
+        vreduce_count: vreduce_cnt,
+        scalar_cost: tree.cost.scalar_cost,
+        vec_cost: tree.cost.total_vec_cost,
+        net_benefit: tree.cost.net_benefit,
+        confidence: tree.cost.confidence,
+    }
+}
+
+fn slp_apply_tree(
+    body: mut_view<OptBody>,
+    bb: mut_view<OptBlock>,
+    tree: view<SlpTree>,
+    caps: view<TargetSimdCaps>,
+    stats: mut_view<SlpVecStats>,
+    arena: mut_view<Arena>
+) {
+    let lanes = tree.lane_count as usize;
+    let mut n: usize = 0;
+    while n < tree.node_count && (tree.nodes as usize) != 0 {
+        let nd = unsafe { slp_node_at(tree.nodes, n) };
+        let linst0 = unsafe { (*nd).lane_insts[0] };
+        let lval0 = unsafe { (*nd).lane_vals[0] };
+        let inst_id0: OptInstId = if linst0 != OPT_INST_NONE && (linst0 as usize) < bb.inst_count {
+            unsafe { (*opt_inst_at(bb.insts, linst0 as usize)).id }
+        } else {
+            OptInstId { v: OPT_INST_NONE }
+        };
+        let vopc = unsafe { (*nd).vec_opcode };
+        if vopc == OPT_INST_VLOAD || vopc == OPT_INST_VSTORE {
+            optir_record_provenance(
+                mut_view(*body),
+                mut_view(*arena),
+                PROP_NO_ALIAS,
+                CERTAINTY_PROVEN,
+                ANALYSIS_ALIAS_INFO,
+                lval0,
+                OptValueId { v: (unsafe { (*nd).base_local.v }) },
+                bb.id,
+                inst_id0,
+                PASS_SLP_VEC
+            );
+            optir_record_provenance(
+                mut_view(*body),
+                mut_view(*arena),
+                PROP_IN_BOUNDS,
+                CERTAINTY_PROVEN,
+                ANALYSIS_RANGE_INFO,
+                lval0,
+                OptValueId { v: (tree.lane_count as u32) },
+                bb.id,
+                inst_id0,
+                PASS_SLP_VEC
+            );
+        } else if vopc == OPT_INST_VBINOP || vopc == OPT_INST_VREDUCE {
+            optir_record_provenance(
+                mut_view(*body),
+                mut_view(*arena),
+                PROP_NO_OVERFLOW,
+                CERTAINTY_PROVEN,
+                ANALYSIS_RANGE_INFO,
+                lval0,
+                OptValueId { v: (tree.lane_count as u32) },
+                bb.id,
+                inst_id0,
+                PASS_SLP_VEC
+            );
+        }
+        // Stamp pass_id on origin of packed instructions
+        let mut l: usize = 0;
+        while l < lanes && l < SLP_MAX_LANES {
+            let li = unsafe { (*nd).lane_insts[l] };
+            if li != OPT_INST_NONE && (li as usize) < bb.inst_count {
+                let pinst = unsafe { opt_inst_at(bb.insts, li as usize) };
+                unsafe { (*pinst).origin.pass_id = PASS_SLP_VEC; }
+            }
+            l = l + 1;
+        }
+        n = n + 1;
+    }
+
+    stats.trees_vectorized = stats.trees_vectorized + 1u32;
+    if tree.seed_kind == SLP_SEED_ADJACENT_STORES {
+        stats.store_chains_vectorized = stats.store_chains_vectorized + 1u32;
+    } else if tree.seed_kind == SLP_SEED_HORIZ_REDUCTION {
+        stats.reductions_vectorized = stats.reductions_vectorized + 1u32;
+    }
+    stats.lanes_packed_total = stats.lanes_packed_total + (tree.lane_count as u32);
+    stats.vectorizable_nodes_emitted = stats.vectorizable_nodes_emitted + (tree.cost.vectorizable_nodes as u32);
+    stats.broadcast_nodes_emitted = stats.broadcast_nodes_emitted + (tree.cost.broadcast_nodes as u32);
+    stats.gather_packs_emitted = stats.gather_packs_emitted + (tree.cost.gather_pack_nodes as u32);
+    stats.external_extracts_emitted = stats.external_extracts_emitted + (tree.cost.external_extracts as u32);
+
+    let rec = slp_make_record_from_tree(tree, caps, true);
+    slp_push_record(mut_view(*stats), mut_view(*arena), view(rec));
+}
+
+fn slp_sort_accesses_by_offset(arr: *mut SlpMemAccess, count: usize) {
+    let mut i: usize = 1;
+    while i < count {
+        let key = unsafe { *(((arr as usize) + i * size_of<SlpMemAccess>()) as *const SlpMemAccess) };
+        let mut j: usize = i;
+        while j > 0 {
+            let prev = unsafe { *(((arr as usize) + (j - 1) * size_of<SlpMemAccess>()) as *const SlpMemAccess) };
+            if prev.offset > key.offset {
+                unsafe {
+                    *(((arr as usize) + j * size_of<SlpMemAccess>()) as *mut SlpMemAccess) = prev;
+                }
+                j = j - 1;
+            } else {
+                break;
+            }
+        }
+        unsafe {
+            *(((arr as usize) + j * size_of<SlpMemAccess>()) as *mut SlpMemAccess) = key;
+        }
+        i = i + 1;
+    }
+}
+
+fn slp_scan_and_vectorize_block(
+    body: mut_view<OptBody>,
+    bb_idx: usize,
+    info: *const AliasInfo,
+    caps: view<TargetSimdCaps>,
+    profile: u8,
+    stats: mut_view<SlpVecStats>,
+    arena: mut_view<Arena>
+) -> bool {
+    let bb_ptr = unsafe { opt_block_at(body.blocks, bb_idx) };
+    let icnt = unsafe { (*bb_ptr).inst_count };
+    if icnt < 2 {
+        return false;
+    }
+    stats.blocks_analyzed = stats.blocks_analyzed + 1u32;
+
+    let used_bytes = slp_mul_usize(icnt, size_of<u8>());
+    let used_flags = arena_alloc_raw(mut_view(*arena), used_bytes, 1) as *mut u8;
+    let mut u: usize = 0;
+    while u < icnt {
+        unsafe { *(((used_flags as usize) + u) as *mut u8) = 0u8; }
+        u = u + 1;
+    }
+
+    let mut changed = false;
+    let group_buf = arena_alloc_raw(mut_view(*arena), slp_mul_usize(16, size_of<SlpMemAccess>()), align_of<SlpMemAccess>()) as *mut SlpMemAccess;
+
+    // Phase 1: Adjacent store / field-write chain seeds
+    let mut i: usize = 0;
+    while i < icnt {
+        let is_used = unsafe { *(((used_flags as usize) + i) as *const u8) } != 0u8;
+        if !is_used {
+            let w0 = slp_extract_inst_write_access(view(*body), unsafe { view(*bb_ptr) }, i);
+            if w0.is_valid {
+                unsafe { *slp_acc_at(group_buf, 0) = w0; }
+                let mut gcnt: usize = 1;
+                let mut j: usize = i + 1;
+                while j < icnt && gcnt < 16 {
+                    let j_used = unsafe { *(((used_flags as usize) + j) as *const u8) } != 0u8;
+                    if !j_used {
+                        let wj = slp_extract_inst_write_access(view(*body), unsafe { view(*bb_ptr) }, j);
+                        if wj.is_valid &&
+                           wj.access_kind == w0.access_kind &&
+                           wj.base_local.v == w0.base_local.v &&
+                           wj.anchor_local.v == w0.anchor_local.v &&
+                           wj.elem_kind == w0.elem_kind {
+                            // Avoid duplicate offsets in same candidate group (e.g. overwritten field)
+                            let mut dup = false;
+                            let mut d: usize = 0;
+                            while d < gcnt {
+                                let gd = unsafe { *slp_acc_at(group_buf, d) };
+                                if gd.offset == wj.offset {
+                                    dup = true;
+                                }
+                                d = d + 1;
+                            }
+                            if !dup {
+                                unsafe { *slp_acc_at(group_buf, gcnt) = wj; }
+                                gcnt = gcnt + 1;
+                            }
+                        }
+                    }
+                    j = j + 1;
+                }
+
+                if gcnt >= 2 {
+                    slp_sort_accesses_by_offset(group_buf, gcnt);
+                    let mut start: usize = 0;
+                    while start + 2 <= gcnt {
+                        let widths: [3]usize = [8, 4, 2];
+                        let mut matched = false;
+                        let mut last_rej_tree = slp_make_empty_tree(unsafe { (*bb_ptr).id }, SLP_SEED_ADJACENT_STORES, 2u8, w0.elem_kind);
+                        let mut has_rej = false;
+                        let mut wi: usize = 0;
+                        while wi < 3 && !matched {
+                            let wlen = widths[wi];
+                            if start + wlen <= gcnt {
+                                let sub_ptr = unsafe { slp_acc_at(group_buf, start) as *const SlpMemAccess };
+                                if slp_are_accesses_contiguous(sub_ptr, wlen) &&
+                                   slp_is_legal_bundle_width(caps, w0.elem_kind, wlen as u8) {
+                                    stats.seeds_discovered = stats.seeds_discovered + 1u32;
+                                    let tree = slp_build_store_seed_tree(
+                                        view(*body),
+                                        unsafe { view(*bb_ptr) },
+                                        info,
+                                        caps,
+                                        profile,
+                                        sub_ptr,
+                                        wlen,
+                                        mut_view(*arena)
+                                    );
+                                    if tree.is_valid && tree.cost.profitable {
+                                        let mut k: usize = 0;
+                                        while k < wlen {
+                                            let gk = unsafe { *slp_acc_at(group_buf, start + k) };
+                                            let s_idx = gk.inst_idx as usize;
+                                            if s_idx < icnt {
+                                                unsafe { *(((used_flags as usize) + s_idx) as *mut u8) = 1u8; }
+                                            }
+                                            k = k + 1;
+                                        }
+                                        let mut n: usize = 0;
+                                        while n < tree.node_count {
+                                            let nd = unsafe { slp_node_at(tree.nodes, n) };
+                                            let mut l: usize = 0;
+                                            while l < wlen {
+                                                let li = (unsafe { (*nd).lane_insts[l] }) as usize;
+                                                if li < icnt {
+                                                    unsafe { *(((used_flags as usize) + li) as *mut u8) = 1u8; }
+                                                }
+                                                l = l + 1;
+                                            }
+                                            n = n + 1;
+                                        }
+                                        slp_apply_tree(mut_view(*body), unsafe { mut_view(*bb_ptr) }, view(tree), caps, mut_view(*stats), mut_view(*arena));
+                                        changed = true;
+                                        matched = true;
+                                        start = start + wlen;
+                                    } else {
+                                        last_rej_tree = tree;
+                                        has_rej = true;
+                                    }
+                                }
+                            }
+                            wi = wi + 1;
+                        }
+                        if !matched {
+                            if has_rej && last_rej_tree.reject_reason != REASON_NONE {
+                                slp_bump_reject_stat(mut_view(*stats), last_rej_tree.reject_reason);
+                                let rec = slp_make_record_from_tree(view(last_rej_tree), caps, false);
+                                slp_push_record(mut_view(*stats), mut_view(*arena), view(rec));
+                                // Mark group members as visited so we don't re-report the same rejected group
+                                let mut k: usize = start;
+                                while k < gcnt {
+                                    let gk = unsafe { *slp_acc_at(group_buf, k) };
+                                    let s_idx = gk.inst_idx as usize;
+                                    if s_idx < icnt {
+                                        unsafe { *(((used_flags as usize) + s_idx) as *mut u8) = 1u8; }
+                                    }
+                                    k = k + 1;
+                                }
+                                break;
+                            }
+                            start = start + 1;
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    // Phase 2: Horizontal reduction seeds (`(s0 op s1) op (s2 op s3)` or `((s0 op s1) op s2) op s3`)
+    let mut r: usize = icnt;
+    while r > 0 {
+        r = r - 1;
+        let r_used = unsafe { *(((used_flags as usize) + r) as *const u8) } != 0u8;
+        if !r_used {
+            let rinst = unsafe { opt_inst_at((*bb_ptr).insts, r) };
+            let ropc = unsafe { (*rinst).opcode };
+            if ropc == OPT_INST_BINOP || ropc == OPT_INST_WRAPPING_BINOP || ropc == OPT_INST_CHECKED_BINOP {
+                let rtree = slp_build_reduction_seed_tree(
+                    view(*body),
+                    unsafe { view(*bb_ptr) },
+                    info,
+                    caps,
+                    profile,
+                    r,
+                    mut_view(*arena)
+                );
+                if rtree.is_valid && rtree.cost.profitable {
+                    stats.seeds_discovered = stats.seeds_discovered + 1u32;
+                    let mut n: usize = 0;
+                    while n < rtree.node_count {
+                        let nd = unsafe { slp_node_at(rtree.nodes, n) };
+                        let mut l: usize = 0;
+                        while l < (rtree.lane_count as usize) {
+                            let li = (unsafe { (*nd).lane_insts[l] }) as usize;
+                            if li < icnt {
+                                unsafe { *(((used_flags as usize) + li) as *mut u8) = 1u8; }
+                            }
+                            l = l + 1;
+                        }
+                        n = n + 1;
+                    }
+                    slp_apply_tree(mut_view(*body), unsafe { mut_view(*bb_ptr) }, view(rtree), caps, mut_view(*stats), mut_view(*arena));
+                    changed = true;
+                } else if rtree.reject_reason == REASON_STRICT_FP_REDUCTION {
+                    stats.seeds_discovered = stats.seeds_discovered + 1u32;
+                    slp_bump_reject_stat(mut_view(*stats), rtree.reject_reason);
+                    let rec = slp_make_record_from_tree(view(rtree), caps, false);
+                    slp_push_record(mut_view(*stats), mut_view(*arena), view(rec));
+                    unsafe { *(((used_flags as usize) + r) as *mut u8) = 1u8; }
+                }
+            }
+        }
+    }
+
+    changed
+}
+
+pub fn opt_slp_vec_with_caps(
+    pm: mut_view<PassManager>,
+    body: mut_view<OptBody>,
+    call_table: *const EffectCallTable,
+    alias_info: *const AliasInfo,
+    caps: view<TargetSimdCaps>,
+    stats: mut_view<SlpVecStats>,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if pm.budget.profile == OPT_PROFILE_DEBUG_O0 {
+        return false;
+    }
+
+    let contract = slp_vec_contract();
+    passmgr_ensure_analyses(mut_view(*pm), mut_view(*body), mut_view(*arena), contract.required_analyses);
+    let info_use: *const AliasInfo = if (alias_info as usize) != 0 {
+        alias_info
+    } else {
+        alias_build_info(view(*body), call_table, mut_view(*arena)) as *const AliasInfo
+    };
+
+    let pre_rev = pm.ir_revision;
+    let pre_valid = pm.valid_analyses;
+    let pre_stats = *stats;
+    stats.pass_runs = stats.pass_runs + 1u32;
+    let snap = passmgr_snapshot_body(view(*body), mut_view(*arena));
+    let mut any_changed = false;
+
+    let mut b: usize = 0;
+    while b < body.bb_count {
+        let bb = unsafe { opt_block_at(body.blocks, b) };
+        if (unsafe { (*bb).is_reachable }) && !(unsafe { (*bb).is_cleanup }) {
+            if slp_scan_and_vectorize_block(
+                mut_view(*body),
+                b,
+                info_use,
+                caps,
+                pm.budget.profile,
+                mut_view(*stats),
+                mut_view(*arena)
+            ) {
+                any_changed = true;
+            }
+        }
+        b = b + 1;
+    }
+
+    if any_changed {
+        pm.ir_revision = pm.ir_revision + 1u32;
+        stats.pass_changes = stats.pass_changes + 1u32;
+        passmgr_invalidate_analyses(mut_view(*pm), contract.invalidated_analyses);
+        pm.valid_analyses = pm.valid_analyses | ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS | ANALYSIS_MASK_SSA | ANALYSIS_MASK_MEMORY_SSA | ANALYSIS_MASK_LOOP_INFO;
+        loops_stamp_valid_analysis_revs(mut_view(*pm));
+        if pm.budget.verify_each {
+            if !loops_verify_pass_postconditions(mut_view(*pm), mut_view(*body), mut_view(*arena), mut_view(*sink)) {
+                passmgr_rollback_body(mut_view(*body), view(snap), mut_view(*arena));
+                pm.ir_revision = pre_rev;
+                pm.valid_analyses = pre_valid;
+                *stats = pre_stats;
+                stats.pass_runs = pre_stats.pass_runs + 1u32;
+                stats.pass_rollbacks = pre_stats.pass_rollbacks + 1u32;
+                return false;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+pub fn opt_slp_vec(
+    pm: mut_view<PassManager>,
+    body: mut_view<OptBody>,
+    call_table: *const EffectCallTable,
+    alias_info: *const AliasInfo,
+    stats: mut_view<SlpVecStats>,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    let caps = vec_default_target_caps();
+    opt_slp_vec_with_caps(pm, body, call_table, alias_info, view(caps), stats, arena, sink)
+}
+
+pub fn slp_vec_optimize_mir_body(
+    mir_body: mut_view<MirBody>,
+    thir: *const Thir,
+    profile: u8,
+    verify_each: bool,
+    call_table: *const EffectCallTable,
+    caps: view<TargetSimdCaps>,
+    stats: mut_view<SlpVecStats>,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>,
+    fn_item: *const HirItem
+) -> bool {
+    slp_vec_stats_zero(mut_view(*stats));
+    let prev_errs = sink.errors;
+    let fn_use: *const HirItem = if (fn_item as usize) != 0 {
+        fn_item
+    } else {
+        let dummy = arena_alloc_raw(mut_view(*arena), size_of<HirItem>(), align_of<HirItem>()) as *mut u8;
+        let mut z: usize = 0;
+        while z < size_of<HirItem>() {
+            unsafe { *(((dummy as usize) + z) as *mut u8) = 0u8; }
+            z = z + 1;
+        }
+        dummy as *const HirItem
+    };
+
+    let obody = optir_build_from_mir(view(*mir_body), thir, mut_view(*arena), mut_view(*sink), fn_use);
+    if (obody as usize) == 0 || sink.errors != prev_errs {
+        return false;
+    }
+
+    let pm_ptr = arena_alloc_raw(mut_view(*arena), size_of<PassManager>(), align_of<PassManager>()) as *mut PassManager;
+    let budget = opt_budget_for_profile(profile, verify_each);
+    passmgr_init(unsafe { mut_view(*pm_ptr) }, budget, mut_view(*arena));
+    passmgr_mark_all_valid_from_lowering(unsafe { mut_view(*pm_ptr) }, unsafe { mut_view(*obody) }, mut_view(*arena));
+
+    if profile == OPT_PROFILE_DEBUG_O0 {
+        if verify_each {
+            return loops_verify_pass_postconditions(unsafe { mut_view(*pm_ptr) }, unsafe { mut_view(*obody) }, mut_view(*arena), mut_view(*sink));
+        }
+        return true;
+    }
+
+    let mut bce_stats = BceStats {
+        pass_runs: 0u32, pass_changes: 0u32, pass_rollbacks: 0u32,
+        sites_inspected: 0u32, checks_eliminated: 0u32, checks_retained_possible: 0u32,
+        checks_retained_unknown: 0u32, array_checks_eliminated: 0u32, slice_checks_eliminated: 0u32,
+        vec_checks_eliminated: 0u32, blocks_pruned: 0u32,
+    };
+    bce_stats_zero(mut_view(bce_stats));
+    let _ = opt_bce(
+        unsafe { mut_view(*pm_ptr) },
+        unsafe { mut_view(*obody) },
+        call_table,
+        mut_view(*arena),
+        mut_view(*sink),
+        mut_view(bce_stats),
+        0 as *mut *mut BceSiteRecord,
+        0 as *mut usize
+    );
+
+    let fresh_alias = alias_build_info(unsafe { view(*obody) }, call_table, mut_view(*arena)) as *const AliasInfo;
+    let _ = opt_slp_vec_with_caps(
+        unsafe { mut_view(*pm_ptr) },
+        unsafe { mut_view(*obody) },
+        call_table,
+        fresh_alias,
+        caps,
+        mut_view(*stats),
+        mut_view(*arena),
+        mut_view(*sink)
+    );
+
+    let rec_mir = arena_alloc_raw(mut_view(*arena), size_of<MirBody>(), align_of<MirBody>()) as *mut MirBody;
+    if !optir_reconstruct_mir(unsafe { view(*obody) }, unsafe { mut_view(*rec_mir) }, mut_view(*arena)) {
+        return false;
+    }
+    verify_mir(unsafe { view(*rec_mir) }, thir, mut_view(*sink), fn_use);
+    if sink.errors != prev_errs {
+        return false;
+    }
+
+    unsafe {
+        mir_body.sym.v = (*rec_mir).sym.v;
+        mir_body.fn_sym.v = (*rec_mir).fn_sym.v;
+        mir_body.fn_name.v = (*rec_mir).fn_name.v;
+        mir_body.span.file.v = (*rec_mir).span.file.v;
+        mir_body.span.start = (*rec_mir).span.start;
+        mir_body.span.end = (*rec_mir).span.end;
+        mir_body.locals = (*rec_mir).locals;
+        mir_body.local_count = (*rec_mir).local_count;
+        mir_body.local_cap = (*rec_mir).local_cap;
+        mir_body.arg_count = (*rec_mir).arg_count;
+        mir_body.bbs = (*rec_mir).bbs;
+        mir_body.bb_count = (*rec_mir).bb_count;
+        mir_body.bb_cap = (*rec_mir).bb_cap;
+        mir_body.drop_flag_count = (*rec_mir).drop_flag_count;
+    }
+    true
+}
+
+// --- 7. Deterministic `--emit=vectorize` & `--emit=vector-cost` Formatters (SPEC-74 §10, AXS-VEC-051) ---
+
+const SLP_STR_DATA: [251]u8 = [
+    // 0: "slp_vectorize {\n" (16)
+    115u8, 108u8, 112u8, 95u8, 118u8, 101u8, 99u8, 116u8, 111u8, 114u8, 105u8, 122u8, 101u8, 32u8, 123u8, 10u8,
+    // 1: "  pass_runs=" (12)
+    32u8, 32u8, 112u8, 97u8, 115u8, 115u8, 95u8, 114u8, 117u8, 110u8, 115u8, 61u8,
+    // 2: " trees_vectorized=" (18)
+    32u8, 116u8, 114u8, 101u8, 101u8, 115u8, 95u8, 118u8, 101u8, 99u8, 116u8, 111u8, 114u8, 105u8, 122u8, 101u8, 100u8, 61u8,
+    // 3: " rejected=" (10)
+    32u8, 114u8, 101u8, 106u8, 101u8, 99u8, 116u8, 101u8, 100u8, 61u8,
+    // 4: " lanes=" (7)
+    32u8, 108u8, 97u8, 110u8, 101u8, 115u8, 61u8,
+    // 5: "\n  seeds: stores=" (17)
+    10u8, 32u8, 32u8, 115u8, 101u8, 101u8, 100u8, 115u8, 58u8, 32u8, 115u8, 116u8, 111u8, 114u8, 101u8, 115u8, 61u8,
+    // 6: " reductions=" (12)
+    32u8, 114u8, 101u8, 100u8, 117u8, 99u8, 116u8, 105u8, 111u8, 110u8, 115u8, 61u8,
+    // 7: " broadcasts=" (12)
+    32u8, 98u8, 114u8, 111u8, 97u8, 100u8, 99u8, 97u8, 115u8, 116u8, 115u8, 61u8,
+    // 8: " gathers=" (9)
+    32u8, 103u8, 97u8, 116u8, 104u8, 101u8, 114u8, 115u8, 61u8,
+    // 9: " extracts=" (10)
+    32u8, 101u8, 120u8, 116u8, 114u8, 97u8, 99u8, 116u8, 115u8, 61u8,
+    // 10: "\n  bb[B" (7)
+    10u8, 32u8, 32u8, 98u8, 98u8, 91u8, 66u8,
+    // 11: "]: applied=" (11)
+    93u8, 58u8, 32u8, 97u8, 112u8, 112u8, 108u8, 105u8, 101u8, 100u8, 61u8,
+    // 12: " seed=" (6)
+    32u8, 115u8, 101u8, 101u8, 100u8, 61u8,
+    // 13: " nodes=" (7)
+    32u8, 110u8, 111u8, 100u8, 101u8, 115u8, 61u8,
+    // 14: " reason=" (8)
+    32u8, 114u8, 101u8, 97u8, 115u8, 111u8, 110u8, 61u8,
+    // 15: " scalar_cost=" (13)
+    32u8, 115u8, 99u8, 97u8, 108u8, 97u8, 114u8, 95u8, 99u8, 111u8, 115u8, 116u8, 61u8,
+    // 16: " vec_cost=" (10)
+    32u8, 118u8, 101u8, 99u8, 95u8, 99u8, 111u8, 115u8, 116u8, 61u8,
+    // 17: " pack_cost=" (11)
+    32u8, 112u8, 97u8, 99u8, 107u8, 95u8, 99u8, 111u8, 115u8, 116u8, 61u8,
+    // 18: " extract_cost=" (14)
+    32u8, 101u8, 120u8, 116u8, 114u8, 97u8, 99u8, 116u8, 95u8, 99u8, 111u8, 115u8, 116u8, 61u8,
+    // 19: " profitable=" (12)
+    32u8, 112u8, 114u8, 111u8, 102u8, 105u8, 116u8, 97u8, 98u8, 108u8, 101u8, 61u8,
+    // 20: "\n}\n" (3)
+    10u8, 125u8, 10u8,
+    // 21: "slp_vector_cost {\n" (18)
+    115u8, 108u8, 112u8, 95u8, 118u8, 101u8, 99u8, 116u8, 111u8, 114u8, 95u8, 99u8, 111u8, 115u8, 116u8, 32u8, 123u8, 10u8,
+    // 22: "]:" (2)
+    93u8, 58u8,
+    // 23: " conf=" (6)
+    32u8, 99u8, 111u8, 110u8, 102u8, 61u8
+];
+
+const SLP_STR_OFF: [25]u32 = [
+    0u32, 16u32, 28u32, 46u32, 56u32, 63u32, 80u32, 92u32,
+    104u32, 113u32, 123u32, 130u32, 141u32, 147u32, 154u32, 162u32,
+    175u32, 185u32, 196u32, 210u32, 222u32, 225u32, 243u32, 245u32,
+    251u32
+];
+
+fn slp_push_str(buf: mut_view<DiagBuffer>, idx: usize) {
+    let start = SLP_STR_OFF[idx] as usize;
+    let end = SLP_STR_OFF[idx + 1] as usize;
+    let mut i = start;
+    while i < end {
+        diag_buf_push_byte(mut_view(*buf), SLP_STR_DATA[i]);
+        i = i + 1;
+    }
+}
+
+pub fn slp_vec_print(stats: view<SlpVecStats>, buf: mut_view<DiagBuffer>) {
+    slp_push_str(mut_view(*buf), 0);
+    slp_push_str(mut_view(*buf), 1);
+    diag_buf_push_u32(mut_view(*buf), stats.pass_runs);
+    slp_push_str(mut_view(*buf), 2);
+    diag_buf_push_u32(mut_view(*buf), stats.trees_vectorized);
+    slp_push_str(mut_view(*buf), 3);
+    diag_buf_push_u32(mut_view(*buf), stats.trees_rejected);
+    slp_push_str(mut_view(*buf), 4);
+    diag_buf_push_u32(mut_view(*buf), stats.lanes_packed_total);
+
+    slp_push_str(mut_view(*buf), 5);
+    diag_buf_push_u32(mut_view(*buf), stats.store_chains_vectorized);
+    slp_push_str(mut_view(*buf), 6);
+    diag_buf_push_u32(mut_view(*buf), stats.reductions_vectorized);
+    slp_push_str(mut_view(*buf), 7);
+    diag_buf_push_u32(mut_view(*buf), stats.broadcast_nodes_emitted);
+    slp_push_str(mut_view(*buf), 8);
+    diag_buf_push_u32(mut_view(*buf), stats.gather_packs_emitted);
+    slp_push_str(mut_view(*buf), 9);
+    diag_buf_push_u32(mut_view(*buf), stats.external_extracts_emitted);
+
+    let mut r: usize = 0;
+    while r < stats.record_count && (stats.records as usize) != 0 {
+        let rec = unsafe { slp_vec_record_at(stats.records, r) };
+        slp_push_str(mut_view(*buf), 10);
+        diag_buf_push_u32(mut_view(*buf), unsafe { (*rec).bb_id.v });
+        slp_push_str(mut_view(*buf), 11);
+        diag_buf_push_u32(mut_view(*buf), if unsafe { (*rec).applied } { 1u32 } else { 0u32 });
+        slp_push_str(mut_view(*buf), 12);
+        diag_buf_push_u32(mut_view(*buf), (unsafe { (*rec).seed_kind }) as u32);
+        slp_push_str(mut_view(*buf), 4);
+        diag_buf_push_u32(mut_view(*buf), (unsafe { (*rec).lane_count }) as u32);
+        slp_push_str(mut_view(*buf), 13);
+        diag_buf_push_u32(mut_view(*buf), (unsafe { (*rec).node_count }) as u32);
+        slp_push_str(mut_view(*buf), 15);
+        diag_buf_push_u32(mut_view(*buf), unsafe { (*rec).scalar_cost });
+        slp_push_str(mut_view(*buf), 16);
+        diag_buf_push_u32(mut_view(*buf), unsafe { (*rec).vec_cost });
+        slp_push_str(mut_view(*buf), 14);
+        diag_buf_push_u32(mut_view(*buf), (unsafe { (*rec).reason }) as u32);
+        r = r + 1;
+    }
+
+    slp_push_str(mut_view(*buf), 20);
+}
+
+pub fn slp_vec_cost_print(est: view<SlpCostEstimate>, buf: mut_view<DiagBuffer>) {
+    slp_push_str(mut_view(*buf), 21);
+    slp_push_str(mut_view(*buf), 10);
+    diag_buf_push_u32(mut_view(*buf), est.bb_id.v);
+    slp_push_str(mut_view(*buf), 22);
+    slp_push_str(mut_view(*buf), 12);
+    diag_buf_push_u32(mut_view(*buf), est.seed_kind as u32);
+    slp_push_str(mut_view(*buf), 4);
+    diag_buf_push_u32(mut_view(*buf), est.lane_count as u32);
+    slp_push_str(mut_view(*buf), 13);
+    diag_buf_push_u32(mut_view(*buf), est.node_count as u32);
+    slp_push_str(mut_view(*buf), 15);
+    diag_buf_push_u32(mut_view(*buf), est.scalar_cost);
+    slp_push_str(mut_view(*buf), 16);
+    diag_buf_push_u32(mut_view(*buf), est.total_vec_cost);
+    slp_push_str(mut_view(*buf), 17);
+    diag_buf_push_u32(mut_view(*buf), est.pack_cost);
+    slp_push_str(mut_view(*buf), 18);
+    diag_buf_push_u32(mut_view(*buf), est.extract_cost);
+    slp_push_str(mut_view(*buf), 23);
+    diag_buf_push_u32(mut_view(*buf), est.confidence as u32);
+    slp_push_str(mut_view(*buf), 19);
+    diag_buf_push_u32(mut_view(*buf), if est.profitable { 1u32 } else { 0u32 });
+    slp_push_str(mut_view(*buf), 14);
+    diag_buf_push_u32(mut_view(*buf), est.reject_reason as u32);
+    slp_push_str(mut_view(*buf), 20);
+}
