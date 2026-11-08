@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T220, T681, T685, T318, T870, T871]
 priority: 222
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [std/component/loader, std/component/hot_reload, tests/run/component_hot_reload]
 spec: [spec/SPEC-115-dynamic-components-plugins-hot-reload.md, 0104, tasks/0583, tasks/0584, tasks/0739, tasks/0856]
 covers: [REQ-ECO-8734]
+started: 2026-11-08 22:44:56
+agent: T872-impl
 ---
 # T872 — E20.7 std.component dynamic plugin loader, version/capability negotiator, epoch lease table & state-hand-off hot-reload runtime
 
@@ -40,3 +42,4 @@ Implement the `std.component` dynamic component discovery/loader, load-time ABI/
 
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
+- 2026-11-08 22:44:56 started (attempt 1) T872-impl

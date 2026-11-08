@@ -8,14 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T220, T681, T685, T318]
 priority: 224
-status: doing
+status: done
 attempts: 1
 paths: [spec/SPEC-116-sdk-sysroot-toolchain-distribution.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-88-cross-compilation-platform-layer.md, spec/SPEC-110-build-graph-driver.md, tasks/0605, tasks/1034, tasks/0661, tasks/0858]
 covers: [REQ-ECO-8736, REQ-PKG-022]
 started: 2026-11-08 22:29:11
-agent: T874-impl
+finished: 2026-11-08 22:52:18
 ---
 # T874 — E20.6 Canonical native SDK, declarative .axsdk sysroot metadata, AXTOOLCHAIN descriptor & toolchain distribution specification (SPEC-116)
 
@@ -46,3 +46,4 @@ Consolidate the canonical specification for Axiom's C-free Native SDK (`.axsdk`)
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
 - 2026-11-08 22:29:11 started (attempt 1) T874-impl
+- 2026-11-08 22:52:18 accepted by QA -> done

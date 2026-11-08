@@ -741,6 +741,19 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_COMP_QUIESCE_TIMEOUT` | E | T872 | hot-reload quiescence failed because active operations did not drain within the timeout limit (`SPEC-115` AXS-COMP-031) |
 | `AX_COMP_HOT_RELOAD_SCHEMA_MISMATCH` | E | T871/T872 | hot-reload state snapshot schema version cannot be parsed by candidate component (`SPEC-115` AXS-COMP-034) |
 | `AX_COMP_HOT_RELOAD_MIGRATION_FAILED` | E | T872 | hot-reload migration hook returned an error; transactional rollback executed to previous epoch (`SPEC-115` AXS-COMP-034, AXS-COMP-036) |
+| `AX_SDK_MANIFEST_NOT_FOUND` | E | T875 | `.axsdk` manifest `sdk.toml` or `sdk.json` missing or unreadable in sysroot directory (`SPEC-116` AXS-SDK-010) |
+| `AX_SDK_CORRUPT_MANIFEST` | E | T875 | `.axsdk` manifest contains syntax errors, unknown schema version, or inconsistent metadata (`SPEC-116` AXS-SDK-010) |
+| `AX_SDK_FINGERPRINT_MISMATCH` | E | T875/T876 | calculated `SdkFingerprint` does not match manifest or `axiom.lock` pinned digest (`SPEC-116` AXS-SDK-035, AXS-SDK-039) |
+| `AX_SDK_TOOLCHAIN_FINGERPRINT_MISMATCH` | E | T875/T876 | calculated `ToolchainFingerprint` does not match active toolchain binary hash or `axiom.lock` pinned digest (`SPEC-116` AXS-SDK-036, AXS-SDK-039) |
+| `AX_SDK_HOST_FALLBACK_DENIED` | E | T875 | hermetic build attempted fallback to ambient host OS paths without an installed `.axsdk` (`SPEC-116` AXS-SDK-004) |
+| `AX_SDK_API_UNAVAILABLE` | E | T875 | referenced platform API requires an OS version newer than target deployment version without `@available(...)` guard (`SPEC-116` AXS-SDK-015) |
+| `AX_SDK_IMPORT_STUB_NOT_FOUND` | E | T875 | required platform syscall or dynamic import stub (`.def`, `.tbd`, `.so` stub) not provided by `.axsdk` (`SPEC-116` AXS-SDK-012) |
+| `AX_SDK_STARTUP_CONTRACT_MISMATCH` | E | T875 | CRT/startup contract incompatible with selected binary subsystem, runtime profile, or target ABI (`SPEC-116` AXS-SDK-013) |
+| `AX_SDK_TOOLCHAIN_NOT_FOUND` | E | T875/T876 | requested `AXTOOLCHAIN` target descriptor or pipeline component not installed in toolchain store (`SPEC-116` AXS-SDK-025) |
+| `AX_SDK_TOOLCHAIN_INCOMPATIBLE` | E | T875 | selected toolchain pipeline components disagree on pointer width, endianness, data model, or calling convention (`SPEC-116` AXS-SDK-026, AXS-SDK-027) |
+| `AX_SDK_LOCK_MISMATCH` | E | T876 | active SDK or toolchain fingerprint differs from `axiom.lock` under `--locked` or `--frozen` (`SPEC-116` AXS-SDK-039) |
+| `AX_SDK_BUNDLE_CORRUPT` | E | T876 | `.axsdk` or `.axtoolchain` distribution archive contains corrupt headers, checksum mismatch, or path traversal (`SPEC-116` AXS-SDK-043) |
+| `AX_SDK_SIGNATURE_INVALID` | E | T876 | Ed25519 signature verification failed for `.axsdk` or `.axtoolchain` archive manifest against trusted public keys (`SPEC-116` AXS-SDK-044) |
 
 ## Sources
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); tasks/0791 (BOOTSTRAP-569: §10-§11); 0098; 0104; 0146 Part XXVII §3-§12, §19-§21, §50-§58;
