@@ -8,14 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T219, T752, T755, T756, T759, T812]
 priority: 206
-status: doing
+status: done
 attempts: 1
 paths: [spec/SPEC-104-docgen-test-framework-ux.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-21-query-engine-semantic-db.md, spec/SPEC-103-diagnostics-ux-ai-interface.md, 0120, 0121, 0147, 0161, 0163, tasks/0361, tasks/0374, tasks/0418, tasks/0423, tasks/0662, tasks/0693, tasks/0695, tasks/0696]
 covers: [REQ-TOOL-002, REQ-TOOL-003, REQ-TOOL-005, REQ-TOOL-006, REQ-TOOL-007, REQ-TOOL-008, REQ-TOOL-009, REQ-TOOL-010, REQ-TOOL-011, REQ-TOOL-179, REQ-TOOL-187, REQ-TST-112]
 started: 2026-11-08 16:18:26
-agent: T816-impl
+finished: 2026-11-08 16:39:39
 ---
 # T816 — E19.5 Canonical documentation generator (axiomc doc) & integrated test/pass-bisection framework specification (SPEC-104)
 
@@ -44,3 +44,4 @@ Consolidate the canonical specification for Axiom's documentation generator (`ax
 ## Log
 - 2026-11-03 09:50:00 created by T219 (P19 phase planning)
 - 2026-11-08 16:18:26 started (attempt 1) T816-impl
+- 2026-11-08 16:39:39 accepted by QA -> done
