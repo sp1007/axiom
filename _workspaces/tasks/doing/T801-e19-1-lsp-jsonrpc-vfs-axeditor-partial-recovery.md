@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T219, T752, T755, T756, T759, T800]
 priority: 191
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/lsp/protocol, compiler/lsp/vfs, std/editor, tests/run/lsp_vfs]
 spec: [spec/SPEC-100-lsp-server-ide-engine.md, spec/SPEC-21-query-engine-semantic-db.md, spec/SPEC-22-incremental-compilation.md, 0101, tasks/0374, tasks/0448, tasks/0450, tasks/0479, tasks/0664, tasks/1053]
 covers: [REQ-TOOL-183, REQ-TOOL-184, REQ-TOOL-188, REQ-TOOL-191, REQ-TOOL-297, REQ-TOOL-298, REQ-TOOL-299]
+started: 2026-11-08 12:35:07
+agent: T801-impl
 ---
 # T801 — E19.1 LSP JSON-RPC transport, incremental VFS, AXEDITOR piece-table buffer & partial-program recovery
 
@@ -40,3 +42,4 @@ Implement the LSP 3.17 JSON-RPC 2.0 transport, incremental Virtual File System (
 
 ## Log
 - 2026-11-03 09:50:00 created by T219 (P19 phase planning)
+- 2026-11-08 12:35:07 started (attempt 1) T801-impl

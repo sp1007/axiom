@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T219, T752, T755, T756, T759]
 priority: 194
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-101-canonical-formatter.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-01-lexical.md, spec/SPEC-02-grammar.md, tasks/0476, tasks/0374, tasks/0448, tasks/0693, tasks/0695, tasks/0696]
 covers: [REQ-TOOL-183, REQ-TOOL-298]
+started: 2026-11-08 12:36:06
+finished: 2026-11-08 13:29:28
 ---
 # T804 — E19.2 Canonical language form, lossless CST trivia model & deterministic formatter specification (SPEC-101)
 
@@ -42,3 +44,5 @@ Consolidate the canonical specification for Axiom's lossless Concrete Syntax Tre
 
 ## Log
 - 2026-11-03 09:50:00 created by T219 (P19 phase planning)
+- 2026-11-08 12:36:06 started (attempt 1) T804-impl
+- 2026-11-08 13:29:28 accepted by QA -> done
