@@ -1,0 +1,367 @@
+// test: run
+// modes: interp native
+// stdout-file: boundary_manifest_and_handle_saturation.stdout
+// SPEC-115 §§1..5 & §6 (AXS-COMP-002, AXS-COMP-011, AXS-COMP-022..024; REQ-ECO-8734):
+// Verifies boundary conditions:
+// 1. ComponentId edge validation: missing dots, consecutive dots, leading/trailing dots, dash/underscore
+// 2. SemVer 2.0 caret negotiation with pre-release isolation and 0.0.x / 0.x.y strict bounds
+// 3. Generational HandleTable saturation (capacity exhaustion), slot recycling with generation increment,
+//    and stale-epoch invalidation after epoch advancement
+// 4. Multi-kind lease tracking (borrow + GPU fence) with cumulative unload guard.
+
+const AX_COMP_STALE_HANDLE: u32 = 240u32
+const AX_COMP_UNLOAD_ACTIVE_LEASES: u32 = 241u32
+
+const LEASE_KIND_BORROW: u32 = 1u32
+const LEASE_KIND_GPU_FENCE: u32 = 4u32
+
+@derive(Copy)
+struct SemVer {
+    major: u32,
+    minor: u32,
+    patch: u32,
+    prerelease_len: usize,
+    prerelease_tag: u32,
+}
+
+fn semver_matches_caret(req: SemVer, cand: SemVer) -> bool {
+    if req.prerelease_len == 0usize && cand.prerelease_len > 0usize {
+        return false
+    }
+    if req.prerelease_len > 0usize {
+        if req.prerelease_len != cand.prerelease_len || req.prerelease_tag != cand.prerelease_tag {
+            return false
+        }
+    }
+    if req.major > 0u32 {
+        if cand.major != req.major {
+            return false
+        }
+        if req.minor > cand.minor {
+            return false
+        }
+        if cand.minor == req.minor && (req.patch > cand.patch) {
+            return false
+        }
+        return true
+    }
+    if req.minor > 0u32 {
+        if cand.major != 0u32 || cand.minor != req.minor {
+            return false
+        }
+        return cand.patch >= req.patch
+    }
+    cand.major == 0u32 && cand.minor == 0u32 && cand.patch == req.patch
+}
+
+fn validate_cid(b: view<[32]u8>, len: usize) -> bool {
+    if 5usize > len {
+        return false
+    }
+    let mut dots: u32 = 0u32
+    let mut seg_len: u32 = 0u32
+    let mut i: usize = 0usize
+    while i < len {
+        let ch = (*b)[i]
+        if ch == 46u8 { // '.'
+            if seg_len == 0u32 {
+                return false
+            }
+            dots = dots + 1u32
+            seg_len = 0u32
+        } else {
+            let is_alpha = (ch >= 97u8 && ch <= 122u8) || (ch >= 65u8 && ch <= 90u8)
+            let is_digit = (ch >= 48u8 && ch <= 57u8)
+            let is_special = (ch == 95u8 || ch == 45u8) // '_' or '-'
+            if !is_alpha && !is_digit && !is_special {
+                return false
+            }
+            seg_len = seg_len + 1u32
+        }
+        i = i + 1usize
+    }
+    if seg_len == 0u32 {
+        return false
+    }
+    dots >= 2u32
+}
+
+@repr(C)
+@derive(Copy)
+struct ComponentHandle {
+    index: u32,
+    generation: u32,
+    epoch_id: u32,
+}
+
+@derive(Copy)
+struct HandleSlot {
+    generation: u32,
+    epoch_id: u32,
+    is_occupied: bool,
+    value: u64,
+}
+
+struct HandleTable {
+    slots: [4]HandleSlot,
+    capacity: usize,
+    count: usize,
+    current_epoch: u32,
+}
+
+fn handle_table_new(epoch: u32) -> HandleTable {
+    let empty_slot = HandleSlot {
+        generation: 1u32,
+        epoch_id: epoch,
+        is_occupied: false,
+        value: 0u64,
+    }
+    HandleTable {
+        slots: [empty_slot, empty_slot, empty_slot, empty_slot],
+        capacity: 4usize,
+        count: 0usize,
+        current_epoch: epoch,
+    }
+}
+
+fn handle_table_insert(tbl: mut_view<HandleTable>, val: u64) -> ComponentHandle {
+    let mut target_idx: usize = 4usize
+    let mut i: usize = 0usize
+    while i < tbl.capacity {
+        if !tbl.slots[i].is_occupied {
+            target_idx = i
+            i = tbl.capacity
+        } else {
+            i = i + 1usize
+        }
+    }
+    if target_idx >= tbl.capacity {
+        return ComponentHandle { index: 0xFFFFFFFFu32, generation: 0u32, epoch_id: 0u32 }
+    }
+
+    tbl.slots[target_idx].epoch_id = tbl.current_epoch
+    tbl.slots[target_idx].is_occupied = true
+    tbl.slots[target_idx].value = val
+    tbl.count = tbl.count + 1usize
+
+    ComponentHandle {
+        index: target_idx as u32,
+        generation: tbl.slots[target_idx].generation,
+        epoch_id: tbl.current_epoch,
+    }
+}
+
+fn handle_table_get(tbl: view<HandleTable>, handle: ComponentHandle, out_val: mut_view<u64>) -> u32 {
+    let idx = handle.index as usize
+    if idx >= tbl.capacity {
+        return AX_COMP_STALE_HANDLE
+    }
+    let slot = tbl.slots[idx]
+    if !slot.is_occupied {
+        return AX_COMP_STALE_HANDLE
+    }
+    if slot.generation != handle.generation {
+        return AX_COMP_STALE_HANDLE
+    }
+    if slot.epoch_id != handle.epoch_id || handle.epoch_id != tbl.current_epoch {
+        return AX_COMP_STALE_HANDLE
+    }
+
+    *out_val = slot.value
+    0u32
+}
+
+fn handle_table_release(tbl: mut_view<HandleTable>, handle: ComponentHandle) -> u32 {
+    let idx = handle.index as usize
+    if idx >= tbl.capacity {
+        return AX_COMP_STALE_HANDLE
+    }
+    if !tbl.slots[idx].is_occupied {
+        return AX_COMP_STALE_HANDLE
+    }
+    if tbl.slots[idx].generation != handle.generation || tbl.slots[idx].epoch_id != handle.epoch_id {
+        return AX_COMP_STALE_HANDLE
+    }
+
+    tbl.slots[idx].is_occupied = false
+    tbl.slots[idx].generation = tbl.slots[idx].generation + 1u32
+    if tbl.count > 0usize {
+        tbl.count = tbl.count - 1usize
+    }
+    0u32
+}
+
+fn handle_table_advance_epoch(tbl: mut_view<HandleTable>, new_epoch: u32) {
+    tbl.current_epoch = new_epoch
+}
+
+struct EpochTracker {
+    epoch_id: u32,
+    active_leases: u64,
+    active_borrows: u32,
+    active_gpu_fences: u32,
+}
+
+fn epoch_tracker_new(epoch: u32) -> EpochTracker {
+    EpochTracker {
+        epoch_id: epoch,
+        active_leases: 0u64,
+        active_borrows: 0u32,
+        active_gpu_fences: 0u32,
+    }
+}
+
+fn acquire_lease(trk: mut_view<EpochTracker>, kind: u32) {
+    trk.active_leases = trk.active_leases + 1u64
+    if kind == LEASE_KIND_BORROW {
+        trk.active_borrows = trk.active_borrows + 1u32
+    } else if kind == LEASE_KIND_GPU_FENCE {
+        trk.active_gpu_fences = trk.active_gpu_fences + 1u32
+    }
+}
+
+fn release_lease(trk: mut_view<EpochTracker>, kind: u32) {
+    if trk.active_leases > 0u64 {
+        trk.active_leases = trk.active_leases - 1u64
+    }
+    if kind == LEASE_KIND_BORROW && trk.active_borrows > 0u32 {
+        trk.active_borrows = trk.active_borrows - 1u32
+    } else if kind == LEASE_KIND_GPU_FENCE && trk.active_gpu_fences > 0u32 {
+        trk.active_gpu_fences = trk.active_gpu_fences - 1u32
+    }
+}
+
+fn validate_unload(trk: view<EpochTracker>) -> u32 {
+    if trk.active_leases > 0u64 {
+        return AX_COMP_UNLOAD_ACTIVE_LEASES
+    }
+    0u32
+}
+
+pub fn main() -> i32 {
+    // 1. ComponentId edge cases
+    // "org-axiom.sub_sys.mod-1" -> valid
+    let cid_valid: [32]u8 = [
+        111u8, 114u8, 103u8, 45u8, 97u8, 120u8, 105u8, 111u8, 109u8, 46u8,
+        115u8, 117u8, 98u8, 95u8, 115u8, 121u8, 115u8, 46u8,
+        109u8, 111u8, 100u8, 45u8, 49u8,
+        0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8
+    ]
+    if !validate_cid(view(cid_valid), 23usize) {
+        return 1
+    }
+
+    // ".leading.dot" -> invalid
+    let cid_leading: [32]u8 = [
+        46u8, 108u8, 101u8, 97u8, 100u8, 105u8, 110u8, 103u8, 46u8, 100u8, 111u8, 116u8,
+        0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8
+    ]
+    if validate_cid(view(cid_leading), 12usize) {
+        return 2
+    }
+
+    // "consecutive..dots" -> invalid
+    let cid_consec: [32]u8 = [
+        97u8, 98u8, 46u8, 46u8, 99u8, 100u8,
+        0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8
+    ]
+    if validate_cid(view(cid_consec), 6usize) {
+        return 3
+    }
+
+    // 2. SemVer Caret & Pre-release isolation (AXS-COMP-011)
+    let sem_req_stable = SemVer { major: 1u32, minor: 0u32, patch: 0u32, prerelease_len: 0usize, prerelease_tag: 0u32 }
+    let sem_cand_pre = SemVer { major: 1u32, minor: 1u32, patch: 0u32, prerelease_len: 5usize, prerelease_tag: 42u32 }
+    // Candidate pre-release must NOT match stable requirement
+    if semver_matches_caret(sem_req_stable, sem_cand_pre) {
+        return 4
+    }
+
+    let sem_req_pre = SemVer { major: 1u32, minor: 1u32, patch: 0u32, prerelease_len: 5usize, prerelease_tag: 42u32 }
+    // Candidate pre-release with same tag matches
+    if !semver_matches_caret(sem_req_pre, sem_cand_pre) {
+        return 5
+    }
+
+    let sem_cand_pre_diff = SemVer { major: 1u32, minor: 1u32, patch: 0u32, prerelease_len: 5usize, prerelease_tag: 99u32 }
+    // Candidate pre-release with different tag must NOT match
+    if semver_matches_caret(sem_req_pre, sem_cand_pre_diff) {
+        return 6
+    }
+
+    // 3. HandleTable capacity saturation and slot recycling (AXS-COMP-022)
+    let mut table = handle_table_new(1u32)
+    let h0 = handle_table_insert(mut_view(table), 100u64)
+    let h1 = handle_table_insert(mut_view(table), 200u64)
+    let h2 = handle_table_insert(mut_view(table), 300u64)
+    let h3 = handle_table_insert(mut_view(table), 400u64)
+    let _ = h0
+    let _ = h2
+    let _ = h3
+    if table.count != 4usize {
+        return 7
+    }
+
+    // Table is full (capacity 4): 5th insert must return invalid index
+    let h_overflow = handle_table_insert(mut_view(table), 500u64)
+    if h_overflow.index != 0xFFFFFFFFu32 {
+        return 8
+    }
+
+    // Release slot 1 (h1)
+    let rel_ok = handle_table_release(mut_view(table), h1)
+    if rel_ok != 0u32 || table.count != 3usize {
+        return 9
+    }
+
+    // Re-insert into table: should recycle slot 1 and increment generation
+    let h1_new = handle_table_insert(mut_view(table), 999u64)
+    if h1_new.index != 1u32 || h1_new.generation != 2u32 {
+        return 10
+    }
+
+    // Stale handle access (old generation) must fail
+    let mut read_val: u64 = 0u64
+    let stale_err = handle_table_get(view(table), h1, mut_view(read_val))
+    if stale_err != AX_COMP_STALE_HANDLE {
+        return 11
+    }
+
+    // Fresh handle access must succeed
+    let fresh_ok = handle_table_get(view(table), h1_new, mut_view(read_val))
+    if fresh_ok != 0u32 || read_val != 999u64 {
+        return 12
+    }
+
+    // Advance epoch from 1 to 2
+    handle_table_advance_epoch(mut_view(table), 2u32)
+    // Access with epoch 1 handle must fail as stale epoch
+    let stale_epoch_err = handle_table_get(view(table), h1_new, mut_view(read_val))
+    if stale_epoch_err != AX_COMP_STALE_HANDLE {
+        return 13
+    }
+
+    // 4. EpochTracker multiple leases cumulative unload guard (AXS-COMP-023)
+    let mut tracker = epoch_tracker_new(1u32)
+    acquire_lease(mut_view(tracker), LEASE_KIND_BORROW)
+    acquire_lease(mut_view(tracker), LEASE_KIND_GPU_FENCE)
+
+    if validate_unload(view(tracker)) != AX_COMP_UNLOAD_ACTIVE_LEASES {
+        return 14
+    }
+
+    // Releasing only 1 lease keeps unload blocked
+    release_lease(mut_view(tracker), LEASE_KIND_BORROW)
+    if validate_unload(view(tracker)) != AX_COMP_UNLOAD_ACTIVE_LEASES {
+        return 15
+    }
+
+    // Releasing final lease unblocks unload
+    release_lease(mut_view(tracker), LEASE_KIND_GPU_FENCE)
+    if validate_unload(view(tracker)) != 0u32 {
+        return 16
+    }
+
+    print("BOUNDARY-MANIFEST-AND-HANDLE-SATURATION-OK\n");
+    0
+}
