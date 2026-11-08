@@ -1,0 +1,987 @@
+module compiler.driver.fmt_cmd
+
+use compiler.kernel.interner.StrView
+use compiler.source.span.span_none
+use compiler.diag.code.AX_DRIVER_USAGE
+use compiler.diag.code.AX_DRIVER_UNKNOWN_OPTION
+use compiler.diag.code.AX_ICE_INTERNAL
+use compiler.diag.code.diag_code
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.diag_new
+use compiler.diag.emitter.diag_sink_init
+use compiler.diag.emitter.diag_sink_free
+use compiler.diag.emitter.diag_sink_report
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_bytes
+use compiler.diag.format.diag_buf_push_u32
+use std.editor.LspRange
+use std.editor.lsp_pos_new
+use std.editor.lsp_range_new
+use std.editor.text_range_new
+use std.editor.editor_lsp_pos_to_byte_offset
+use std.editor.editor_byte_range_to_lsp_range
+use compiler.lsp.protocol.CERTAINTY_EXACT
+use compiler.lsp.protocol.CERTAINTY_UNAVAILABLE
+use compiler.lsp.protocol.FALLBACK_NONE
+use compiler.lsp.protocol.FALLBACK_INCOMPLETE_EXPR
+use compiler.lsp.protocol.LspStrView
+use compiler.lsp.protocol.lsp_fact_header_new
+use compiler.lsp.protocol.lsp_str_view
+use compiler.lsp.vfs.VfsWorkspace
+use compiler.lsp.vfs.vfs_doc_ptr
+use compiler.lsp.handlers.LspSemanticEngine
+use compiler.lsp.handlers.LspRenameTextEdit
+use compiler.lsp.handlers.LspFormattingOptions
+use compiler.lsp.handlers.LspFormattingResult
+use compiler.lsp.handlers.lsp_compute_minimal_format_edit
+use compiler.fmt.verify.FMT_VERIFY_OK
+use compiler.fmt.verify.FMT_VERIFY_ERR_SYNTAX
+use compiler.fmt.verify.FmtVerifyStats
+use compiler.fmt.verify.fmt_verify_stats_empty
+use compiler.fmt.verify.fmt_sv_eq
+use compiler.fmt.verify.fmt_format_and_verify
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+pub const FMT_EXIT_OK: i32 = 0
+pub const FMT_EXIT_CHECK_OR_SYNTAX: i32 = 1
+pub const FMT_EXIT_USAGE: i32 = 2
+pub const FMT_EXIT_ICE: i32 = 3
+
+pub struct FmtCliOptions {
+    pub check_mode: bool,
+    pub stdin_mode: bool,
+    pub quiet: bool,
+    pub show_help: bool,
+    pub show_version: bool,
+    pub paths: [16]StrView,
+    pub path_is_explicit_file: [16]bool,
+    pub path_count: usize,
+    pub has_error: bool,
+    pub exit_code: i32,
+}
+
+pub fn fmt_cli_options_default() -> FmtCliOptions {
+    FmtCliOptions {
+        check_mode: false,
+        stdin_mode: false,
+        quiet: false,
+        show_help: false,
+        show_version: false,
+        paths: [StrView { ptr: 0 as *const u8, len: 0 }; 16],
+        path_is_explicit_file: [false; 16],
+        path_count: 0,
+        has_error: false,
+        exit_code: 0,
+    }
+}
+
+fn sv_from_str(s: str) -> StrView {
+    let lv: LspStrView = lsp_str_view(s);
+    StrView { ptr: lv.ptr, len: lv.len }
+}
+
+fn sv_eq_str(sv: StrView, s: str) -> bool {
+    let raw: StrView = unsafe { *(address_of(s) as *const StrView) };
+    let bytes: view<[u8]> = unsafe { *(address_of(s) as *const view<[u8]>) };
+    if sv.len != raw.len {
+        return false;
+    }
+    if sv.len == 0 {
+        return true;
+    }
+    if (sv.ptr as usize) == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < raw.len {
+        if (unsafe { *(sv.ptr + i) }) != bytes[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn fmt_buf_push_str(b: mut_view<DiagBuffer>, s: str) {
+    let raw: StrView = unsafe { *(address_of(s) as *const StrView) };
+    let bytes: view<[u8]> = unsafe { *(address_of(s) as *const view<[u8]>) };
+    let mut i: usize = 0;
+    while i < raw.len {
+        diag_buf_push_byte(mut_view(*b), bytes[i]);
+        i = i + 1;
+    }
+}
+
+fn sv_starts_with(sv: StrView, prefix: StrView) -> bool {
+    if (sv.len) < prefix.len {
+        return false;
+    }
+    if prefix.len == 0 {
+        return true;
+    }
+    let mut i: usize = 0;
+    while i < prefix.len {
+        if (unsafe { *(sv.ptr + i) }) != (unsafe { *(prefix.ptr + i) }) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn sv_ends_with(sv: StrView, suffix: StrView) -> bool {
+    if (sv.len) < suffix.len {
+        return false;
+    }
+    if suffix.len == 0 {
+        return true;
+    }
+    let off: usize = sv.len - suffix.len;
+    let mut i: usize = 0;
+    while i < suffix.len {
+        if (unsafe { *(sv.ptr + off + i) }) != (unsafe { *(suffix.ptr + i) }) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn sv_lex_cmp(a: StrView, b: StrView) -> i32 {
+    let min_len: usize = if (a.len) < b.len { a.len } else { b.len };
+    let mut i: usize = 0;
+    while i < min_len {
+        let ba: u8 = unsafe { *(a.ptr + i) };
+        let bb: u8 = unsafe { *(b.ptr + i) };
+        if ba < bb {
+            return -1;
+        }
+        if ba > bb {
+            return 1;
+        }
+        i = i + 1;
+    }
+    if (a.len) < b.len {
+        return -1;
+    }
+    if a.len > b.len {
+        return 1;
+    }
+    0
+}
+
+fn has_ax_extension(path: StrView) -> bool {
+    if (path.len) < 3 || (path.ptr as usize) == 0 {
+        return false;
+    }
+    let n: usize = path.len;
+    unsafe {
+        *(path.ptr + n - 3) == 46u8 && *(path.ptr + n - 2) == 97u8 && *(path.ptr + n - 1) == 120u8
+    }
+}
+
+// AXS-FMT-040: Parses `axiomc fmt` CLI arguments (`args` after `fmt`).
+// Rejects unknown options with `AX_DRIVER_UNKNOWN_OPTION` (exit 2) and `--stdin` + `<path>` with `AX_DRIVER_USAGE` (exit 2).
+pub fn fmt_parse_cli_args(args: view<[16]StrView>, arg_count: usize, sink: mut_view<DiagSink>) -> FmtCliOptions {
+    let mut opts: FmtCliOptions = fmt_cli_options_default();
+    let mut i: usize = 0;
+    while i < arg_count && i < 16 {
+        let arg: StrView = (*args)[i];
+        if arg.len == 0 || (arg.ptr as usize) == 0 {
+            i = i + 1;
+            continue;
+        }
+        let b0: u8 = unsafe { *(arg.ptr + 0) };
+        if b0 == 45u8 {
+            if sv_eq_str(arg, "--check") {
+                opts.check_mode = true;
+            } else if sv_eq_str(arg, "--stdin") {
+                opts.stdin_mode = true;
+            } else if sv_eq_str(arg, "--quiet") || sv_eq_str(arg, "-q") {
+                opts.quiet = true;
+            } else if sv_eq_str(arg, "--help") || sv_eq_str(arg, "-h") {
+                opts.show_help = true;
+            } else if sv_eq_str(arg, "--version") || sv_eq_str(arg, "-V") {
+                opts.show_version = true;
+            } else {
+                let d: Diagnostic = diag_new(diag_code(AX_DRIVER_UNKNOWN_OPTION), span_none(), arg);
+                diag_sink_report(sink, view(d));
+                opts.has_error = true;
+                opts.exit_code = FMT_EXIT_USAGE;
+                return opts;
+            }
+        } else {
+            if (opts.path_count) < 16 {
+                let idx: usize = opts.path_count;
+                opts.paths[idx] = arg;
+                opts.path_is_explicit_file[idx] = has_ax_extension(arg);
+                opts.path_count = idx + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    if opts.stdin_mode && opts.path_count > 0 {
+        let d: Diagnostic = diag_new(
+            diag_code(AX_DRIVER_USAGE),
+            span_none(),
+            sv_from_str("--stdin cannot be combined with file or directory path arguments")
+        );
+        diag_sink_report(sink, view(d));
+        opts.has_error = true;
+        opts.exit_code = FMT_EXIT_USAGE;
+    }
+    opts
+}
+
+pub struct FmtManifestConfig {
+    pub excludes: [16]StrView,
+    pub exclude_count: usize,
+    pub is_valid: bool,
+    pub rejected_key: StrView,
+}
+
+pub fn fmt_manifest_config_empty() -> FmtManifestConfig {
+    FmtManifestConfig {
+        excludes: [StrView { ptr: 0 as *const u8, len: 0 }; 16],
+        exclude_count: 0,
+        is_valid: true,
+        rejected_key: StrView { ptr: 0 as *const u8, len: 0 },
+    }
+}
+
+fn is_ws_byte(b: u8) -> bool {
+    b == 32u8 || b == 9u8 || b == 13u8
+}
+
+fn trim_line_sv(raw: StrView) -> StrView {
+    if raw.len == 0 || (raw.ptr as usize) == 0 {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let mut s: usize = 0;
+    while s < raw.len && is_ws_byte(unsafe { *(raw.ptr + s) }) {
+        s = s + 1;
+    }
+    let mut e: usize = raw.len;
+    let mut k: usize = s;
+    while k < raw.len {
+        let b: u8 = unsafe { *(raw.ptr + k) };
+        if b == 35u8 {
+            e = k;
+            break;
+        }
+        k = k + 1;
+    }
+    while e > s && is_ws_byte(unsafe { *(raw.ptr + e - 1) }) {
+        e = e - 1;
+    }
+    StrView { ptr: unsafe { raw.ptr + s }, len: e - s }
+}
+// AXS-FMT-010 §2: Parses `[format]` section of `axiom.toml`.
+// Allows `exclude = [...]` and rejects any style-altering key with `AX_DRIVER_UNKNOWN_OPTION` (exit 2).
+pub fn fmt_parse_manifest(toml_src: StrView, sink: mut_view<DiagSink>) -> FmtManifestConfig {
+    let mut cfg: FmtManifestConfig = fmt_manifest_config_empty();
+    if toml_src.len == 0 || (toml_src.ptr as usize) == 0 {
+        return cfg;
+    }
+    let mut in_format_section: bool = false;
+    let mut in_exclude_array: bool = false;
+    let mut pos: usize = 0;
+    while pos < toml_src.len {
+        let line_start: usize = pos;
+        while pos < toml_src.len && (unsafe { *(toml_src.ptr + pos) }) != 10u8 {
+            pos = pos + 1;
+        }
+        let raw_line: StrView = StrView { ptr: unsafe { toml_src.ptr + line_start }, len: pos - line_start };
+        if pos < toml_src.len {
+            pos = pos + 1;
+        }
+        let line: StrView = trim_line_sv(raw_line);
+        if line.len == 0 {
+            continue;
+        }
+        if !in_exclude_array && (unsafe { *(line.ptr + 0) }) == 91u8 && (unsafe { *(line.ptr + line.len - 1) }) == 93u8 {
+            in_format_section = sv_eq_str(line, "[format]");
+            continue;
+        }
+        if !in_format_section {
+            continue;
+        }
+
+        if in_exclude_array {
+            let mut k: usize = 0;
+            while k < line.len {
+                let b: u8 = unsafe { *(line.ptr + k) };
+                if b == 93u8 {
+                    in_exclude_array = false;
+                    break;
+                }
+                if b == 34u8 {
+                    let q_start: usize = k + 1;
+                    k = k + 1;
+                    while k < line.len && (unsafe { *(line.ptr + k) }) != 34u8 {
+                        k = k + 1;
+                    }
+                    if (cfg.exclude_count) < 16 {
+                        let idx: usize = cfg.exclude_count;
+                        cfg.excludes[idx] = StrView { ptr: unsafe { line.ptr + q_start }, len: k - q_start };
+                        cfg.exclude_count = idx + 1;
+                    }
+                }
+                k = k + 1;
+            }
+            continue;
+        }
+
+        // Parse `key = value` inside `[format]`.
+        let mut eq_idx: usize = line.len;
+        let mut i: usize = 0;
+        while i < line.len {
+            if (unsafe { *(line.ptr + i) }) == 61u8 {
+                eq_idx = i;
+                break;
+            }
+            i = i + 1;
+        }
+        if eq_idx == line.len {
+            continue;
+        }
+        let key_sv: StrView = trim_line_sv(StrView { ptr: line.ptr, len: eq_idx });
+        if !sv_eq_str(key_sv, "exclude") {
+            let d: Diagnostic = diag_new(diag_code(AX_DRIVER_UNKNOWN_OPTION), span_none(), key_sv);
+            diag_sink_report(sink, view(d));
+            cfg.is_valid = false;
+            cfg.rejected_key = key_sv;
+            return cfg;
+        }
+
+        // Extract quoted string entries from the RHS of `exclude = [...]`.
+        let mut k: usize = eq_idx + 1;
+        let mut saw_open_bracket: bool = false;
+        let mut saw_close_bracket: bool = false;
+        while k < line.len {
+            let b: u8 = unsafe { *(line.ptr + k) };
+            if b == 91u8 {
+                saw_open_bracket = true;
+            } else if b == 93u8 {
+                saw_close_bracket = true;
+                break;
+            } else if b == 34u8 {
+                let q_start: usize = k + 1;
+                k = k + 1;
+                while k < line.len && (unsafe { *(line.ptr + k) }) != 34u8 {
+                    k = k + 1;
+                }
+                if (cfg.exclude_count) < 16 {
+                    let idx: usize = cfg.exclude_count;
+                    cfg.excludes[idx] = StrView { ptr: unsafe { line.ptr + q_start }, len: k - q_start };
+                    cfg.exclude_count = idx + 1;
+                }
+            }
+            k = k + 1;
+        }
+        if saw_open_bracket && !saw_close_bracket {
+            in_exclude_array = true;
+        }
+    }
+    cfg
+}
+
+// AXS-FMT-041 §1: Skips hidden directories (starting with `.`) and build output directories (`build`, `target`, `out`).
+pub fn fmt_is_hidden_or_build_dir(path: StrView) -> bool {
+    if path.len == 0 || (path.ptr as usize) == 0 {
+        return false;
+    }
+    let mut seg_start: usize = 0;
+    let mut i: usize = 0;
+    while i < path.len {
+        let b: u8 = unsafe { *(path.ptr + i) };
+        if b == 47u8 || b == 92u8 {
+            let seg_len: usize = i - seg_start;
+            if seg_len > 0 {
+                let seg: StrView = StrView { ptr: unsafe { path.ptr + seg_start }, len: seg_len };
+                let b0: u8 = unsafe { *(seg.ptr + 0) };
+                if b0 == 46u8 && !(seg_len == 1 || (seg_len == 2 && (unsafe { *(seg.ptr + 1) }) == 46u8)) {
+                    return true;
+                }
+                if sv_eq_str(seg, "build") || sv_eq_str(seg, "target") || sv_eq_str(seg, "out") {
+                    return true;
+                }
+            }
+            seg_start = i + 1;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+pub fn fmt_glob_matches(path: StrView, pat: StrView) -> bool {
+    if pat.len == 0 || (pat.ptr as usize) == 0 {
+        return false;
+    }
+    if fmt_sv_eq(path, pat) {
+        return true;
+    }
+    // `prefix/**`
+    if pat.len >= 3 {
+        let n: usize = pat.len;
+        if (unsafe { *(pat.ptr + n - 3) }) == 47u8 &&
+                (unsafe { *(pat.ptr + n - 2) }) == 42u8 &&
+                (unsafe { *(pat.ptr + n - 1) }) == 42u8 {
+            let prefix_with_slash: StrView = StrView { ptr: pat.ptr, len: n - 2 };
+            let prefix_dir: StrView = StrView { ptr: pat.ptr, len: n - 3 };
+            if sv_starts_with(path, prefix_with_slash) || fmt_sv_eq(path, prefix_dir) {
+                return true;
+            }
+        }
+    }
+    // `*.suffix` or `**/*.suffix`
+    if (unsafe { *(pat.ptr + 0) }) == 42u8 {
+        let mut s_off: usize = 1;
+        if pat.len >= 3 && (unsafe { *(pat.ptr + 1) }) == 42u8 && (unsafe { *(pat.ptr + 2) }) == 47u8 {
+            s_off = 3;
+            let tail: StrView = StrView { ptr: unsafe { pat.ptr + s_off }, len: pat.len - s_off };
+            if tail.len > 0 && (unsafe { *(tail.ptr + 0) }) == 42u8 {
+                let ext: StrView = StrView { ptr: unsafe { tail.ptr + 1 }, len: tail.len - 1 };
+                return sv_ends_with(path, ext);
+            }
+            return sv_ends_with(path, tail);
+        }
+        let suffix: StrView = StrView { ptr: unsafe { pat.ptr + s_off }, len: pat.len - s_off };
+        return sv_ends_with(path, suffix);
+    }
+    // Directory prefix match `dir` -> matches `dir/...`
+    if path.len > pat.len && sv_starts_with(path, pat) {
+        let sep: u8 = unsafe { *(path.ptr + pat.len) };
+        if sep == 47u8 || sep == 92u8 {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn fmt_should_format_file(path: StrView, is_explicit_file: bool, cfg: view<FmtManifestConfig>) -> bool {
+    if !has_ax_extension(path) {
+        return false;
+    }
+    if is_explicit_file {
+        return true;
+    }
+    if fmt_is_hidden_or_build_dir(path) {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < cfg.exclude_count {
+        if fmt_glob_matches(path, cfg.excludes[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+struct LineSliceList {
+    lines: [128]StrView,
+    count: usize,
+}
+
+fn split_lines_sv(src: StrView, out: mut_view<LineSliceList>) {
+    out.count = 0;
+    if src.len == 0 || (src.ptr as usize) == 0 {
+        return;
+    }
+    let mut pos: usize = 0;
+    while pos < src.len && (out.count) < 128 {
+        let start: usize = pos;
+        while pos < src.len && (unsafe { *(src.ptr + pos) }) != 10u8 {
+            pos = pos + 1;
+        }
+        let mut end: usize = pos;
+        if end > start && (unsafe { *(src.ptr + end - 1) }) == 13u8 {
+            end = end - 1;
+        }
+        let idx: usize = out.count;
+        out.lines[idx] = StrView { ptr: unsafe { src.ptr + start }, len: end - start };
+        out.count = idx + 1;
+        if pos < src.len {
+            pos = pos + 1;
+        }
+    }
+}
+
+// AXS-FMT-040: Renders a deterministic unified diff for `--check` mode.
+pub fn fmt_render_unified_diff(path: StrView, orig: StrView, formatted: StrView, out_buf: mut_view<DiagBuffer>) {
+    if fmt_sv_eq(orig, formatted) {
+        return;
+    }
+    fmt_buf_push_str(mut_view(*out_buf), "--- a/");
+    diag_buf_push_bytes(mut_view(*out_buf), path.ptr, path.len);
+    diag_buf_push_byte(mut_view(*out_buf), 10u8);
+    fmt_buf_push_str(mut_view(*out_buf), "+++ b/");
+    diag_buf_push_bytes(mut_view(*out_buf), path.ptr, path.len);
+    diag_buf_push_byte(mut_view(*out_buf), 10u8);
+
+    let mut orig_lines: LineSliceList = LineSliceList {
+        lines: [StrView { ptr: 0 as *const u8, len: 0 }; 128],
+        count: 0,
+    };
+    let mut fmt_lines: LineSliceList = LineSliceList {
+        lines: [StrView { ptr: 0 as *const u8, len: 0 }; 128],
+        count: 0,
+    };
+    split_lines_sv(orig, mut_view(orig_lines));
+    split_lines_sv(formatted, mut_view(fmt_lines));
+
+    let mut prefix: usize = 0;
+    while prefix < orig_lines.count && prefix < fmt_lines.count &&
+            fmt_sv_eq(orig_lines.lines[prefix], fmt_lines.lines[prefix]) {
+        prefix = prefix + 1;
+    }
+
+    let mut orig_end: usize = orig_lines.count;
+    let mut fmt_end: usize = fmt_lines.count;
+    while orig_end > prefix && fmt_end > prefix &&
+            fmt_sv_eq(orig_lines.lines[orig_end - 1], fmt_lines.lines[fmt_end - 1]) {
+        orig_end = orig_end - 1;
+        fmt_end = fmt_end - 1;
+    }
+
+    let orig_start_1: u32 = (prefix + 1) as u32;
+    let orig_cnt: u32 = (orig_end - prefix) as u32;
+    let fmt_start_1: u32 = (prefix + 1) as u32;
+    let fmt_cnt: u32 = (fmt_end - prefix) as u32;
+
+    fmt_buf_push_str(mut_view(*out_buf), "@@ -");
+    diag_buf_push_u32(mut_view(*out_buf), orig_start_1);
+    diag_buf_push_byte(mut_view(*out_buf), 44u8);
+    diag_buf_push_u32(mut_view(*out_buf), orig_cnt);
+    fmt_buf_push_str(mut_view(*out_buf), " +");
+    diag_buf_push_u32(mut_view(*out_buf), fmt_start_1);
+    diag_buf_push_byte(mut_view(*out_buf), 44u8);
+    diag_buf_push_u32(mut_view(*out_buf), fmt_cnt);
+    fmt_buf_push_str(mut_view(*out_buf), " @@\n");
+
+    let mut i: usize = prefix;
+    while i < orig_end {
+        diag_buf_push_byte(mut_view(*out_buf), 45u8);
+        let ln: StrView = orig_lines.lines[i];
+        diag_buf_push_bytes(mut_view(*out_buf), ln.ptr, ln.len);
+        diag_buf_push_byte(mut_view(*out_buf), 10u8);
+        i = i + 1;
+    }
+    let mut j: usize = prefix;
+    while j < fmt_end {
+        diag_buf_push_byte(mut_view(*out_buf), 43u8);
+        let ln: StrView = fmt_lines.lines[j];
+        diag_buf_push_bytes(mut_view(*out_buf), ln.ptr, ln.len);
+        diag_buf_push_byte(mut_view(*out_buf), 10u8);
+        j = j + 1;
+    }
+}
+
+@derive(Copy)
+pub struct FmtVirtualFile {
+    pub path: StrView,
+    pub content: StrView,
+    pub is_explicit_file: bool,
+    pub mtime_ticks: u64,
+    pub mutated: bool,
+}
+
+@derive(Copy)
+pub struct FmtRunResult {
+    pub exit_code: i32,
+    pub files_scanned: u32,
+    pub files_formatted: u32,
+    pub files_unformatted: u32,
+    pub files_unchanged: u32,
+    pub files_skipped: u32,
+    pub syntax_errors: u32,
+    pub ice_errors: u32,
+}
+
+pub fn fmt_run_result_empty() -> FmtRunResult {
+    FmtRunResult {
+        exit_code: 0,
+        files_scanned: 0u32,
+        files_formatted: 0u32,
+        files_unformatted: 0u32,
+        files_unchanged: 0u32,
+        files_skipped: 0u32,
+        syntax_errors: 0u32,
+        ice_errors: 0u32,
+    }
+}
+
+// AXS-FMT-041 §1: Sorts virtual workspace files in deterministic lexicographical byte order.
+pub fn fmt_sort_virtual_files(files: mut_view<[16]FmtVirtualFile>, count: usize) {
+    let mut i: usize = 1;
+    while i < count && i < 16 {
+        let key: FmtVirtualFile = (*files)[i];
+        let mut j: usize = i;
+        while j > 0 {
+            let prev: FmtVirtualFile = (*files)[j - 1];
+            if sv_lex_cmp(prev.path, key.path) > 0 {
+                (*files)[j] = prev;
+                j = j - 1;
+            } else {
+                break;
+            }
+        }
+        (*files)[j] = key;
+        i = i + 1;
+    }
+}
+
+// AXS-FMT-040: Executes `axiomc fmt --stdin` (and `axiomc fmt --stdin --check`).
+pub fn fmt_run_stdin(
+    stdin_src: StrView,
+    check_mode: bool,
+    quiet: bool,
+    stdout_buf: mut_view<DiagBuffer>,
+    out_stats: mut_view<FmtVerifyStats>,
+    out_sink: mut_view<DiagSink>
+) -> i32 {
+    stdout_buf.len = 0;
+    let mut fmt_buf: DiagBuffer = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(fmt_buf));
+    let st: u8 = fmt_format_and_verify(stdin_src, mut_view(fmt_buf), mut_view(*out_stats), mut_view(*out_sink));
+    if st == FMT_VERIFY_ERR_SYNTAX {
+        diag_buf_free(mut_view(fmt_buf));
+        return FMT_EXIT_CHECK_OR_SYNTAX;
+    }
+    if st != FMT_VERIFY_OK {
+        diag_buf_free(mut_view(fmt_buf));
+        return FMT_EXIT_ICE;
+    }
+    let fmt_sv: StrView = StrView { ptr: fmt_buf.ptr as *const u8, len: fmt_buf.len };
+    if check_mode {
+        if !out_stats.is_already_canonical {
+            let label_sv: StrView = sv_from_str("<stdin>");
+            if quiet {
+                diag_buf_push_bytes(mut_view(*stdout_buf), label_sv.ptr, label_sv.len);
+                diag_buf_push_byte(mut_view(*stdout_buf), 10u8);
+            } else {
+                fmt_render_unified_diff(label_sv, stdin_src, fmt_sv, mut_view(*stdout_buf));
+            }
+            diag_buf_free(mut_view(fmt_buf));
+            return FMT_EXIT_CHECK_OR_SYNTAX;
+        }
+        diag_buf_free(mut_view(fmt_buf));
+        return FMT_EXIT_OK;
+    }
+    diag_buf_push_bytes(mut_view(*stdout_buf), fmt_sv.ptr, fmt_sv.len);
+    diag_buf_free(mut_view(fmt_buf));
+    FMT_EXIT_OK
+}
+
+// AXS-FMT-040 & AXS-FMT-041: Executes `axiomc fmt` across a workspace of files.
+pub fn fmt_run_workspace(
+    opts: view<FmtCliOptions>,
+    manifest_toml: StrView,
+    files: mut_view<[16]FmtVirtualFile>,
+    file_count: usize,
+    stdout_buf: mut_view<DiagBuffer>,
+    out_sink: mut_view<DiagSink>
+) -> FmtRunResult {
+    let mut res: FmtRunResult = fmt_run_result_empty();
+    stdout_buf.len = 0;
+    if opts.has_error {
+        res.exit_code = opts.exit_code;
+        return res;
+    }
+    if opts.show_help {
+        fmt_buf_push_str(mut_view(*stdout_buf), "Usage: axiomc fmt [--check] [--stdin] [--quiet] [<path>...]\n");
+        res.exit_code = FMT_EXIT_OK;
+        return res;
+    }
+    if opts.show_version {
+        fmt_buf_push_str(mut_view(*stdout_buf), "axiomc fmt 0.1.0\n");
+        res.exit_code = FMT_EXIT_OK;
+        return res;
+    }
+
+    let manifest_cfg: FmtManifestConfig = fmt_parse_manifest(manifest_toml, mut_view(*out_sink));
+    if !manifest_cfg.is_valid {
+        res.exit_code = FMT_EXIT_USAGE;
+        return res;
+    }
+
+    fmt_sort_virtual_files(mut_view(*files), file_count);
+
+    let mut fmt_buf: DiagBuffer = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(fmt_buf));
+    let mut i: usize = 0;
+    while i < file_count && i < 16 {
+        let f_path: StrView = (*files)[i].path;
+        let is_exp: bool = (*files)[i].is_explicit_file;
+        if !fmt_should_format_file(f_path, is_exp, view(manifest_cfg)) {
+            res.files_skipped = res.files_skipped + 1u32;
+            (*files)[i].mutated = false;
+            i = i + 1;
+            continue;
+        }
+        res.files_scanned = res.files_scanned + 1u32;
+        let mut vstats: FmtVerifyStats = fmt_verify_stats_empty();
+        let st: u8 = fmt_format_and_verify(
+            (*files)[i].content,
+            mut_view(fmt_buf),
+            mut_view(vstats),
+            mut_view(*out_sink)
+        );
+        if st == FMT_VERIFY_ERR_SYNTAX {
+            // AXS-FMT-030: Refuse to format on syntax/lex error; preserve file & mtime untouched.
+            res.syntax_errors = res.syntax_errors + 1u32;
+            (*files)[i].mutated = false;
+            if res.exit_code == 0 {
+                res.exit_code = FMT_EXIT_CHECK_OR_SYNTAX;
+            }
+        } else if st != FMT_VERIFY_OK {
+            // AXS-FMT-031(4): Hard abort on post-format verification failure (exit 3).
+            res.ice_errors = res.ice_errors + 1u32;
+            (*files)[i].mutated = false;
+            res.exit_code = FMT_EXIT_ICE;
+            diag_buf_free(mut_view(fmt_buf));
+            return res;
+        } else if vstats.is_already_canonical {
+            // AXS-FMT-041 §2: Idempotent timestamp preservation (`fmt(S) == S` -> no write, mtime unchanged).
+            res.files_unchanged = res.files_unchanged + 1u32;
+            (*files)[i].mutated = false;
+        } else {
+            res.files_unformatted = res.files_unformatted + 1u32;
+            let fmt_sv: StrView = StrView { ptr: fmt_buf.ptr as *const u8, len: fmt_buf.len };
+            if opts.check_mode {
+                (*files)[i].mutated = false;
+                if opts.quiet {
+                    diag_buf_push_bytes(mut_view(*stdout_buf), f_path.ptr, f_path.len);
+                    diag_buf_push_byte(mut_view(*stdout_buf), 10u8);
+                } else {
+                    fmt_render_unified_diff(f_path, (*files)[i].content, fmt_sv, mut_view(*stdout_buf));
+                }
+                if res.exit_code == 0 {
+                    res.exit_code = FMT_EXIT_CHECK_OR_SYNTAX;
+                }
+            } else {
+                res.files_formatted = res.files_formatted + 1u32;
+                (*files)[i].mutated = true;
+                (*files)[i].mtime_ticks = (*files)[i].mtime_ticks + 1u64;
+            }
+        }
+        i = i + 1;
+    }
+    diag_buf_free(mut_view(fmt_buf));
+    res
+}
+
+// AXS-FMT-042 §1..3: End-to-end LSP `textDocument/formatting` integration with `compiler.fmt.verify`.
+// Formats the active VFS document in-memory, verifies AST & comment conservation, and returns the minimal `TextEdit`.
+pub fn fmt_lsp_format_document(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    options: LspFormattingOptions,
+    out_fmt_buf: mut_view<DiagBuffer>,
+    out_stats: mut_view<FmtVerifyStats>,
+    out_sink: mut_view<DiagSink>
+) -> LspFormattingResult {
+    let _ = options;
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let zero_range = lsp_range_new(lsp_pos_new(0u32, 0u32), lsp_pos_new(0u32, 0u32));
+    let empty_edit = LspRenameTextEdit {
+        doc_id: doc_id,
+        span_start: 0u32,
+        span_end: 0u32,
+        range: zero_range,
+        new_text_str: lsp_str_view(""),
+    };
+    let mut res = LspFormattingResult {
+        accepted: false,
+        has_syntax_error: false,
+        is_already_canonical: false,
+        options_ignored: true,
+        canonical_indent_spaces: 4u32,
+        canonical_max_width: 100u32,
+        edit_count: 0u32,
+        edit: empty_edit,
+        snapped_start_byte: 0u32,
+        snapped_end_byte: 0u32,
+        header: lsp_fact_header_new(ws.revision, CERTAINTY_UNAVAILABLE, FALLBACK_INCOMPLETE_EXPR),
+    };
+
+    if doc_id >= ws.doc_cap {
+        res.has_syntax_error = true;
+        return res;
+    }
+    let dp = vfs_doc_ptr(view(*ws), doc_id);
+    if !(unsafe { (*dp).active }) || (unsafe { (*dp).parse_Incomplete_count }) > 0u32 {
+        res.has_syntax_error = true;
+        return res;
+    }
+
+    let orig_ptr: *const u8 = unsafe { (*dp).editor.compact_buf as *const u8 };
+    let orig_len: usize = unsafe { (*dp).editor.compact_len };
+    let orig_sv: StrView = StrView { ptr: orig_ptr, len: orig_len };
+
+    let st: u8 = fmt_format_and_verify(orig_sv, mut_view(*out_fmt_buf), mut_view(*out_stats), mut_view(*out_sink));
+    if st != FMT_VERIFY_OK {
+        res.has_syntax_error = st == FMT_VERIFY_ERR_SYNTAX;
+        return res;
+    }
+
+    res.accepted = true;
+    res.snapped_start_byte = 0u32;
+    res.snapped_end_byte = orig_len as u32;
+    res.header = lsp_fact_header_new(ws.revision, CERTAINTY_EXACT, FALLBACK_NONE);
+
+    if out_stats.is_already_canonical {
+        res.is_already_canonical = true;
+        res.edit_count = 0u32;
+        return res;
+    }
+
+    res.is_already_canonical = false;
+    res.edit = lsp_compute_minimal_format_edit(
+        view(*ws),
+        doc_id,
+        orig_ptr,
+        orig_len,
+        out_fmt_buf.ptr as *const u8,
+        out_fmt_buf.len
+    );
+    res.edit_count = 1u32;
+    res
+}
+
+// AXS-FMT-042 §4: End-to-end LSP `textDocument/rangeFormatting` integration with `compiler.fmt.verify`.
+// Snaps the requested range to the smallest enclosing syntactic declaration/statement boundary,
+// formats and verifies ONLY that enclosing slice, and returns the minimal `TextEdit` within the range.
+pub fn fmt_lsp_range_format_document(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    requested_range: LspRange,
+    options: LspFormattingOptions,
+    out_fmt_buf: mut_view<DiagBuffer>,
+    out_stats: mut_view<FmtVerifyStats>,
+    out_sink: mut_view<DiagSink>
+) -> LspFormattingResult {
+    let _ = options;
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let zero_range = lsp_range_new(lsp_pos_new(0u32, 0u32), lsp_pos_new(0u32, 0u32));
+    let empty_edit = LspRenameTextEdit {
+        doc_id: doc_id,
+        span_start: 0u32,
+        span_end: 0u32,
+        range: zero_range,
+        new_text_str: lsp_str_view(""),
+    };
+    let mut res = LspFormattingResult {
+        accepted: false,
+        has_syntax_error: false,
+        is_already_canonical: false,
+        options_ignored: true,
+        canonical_indent_spaces: 4u32,
+        canonical_max_width: 100u32,
+        edit_count: 0u32,
+        edit: empty_edit,
+        snapped_start_byte: 0u32,
+        snapped_end_byte: 0u32,
+        header: lsp_fact_header_new(ws.revision, CERTAINTY_UNAVAILABLE, FALLBACK_INCOMPLETE_EXPR),
+    };
+
+    if doc_id >= ws.doc_cap {
+        res.has_syntax_error = true;
+        return res;
+    }
+    let dp = vfs_doc_ptr(view(*ws), doc_id);
+    if !(unsafe { (*dp).active }) || (unsafe { (*dp).parse_Incomplete_count }) > 0u32 {
+        res.has_syntax_error = true;
+        return res;
+    }
+
+    let orig_ptr: *const u8 = unsafe { (*dp).editor.compact_buf as *const u8 };
+    let orig_len: usize = unsafe { (*dp).editor.compact_len };
+    let req_start_tp: u64 = editor_lsp_pos_to_byte_offset(unsafe { view((*dp).editor) }, requested_range.start, ws.position_encoding);
+    let req_end_tp: u64 = editor_lsp_pos_to_byte_offset(unsafe { view((*dp).editor) }, requested_range.end, ws.position_encoding);
+    let mut snap_start: u32 = req_start_tp as u32;
+    let mut snap_end: u32 = req_end_tp as u32;
+
+    let mut best_span_len: u32 = 0xFFFFFFFFu32;
+    let mut i: u32 = 0u32;
+    while i < eng.node_count {
+        let nd = unsafe { *(eng.nodes + (i as usize)) };
+        if nd.doc_id == doc_id && nd.is_declaration &&
+                nd.span_start <= snap_start && nd.span_end >= snap_end {
+            let slen: u32 = nd.span_end - nd.span_start;
+            if slen < best_span_len {
+                best_span_len = slen;
+                snap_start = nd.span_start;
+                snap_end = nd.span_end;
+            }
+        }
+        i = i + 1u32;
+    }
+
+    while snap_start > 0u32 && (unsafe { *(orig_ptr + ((snap_start - 1u32) as usize)) }) != 10u8 {
+        snap_start = snap_start - 1u32;
+    }
+    while (snap_end as usize) < orig_len && (unsafe { *(orig_ptr + (snap_end as usize)) }) != 10u8 {
+        snap_end = snap_end + 1u32;
+    }
+    if (snap_end as usize) < orig_len && (unsafe { *(orig_ptr + (snap_end as usize)) }) == 10u8 {
+        snap_end = snap_end + 1u32;
+    }
+
+    if (snap_start as usize) >= orig_len || snap_start >= snap_end {
+        res.has_syntax_error = true;
+        return res;
+    }
+
+    let slice_len: usize = (snap_end - snap_start) as usize;
+    let slice_ptr: *const u8 = unsafe { orig_ptr + (snap_start as usize) };
+    let slice_sv: StrView = StrView { ptr: slice_ptr, len: slice_len };
+
+    let st: u8 = fmt_format_and_verify(slice_sv, mut_view(*out_fmt_buf), mut_view(*out_stats), mut_view(*out_sink));
+    if st != FMT_VERIFY_OK {
+        res.has_syntax_error = st == FMT_VERIFY_ERR_SYNTAX;
+        return res;
+    }
+
+    res.accepted = true;
+    res.snapped_start_byte = snap_start;
+    res.snapped_end_byte = snap_end;
+    res.header = lsp_fact_header_new(ws.revision, CERTAINTY_EXACT, FALLBACK_NONE);
+
+    if out_stats.is_already_canonical {
+        res.is_already_canonical = true;
+        res.edit_count = 0u32;
+        return res;
+    }
+
+    let sub_edit = lsp_compute_minimal_format_edit(
+        view(*ws),
+        doc_id,
+        slice_ptr,
+        slice_len,
+        out_fmt_buf.ptr as *const u8,
+        out_fmt_buf.len
+    );
+    let abs_start: u32 = snap_start + sub_edit.span_start;
+    let abs_end: u32 = snap_start + sub_edit.span_end;
+    let abs_tr = text_range_new(abs_start as u64, abs_end as u64);
+    let abs_lrange = editor_byte_range_to_lsp_range(unsafe { view((*dp).editor) }, abs_tr, ws.position_encoding);
+    res.edit = LspRenameTextEdit {
+        doc_id: doc_id,
+        span_start: abs_start,
+        span_end: abs_end,
+        range: abs_lrange,
+        new_text_str: sub_edit.new_text_str,
+    };
+    res.edit_count = 1u32;
+    res
+}

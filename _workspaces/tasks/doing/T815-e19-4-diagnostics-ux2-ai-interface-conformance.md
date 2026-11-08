@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T219, T752, T755, T756, T759, T814]
 priority: 205
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tests/conformance/p19/e19_4_diagnostics_ai]
 spec: [spec/SPEC-103-diagnostics-ux-ai-interface.md, 0101, 0129, 0146, tasks/0360, tasks/0374, tasks/0421, tasks/0425, tasks/0444, tasks/0448, tasks/0456]
 covers: [REQ-TOOL-004, REQ-TOOL-180, REQ-TOOL-181, REQ-TOOL-182, REQ-TOOL-185, REQ-TOOL-186, REQ-TOOL-187, REQ-TOOL-190, REQ-TOOL-298]
+started: 2026-11-08 17:48:14
+agent: T815-impl
 ---
 # T815 — E19.4 Diagnostics UX 2.0, explain codes, machine-applicable fixes & AI-agent fact interface conformance suite
 
@@ -41,3 +43,4 @@ Certify E19.4 exit criteria with an end-to-end conformance suite covering Diagno
 
 ## Log
 - 2026-11-03 09:50:00 created by T219 (P19 phase planning)
+- 2026-11-08 17:48:14 started (attempt 1) T815-impl

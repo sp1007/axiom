@@ -1,0 +1,536 @@
+module main
+
+use host_intrinsics.stdio
+use host_intrinsics.write
+
+use std.editor.LspRange
+use std.editor.lsp_pos_new
+use std.editor.lsp_range_new
+use compiler.kernel.arena.arena_new
+use compiler.kernel.interner.StrView
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.diag_sink_init
+use compiler.diag.emitter.diag_sink_free
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+use compiler.diag.format.diag_buf_push_bytes
+use compiler.diag.format.diag_buf_push_u32
+use compiler.lsp.protocol.LspStrView
+use compiler.lsp.protocol.lsp_str_view
+use compiler.lsp.vfs.VfsWorkspace
+use compiler.lsp.vfs.vfs_workspace_new
+use compiler.lsp.vfs.vfs_workspace_free
+use compiler.lsp.vfs.vfs_hash_str
+use compiler.lsp.vfs.vfs_did_open
+use compiler.lsp.handlers.LspSemanticEngine
+use compiler.lsp.handlers.LspFormattingOptions
+use compiler.lsp.handlers.LspFormattingResult
+use compiler.lsp.handlers.lsp_engine_new
+use compiler.lsp.handlers.lsp_engine_free
+use compiler.lsp.handlers.lsp_formatting_options_new
+use compiler.fmt.verify.FMT_VERIFY_OK
+use compiler.fmt.verify.FMT_VERIFY_ERR_SYNTAX
+use compiler.fmt.verify.FMT_VERIFY_ERR_REPARSE
+use compiler.fmt.verify.FMT_VERIFY_ERR_COMMENTS
+use compiler.fmt.verify.FMT_VERIFY_ERR_AST_MISMATCH
+use compiler.fmt.verify.FmtVerifyStats
+use compiler.fmt.verify.fmt_verify_stats_empty
+use compiler.fmt.verify.fmt_sv_eq
+use compiler.fmt.verify.fmt_verify_formatted_output
+use compiler.fmt.verify.fmt_format_and_verify
+use compiler.driver.fmt_cmd.FmtCliOptions
+use compiler.driver.fmt_cmd.FmtManifestConfig
+use compiler.driver.fmt_cmd.FmtVirtualFile
+use compiler.driver.fmt_cmd.FmtRunResult
+use compiler.driver.fmt_cmd.fmt_cli_options_default
+use compiler.driver.fmt_cmd.fmt_parse_cli_args
+use compiler.driver.fmt_cmd.fmt_parse_manifest
+use compiler.driver.fmt_cmd.fmt_should_format_file
+use compiler.driver.fmt_cmd.fmt_run_stdin
+use compiler.driver.fmt_cmd.fmt_run_workspace
+use compiler.driver.fmt_cmd.fmt_lsp_format_document
+use compiler.driver.fmt_cmd.fmt_lsp_range_format_document
+
+fn sv_lit(s: str) -> StrView {
+    let lv: LspStrView = lsp_str_view(s);
+    StrView { ptr: lv.ptr, len: lv.len }
+}
+
+fn probe_sv_starts_with(sv: StrView, prefix: StrView) -> bool {
+    if (sv.len) < prefix.len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < prefix.len {
+        if (unsafe { *(sv.ptr + i) }) != (unsafe { *(prefix.ptr + i) }) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn p_str(s: str) {
+    let sv: StrView = sv_lit(s);
+    let mut b: DiagBuffer = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(b));
+    diag_buf_push_bytes(mut_view(b), sv.ptr, sv.len);
+    unsafe { write(stdio(1), b.ptr as *const u8, b.len); }
+    diag_buf_free(mut_view(b));
+}
+
+fn p_bool(v: bool) {
+    if v {
+        p_str("true");
+    } else {
+        p_str("false");
+    }
+}
+
+fn p_i32(v: i32) {
+    if v < 0 {
+        p_str("-");
+        p_u32((0 - v) as u32);
+    } else {
+        p_u32(v as u32);
+    }
+}
+
+fn p_u32(v: u32) {
+    let mut b: DiagBuffer = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(b));
+    diag_buf_push_u32(mut_view(b), v);
+    unsafe { write(stdio(1), b.ptr as *const u8, b.len); }
+    diag_buf_free(mut_view(b));
+}
+
+fn test_ast_verify() {
+    let sv: StrView = sv_lit("//! Module header\nmodule demo.verify\nuse std.io.{Write, Read, self}\nuse std.fmt.{Display}\n\n/// Doc comment\n@derive(Copy, Clone)\n@repr(C)\npub struct Pair {\n    // field a\n    pub a: u32,\n    pub b: u32, // trailing b\n}\n\npub fn compute(p: Pair) -> u32 {\n    let mask: u32 = 0xffu32;\n    let sum = (p.a + p.b) & mask;\n    sum\n}\n");
+    let mut out_buf: DiagBuffer = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(out_buf));
+    let mut vstats: FmtVerifyStats = fmt_verify_stats_empty();
+    let mut sink: DiagSink = DiagSink {
+        arena: arena_new(),
+        diags: 0 as *mut Diagnostic,
+        len: 0,
+        cap: 0,
+        errors: 0,
+        warnings: 0,
+    };
+    diag_sink_init(mut_view(sink));
+
+    let st: u8 = fmt_format_and_verify(sv, mut_view(out_buf), mut_view(vstats), mut_view(sink));
+    let ok_exit: i32 = if st == FMT_VERIFY_OK && sink.errors == 0 { vstats.exit_code } else { 99 };
+
+    p_str("probe[ast_verify] ok_exit=");
+    p_i32(ok_exit);
+    p_str(" comments_conserved=");
+    p_bool(vstats.comments_conserved && vstats.orig_comment_count == 4u32 && vstats.unemitted_comment_count == 0u32);
+    p_str(" ast_equiv=");
+    p_bool(vstats.ast_equivalent && vstats.orig_item_count == 5u32 && vstats.fmt_item_count == 5u32);
+    p_str(" idempotent=");
+    p_bool(vstats.idempotent);
+    p_str("\n");
+
+    diag_sink_free(mut_view(sink));
+    diag_buf_free(mut_view(out_buf));
+}
+
+fn test_ast_verify_tamper() {
+    let orig_sv: StrView = sv_lit("// keep comment\npub fn calc(a: i32, b: i32) -> i32 {\n    let x = a + b\n    x\n}\n");
+
+    // 1. Tampered output with dropped comment -> exit 3 (AX_ICE_INTERNAL)
+    let dropped_comment: StrView = sv_lit("pub fn calc(a: i32, b: i32) -> i32 {\n    let x = a + b\n    x\n}\n");
+    let mut stats1: FmtVerifyStats = fmt_verify_stats_empty();
+    let mut sink1: DiagSink = DiagSink { arena: arena_new(), diags: 0 as *mut Diagnostic, len: 0, cap: 0, errors: 0, warnings: 0 };
+    diag_sink_init(mut_view(sink1));
+    let st1: u8 = fmt_verify_formatted_output(orig_sv, dropped_comment, mut_view(stats1), mut_view(sink1));
+    let drop_exit: i32 = if st1 == FMT_VERIFY_ERR_COMMENTS && sink1.errors == 1 { stats1.exit_code } else { 0 };
+    diag_sink_free(mut_view(sink1));
+
+    // 2. Tampered output with mutated AST operator (`+` -> `-`) -> exit 3 (AX_ICE_INTERNAL)
+    let mutated_ast: StrView = sv_lit("// keep comment\npub fn calc(a: i32, b: i32) -> i32 {\n    let x = a - b\n    x\n}\n");
+    let mut stats2: FmtVerifyStats = fmt_verify_stats_empty();
+    let mut sink2: DiagSink = DiagSink { arena: arena_new(), diags: 0 as *mut Diagnostic, len: 0, cap: 0, errors: 0, warnings: 0 };
+    diag_sink_init(mut_view(sink2));
+    let st2: u8 = fmt_verify_formatted_output(orig_sv, mutated_ast, mut_view(stats2), mut_view(sink2));
+    let ast_exit: i32 = if st2 == FMT_VERIFY_ERR_AST_MISMATCH && sink2.errors == 1 { stats2.exit_code } else { 0 };
+    diag_sink_free(mut_view(sink2));
+
+    // 3. Tampered output with trailing semicolon added to final value expression (`x` -> `x;`) -> exit 3
+    let semi_tamper: StrView = sv_lit("// keep comment\npub fn calc(a: i32, b: i32) -> i32 {\n    let x = a + b\n    x;\n}\n");
+    let mut stats3: FmtVerifyStats = fmt_verify_stats_empty();
+    let mut sink3: DiagSink = DiagSink { arena: arena_new(), diags: 0 as *mut Diagnostic, len: 0, cap: 0, errors: 0, warnings: 0 };
+    diag_sink_init(mut_view(sink3));
+    let st3: u8 = fmt_verify_formatted_output(orig_sv, semi_tamper, mut_view(stats3), mut_view(sink3));
+    let semi_exit: i32 = if st3 == FMT_VERIFY_ERR_AST_MISMATCH && sink3.errors == 1 { stats3.exit_code } else { 0 };
+    diag_sink_free(mut_view(sink3));
+
+    // 4. Tampered output that fails re-parse -> exit 3
+    let bad_reparse: StrView = sv_lit("// keep comment\npub fn calc(a: i32 -> i32 {\n");
+    let mut stats4: FmtVerifyStats = fmt_verify_stats_empty();
+    let mut sink4: DiagSink = DiagSink { arena: arena_new(), diags: 0 as *mut Diagnostic, len: 0, cap: 0, errors: 0, warnings: 0 };
+    diag_sink_init(mut_view(sink4));
+    let st4: u8 = fmt_verify_formatted_output(orig_sv, bad_reparse, mut_view(stats4), mut_view(sink4));
+    let reparse_exit: i32 = if st4 == FMT_VERIFY_ERR_REPARSE && sink4.errors == 1 { stats4.exit_code } else { 0 };
+    diag_sink_free(mut_view(sink4));
+
+    // 5. Input with syntax error -> exit 1 (AXS-FMT-030 refusal gate, empty output buffer)
+    let bad_input: StrView = sv_lit("pub fn broken(\n");
+    let mut out5: DiagBuffer = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(out5));
+    let mut stats5: FmtVerifyStats = fmt_verify_stats_empty();
+    let mut sink5: DiagSink = DiagSink { arena: arena_new(), diags: 0 as *mut Diagnostic, len: 0, cap: 0, errors: 0, warnings: 0 };
+    diag_sink_init(mut_view(sink5));
+    let st5: u8 = fmt_format_and_verify(bad_input, mut_view(out5), mut_view(stats5), mut_view(sink5));
+    let syn_exit: i32 = if st5 == FMT_VERIFY_ERR_SYNTAX && out5.len == 0 { stats5.exit_code } else { 0 };
+    diag_sink_free(mut_view(sink5));
+    diag_buf_free(mut_view(out5));
+
+    p_str("probe[ast_verify_tamper] dropped_comment_exit=");
+    p_i32(drop_exit);
+    p_str(" mutated_ast_exit=");
+    p_i32(ast_exit);
+    p_str(" semi_mismatch_exit=");
+    p_i32(semi_exit);
+    p_str(" bad_reparse_exit=");
+    p_i32(reparse_exit);
+    p_str(" syntax_err_exit=");
+    p_i32(syn_exit);
+    p_str("\n");
+}
+fn test_cli_flags_and_manifest() {
+    // 1. Unknown CLI option (`--indent-width=2`) -> exit 2 (AX_DRIVER_UNKNOWN_OPTION)
+    let mut args1: [16]StrView = [StrView { ptr: 0 as *const u8, len: 0 }; 16];
+    args1[0] = sv_lit("--indent-width=2");
+    let mut sink1: DiagSink = DiagSink { arena: arena_new(), diags: 0 as *mut Diagnostic, len: 0, cap: 0, errors: 0, warnings: 0 };
+    diag_sink_init(mut_view(sink1));
+    let opts1: FmtCliOptions = fmt_parse_cli_args(view(args1), 1, mut_view(sink1));
+    let unk_exit: i32 = if opts1.has_error && sink1.errors == 1 { opts1.exit_code } else { 0 };
+    diag_sink_free(mut_view(sink1));
+
+    // 2. `--stdin` combined with `<path>` -> exit 2 (AX_DRIVER_USAGE)
+    let mut args2: [16]StrView = [StrView { ptr: 0 as *const u8, len: 0 }; 16];
+    args2[0] = sv_lit("--stdin");
+    args2[1] = sv_lit("src/main.ax");
+    let mut sink2: DiagSink = DiagSink { arena: arena_new(), diags: 0 as *mut Diagnostic, len: 0, cap: 0, errors: 0, warnings: 0 };
+    diag_sink_init(mut_view(sink2));
+    let opts2: FmtCliOptions = fmt_parse_cli_args(view(args2), 2, mut_view(sink2));
+    let stdin_path_exit: i32 = if opts2.has_error && sink2.errors == 1 { opts2.exit_code } else { 0 };
+    diag_sink_free(mut_view(sink2));
+
+    // 3. `axiom.toml` with forbidden style-altering key (`indent_width = 2`) -> exit 2
+    let bad_toml: StrView = sv_lit("[package]\nname = \"demo\"\n\n[format]\nindent_width = 2\n");
+    let mut sink3: DiagSink = DiagSink { arena: arena_new(), diags: 0 as *mut Diagnostic, len: 0, cap: 0, errors: 0, warnings: 0 };
+    diag_sink_init(mut_view(sink3));
+    let mut dummy_files: [16]FmtVirtualFile = [FmtVirtualFile {
+        path: StrView { ptr: 0 as *const u8, len: 0 },
+        content: StrView { ptr: 0 as *const u8, len: 0 },
+        is_explicit_file: false,
+        mtime_ticks: 0u64,
+        mutated: false,
+    }; 16];
+    let mut out3: DiagBuffer = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(out3));
+    let default_opts: FmtCliOptions = fmt_cli_options_default();
+    let res3: FmtRunResult = fmt_run_workspace(
+        view(default_opts),
+        bad_toml,
+        mut_view(dummy_files),
+        0,
+        mut_view(out3),
+        mut_view(sink3)
+    );
+    let bad_manifest_exit: i32 = if sink3.errors == 1 { res3.exit_code } else { 0 };
+    diag_buf_free(mut_view(out3));
+    diag_sink_free(mut_view(sink3));
+
+    // 4. Valid `axiom.toml` `[format].exclude` + hidden/build directory skipping + explicit-file override
+    let good_toml: StrView = sv_lit("[format]\nexclude = [\n    \"generated/**\",\n    \"tests/fixtures/bad_syntax/**\"\n]\n");
+    let mut sink4: DiagSink = DiagSink { arena: arena_new(), diags: 0 as *mut Diagnostic, len: 0, cap: 0, errors: 0, warnings: 0 };
+    diag_sink_init(mut_view(sink4));
+    let mcfg: FmtManifestConfig = fmt_parse_manifest(good_toml, mut_view(sink4));
+    let p_gen: StrView = sv_lit("generated/bindings.ax");
+    let p_bad: StrView = sv_lit("tests/fixtures/bad_syntax/err.ax");
+    let p_git: StrView = sv_lit(".git/hooks/pre.ax");
+    let p_bld: StrView = sv_lit("build/out.ax");
+    let p_src: StrView = sv_lit("src/lib.ax");
+    let exclude_ok: bool = mcfg.is_valid && mcfg.exclude_count == 2 &&
+        !fmt_should_format_file(p_gen, false, view(mcfg)) &&
+        fmt_should_format_file(p_gen, true, view(mcfg)) &&
+        !fmt_should_format_file(p_bad, false, view(mcfg)) &&
+        !fmt_should_format_file(p_git, false, view(mcfg)) &&
+        !fmt_should_format_file(p_bld, false, view(mcfg)) &&
+        fmt_should_format_file(p_src, false, view(mcfg));
+    diag_sink_free(mut_view(sink4));
+
+    p_str("probe[cli_flags_and_manifest] unknown_opt_exit=");
+    p_i32(unk_exit);
+    p_str(" stdin_with_path_exit=");
+    p_i32(stdin_path_exit);
+    p_str(" bad_manifest_exit=");
+    p_i32(bad_manifest_exit);
+    p_str(" exclude_ok=");
+    p_bool(exclude_ok);
+    p_str("\n");
+}
+
+fn make_workspace_files(files: mut_view<[16]FmtVirtualFile>) {
+    // Intentionally insert out-of-order (`src/b.ax` before `src/a.ax`) to test lexicographical sorting.
+    (*files)[0] = FmtVirtualFile {
+        path: sv_lit("src/b.ax"),
+        content: sv_lit("pub fn   b_fn(x:i32,y:i32)->i32{\nlet z=x+y;\nz\n}\n"),
+        is_explicit_file: false,
+        mtime_ticks: 100u64,
+        mutated: false,
+    };
+    (*files)[1] = FmtVirtualFile {
+        path: sv_lit("src/a.ax"),
+        content: sv_lit("pub fn a_fn(x: i32) -> i32 {\n    x + 1\n}\n"),
+        is_explicit_file: false,
+        mtime_ticks: 200u64,
+        mutated: false,
+    };
+    (*files)[2] = FmtVirtualFile {
+        path: sv_lit("generated/skip.ax"),
+        content: sv_lit("pub fn skip( {\n"),
+        is_explicit_file: false,
+        mtime_ticks: 300u64,
+        mutated: false,
+    };
+}
+
+fn test_cli_modes() {
+    let toml_sv: StrView = sv_lit("[format]\nexclude = [\"generated/**\"]\n");
+
+    let mut files: [16]FmtVirtualFile = [FmtVirtualFile {
+        path: StrView { ptr: 0 as *const u8, len: 0 },
+        content: StrView { ptr: 0 as *const u8, len: 0 },
+        is_explicit_file: false,
+        mtime_ticks: 0u64,
+        mutated: false,
+    }; 16];
+    make_workspace_files(mut_view(files));
+
+    let mut check_opts: FmtCliOptions = fmt_cli_options_default();
+    check_opts.check_mode = true;
+    let mut out_buf: DiagBuffer = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(out_buf));
+    let mut sink: DiagSink = DiagSink { arena: arena_new(), diags: 0 as *mut Diagnostic, len: 0, cap: 0, errors: 0, warnings: 0 };
+    diag_sink_init(mut_view(sink));
+
+    let res_check: FmtRunResult = fmt_run_workspace(view(check_opts), toml_sv, mut_view(files), 3, mut_view(out_buf), mut_view(sink));
+    let diff_hdr: StrView = sv_lit("--- a/src/b.ax\n+++ b/src/b.ax\n@@ -1,3 +1,3 @@\n");
+    let diff_sv: StrView = StrView { ptr: out_buf.ptr as *const u8, len: out_buf.len };
+    let diff_has_headers: bool = probe_sv_starts_with(diff_sv, diff_hdr) &&
+        !files[0].mutated && !files[1].mutated && !files[2].mutated;
+
+    // `--check --quiet`
+    check_opts.quiet = true;
+    make_workspace_files(mut_view(files));
+    let res_quiet: FmtRunResult = fmt_run_workspace(view(check_opts), toml_sv, mut_view(files), 3, mut_view(out_buf), mut_view(sink));
+    let q_expected: StrView = sv_lit("src/b.ax\n");
+    let quiet_only_path: bool = res_quiet.exit_code == 1 &&
+        fmt_sv_eq(StrView { ptr: out_buf.ptr as *const u8, len: out_buf.len }, q_expected);
+
+    // In-place `axiomc fmt`
+    let write_opts: FmtCliOptions = fmt_cli_options_default();
+    make_workspace_files(mut_view(files));
+    let res_write: FmtRunResult = fmt_run_workspace(view(write_opts), toml_sv, mut_view(files), 3, mut_view(out_buf), mut_view(sink));
+    // After sorting, `files[1]` is `src/a.ax` (already canonical, mtime 200 preserved) and `files[2]` is `src/b.ax` (formatted, mtime 101).
+    let mtime_preserved: bool = !files[1].mutated && files[1].mtime_ticks == 200u64 &&
+        files[2].mutated && files[2].mtime_ticks == 101u64;
+
+    // Update `files[2].content` to canonical and verify `--check` now exits 0
+    files[2].content = sv_lit("pub fn b_fn(x: i32, y: i32) -> i32 {\n    let z = x + y\n    z\n}\n");
+    check_opts.quiet = false;
+    let res_check2: FmtRunResult = fmt_run_workspace(view(check_opts), toml_sv, mut_view(files), 3, mut_view(out_buf), mut_view(sink));
+
+    // Refusal on syntax error without file mutation (`AXS-FMT-030`)
+    files[0] = FmtVirtualFile {
+        path: sv_lit("src/err.ax"),
+        content: sv_lit("pub fn bad(x: i32 {\n    let a := x\n}\n"),
+        is_explicit_file: true,
+        mtime_ticks: 500u64,
+        mutated: false,
+    };
+    let res_err: FmtRunResult = fmt_run_workspace(view(write_opts), toml_sv, mut_view(files), 1, mut_view(out_buf), mut_view(sink));
+    let syn_refusal_exit: i32 = if res_err.syntax_errors == 1u32 && !files[0].mutated && files[0].mtime_ticks == 500u64 {
+        res_err.exit_code
+    } else {
+        0
+    };
+
+    // `--stdin` mode
+    let stdin_in: StrView = sv_lit("pub fn   from_stdin(a:i32)->i32{\na+1\n}\n");
+    let stdin_exp: StrView = sv_lit("pub fn from_stdin(a: i32) -> i32 {\n    a + 1\n}\n");
+    let mut stdin_stats: FmtVerifyStats = fmt_verify_stats_empty();
+    let mut stdin_sink: DiagSink = DiagSink { arena: arena_new(), diags: 0 as *mut Diagnostic, len: 0, cap: 0, errors: 0, warnings: 0 };
+    diag_sink_init(mut_view(stdin_sink));
+    let stdin_rc: i32 = fmt_run_stdin(
+        stdin_in,
+        false,
+        false,
+        mut_view(out_buf),
+        mut_view(stdin_stats),
+        mut_view(stdin_sink)
+    );
+    let stdin_ok: bool = stdin_rc == 0 &&
+        fmt_sv_eq(StrView { ptr: out_buf.ptr as *const u8, len: out_buf.len }, stdin_exp);
+    diag_sink_free(mut_view(stdin_sink));
+
+    p_str("probe[cli_modes] check_unfmt_exit=");
+    p_i32(res_check.exit_code);
+    p_str(" diff_has_headers=");
+    p_bool(diff_has_headers);
+    p_str(" quiet_only_path=");
+    p_bool(quiet_only_path);
+    p_str(" fmt_inplace_exit=");
+    p_i32(res_write.exit_code);
+    p_str(" check_after_fmt_exit=");
+    p_i32(res_check2.exit_code);
+    p_str(" mtime_preserved=");
+    p_bool(mtime_preserved);
+    p_str(" syntax_refusal_exit=");
+    p_i32(syn_refusal_exit);
+    p_str(" stdin_ok=");
+    p_bool(stdin_ok);
+    p_str("\n");
+
+    diag_sink_free(mut_view(sink));
+    diag_buf_free(mut_view(out_buf));
+}
+
+fn test_lsp_formatting() {
+    let mut ws: VfsWorkspace = vfs_workspace_new();
+    let mut eng: LspSemanticEngine = lsp_engine_new();
+
+    // Document 0: first function (`keep`) is already canonical (lines 0..3, bytes 0..37);
+    // second function (`messy`) is unformatted (starting at line 4, byte 37).
+    let doc0_sv: LspStrView = lsp_str_view("pub fn keep(a: i32) -> i32 {\n    a + 1\n}\n\npub fn   messy(x:i32,y:i32)->i32{\nlet sum=x+y;\nsum\n}\n");
+    let _ = vfs_did_open(
+        mut_view(ws),
+        0u32,
+        vfs_hash_str("file:///workspace/fmt_target.ax"),
+        1i64,
+        doc0_sv.ptr,
+        doc0_sv.len,
+        0x1111u64,
+        0x2222u64
+    );
+
+    // Client passes non-canonical options (`tab_size = 2, insert_spaces = false`); formatter must ignore them.
+    let client_opts: LspFormattingOptions = lsp_formatting_options_new(2u32, false);
+    let mut fmt_buf: DiagBuffer = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(fmt_buf));
+    let mut vstats: FmtVerifyStats = fmt_verify_stats_empty();
+    let mut sink: DiagSink = DiagSink { arena: arena_new(), diags: 0 as *mut Diagnostic, len: 0, cap: 0, errors: 0, warnings: 0 };
+    diag_sink_init(mut_view(sink));
+
+    let res0: LspFormattingResult = fmt_lsp_format_document(
+        mut_view(eng),
+        mut_view(ws),
+        0u32,
+        client_opts,
+        mut_view(fmt_buf),
+        mut_view(vstats),
+        mut_view(sink)
+    );
+    let minimal_edit_ok: bool = res0.edit_count == 1u32 &&
+        res0.edit.span_start == 42u32 &&
+        res0.edit.range.start.line == 4u32 &&
+        vstats.comments_conserved && vstats.ast_equivalent;
+
+    // Document 1: already canonical -> 0 edits returned
+    let doc1_sv: LspStrView = lsp_str_view("pub fn already_clean(x: i32) -> i32 {\n    x + 1\n}\n");
+    let _ = vfs_did_open(
+        mut_view(ws),
+        1u32,
+        vfs_hash_str("file:///workspace/clean.ax"),
+        1i64,
+        doc1_sv.ptr,
+        doc1_sv.len,
+        0x3333u64,
+        0x4444u64
+    );
+    let res1: LspFormattingResult = fmt_lsp_format_document(
+        mut_view(eng),
+        mut_view(ws),
+        1u32,
+        client_opts,
+        mut_view(fmt_buf),
+        mut_view(vstats),
+        mut_view(sink)
+    );
+
+    // Range formatting on Document 0 targeting `messy` (lines 4..7)
+    let sub_range: LspRange = lsp_range_new(lsp_pos_new(4u32, 0u32), lsp_pos_new(7u32, 1u32));
+    let res_range: LspFormattingResult = fmt_lsp_range_format_document(
+        mut_view(eng),
+        mut_view(ws),
+        0u32,
+        sub_range,
+        client_opts,
+        mut_view(fmt_buf),
+        mut_view(vstats),
+        mut_view(sink)
+    );
+    let range_fmt_ok: bool = res_range.accepted && res_range.edit_count == 1u32 &&
+        res_range.snapped_start_byte == 42u32 && res_range.edit.range.start.line == 4u32;
+
+    // Document 2: syntax error in active editor buffer -> refusal (`edit_count == 0`, buffer untouched)
+    let doc2_sv: LspStrView = lsp_str_view("pub fn broken_editor_buf(x: i32 {\n    x +\n");
+    let _ = vfs_did_open(
+        mut_view(ws),
+        2u32,
+        vfs_hash_str("file:///workspace/broken.ax"),
+        1i64,
+        doc2_sv.ptr,
+        doc2_sv.len,
+        0x5555u64,
+        0x6666u64
+    );
+    let mut sink_broken: DiagSink = DiagSink { arena: arena_new(), diags: 0 as *mut Diagnostic, len: 0, cap: 0, errors: 0, warnings: 0 };
+    diag_sink_init(mut_view(sink_broken));
+    let res_broken: LspFormattingResult = fmt_lsp_format_document(
+        mut_view(eng),
+        mut_view(ws),
+        2u32,
+        client_opts,
+        mut_view(fmt_buf),
+        mut_view(vstats),
+        mut_view(sink_broken)
+    );
+    diag_sink_free(mut_view(sink_broken));
+
+    p_str("probe[lsp_formatting] fmt_accepted=");
+    p_bool(res0.accepted);
+    p_str(" options_ignored=");
+    p_bool(res0.options_ignored && res0.canonical_indent_spaces == 4u32 && res0.canonical_max_width == 100u32);
+    p_str(" minimal_edit_ok=");
+    p_bool(minimal_edit_ok);
+    p_str(" canonical_noop_edits=");
+    p_u32(res1.edit_count);
+    p_str(" range_fmt_ok=");
+    p_bool(range_fmt_ok);
+    p_str(" broken_doc_edits=");
+    p_u32(res_broken.edit_count);
+    p_str("\n");
+
+    diag_sink_free(mut_view(sink));
+    diag_buf_free(mut_view(fmt_buf));
+    lsp_engine_free(mut_view(eng));
+    vfs_workspace_free(mut_view(ws));
+}
+
+pub fn main() -> i32 {
+    test_ast_verify();
+    test_ast_verify_tamper();
+    test_cli_flags_and_manifest();
+    test_cli_modes();
+    test_lsp_formatting();
+    p_str("FMT-CLI-PROBE-PASS\n");
+    0
+}
