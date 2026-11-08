@@ -1,0 +1,420 @@
+// Direct verification probe for `compiler.component.interface` and `compiler.component.verify`
+// (T871 / E20.7: SPEC-115 §§1..4 & §6, REQ-ECO-8734, INV-COMP-001).
+
+module main
+
+use host_intrinsics.stdio
+use host_intrinsics.write
+
+use compiler.kernel.interner.StrView
+use compiler.diag.code.DiagCode
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.diag_sink_init
+use compiler.diag.emitter.diag_sink_free
+use compiler.diag.emitter.diag_sink_get
+use compiler.query.db.query_db_empty
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+
+use compiler.component.interface.InterfaceFingerprint
+use compiler.component.interface.TargetTripleFingerprint
+use compiler.component.interface.StateSchemaId
+use compiler.component.interface.ComponentSemVer
+use compiler.component.interface.ComponentParamDesc
+use compiler.component.interface.ComponentMethodDesc
+use compiler.component.interface.ComponentInterfaceDesc
+use compiler.component.interface.PARAM_PASS_BY_VAL
+use compiler.component.interface.PARAM_PASS_VIEW
+use compiler.component.interface.PARAM_PASS_MUT_VIEW
+use compiler.component.interface.PARAM_PASS_COMPONENT_BOX
+use compiler.component.interface.PARAM_PASS_COMPONENT_HANDLE
+use compiler.component.interface.PARAM_PASS_OPAQUE_PTR
+use compiler.component.interface.PARAM_PASS_RAW_PTR
+use compiler.component.interface.PARAM_PASS_PLAIN_HOST_BOX
+use compiler.component.interface.PARAM_PASS_PLAIN_HOST_COLLECTION
+use compiler.component.interface.CapabilityManifest
+use compiler.component.interface.AxCompHeader
+use compiler.component.interface.AXCOMP_MAGIC
+use compiler.component.interface.AXCOMP_FORMAT_VERSION
+use compiler.component.interface.AXCOMP_HEADER_SIZE
+use compiler.component.interface.CAP_HEAP_ALLOCATION
+use compiler.component.interface.CAP_FS_READ
+use compiler.component.interface.CAP_NET_CONNECT
+use compiler.component.interface.interface_fingerprint_eq
+use compiler.component.interface.target_triple_fingerprint_eq
+use compiler.component.interface.state_schema_id_eq
+use compiler.component.interface.component_semver_new
+use compiler.component.interface.component_semver_eq
+use compiler.component.interface.component_semver_matches_caret
+use compiler.component.interface.validate_component_id_format
+use compiler.component.interface.component_param_desc_default
+use compiler.component.interface.component_method_desc_default
+use compiler.component.interface.calculate_vtable_size
+use compiler.component.interface.compute_interface_fingerprint
+use compiler.component.interface.compute_target_triple_fingerprint
+use compiler.component.interface.capability_manifest_new
+use compiler.component.interface.capability_manifest_satisfies
+use compiler.component.interface.axcomp_header_zero
+use compiler.component.interface.axcomp_serialize_header
+use compiler.component.interface.axcomp_parse_header
+use compiler.component.interface.axcomp_validate_section
+
+use compiler.component.verify.AX_COMP_MISSING_ENTRY_POINT
+use compiler.component.verify.AX_COMP_MISSING_MANIFEST
+use compiler.component.verify.AX_COMP_CORRUPT_MANIFEST
+use compiler.component.verify.AX_COMP_DUPLICATE_REGISTRATION
+use compiler.component.verify.AX_COMP_TARGET_MISMATCH
+use compiler.component.verify.AX_COMP_VERSION_INCOMPATIBLE
+use compiler.component.verify.AX_COMP_ABI_MISMATCH
+use compiler.component.verify.AX_COMP_CAPABILITY_DENIED
+use compiler.component.verify.AX_COMP_RAW_POINTER_ESCAPE
+use compiler.component.verify.AX_COMP_CROSS_ALLOCATOR_VIOLATION
+use compiler.component.verify.AX_COMP_STALE_HANDLE
+use compiler.component.verify.AX_COMP_UNLOAD_ACTIVE_LEASES
+use compiler.component.verify.AX_COMP_QUIESCE_TIMEOUT
+use compiler.component.verify.AX_COMP_HOT_RELOAD_SCHEMA_MISMATCH
+use compiler.component.verify.AX_COMP_HOT_RELOAD_MIGRATION_FAILED
+use compiler.component.verify.StateFieldDesc
+use compiler.component.verify.HotReloadMigrationDesc
+use compiler.component.verify.ComponentRegistry
+use compiler.component.verify.validate_boundary_method
+use compiler.component.verify.validate_component_handle
+use compiler.component.verify.validate_component_box_drop
+use compiler.component.verify.validate_component_unload_safety
+use compiler.component.verify.validate_component_capability_grants
+use compiler.component.verify.component_registry_empty
+use compiler.component.verify.register_component_in_registry
+use compiler.component.verify.state_field_desc_default
+use compiler.component.verify.compute_state_schema_id
+use compiler.component.verify.hot_reload_migration_desc_default
+use compiler.component.verify.validate_hot_reload_transition
+
+fn out_str(s: str) {
+    let sv = ux2_sv(s)
+    let _ = unsafe { write(stdio(1), sv.ptr, sv.len) }
+}
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+fn out_bool(b: bool) {
+    if b {
+        out_str("true")
+    } else {
+        out_str("false")
+    }
+}
+
+fn new_diag_sink() -> DiagSink {
+    let mut sink = DiagSink {
+        arena: (query_db_empty()).arena,
+        diags: 0 as *mut compiler.diag.emitter.Diagnostic,
+        len: 0,
+        cap: 0,
+        errors: 0,
+        warnings: 0,
+    }
+    diag_sink_init(mut_view(sink))
+    sink
+}
+
+fn sink_has_code(sink: view<DiagSink>, code_v: u32) -> bool {
+    let mut i: usize = 0usize
+    while i < sink.len {
+        let d = diag_sink_get(sink, i)
+        if d.code.v == code_v {
+            return true
+        }
+        i = i + 1usize
+    }
+    false
+}
+
+// -----------------------------------------------------------------------------
+// Probe 1: VTable Lowering, Fingerprint & .axcomp Emitter
+// -----------------------------------------------------------------------------
+
+fn run_vtable_axcomp_probe() -> bool {
+    // 1. InterfaceFingerprint calculation and determinism
+    let iface_name = ux2_sv("ImageCodec")
+    let ver = component_semver_new(1u32, 2u32, 0u32, ux2_sv_empty())
+
+    let mut m0 = component_method_desc_default(ux2_sv("decode"), 0u32)
+    m0.param_count = 1u32
+    m0.param_types_hash = 0x12345678u64
+    m0.ret_type_name = ux2_sv("Result<DecodedImage, CodecError>")
+    m0.ret_pass_mode = PARAM_PASS_BY_VAL
+
+    let mut m1 = component_method_desc_default(ux2_sv("encode"), 1u32)
+    m1.param_count = 1u32
+    m1.param_types_hash = 0x87654321u64
+    m1.ret_type_name = ux2_sv("Result<ComponentBox<u8>, CodecError>")
+    m1.ret_pass_mode = PARAM_PASS_COMPONENT_BOX
+
+    let dummy_m = component_method_desc_default(ux2_sv_empty(), 0u32)
+    let methods: [8]ComponentMethodDesc = [m0, m1, dummy_m, dummy_m, dummy_m, dummy_m, dummy_m, dummy_m]
+
+    let fp1 = compute_interface_fingerprint(iface_name, ver, view(methods), 2usize)
+    let fp2 = compute_interface_fingerprint(iface_name, ver, view(methods), 2usize)
+    let iface_fp_ok = interface_fingerprint_eq(fp1, fp2) && (fp1.lo != 0u64 || fp1.hi != 0u64)
+
+    // 2. VTable size calculation (32-byte header + 8 bytes per method)
+    let vt_sz = calculate_vtable_size(2u32)
+    let vtable_size_ok = (vt_sz == 48u32)
+
+    // 3. SemVer caret requirement matching
+    let req = component_semver_new(1u32, 2u32, 0u32, ux2_sv_empty())
+    let cand_ok1 = component_semver_new(1u32, 2u32, 1u32, ux2_sv_empty())
+    let cand_ok2 = component_semver_new(1u32, 3u32, 0u32, ux2_sv_empty())
+    let cand_bad_major = component_semver_new(2u32, 0u32, 0u32, ux2_sv_empty())
+    let cand_bad_minor = component_semver_new(1u32, 1u32, 0u32, ux2_sv_empty())
+    let semver_caret_ok = component_semver_matches_caret(req, cand_ok1) &&
+        component_semver_matches_caret(req, cand_ok2) &&
+        !component_semver_matches_caret(req, cand_bad_major) &&
+        !component_semver_matches_caret(req, cand_bad_minor)
+
+    // 4. ComponentId validation
+    let valid_cid = validate_component_id_format(ux2_sv("com.acme.image.codec"))
+    let invalid_cid = validate_component_id_format(ux2_sv("single_segment"))
+    let cid_ok = valid_cid && !invalid_cid
+
+    // 5. AxCompHeader round-trip serialization and section validation
+    let mut buf: [192]u8 = [
+        0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+        0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+        0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+        0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+        0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+        0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+        0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+        0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+        0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+        0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+        0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+        0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8
+    ]
+
+    let mut hdr = axcomp_header_zero()
+    hdr.component_id_offset = 128u32
+    hdr.component_id_len = 20u32 // "com.acme.image.codec" is 20 chars
+    hdr.semver_major = 1u32
+    hdr.semver_minor = 2u32
+    hdr.semver_patch = 0u32
+    hdr.abi_fingerprint_lo = 0xA1B2C3D4u64
+    hdr.abi_fingerprint_hi = 0xE5F60718u64
+
+    let mut raw_ptr = unsafe { address_of_mut(buf[0]) }
+    let ser_ok = axcomp_serialize_header(view(hdr), raw_ptr, 192usize)
+
+    // Write component id string at offset 128: "com.acme.image.codec"
+    let cid_str = ux2_sv("com.acme.image.codec")
+    let mut ci: usize = 0usize
+    while ci < cid_str.len {
+        unsafe { *(raw_ptr + 128usize + ci) = *(cid_str.ptr + ci) }
+        ci = ci + 1usize
+    }
+
+    let const_ptr = unsafe { address_of(buf[0]) }
+    let mut parsed_hdr = axcomp_header_zero()
+    let parse_rc = axcomp_parse_header(const_ptr, 192usize, mut_view(parsed_hdr))
+    let axcomp_roundtrip_ok = ser_ok && (parse_rc == 0u32) &&
+        (parsed_hdr.magic == AXCOMP_MAGIC) &&
+        (parsed_hdr.component_id_offset == 128u32) &&
+        (parsed_hdr.component_id_len == 20u32) &&
+        (parsed_hdr.semver_major == 1u32) &&
+        (parsed_hdr.semver_minor == 2u32)
+
+    let validate_rc = axcomp_validate_section(const_ptr, 192usize, mut_view(parsed_hdr))
+    let axcomp_validate_ok = (validate_rc == 0u32)
+
+    // 6. Corrupt magic detection
+    unsafe { *(raw_ptr) = 0u8 } // Corrupt magic
+    let corrupt_rc = axcomp_parse_header(const_ptr, 192usize, mut_view(parsed_hdr))
+    let corrupt_rejected = (corrupt_rc == AX_COMP_CORRUPT_MANIFEST)
+
+    out_str("probe[vtable_axcomp] iface_fp_ok=")
+    out_bool(iface_fp_ok)
+    out_str(" vtable_size_ok=")
+    out_bool(vtable_size_ok)
+    out_str(" semver_caret_ok=")
+    out_bool(semver_caret_ok)
+    out_str(" axcomp_roundtrip_ok=")
+    out_bool(axcomp_roundtrip_ok)
+    out_str(" axcomp_validate_ok=")
+    out_bool(axcomp_validate_ok)
+    out_str(" corrupt_rejected=")
+    out_bool(corrupt_rejected)
+    out_str("\n")
+
+    iface_fp_ok && vtable_size_ok && semver_caret_ok && cid_ok &&
+        axcomp_roundtrip_ok && axcomp_validate_ok && corrupt_rejected
+}
+
+// -----------------------------------------------------------------------------
+// Probe 2: Cross-Boundary Type Firewall & Isolation
+// -----------------------------------------------------------------------------
+
+fn run_boundary_firewall_probe() -> bool {
+    // 1. Raw pointer escape rejected in safe interface (AXS-COMP-020)
+    let mut sink_raw = new_diag_sink()
+    let mut m_raw = component_method_desc_default(ux2_sv("process_raw"), 0u32)
+    m_raw.ret_pass_mode = PARAM_PASS_RAW_PTR
+    m_raw.is_unsafe = false
+    let dummy_param = component_param_desc_default(ux2_sv_empty(), ux2_sv_empty(), PARAM_PASS_BY_VAL)
+    let params: [8]ComponentParamDesc = [dummy_param, dummy_param, dummy_param, dummy_param, dummy_param, dummy_param, dummy_param, dummy_param]
+    let raw_valid = validate_boundary_method(view(m_raw), view(params), 0usize, mut_view(sink_raw))
+    let raw_ptr_rejected = !raw_valid && sink_has_code(view(sink_raw), AX_COMP_RAW_POINTER_ESCAPE)
+
+    // 2. Unleased view escape rejected without ComponentLease (AXS-COMP-023)
+    let mut sink_view = new_diag_sink()
+    let mut m_view = component_method_desc_default(ux2_sv("borrow_buf"), 0u32)
+    m_view.ret_pass_mode = PARAM_PASS_VIEW
+    m_view.has_lease_contract = false
+    let view_valid = validate_boundary_method(view(m_view), view(params), 0usize, mut_view(sink_view))
+    let unleased_view_rejected = !view_valid && sink_has_code(view(sink_view), AX_COMP_UNLOAD_ACTIVE_LEASES)
+
+    // 3. Plain host Box / Vec heap allocation rejected (AXS-COMP-021)
+    let mut sink_box = new_diag_sink()
+    let mut m_box = component_method_desc_default(ux2_sv("produce_vec"), 0u32)
+    m_box.ret_pass_mode = PARAM_PASS_PLAIN_HOST_COLLECTION
+    let box_valid = validate_boundary_method(view(m_box), view(params), 0usize, mut_view(sink_box))
+    let host_box_rejected = !box_valid && sink_has_code(view(sink_box), AX_COMP_CROSS_ALLOCATOR_VIOLATION)
+
+    // 4. Safe modes allowed (ComponentHandle, ComponentBox, LeasedView, OpaquePtr)
+    let mut sink_safe = new_diag_sink()
+    let mut m_safe = component_method_desc_default(ux2_sv("safe_method"), 0u32)
+    m_safe.ret_pass_mode = PARAM_PASS_COMPONENT_BOX
+    let p_handle = component_param_desc_default(ux2_sv("h"), ux2_sv("ComponentHandle<Res>"), PARAM_PASS_COMPONENT_HANDLE)
+    let p_opaque = component_param_desc_default(ux2_sv("op"), ux2_sv("*mut Session"), PARAM_PASS_OPAQUE_PTR)
+    let safe_params: [8]ComponentParamDesc = [p_handle, p_opaque, dummy_param, dummy_param, dummy_param, dummy_param, dummy_param, dummy_param]
+    let safe_valid = validate_boundary_method(view(m_safe), view(safe_params), 2usize, mut_view(sink_safe))
+    let handles_boxes_allowed = safe_valid && (sink_safe.len == 0usize)
+
+    // 5. Stale ComponentHandle rejected (AXS-COMP-022)
+    let mut sink_handle = new_diag_sink()
+    let handle_ok = validate_component_handle(1u32, 1u32, 1u32, 1u32, mut_view(sink_handle))
+    let handle_stale = validate_component_handle(1u32, 2u32, 1u32, 1u32, mut_view(sink_handle))
+    let stale_handle_rejected = handle_ok && !handle_stale && sink_has_code(view(sink_handle), AX_COMP_STALE_HANDLE)
+
+    // 6. Active lease blocks physical unload (AXS-COMP-023)
+    let mut sink_unload = new_diag_sink()
+    let unload_ok = validate_component_unload_safety(0u64, mut_view(sink_unload))
+    let unload_blocked = validate_component_unload_safety(2u64, mut_view(sink_unload))
+    let active_lease_unload_rejected = unload_ok && !unload_blocked && sink_has_code(view(sink_unload), AX_COMP_UNLOAD_ACTIVE_LEASES)
+
+    // 7. Capability manifest denial (AXS-COMP-013)
+    let mut sink_cap = new_diag_sink()
+    let req_mask = CAP_HEAP_ALLOCATION | CAP_NET_CONNECT
+    let grant_mask = CAP_HEAP_ALLOCATION | CAP_FS_READ // NetConnect NOT granted!
+    let cap_valid = validate_component_capability_grants(req_mask, grant_mask, mut_view(sink_cap))
+    let capability_denied_ok = !cap_valid && sink_has_code(view(sink_cap), AX_COMP_CAPABILITY_DENIED)
+
+    // 8. Duplicate registration rejection (AXS-COMP-002)
+    let mut sink_reg = new_diag_sink()
+    let mut reg = component_registry_empty()
+    let comp_id = ux2_sv("org.axiom.plugin.codec")
+    let comp_ver = component_semver_new(1u32, 0u32, 0u32, ux2_sv_empty())
+    let reg1 = register_component_in_registry(mut_view(reg), comp_id, comp_ver, mut_view(sink_reg))
+    let reg2 = register_component_in_registry(mut_view(reg), comp_id, comp_ver, mut_view(sink_reg))
+    let duplicate_reg_rejected = reg1 && !reg2 && sink_has_code(view(sink_reg), AX_COMP_DUPLICATE_REGISTRATION)
+
+    out_str("probe[boundary_firewall] raw_ptr_rejected=")
+    out_bool(raw_ptr_rejected)
+    out_str(" unleased_view_rejected=")
+    out_bool(unleased_view_rejected)
+    out_str(" host_box_rejected=")
+    out_bool(host_box_rejected)
+    out_str(" handles_boxes_allowed=")
+    out_bool(handles_boxes_allowed)
+    out_str(" stale_handle_rejected=")
+    out_bool(stale_handle_rejected)
+    out_str(" active_lease_unload_rejected=")
+    out_bool(active_lease_unload_rejected)
+    out_str(" capability_denied_ok=")
+    out_bool(capability_denied_ok)
+    out_str(" duplicate_reg_rejected=")
+    out_bool(duplicate_reg_rejected)
+    out_str("\n")
+
+    raw_ptr_rejected && unleased_view_rejected && host_box_rejected &&
+        handles_boxes_allowed && stale_handle_rejected && active_lease_unload_rejected &&
+        capability_denied_ok && duplicate_reg_rejected
+}
+
+// -----------------------------------------------------------------------------
+// Probe 3: @hot_reload_state Schema Calculation & Migration Protocol
+// -----------------------------------------------------------------------------
+
+fn run_hot_reload_probe() -> bool {
+    let dummy_f = state_field_desc_default(ux2_sv_empty(), ux2_sv_empty(), 0u32, 0u32)
+
+    // 1. Schema ID calculation for CounterStateV1
+    let f0_v1 = state_field_desc_default(ux2_sv("count"), ux2_sv("u32"), 0u32, 4u32)
+    let fields_v1: [8]StateFieldDesc = [f0_v1, dummy_f, dummy_f, dummy_f, dummy_f, dummy_f, dummy_f, dummy_f]
+    let s1_a = compute_state_schema_id(ux2_sv("CounterState"), 1u32, view(fields_v1), 1usize)
+    let s1_b = compute_state_schema_id(ux2_sv("CounterState"), 1u32, view(fields_v1), 1usize)
+    let schema_id_deterministic = state_schema_id_eq(s1_a, s1_b) && (s1_a.lo != 0u64 || s1_a.hi != 0u64)
+
+    // 2. Schema ID distinctness when adding fields in CounterStateV2
+    let f1_v2 = state_field_desc_default(ux2_sv("total_resets"), ux2_sv("u32"), 4u32, 4u32)
+    let fields_v2: [8]StateFieldDesc = [f0_v1, f1_v2, dummy_f, dummy_f, dummy_f, dummy_f, dummy_f, dummy_f]
+    let s2 = compute_state_schema_id(ux2_sv("CounterState"), 2u32, view(fields_v2), 2usize)
+    let schema_id_distinct = !state_schema_id_eq(s1_a, s2)
+
+    // 3. Fast-path identity transition (s1 -> s1)
+    let mut sink_fast = new_diag_sink()
+    let mut mig_dummy = hot_reload_migration_desc_default(0u32, 0u32)
+    let fast_path_identity_ok = validate_hot_reload_transition(s1_a, 1u32, s1_a, 1u32, view(mig_dummy), mut_view(sink_fast)) && (sink_fast.len == 0usize)
+
+    // 4. Differing schema without registered migration hook -> rejected
+    let mut sink_missing = new_diag_sink()
+    let mut mig_unregistered = hot_reload_migration_desc_default(1u32, 2u32)
+    mig_unregistered.is_registered = false
+    let missing_valid = validate_hot_reload_transition(s1_a, 1u32, s2, 2u32, view(mig_unregistered), mut_view(sink_missing))
+    let missing_migration_rejected = !missing_valid && sink_has_code(view(sink_missing), AX_COMP_HOT_RELOAD_SCHEMA_MISMATCH)
+
+    // 5. Differing schema with invalid migration signature -> rejected
+    let mut sink_bad_sig = new_diag_sink()
+    let mut mig_bad_sig = hot_reload_migration_desc_default(1u32, 2u32)
+    mig_bad_sig.has_valid_signature = false
+    let bad_sig_valid = validate_hot_reload_transition(s1_a, 1u32, s2, 2u32, view(mig_bad_sig), mut_view(sink_bad_sig))
+    let bad_signature_rejected = !bad_sig_valid && sink_has_code(view(sink_bad_sig), AX_COMP_HOT_RELOAD_MIGRATION_FAILED)
+
+    // 6. Valid migration hook from v1 to v2 -> successful transition
+    let mut sink_valid = new_diag_sink()
+    let mig_valid = hot_reload_migration_desc_default(1u32, 2u32)
+    let valid_ok = validate_hot_reload_transition(s1_a, 1u32, s2, 2u32, view(mig_valid), mut_view(sink_valid))
+    let valid_migration_ok = valid_ok && (sink_valid.len == 0usize)
+
+    out_str("probe[hot_reload] schema_id_deterministic=")
+    out_bool(schema_id_deterministic)
+    out_str(" schema_id_distinct=")
+    out_bool(schema_id_distinct)
+    out_str(" fast_path_identity_ok=")
+    out_bool(fast_path_identity_ok)
+    out_str(" missing_migration_rejected=")
+    out_bool(missing_migration_rejected)
+    out_str(" bad_signature_rejected=")
+    out_bool(bad_signature_rejected)
+    out_str(" valid_migration_ok=")
+    out_bool(valid_migration_ok)
+    out_str("\n")
+
+    schema_id_deterministic && schema_id_distinct && fast_path_identity_ok &&
+        missing_migration_rejected && bad_signature_rejected && valid_migration_ok
+}
+
+pub fn main() -> i32 {
+    let p1 = run_vtable_axcomp_probe()
+    let p2 = run_boundary_firewall_probe()
+    let p3 = run_hot_reload_probe()
+
+    if p1 && p2 && p3 {
+        out_str("COMPONENT-INTERFACE-PROBE-PASS\n")
+        0
+    } else {
+        out_str("COMPONENT-INTERFACE-PROBE-FAIL\n")
+        1
+    }
+}

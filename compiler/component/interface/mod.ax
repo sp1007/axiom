@@ -1,0 +1,599 @@
+// Axiom Compiler — Component Interface VTable Lowering & .axcomp Emitter (compiler/component/interface/mod.ax)
+// Implements SPEC-115 §§1..2 (AXS-COMP-001..006, AXS-COMP-010..015; REQ-ECO-8734, INV-COMP-001).
+
+module compiler.component.interface
+
+use compiler.kernel.hash.ax_hash_bytes
+use compiler.kernel.hash.ax_hash_u64
+use compiler.kernel.hash.ax_hash_combine
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+
+use compiler.abi.fingerprint.AbiFingerprint
+use compiler.abi.fingerprint.abi_fingerprint_zero
+use compiler.abi.fingerprint.abi_fingerprint_eq
+use compiler.abi.fingerprint.push_fingerprint_hex
+
+// =============================================================================
+// 1. 128-Bit Cryptographic Digests for Dynamic Components (AXS-COMP-003, AXS-COMP-005)
+// =============================================================================
+
+@derive(Copy)
+pub struct InterfaceFingerprint {
+    pub lo: u64,
+    pub hi: u64,
+}
+
+pub fn interface_fingerprint_zero() -> InterfaceFingerprint {
+    InterfaceFingerprint { lo: 0u64, hi: 0u64 }
+}
+
+pub fn interface_fingerprint_eq(a: InterfaceFingerprint, b: InterfaceFingerprint) -> bool {
+    a.lo == b.lo && a.hi == b.hi
+}
+
+@derive(Copy)
+pub struct TargetTripleFingerprint {
+    pub lo: u64,
+    pub hi: u64,
+}
+
+pub fn target_triple_fingerprint_zero() -> TargetTripleFingerprint {
+    TargetTripleFingerprint { lo: 0u64, hi: 0u64 }
+}
+
+pub fn target_triple_fingerprint_eq(a: TargetTripleFingerprint, b: TargetTripleFingerprint) -> bool {
+    a.lo == b.lo && a.hi == b.hi
+}
+
+@derive(Copy)
+pub struct StateSchemaId {
+    pub lo: u64,
+    pub hi: u64,
+}
+
+pub fn state_schema_id_zero() -> StateSchemaId {
+    StateSchemaId { lo: 0u64, hi: 0u64 }
+}
+
+pub fn state_schema_id_eq(a: StateSchemaId, b: StateSchemaId) -> bool {
+    a.lo == b.lo && a.hi == b.hi
+}
+
+// Helper to hash StrView into an accumulator
+fn hash_str_view(acc: u64, sv: StrView) -> u64 {
+    if sv.len == 0usize || (sv.ptr as usize) == 0usize {
+        return ax_hash_combine(acc, 0u64)
+    }
+    let h = ax_hash_bytes(sv.ptr, sv.len)
+    ax_hash_combine(acc, h)
+}
+
+pub fn compute_target_triple_fingerprint(
+    arch: StrView,
+    os: StrView,
+    vendor: StrView,
+    env: StrView
+) -> TargetTripleFingerprint {
+    let tag = ux2_sv("AXIOM-TRIPLE-v1\0")
+    let base = ax_hash_bytes(tag.ptr, tag.len)
+    let mut lo = ax_hash_combine(base, 0x4158545249504Cu64)
+    let mut hi = ax_hash_combine(base, 0x9e3779b97f4a7c15u64)
+    lo = hash_str_view(lo, arch)
+    hi = hash_str_view(hi, os)
+    lo = hash_str_view(lo, vendor)
+    hi = hash_str_view(hi, env)
+    TargetTripleFingerprint { lo: lo, hi: hi }
+}
+
+// =============================================================================
+// 2. Component Identity & Semantic Versioning (AXS-COMP-002, AXS-COMP-011)
+// =============================================================================
+
+@derive(Copy)
+pub struct ComponentSemVer {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+    pub prerelease: StrView,
+}
+
+pub fn component_semver_new(maj: u32, min: u32, pat: u32, pre: StrView) -> ComponentSemVer {
+    ComponentSemVer {
+        major: maj,
+        minor: min,
+        patch: pat,
+        prerelease: pre,
+    }
+}
+
+pub fn component_semver_eq(a: ComponentSemVer, b: ComponentSemVer) -> bool {
+    a.major == b.major && a.minor == b.minor && a.patch == b.patch && ux2_sv_eq(a.prerelease, b.prerelease)
+}
+
+// Evaluates SemVer 2.0 Caret (^) requirement matching (AXS-COMP-011 §2):
+// ^2.1.0 matches >=2.1.0, <3.0.0
+// ^0.2.1 matches >=0.2.1, <0.3.0
+// ^0.0.3 matches ==0.0.3
+pub fn component_semver_matches_caret(req: ComponentSemVer, cand: ComponentSemVer) -> bool {
+    if req.prerelease.len == 0usize && cand.prerelease.len > 0usize {
+        return false
+    }
+    if req.prerelease.len > 0usize {
+        if !ux2_sv_eq(req.prerelease, cand.prerelease) {
+            return false
+        }
+    }
+    if req.major > 0u32 {
+        if cand.major != req.major {
+            return false
+        }
+        if req.minor > cand.minor {
+            return false
+        }
+        if cand.minor == req.minor && (req.patch > cand.patch) {
+            return false
+        }
+        return true
+    }
+    if req.minor > 0u32 {
+        if cand.major != 0u32 || cand.minor != req.minor {
+            return false
+        }
+        return cand.patch >= req.patch
+    }
+    cand.major == 0u32 && cand.minor == 0u32 && cand.patch == req.patch
+}
+
+// Validates ComponentId format: "<vendor>.<namespace>.<name>" (AXS-COMP-002 §1)
+// Must contain at least two dots, non-empty segments, allowed: [a-zA-Z0-9_-]
+pub fn validate_component_id_format(id: StrView) -> bool {
+    if 5usize > id.len || (id.ptr as usize) == 0usize {
+        return false
+    }
+    let mut dot_count: u32 = 0u32
+    let mut seg_len: u32 = 0u32
+    let mut i: usize = 0usize
+    while i < id.len {
+        let b: u8 = unsafe { *(id.ptr + i) }
+        if b == 46u8 { // '.'
+            if seg_len == 0u32 {
+                return false
+            }
+            dot_count = dot_count + 1u32
+            seg_len = 0u32
+        } else {
+            let is_alpha = (b >= 97u8 && b <= 122u8) || (b >= 65u8 && b <= 90u8)
+            let is_digit = (b >= 48u8 && b <= 57u8)
+            let is_special = (b == 95u8 || b == 45u8)
+            if !is_alpha && !is_digit && !is_special {
+                return false
+            }
+            seg_len = seg_len + 1u32
+        }
+        i = i + 1usize
+    }
+    if seg_len == 0u32 {
+        return false
+    }
+    dot_count >= 2u32
+}
+
+// =============================================================================
+// 3. @component_interface Model & VTable Lowering (AXS-COMP-003)
+// =============================================================================
+
+pub const PARAM_PASS_BY_VAL: u8 = 0u8
+pub const PARAM_PASS_VIEW: u8 = 1u8
+pub const PARAM_PASS_MUT_VIEW: u8 = 2u8
+pub const PARAM_PASS_COMPONENT_BOX: u8 = 3u8
+pub const PARAM_PASS_COMPONENT_HANDLE: u8 = 4u8
+pub const PARAM_PASS_OPAQUE_PTR: u8 = 5u8
+pub const PARAM_PASS_RAW_PTR: u8 = 6u8
+pub const PARAM_PASS_PLAIN_HOST_BOX: u8 = 7u8
+pub const PARAM_PASS_PLAIN_HOST_COLLECTION: u8 = 8u8
+
+@derive(Copy)
+pub struct ComponentParamDesc {
+    pub name: StrView,
+    pub type_name: StrView,
+    pub pass_mode: u8,
+    pub type_id: u8,
+}
+
+pub fn component_param_desc_default(name: StrView, type_name: StrView, pass_mode: u8) -> ComponentParamDesc {
+    ComponentParamDesc {
+        name: name,
+        type_name: type_name,
+        pass_mode: pass_mode,
+        type_id: 0u8,
+    }
+}
+
+@derive(Copy)
+pub struct ComponentMethodDesc {
+    pub name: StrView,
+    pub slot_index: u32,
+    pub param_count: u32,
+    pub param_types_hash: u64,
+    pub ret_type_name: StrView,
+    pub ret_type_id: u8,
+    pub ret_pass_mode: u8,
+    pub has_lease_contract: bool,
+    pub is_unsafe: bool,
+}
+
+pub fn component_method_desc_default(name: StrView, slot_index: u32) -> ComponentMethodDesc {
+    ComponentMethodDesc {
+        name: name,
+        slot_index: slot_index,
+        param_count: 0u32,
+        param_types_hash: 0u64,
+        ret_type_name: ux2_sv("()"),
+        ret_type_id: 0u8,
+        ret_pass_mode: PARAM_PASS_BY_VAL,
+        has_lease_contract: false,
+        is_unsafe: false,
+    }
+}
+
+@derive(Copy)
+pub struct ComponentInterfaceDesc {
+    pub name: StrView,
+    pub version: ComponentSemVer,
+    pub fingerprint: InterfaceFingerprint,
+    pub method_count: u32,
+    pub vtable_size: u32,
+    pub vtable_abi_version: u32,
+}
+
+pub fn calculate_vtable_size(method_count: u32) -> u32 {
+    // Stable Axiom ABI vtable layout:
+    // abi_version (u32: 4) + vtable_size (u32: 4) + fingerprint (16 bytes) + reserved (8 bytes) = 32 bytes
+    // plus method pointers: method_count * 8 bytes (ctx: *mut () + params)
+    32u32 + (method_count * 8u32)
+}
+
+pub fn compute_interface_fingerprint(
+    name: StrView,
+    version: ComponentSemVer,
+    methods: view<[8]ComponentMethodDesc>,
+    count: usize
+) -> InterfaceFingerprint {
+    let tag = ux2_sv("AXIOM-COMP-IFACE-v1\0")
+    let base = ax_hash_bytes(tag.ptr, tag.len)
+    let mut lo = ax_hash_combine(base, 0x49464143454650u64)
+    let mut hi = ax_hash_combine(base, 0x9e3779b97f4a7c15u64)
+
+    lo = hash_str_view(lo, name)
+    lo = ax_hash_combine(lo, version.major as u64)
+    hi = ax_hash_combine(hi, version.minor as u64)
+    lo = ax_hash_combine(lo, version.patch as u64)
+    hi = hash_str_view(hi, version.prerelease)
+    lo = ax_hash_combine(lo, count as u64)
+
+    let mut i: usize = 0usize
+    while i < count && i < 8usize {
+        let m = (*methods)[i]
+        lo = ax_hash_combine(lo, m.slot_index as u64)
+        lo = hash_str_view(lo, m.name)
+        hi = ax_hash_combine(hi, m.param_count as u64)
+        hi = ax_hash_combine(hi, m.param_types_hash)
+        lo = hash_str_view(lo, m.ret_type_name)
+        hi = ax_hash_combine(hi, m.ret_pass_mode as u64)
+        lo = ax_hash_combine(lo, if m.has_lease_contract { 1u64 } else { 0u64 })
+        hi = ax_hash_combine(hi, if m.is_unsafe { 1u64 } else { 0u64 })
+        i = i + 1usize
+    }
+
+    InterfaceFingerprint { lo: lo, hi: hi }
+}
+
+// =============================================================================
+// 4. @plugin_export Entry Point Contract (AXS-COMP-004)
+// =============================================================================
+
+pub fn axiom_component_entry_symbol() -> StrView {
+    ux2_sv("axiom_component_entry")
+}
+
+@derive(Copy)
+pub struct ComponentHostContext {
+    pub host_abi_version: u32,
+    pub host_context_size: u32,
+    pub host_fingerprint_lo: u64,
+    pub host_fingerprint_hi: u64,
+}
+
+pub fn component_host_context_default() -> ComponentHostContext {
+    ComponentHostContext {
+        host_abi_version: 1u32,
+        host_context_size: 48u32,
+        host_fingerprint_lo: 0u64,
+        host_fingerprint_hi: 0u64,
+    }
+}
+
+// =============================================================================
+// 5. Capability Manifest (AXS-COMP-013)
+// =============================================================================
+
+pub const CAP_HEAP_ALLOCATION: u32 = 0x0001u32
+pub const CAP_FS_READ: u32 = 0x0002u32
+pub const CAP_FS_WRITE: u32 = 0x0004u32
+pub const CAP_NET_CONNECT: u32 = 0x0008u32
+pub const CAP_CONCURRENCY: u32 = 0x0010u32
+pub const CAP_GPU: u32 = 0x0020u32
+
+@derive(Copy)
+pub struct CapabilityEntry {
+    pub cap_type: u32,
+    pub flags: u32,
+    pub resource_path: StrView,
+}
+
+pub fn capability_entry_new(cap_type: u32, flags: u32, path: StrView) -> CapabilityEntry {
+    CapabilityEntry {
+        cap_type: cap_type,
+        flags: flags,
+        resource_path: path,
+    }
+}
+
+@derive(Copy)
+pub struct CapabilityManifest {
+    pub mask: u32,
+    pub entry_count: u32,
+}
+
+pub fn capability_manifest_new(mask: u32, entry_count: u32) -> CapabilityManifest {
+    CapabilityManifest { mask: mask, entry_count: entry_count }
+}
+
+pub fn capability_manifest_satisfies(req: CapabilityManifest, grant: CapabilityManifest) -> bool {
+    let ungranted = req.mask & (~grant.mask)
+    ungranted == 0u32
+}
+
+// =============================================================================
+// 6. Embedded .axcomp Section Layout & Serializer/Parser (AXS-COMP-005)
+// =============================================================================
+
+pub const AXCOMP_MAGIC: u32 = 0x504D4F43u32 // ASCII "COMP" in little-endian
+pub const AXCOMP_FORMAT_VERSION: u16 = 1u16
+pub const AXCOMP_HEADER_SIZE: u16 = 128u16
+
+@derive(Copy)
+pub struct AxCompHeader {
+    pub magic: u32,
+    pub format_version: u16,
+    pub header_size: u16,
+    pub component_id_offset: u32,
+    pub component_id_len: u32,
+    pub semver_major: u32,
+    pub semver_minor: u32,
+    pub semver_patch: u32,
+    pub semver_prerelease_offset: u32,
+    pub abi_fingerprint_lo: u64,
+    pub abi_fingerprint_hi: u64,
+    pub target_triple_lo: u64,
+    pub target_triple_hi: u64,
+    pub state_schema_id_lo: u64,
+    pub state_schema_id_hi: u64,
+    pub capability_count: u32,
+    pub capability_table_offset: u32,
+    pub exported_iface_count: u32,
+    pub exported_iface_table_offset: u32,
+}
+
+pub fn axcomp_header_zero() -> AxCompHeader {
+    AxCompHeader {
+        magic: AXCOMP_MAGIC,
+        format_version: AXCOMP_FORMAT_VERSION,
+        header_size: AXCOMP_HEADER_SIZE,
+        component_id_offset: 0u32,
+        component_id_len: 0u32,
+        semver_major: 0u32,
+        semver_minor: 0u32,
+        semver_patch: 0u32,
+        semver_prerelease_offset: 0u32,
+        abi_fingerprint_lo: 0u64,
+        abi_fingerprint_hi: 0u64,
+        target_triple_lo: 0u64,
+        target_triple_hi: 0u64,
+        state_schema_id_lo: 0u64,
+        state_schema_id_hi: 0u64,
+        capability_count: 0u32,
+        capability_table_offset: 0u32,
+        exported_iface_count: 0u32,
+        exported_iface_table_offset: 0u32,
+    }
+}
+
+@derive(Copy)
+pub struct AxCompExportedInterfaceEntry {
+    pub iface_fingerprint_lo: u64,
+    pub iface_fingerprint_hi: u64,
+    pub name_offset: u32,
+    pub name_len: u32,
+    pub vtable_size: u32,
+    pub method_count: u32,
+}
+
+@derive(Copy)
+pub struct AxCompCapabilityEntry {
+    pub cap_type: u32,
+    pub flags: u32,
+    pub resource_path_offset: u32,
+    pub resource_path_len: u32,
+}
+
+// Low-level little-endian byte read/write primitives
+pub fn write_u16_le(buf: *mut u8, offset: usize, val: u16) {
+    unsafe {
+        *(buf + offset) = (val & 0xFFu16) as u8
+        *(buf + offset + 1usize) = ((val >> 8u16) & 0xFFu16) as u8
+    }
+}
+
+pub fn write_u32_le(buf: *mut u8, offset: usize, val: u32) {
+    unsafe {
+        *(buf + offset) = (val & 0xFFu32) as u8
+        *(buf + offset + 1usize) = ((val >> 8u32) & 0xFFu32) as u8
+        *(buf + offset + 2usize) = ((val >> 16u32) & 0xFFu32) as u8
+        *(buf + offset + 3usize) = ((val >> 24u32) & 0xFFu32) as u8
+    }
+}
+
+pub fn write_u64_le(buf: *mut u8, offset: usize, val: u64) {
+    let lo = (val & 0xFFFFFFFFu64) as u32
+    let hi = ((val >> 32u64) & 0xFFFFFFFFu64) as u32
+    write_u32_le(buf, offset, lo)
+    write_u32_le(buf, offset + 4usize, hi)
+}
+
+pub fn read_u16_le(buf: *const u8, offset: usize) -> u16 {
+    unsafe {
+        let b0 = (*(buf + offset)) as u16
+        let b1 = (*(buf + offset + 1usize)) as u16
+        b0 | (b1 << 8u16)
+    }
+}
+
+pub fn read_u32_le(buf: *const u8, offset: usize) -> u32 {
+    unsafe {
+        let b0 = (*(buf + offset)) as u32
+        let b1 = (*(buf + offset + 1usize)) as u32
+        let b2 = (*(buf + offset + 2usize)) as u32
+        let b3 = (*(buf + offset + 3usize)) as u32
+        b0 | (b1 << 8u32) | (b2 << 16u32) | (b3 << 24u32)
+    }
+}
+
+pub fn read_u64_le(buf: *const u8, offset: usize) -> u64 {
+    let lo = read_u32_le(buf, offset) as u64
+    let hi = read_u32_le(buf, offset + 4usize) as u64
+    lo | (hi << 32u64)
+}
+
+pub fn axcomp_serialize_header(hdr: view<AxCompHeader>, buf: *mut u8, buf_len: usize) -> bool {
+    if buf_len < 128usize || (buf as usize) == 0usize {
+        return false
+    }
+    let mut i: usize = 0usize
+    while i < 128usize {
+        unsafe { *(buf + i) = 0u8 }
+        i = i + 1usize
+    }
+
+    write_u32_le(buf, 0usize, hdr.magic)
+    write_u16_le(buf, 4usize, hdr.format_version)
+    write_u16_le(buf, 6usize, hdr.header_size)
+    write_u32_le(buf, 8usize, hdr.component_id_offset)
+    write_u32_le(buf, 12usize, hdr.component_id_len)
+    write_u32_le(buf, 16usize, hdr.semver_major)
+    write_u32_le(buf, 20usize, hdr.semver_minor)
+    write_u32_le(buf, 24usize, hdr.semver_patch)
+    write_u32_le(buf, 28usize, hdr.semver_prerelease_offset)
+    write_u64_le(buf, 32usize, hdr.abi_fingerprint_lo)
+    write_u64_le(buf, 40usize, hdr.abi_fingerprint_hi)
+    write_u64_le(buf, 48usize, hdr.target_triple_lo)
+    write_u64_le(buf, 56usize, hdr.target_triple_hi)
+    write_u64_le(buf, 64usize, hdr.state_schema_id_lo)
+    write_u64_le(buf, 72usize, hdr.state_schema_id_hi)
+    write_u32_le(buf, 80usize, hdr.capability_count)
+    write_u32_le(buf, 84usize, hdr.capability_table_offset)
+    write_u32_le(buf, 88usize, hdr.exported_iface_count)
+    write_u32_le(buf, 92usize, hdr.exported_iface_table_offset)
+
+    true
+}
+
+// Parses and validates .axcomp header
+// Returns: 0 on success, or diagnostic code (231 = missing, 232 = corrupt)
+pub fn axcomp_parse_header(buf: *const u8, buf_len: usize, out_hdr: mut_view<AxCompHeader>) -> u32 {
+    if buf_len < 128usize || (buf as usize) == 0usize {
+        return 231u32 // AX_COMP_MISSING_MANIFEST
+    }
+    let magic = read_u32_le(buf, 0usize)
+    if magic != AXCOMP_MAGIC {
+        return 232u32 // AX_COMP_CORRUPT_MANIFEST
+    }
+    let ver = read_u16_le(buf, 4usize)
+    if ver != AXCOMP_FORMAT_VERSION {
+        return 232u32 // AX_COMP_CORRUPT_MANIFEST
+    }
+    let hdr_sz = read_u16_le(buf, 6usize)
+    if hdr_sz < AXCOMP_HEADER_SIZE {
+        return 232u32 // AX_COMP_CORRUPT_MANIFEST
+    }
+
+    out_hdr.magic = magic
+    out_hdr.format_version = ver
+    out_hdr.header_size = hdr_sz
+    out_hdr.component_id_offset = read_u32_le(buf, 8usize)
+    out_hdr.component_id_len = read_u32_le(buf, 12usize)
+    out_hdr.semver_major = read_u32_le(buf, 16usize)
+    out_hdr.semver_minor = read_u32_le(buf, 20usize)
+    out_hdr.semver_patch = read_u32_le(buf, 24usize)
+    out_hdr.semver_prerelease_offset = read_u32_le(buf, 28usize)
+    out_hdr.abi_fingerprint_lo = read_u64_le(buf, 32usize)
+    out_hdr.abi_fingerprint_hi = read_u64_le(buf, 40usize)
+    out_hdr.target_triple_lo = read_u64_le(buf, 48usize)
+    out_hdr.target_triple_hi = read_u64_le(buf, 56usize)
+    out_hdr.state_schema_id_lo = read_u64_le(buf, 64usize)
+    out_hdr.state_schema_id_hi = read_u64_le(buf, 72usize)
+    out_hdr.capability_count = read_u32_le(buf, 80usize)
+    out_hdr.capability_table_offset = read_u32_le(buf, 84usize)
+    out_hdr.exported_iface_count = read_u32_le(buf, 88usize)
+    out_hdr.exported_iface_table_offset = read_u32_le(buf, 92usize)
+
+    0u32
+}
+
+// Validates full .axcomp binary section layout, offsets, and ComponentId syntax
+pub fn axcomp_validate_section(buf: *const u8, buf_len: usize, out_hdr: mut_view<AxCompHeader>) -> u32 {
+    let rc = axcomp_parse_header(buf, buf_len, mut_view(*out_hdr))
+    if rc != 0u32 {
+        return rc
+    }
+
+    // Validate ComponentId offset and length
+    let cid_end = (out_hdr.component_id_offset as usize) + (out_hdr.component_id_len as usize)
+    if cid_end > buf_len || 128u32 > out_hdr.component_id_offset {
+        return 232u32 // AX_COMP_CORRUPT_MANIFEST
+    }
+    let cid_sv = StrView {
+        ptr: unsafe { buf + (out_hdr.component_id_offset as usize) },
+        len: out_hdr.component_id_len as usize,
+    }
+    if !validate_component_id_format(cid_sv) {
+        return 232u32 // AX_COMP_CORRUPT_MANIFEST
+    }
+
+    // Validate capability table bounds if non-empty
+    if out_hdr.capability_count > 0u32 {
+        let cap_bytes = (out_hdr.capability_count as usize) * 16usize
+        let cap_end = (out_hdr.capability_table_offset as usize) + cap_bytes
+        if cap_end > buf_len || 128u32 > out_hdr.capability_table_offset {
+            return 232u32 // AX_COMP_CORRUPT_MANIFEST
+        }
+    }
+
+    // Validate exported interface table bounds if non-empty
+    if out_hdr.exported_iface_count > 0u32 {
+        let iface_bytes = (out_hdr.exported_iface_count as usize) * 32usize
+        let iface_end = (out_hdr.exported_iface_table_offset as usize) + iface_bytes
+        if iface_end > buf_len || 128u32 > out_hdr.exported_iface_table_offset {
+            return 232u32 // AX_COMP_CORRUPT_MANIFEST
+        }
+    }
+
+    0u32
+}

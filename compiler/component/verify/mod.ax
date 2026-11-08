@@ -1,0 +1,514 @@
+// Axiom Compiler — Component Boundary Verifier, Cross-Allocator Guard & Hot-Reload Checker (compiler/component/verify/mod.ax)
+// Implements SPEC-115 §§2..4 & §6 (AXS-COMP-002, AXS-COMP-013, AXS-COMP-020..025, AXS-COMP-030..037, AXS-COMP-050; REQ-ECO-8734, INV-COMP-001).
+
+module compiler.component.verify
+
+use compiler.kernel.hash.ax_hash_bytes
+use compiler.kernel.hash.ax_hash_u64
+use compiler.kernel.hash.ax_hash_combine
+use compiler.kernel.interner.StrView
+use compiler.source.span.Span
+use compiler.source.span.span_none
+use compiler.diag.code.DiagCode
+use compiler.diag.code.diag_code
+use compiler.diag.code.DiagDataKind
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.DiagDataEntry
+use compiler.diag.emitter.DiagDataValue
+use compiler.diag.emitter.diag_new
+use compiler.diag.emitter.diag_sink_report
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+
+use compiler.component.interface.InterfaceFingerprint
+use compiler.component.interface.TargetTripleFingerprint
+use compiler.component.interface.StateSchemaId
+use compiler.component.interface.ComponentSemVer
+use compiler.component.interface.ComponentParamDesc
+use compiler.component.interface.ComponentMethodDesc
+use compiler.component.interface.ComponentInterfaceDesc
+use compiler.component.interface.PARAM_PASS_BY_VAL
+use compiler.component.interface.PARAM_PASS_VIEW
+use compiler.component.interface.PARAM_PASS_MUT_VIEW
+use compiler.component.interface.PARAM_PASS_COMPONENT_BOX
+use compiler.component.interface.PARAM_PASS_COMPONENT_HANDLE
+use compiler.component.interface.PARAM_PASS_OPAQUE_PTR
+use compiler.component.interface.PARAM_PASS_RAW_PTR
+use compiler.component.interface.PARAM_PASS_PLAIN_HOST_BOX
+use compiler.component.interface.PARAM_PASS_PLAIN_HOST_COLLECTION
+use compiler.component.interface.CapabilityManifest
+use compiler.component.interface.state_schema_id_eq
+use compiler.component.interface.component_semver_eq
+
+// =============================================================================
+// 1. Diagnostic Codes Owned by SPEC-115 (§6, AXS-COMP-050)
+// =============================================================================
+
+pub const AX_COMP_MISSING_ENTRY_POINT: u32 = 230u32
+pub const AX_COMP_MISSING_MANIFEST: u32 = 231u32
+pub const AX_COMP_CORRUPT_MANIFEST: u32 = 232u32
+pub const AX_COMP_DUPLICATE_REGISTRATION: u32 = 233u32
+pub const AX_COMP_TARGET_MISMATCH: u32 = 234u32
+pub const AX_COMP_VERSION_INCOMPATIBLE: u32 = 235u32
+pub const AX_COMP_ABI_MISMATCH: u32 = 236u32
+pub const AX_COMP_CAPABILITY_DENIED: u32 = 237u32
+pub const AX_COMP_RAW_POINTER_ESCAPE: u32 = 238u32
+pub const AX_COMP_CROSS_ALLOCATOR_VIOLATION: u32 = 239u32
+pub const AX_COMP_STALE_HANDLE: u32 = 240u32
+pub const AX_COMP_UNLOAD_ACTIVE_LEASES: u32 = 241u32
+pub const AX_COMP_QUIESCE_TIMEOUT: u32 = 242u32
+pub const AX_COMP_HOT_RELOAD_SCHEMA_MISMATCH: u32 = 243u32
+pub const AX_COMP_HOT_RELOAD_MIGRATION_FAILED: u32 = 244u32
+
+pub fn comp_diag_code_name(code_raw: u32) -> StrView {
+    if code_raw == AX_COMP_MISSING_ENTRY_POINT {
+        return ux2_sv("AX_COMP_MISSING_ENTRY_POINT")
+    }
+    if code_raw == AX_COMP_MISSING_MANIFEST {
+        return ux2_sv("AX_COMP_MISSING_MANIFEST")
+    }
+    if code_raw == AX_COMP_CORRUPT_MANIFEST {
+        return ux2_sv("AX_COMP_CORRUPT_MANIFEST")
+    }
+    if code_raw == AX_COMP_DUPLICATE_REGISTRATION {
+        return ux2_sv("AX_COMP_DUPLICATE_REGISTRATION")
+    }
+    if code_raw == AX_COMP_TARGET_MISMATCH {
+        return ux2_sv("AX_COMP_TARGET_MISMATCH")
+    }
+    if code_raw == AX_COMP_VERSION_INCOMPATIBLE {
+        return ux2_sv("AX_COMP_VERSION_INCOMPATIBLE")
+    }
+    if code_raw == AX_COMP_ABI_MISMATCH {
+        return ux2_sv("AX_COMP_ABI_MISMATCH")
+    }
+    if code_raw == AX_COMP_CAPABILITY_DENIED {
+        return ux2_sv("AX_COMP_CAPABILITY_DENIED")
+    }
+    if code_raw == AX_COMP_RAW_POINTER_ESCAPE {
+        return ux2_sv("AX_COMP_RAW_POINTER_ESCAPE")
+    }
+    if code_raw == AX_COMP_CROSS_ALLOCATOR_VIOLATION {
+        return ux2_sv("AX_COMP_CROSS_ALLOCATOR_VIOLATION")
+    }
+    if code_raw == AX_COMP_STALE_HANDLE {
+        return ux2_sv("AX_COMP_STALE_HANDLE")
+    }
+    if code_raw == AX_COMP_UNLOAD_ACTIVE_LEASES {
+        return ux2_sv("AX_COMP_UNLOAD_ACTIVE_LEASES")
+    }
+    if code_raw == AX_COMP_QUIESCE_TIMEOUT {
+        return ux2_sv("AX_COMP_QUIESCE_TIMEOUT")
+    }
+    if code_raw == AX_COMP_HOT_RELOAD_SCHEMA_MISMATCH {
+        return ux2_sv("AX_COMP_HOT_RELOAD_SCHEMA_MISMATCH")
+    }
+    if code_raw == AX_COMP_HOT_RELOAD_MIGRATION_FAILED {
+        return ux2_sv("AX_COMP_HOT_RELOAD_MIGRATION_FAILED")
+    }
+    ux2_sv("AX_COMP_UNKNOWN")
+}
+
+// =============================================================================
+// 2. Structured Diagnostics Construction & Reporting Helpers
+// =============================================================================
+
+@intrinsic unsafe fn address_of_mut<T>(mut val: T) -> *mut T { 0 as *mut T }
+
+fn make_str_data_entry(key: StrView, val: StrView) -> DiagDataEntry {
+    DiagDataEntry {
+        key: key,
+        value: DiagDataValue {
+            kind: DiagDataKind.String,
+            str_val: val,
+            int_val: 0i64,
+            bool_val: false,
+            list_items: 0 as *mut StrView,
+            list_count: 0usize,
+        },
+    }
+}
+
+pub fn report_comp_diag_1(
+    sink: mut_view<DiagSink>,
+    code_raw: u32,
+    msg: str,
+    k1: str,
+    v1: StrView
+) {
+    let mut d = diag_new(diag_code(code_raw), span_none(), ux2_sv(msg))
+    let mut entries: [1]DiagDataEntry = [make_str_data_entry(ux2_sv(k1), v1)]
+    d.data = unsafe { address_of_mut(entries[0]) }
+    d.data_count = 1usize
+    diag_sink_report(mut_view(*sink), view(d))
+}
+
+pub fn report_comp_diag_2(
+    sink: mut_view<DiagSink>,
+    code_raw: u32,
+    msg: str,
+    k1: str,
+    v1: StrView,
+    k2: str,
+    v2: StrView
+) {
+    let mut d = diag_new(diag_code(code_raw), span_none(), ux2_sv(msg))
+    let mut entries: [2]DiagDataEntry = [
+        make_str_data_entry(ux2_sv(k1), v1),
+        make_str_data_entry(ux2_sv(k2), v2)
+    ]
+    d.data = unsafe { address_of_mut(entries[0]) }
+    d.data_count = 2usize
+    diag_sink_report(mut_view(*sink), view(d))
+}
+
+// =============================================================================
+// 3. Cross-Boundary Type & Passing Mode Firewall (AXS-COMP-020..025)
+// =============================================================================
+
+pub fn check_boundary_pass_mode(
+    mode: u8,
+    has_lease: bool,
+    is_unsafe: bool,
+    sink: mut_view<DiagSink>,
+    ident: StrView
+) -> bool {
+    // 1. Raw pointer escape check (AXS-COMP-020)
+    if mode == PARAM_PASS_RAW_PTR {
+        if !is_unsafe {
+            report_comp_diag_1(
+                mut_view(*sink),
+                AX_COMP_RAW_POINTER_ESCAPE,
+                "raw pointer escape across safe @component_interface boundary",
+                "ident",
+                ident
+            )
+            return false
+        }
+        return true
+    }
+
+    // 2. Unleased view escape check (AXS-COMP-023)
+    if mode == PARAM_PASS_VIEW || mode == PARAM_PASS_MUT_VIEW {
+        if !has_lease {
+            report_comp_diag_1(
+                mut_view(*sink),
+                AX_COMP_UNLOAD_ACTIVE_LEASES,
+                "unleased view crossing component boundary without ComponentLease contract",
+                "ident",
+                ident
+            )
+            return false
+        }
+        return true
+    }
+
+    // 3. Cross-allocator hazard check (AXS-COMP-021)
+    if mode == PARAM_PASS_PLAIN_HOST_BOX || mode == PARAM_PASS_PLAIN_HOST_COLLECTION {
+        report_comp_diag_1(
+            mut_view(*sink),
+            AX_COMP_CROSS_ALLOCATOR_VIOLATION,
+            "plain host heap allocation crosses component boundary without originating AllocatorVTable; use ComponentBox<T> or ComponentHandle<T>",
+            "ident",
+            ident
+        )
+        return false
+    }
+
+    // Safe modes: PARAM_PASS_BY_VAL, PARAM_PASS_COMPONENT_BOX, PARAM_PASS_COMPONENT_HANDLE, PARAM_PASS_OPAQUE_PTR
+    true
+}
+
+pub fn validate_boundary_method(
+    method: view<ComponentMethodDesc>,
+    params: view<[8]ComponentParamDesc>,
+    param_count: usize,
+    sink: mut_view<DiagSink>
+) -> bool {
+    let mut ok = true
+    let mut i: usize = 0usize
+    while i < param_count && i < 8usize {
+        let p = (*params)[i]
+        let p_ok = check_boundary_pass_mode(
+            p.pass_mode,
+            method.has_lease_contract,
+            method.is_unsafe,
+            mut_view(*sink),
+            p.name
+        )
+        if !p_ok {
+            ok = false
+        }
+        i = i + 1usize
+    }
+
+    let ret_ok = check_boundary_pass_mode(
+        method.ret_pass_mode,
+        method.has_lease_contract,
+        method.is_unsafe,
+        mut_view(*sink),
+        method.name
+    )
+    if !ret_ok {
+        ok = false
+    }
+
+    ok
+}
+
+// =============================================================================
+// 4. Ownership, Generational Handle & Lease Safety Guards (AXS-COMP-021..023)
+// =============================================================================
+
+pub fn validate_component_handle(
+    slot_generation: u32,
+    handle_generation: u32,
+    slot_epoch: u32,
+    handle_epoch: u32,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if slot_generation != handle_generation || slot_epoch != handle_epoch {
+        report_comp_diag_1(
+            mut_view(*sink),
+            AX_COMP_STALE_HANDLE,
+            "access attempted using stale ComponentHandle whose generation or epoch has expired",
+            "reason",
+            ux2_sv("stale_generation_or_epoch")
+        )
+        return false
+    }
+    true
+}
+
+pub fn validate_component_box_drop(
+    has_allocator_vtable: bool,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if !has_allocator_vtable {
+        report_comp_diag_1(
+            mut_view(*sink),
+            AX_COMP_CROSS_ALLOCATOR_VIOLATION,
+            "ComponentBox dropped without valid originating AllocatorVTable pointer",
+            "reason",
+            ux2_sv("missing_originating_allocator")
+        )
+        return false
+    }
+    true
+}
+
+pub fn validate_component_unload_safety(
+    active_leases: u64,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if active_leases > 0u64 {
+        report_comp_diag_1(
+            mut_view(*sink),
+            AX_COMP_UNLOAD_ACTIVE_LEASES,
+            "physical component unload attempted while active epoch leases remain live",
+            "reason",
+            ux2_sv("active_leases_outstanding")
+        )
+        return false
+    }
+    true
+}
+
+// =============================================================================
+// 5. Capability Manifest & Registration Verification (AXS-COMP-002, AXS-COMP-013)
+// =============================================================================
+
+pub fn validate_component_capability_grants(
+    required_mask: u32,
+    granted_mask: u32,
+    sink: mut_view<DiagSink>
+) -> bool {
+    let ungranted = required_mask & (~granted_mask)
+    if ungranted != 0u32 {
+        report_comp_diag_1(
+            mut_view(*sink),
+            AX_COMP_CAPABILITY_DENIED,
+            "component manifest requests capabilities not granted by host policy",
+            "reason",
+            ux2_sv("unauthorized_capability_requested")
+        )
+        return false
+    }
+    true
+}
+
+@derive(Copy)
+pub struct RegisteredComponentEntry {
+    pub id: StrView,
+    pub semver: ComponentSemVer,
+    pub is_occupied: bool,
+}
+
+@derive(Copy)
+pub struct ComponentRegistry {
+    pub entries: [8]RegisteredComponentEntry,
+    pub count: usize,
+}
+
+pub fn component_registry_empty() -> ComponentRegistry {
+    let zero_ver = ComponentSemVer { major: 0u32, minor: 0u32, patch: 0u32, prerelease: ux2_sv_empty() }
+    let empty_entry = RegisteredComponentEntry { id: ux2_sv_empty(), semver: zero_ver, is_occupied: false }
+    ComponentRegistry {
+        entries: [empty_entry, empty_entry, empty_entry, empty_entry, empty_entry, empty_entry, empty_entry, empty_entry],
+        count: 0usize,
+    }
+}
+
+pub fn register_component_in_registry(
+    reg: mut_view<ComponentRegistry>,
+    id: StrView,
+    semver: ComponentSemVer,
+    sink: mut_view<DiagSink>
+) -> bool {
+    let mut i: usize = 0usize
+    while i < reg.count && i < 8usize {
+        let it = reg.entries[i]
+        if it.is_occupied && ux2_sv_eq(it.id, id) && component_semver_eq(it.semver, semver) {
+            report_comp_diag_2(
+                mut_view(*sink),
+                AX_COMP_DUPLICATE_REGISTRATION,
+                "duplicate registration of component (ComponentId, SemVer) in host process context",
+                "id",
+                id,
+                "action",
+                ux2_sv("reject_load")
+            )
+            return false
+        }
+        i = i + 1usize
+    }
+    if 8usize > reg.count {
+        let idx = reg.count
+        reg.entries[idx] = RegisteredComponentEntry {
+            id: id,
+            semver: semver,
+            is_occupied: true,
+        }
+        reg.count = reg.count + 1usize
+        return true
+    }
+    true
+}
+
+// =============================================================================
+// 6. @hot_reload_state Deterministic Schema Calculation & Migration (AXS-COMP-032, AXS-COMP-034)
+// =============================================================================
+
+@derive(Copy)
+pub struct StateFieldDesc {
+    pub name: StrView,
+    pub type_name: StrView,
+    pub offset: u32,
+    pub size: u32,
+    pub align: u32,
+}
+
+pub fn state_field_desc_default(name: StrView, type_name: StrView, offset: u32, size: u32) -> StateFieldDesc {
+    StateFieldDesc {
+        name: name,
+        type_name: type_name,
+        offset: offset,
+        size: size,
+        align: 8u32,
+    }
+}
+
+fn hash_sv(acc: u64, sv: StrView) -> u64 {
+    if sv.len == 0usize || (sv.ptr as usize) == 0usize {
+        return ax_hash_combine(acc, 0u64)
+    }
+    let h = ax_hash_bytes(sv.ptr, sv.len)
+    ax_hash_combine(acc, h)
+}
+
+pub fn compute_state_schema_id(
+    struct_name: StrView,
+    schema_version: u32,
+    fields: view<[8]StateFieldDesc>,
+    count: usize
+) -> StateSchemaId {
+    let tag = ux2_sv("AXIOM-HOT-RELOAD-STATE-v1\0")
+    let base = ax_hash_bytes(tag.ptr, tag.len)
+    let mut lo = ax_hash_combine(base, 0x5354415445534348u64)
+    let mut hi = ax_hash_combine(base, 0x9e3779b97f4a7c15u64)
+
+    lo = hash_sv(lo, struct_name)
+    hi = ax_hash_combine(hi, schema_version as u64)
+    lo = ax_hash_combine(lo, count as u64)
+
+    let mut i: usize = 0usize
+    while i < count && i < 8usize {
+        let f = (*fields)[i]
+        lo = hash_sv(lo, f.name)
+        hi = hash_sv(hi, f.type_name)
+        lo = ax_hash_combine(lo, f.offset as u64)
+        hi = ax_hash_combine(hi, f.size as u64)
+        lo = ax_hash_combine(lo, f.align as u64)
+        i = i + 1usize
+    }
+
+    StateSchemaId { lo: lo, hi: hi }
+}
+
+@derive(Copy)
+pub struct HotReloadMigrationDesc {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub is_registered: bool,
+    pub has_valid_signature: bool,
+}
+
+pub fn hot_reload_migration_desc_default(from_ver: u32, to_ver: u32) -> HotReloadMigrationDesc {
+    HotReloadMigrationDesc {
+        from_version: from_ver,
+        to_version: to_ver,
+        is_registered: true,
+        has_valid_signature: true,
+    }
+}
+
+pub fn validate_hot_reload_transition(
+    active_schema: StateSchemaId,
+    active_ver: u32,
+    candidate_schema: StateSchemaId,
+    candidate_ver: u32,
+    migration: view<HotReloadMigrationDesc>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    // Schema identity fast path (AXS-COMP-034 §1)
+    if state_schema_id_eq(active_schema, candidate_schema) {
+        return true
+    }
+
+    // Schema difference requires valid migration hook (AXS-COMP-034 §2)
+    if !migration.is_registered || migration.from_version != active_ver || migration.to_version != candidate_ver {
+        report_comp_diag_1(
+            mut_view(*sink),
+            AX_COMP_HOT_RELOAD_SCHEMA_MISMATCH,
+            "hot-reload candidate lacks valid registered migration hook for active schema version",
+            "transition",
+            ux2_sv("schema_version_mismatch")
+        )
+        return false
+    }
+
+    if !migration.has_valid_signature {
+        report_comp_diag_1(
+            mut_view(*sink),
+            AX_COMP_HOT_RELOAD_MIGRATION_FAILED,
+            "hot-reload migration function has invalid signature or returned error; initiating rollback",
+            "transition",
+            ux2_sv("migration_signature_invalid")
+        )
+        return false
+    }
+
+    true
+}
