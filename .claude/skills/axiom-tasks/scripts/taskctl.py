@@ -157,7 +157,7 @@ AUTOPILOT = os.path.join(ROOT, "_workspaces", "autopilot.json")
 UNBLOCK_LOCK = os.path.join(LOCKS, "unblock.json")
 UNBLOCK_LOCK_PATHS = ["spec", "_workspaces/tasks"]
 UNBLOCK_LOCK_STALE_MIN = 180
-DEFAULT_TRAILER = "Co-Authored-By: Claude <noreply@anthropic.com>"
+DEFAULT_TRAILER = "Co-Authored-By: Gemini <noreply@google.com>"
 MAX_ATTEMPTS = 3
 MAX_UNBLOCKS = 2          # architect unblock cycles per task, then parked for the owner
 MAX_UNBLOCK_FAILURES = 2  # crashed/overdue unblock agents per task, then parked
@@ -769,8 +769,12 @@ def commit_files(files, msg, label):
     staged = git("-c", "core.quotepath=false", "diff", "--cached", "--name-only").stdout.split("\n")
     staged = [s for s in staged if s.strip()]
     board = os.path.relpath(BOARD, ROOT).replace("\\", "/")
+    todo_dir = board + "/todo"
+    todo_locked = any(os.path.exists(os.path.join(BOARD, "doing", f)) and f.startswith("T2")
+                      for f in os.listdir(os.path.join(BOARD, "doing"))) if os.path.isdir(os.path.join(BOARD, "doing")) else False
     bad = [s for s in staged if s.startswith(OWNER_DIRS)
-           or (s not in files and not under(s, board))]
+           or (s not in files and not under(s, board))
+           or (todo_locked and under(s, todo_dir) and s not in files and os.path.exists(os.path.join(ROOT, s)))]
     for s in bad:
         print(f"WARN unstaging {s}: staged earlier but not part of {label}'s change set")
     if bad:

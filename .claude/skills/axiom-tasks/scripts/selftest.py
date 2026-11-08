@@ -207,7 +207,7 @@ def test_a(a):
           "docs/" not in hf and "tool.exe" not in hf and "M docs/base/owner.md" in status(a)
           and sh(["git", "diff", "--cached", "--name-only"], a)[1] == "", hf + status(a))
     body = sh(["git", "log", "-1", "--format=%B"], a)[1]
-    check("A4-25 trailer has no hard-coded model name", "Co-Authored-By: Claude <noreply@anthropic.com>" in body, body)
+    check("A4-25 trailer has no hard-coded model name", "Co-Authored-By: Gemini <noreply@google.com>" in body, body)
     env = dict(BASE_ENV, AXIOM_COMMIT_TRAILER="Co-Authored-By: X <x@example.invalid>")
 
     # ---- parallel batch after the critical task
