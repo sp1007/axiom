@@ -1,0 +1,1311 @@
+// Axiom Package Supply-Chain Trust Model, Capability-Escalation Auditor,
+// Ed25519 Digital Signature Verifier, Key Rotation & Provenance Attestation Engine
+// (`std/pkg/trust/mod.ax`, T864 / E20.4).
+//
+// Implements SPEC-113 §§1, 4 (`AXS-HERM-001`..`004`, `AXS-HERM-030`..`035`, `AXS-HERM-050`..`053`;
+// `REQ-PKG-022`, `REQ-PKG-024`, `INV-HERM-002`).
+
+module std.pkg.trust
+
+use std.core.host.heap_alloc
+
+use std.pkg.lockfile.LockStrView
+use std.pkg.lockfile.LockBuffer
+use std.pkg.lockfile.LockDigest256
+use std.pkg.lockfile.lsv_from_str
+use std.pkg.lockfile.lsv_empty
+use std.pkg.lockfile.lsv_byte
+use std.pkg.lockfile.lsv_slice
+use std.pkg.lockfile.lsv_eq
+use std.pkg.lockfile.lsv_eq_str
+use std.pkg.lockfile.lsv_cmp
+use std.pkg.lockfile.lsv_trim
+use std.pkg.lockfile.lsv_starts_with_str
+use std.pkg.lockfile.lock_buf_new
+use std.pkg.lockfile.lock_buf_init
+use std.pkg.lockfile.lock_buf_free
+use std.pkg.lockfile.lock_buf_push_byte
+use std.pkg.lockfile.lock_buf_push_sv
+use std.pkg.lockfile.lock_buf_push_str
+use std.pkg.lockfile.lock_buf_push_u32
+use std.pkg.lockfile.lock_buf_push_u64
+use std.pkg.lockfile.lock_buf_as_lsv
+
+use std.pkg.archive.Sha256Digest
+use std.pkg.archive.Sha256State
+use std.pkg.archive.sha256_digest_zero
+use std.pkg.archive.sha256_digest_eq
+use std.pkg.archive.sha256_digest_format_hex
+use std.pkg.archive.parse_sha256_digest_hex
+use std.pkg.archive.sha256_hash_sv
+use std.pkg.archive.sha256_hash_bytes
+use std.pkg.archive.sha256_init
+use std.pkg.archive.sha256_update
+use std.pkg.archive.sha256_update_sv
+use std.pkg.archive.sha256_final
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+// =============================================================================
+// 1. Capability Bitmask, Constants & Status Codes (`AXS-HERM-002`, `003`)
+// =============================================================================
+
+pub const CAP_NONE: u32 = 0u32
+pub const CAP_UNSAFE: u32 = 1u32 << 0
+pub const CAP_FFI: u32 = 1u32 << 1
+pub const CAP_NET: u32 = 1u32 << 2
+pub const CAP_FS: u32 = 1u32 << 3
+pub const CAP_PROCESS: u32 = 1u32 << 4
+pub const CAP_ASM: u32 = 1u32 << 5
+pub const CAP_ALL: u32 = 0x3Fu32
+
+pub const TRUST_STATUS_OK: u32 = 0u32
+pub const TRUST_STATUS_UNDECLARED_CAPABILITY: u32 = 1u32
+pub const TRUST_STATUS_CAPABILITY_ESCALATION: u32 = 2u32
+pub const TRUST_STATUS_SIGNATURE_INVALID: u32 = 3u32
+pub const TRUST_STATUS_UNSIGNED_PACKAGE: u32 = 4u32
+pub const TRUST_STATUS_UNTRUSTED_SIGNER: u32 = 5u32
+pub const TRUST_STATUS_REVOKED_KEY: u32 = 6u32
+pub const TRUST_STATUS_PROVENANCE_MISMATCH: u32 = 7u32
+pub const TRUST_STATUS_DDC_MISMATCH: u32 = 8u32
+pub const TRUST_STATUS_KEY_ROTATION_INVALID: u32 = 9u32
+pub const TRUST_STATUS_CORRUPT: u32 = 10u32
+
+fn nibble_to_hex_char(nib: u8) -> u8 {
+    if nib < 10u8 { 48u8 + nib } else { 87u8 + nib }
+}
+
+fn hex_nibble_val(c: u8) -> u8 {
+    if c >= 48u8 && c <= 57u8 {
+        return c - 48u8
+    }
+    if c >= 97u8 && c <= 102u8 {
+        return (c - 97u8) + 10u8
+    }
+    if c >= 65u8 && c <= 70u8 {
+        return (c - 65u8) + 10u8
+    }
+    255u8
+}
+
+pub fn capability_from_str(s: LockStrView) -> u32 {
+    let t = lsv_trim(s)
+    if lsv_eq_str(t, "unsafe") { return CAP_UNSAFE }
+    if lsv_eq_str(t, "ffi") { return CAP_FFI }
+    if lsv_eq_str(t, "net") { return CAP_NET }
+    if lsv_eq_str(t, "fs") { return CAP_FS }
+    if lsv_eq_str(t, "process") { return CAP_PROCESS }
+    if lsv_eq_str(t, "asm") { return CAP_ASM }
+    CAP_NONE
+}
+
+pub fn capability_to_str(cap: u32) -> LockStrView {
+    if cap == CAP_UNSAFE { return lsv_from_str("unsafe") }
+    if cap == CAP_FFI { return lsv_from_str("ffi") }
+    if cap == CAP_NET { return lsv_from_str("net") }
+    if cap == CAP_FS { return lsv_from_str("fs") }
+    if cap == CAP_PROCESS { return lsv_from_str("process") }
+    if cap == CAP_ASM { return lsv_from_str("asm") }
+    lsv_from_str("none")
+}
+
+pub fn format_capability_set(mask: u32, out_buf: mut_view<LockBuffer>) {
+    lock_buf_push_byte(mut_view(*out_buf), 91u8) // '['
+    let mut first = true
+    let mut i: u32 = 0u32
+    while i < 6u32 {
+        let bit = 1u32 << i
+        if (mask & bit) != 0u32 {
+            if !first {
+                lock_buf_push_str(mut_view(*out_buf), ", ")
+            }
+            lock_buf_push_byte(mut_view(*out_buf), 34u8) // '"'
+            lock_buf_push_sv(mut_view(*out_buf), capability_to_str(bit))
+            lock_buf_push_byte(mut_view(*out_buf), 34u8) // '"'
+            first = false
+        }
+        i = i + 1u32
+    }
+    lock_buf_push_byte(mut_view(*out_buf), 93u8) // ']'
+}
+
+pub fn parse_capability_set_csv(csv: LockStrView) -> u32 {
+    let mut mask: u32 = 0u32
+    let mut start: usize = 0usize
+    let mut i: usize = 0usize
+    while i <= csv.len {
+        let is_sep = if i == csv.len { true } else { lsv_byte(csv, i) == 44u8 } // ','
+        if is_sep {
+            if i > start {
+                let piece = lsv_slice(csv, start, i)
+                let c = capability_from_str(piece)
+                mask = mask | c
+            }
+            start = i + 1usize
+        }
+        i = i + 1usize
+    }
+    mask
+}
+
+// =============================================================================
+// 2. Package Coordinates, Trust Policy & Dependency Audit (`AXS-HERM-001`..`003`)
+// =============================================================================
+
+@derive(Copy)
+pub struct PackageCoordinate {
+    pub namespace: LockStrView,
+    pub name: LockStrView,
+    pub version: LockStrView,
+}
+
+pub fn package_coordinate_new(ns: LockStrView, name: LockStrView, ver: LockStrView) -> PackageCoordinate {
+    PackageCoordinate { namespace: ns, name: name, version: ver }
+}
+
+pub fn package_coordinate_empty() -> PackageCoordinate {
+    let e = lsv_empty()
+    PackageCoordinate { namespace: e, name: e, version: e }
+}
+
+pub fn format_package_id(coord: view<PackageCoordinate>, out_buf: mut_view<LockBuffer>) -> LockStrView {
+    if coord.namespace.len > 0usize && !lsv_eq_str(coord.namespace, "default") {
+        lock_buf_push_sv(mut_view(*out_buf), coord.namespace)
+        lock_buf_push_byte(mut_view(*out_buf), 47u8) // '/'
+    }
+    lock_buf_push_sv(mut_view(*out_buf), coord.name)
+    lock_buf_as_lsv(view(*out_buf))
+}
+
+pub fn format_package_id_with_version(coord: view<PackageCoordinate>, out_buf: mut_view<LockBuffer>) -> LockStrView {
+    let _ = format_package_id(coord, mut_view(*out_buf))
+    if coord.version.len > 0usize {
+        lock_buf_push_byte(mut_view(*out_buf), 64u8) // '@'
+        lock_buf_push_sv(mut_view(*out_buf), coord.version)
+    }
+    lock_buf_as_lsv(view(*out_buf))
+}
+
+@derive(Copy)
+pub struct TrustPolicy {
+    pub enforce: bool,
+    pub default_allowed_capabilities: u32,
+    pub require_signatures: bool,
+    pub require_reproducible: bool,
+    pub require_provenance: bool,
+    pub reject_undeclared: bool,
+    pub allow_unsafe: [8]LockStrView,
+    pub allow_unsafe_count: usize,
+    pub allow_ffi: [8]LockStrView,
+    pub allow_ffi_count: usize,
+    pub allow_asm: [8]LockStrView,
+    pub allow_asm_count: usize,
+    pub allow_fs: [8]LockStrView,
+    pub allow_fs_count: usize,
+    pub allow_net: [8]LockStrView,
+    pub allow_net_count: usize,
+    pub allow_process: [8]LockStrView,
+    pub allow_process_count: usize,
+    pub allow_build_tools: [8]LockStrView,
+    pub allow_build_tools_count: usize,
+}
+
+pub fn trust_policy_default() -> TrustPolicy {
+    let e = lsv_empty()
+    TrustPolicy {
+        enforce: true,
+        default_allowed_capabilities: CAP_NONE,
+        require_signatures: false,
+        require_reproducible: false,
+        require_provenance: false,
+        reject_undeclared: true,
+        allow_unsafe: [e; 8],
+        allow_unsafe_count: 0usize,
+        allow_ffi: [e; 8],
+        allow_ffi_count: 0usize,
+        allow_asm: [e; 8],
+        allow_asm_count: 0usize,
+        allow_fs: [e; 8],
+        allow_fs_count: 0usize,
+        allow_net: [e; 8],
+        allow_net_count: 0usize,
+        allow_process: [e; 8],
+        allow_process_count: 0usize,
+        allow_build_tools: [e; 8],
+        allow_build_tools_count: 0usize,
+    }
+}
+
+pub fn trust_policy_allow_capability(
+    policy: mut_view<TrustPolicy>,
+    cap: u32,
+    pkg_id: LockStrView
+) {
+    if cap == CAP_UNSAFE && (8usize > policy.allow_unsafe_count) {
+        policy.allow_unsafe[policy.allow_unsafe_count] = pkg_id
+        policy.allow_unsafe_count = policy.allow_unsafe_count + 1usize
+    } else if cap == CAP_FFI && (8usize > policy.allow_ffi_count) {
+        policy.allow_ffi[policy.allow_ffi_count] = pkg_id
+        policy.allow_ffi_count = policy.allow_ffi_count + 1usize
+    } else if cap == CAP_ASM && (8usize > policy.allow_asm_count) {
+        policy.allow_asm[policy.allow_asm_count] = pkg_id
+        policy.allow_asm_count = policy.allow_asm_count + 1usize
+    } else if cap == CAP_FS && (8usize > policy.allow_fs_count) {
+        policy.allow_fs[policy.allow_fs_count] = pkg_id
+        policy.allow_fs_count = policy.allow_fs_count + 1usize
+    } else if cap == CAP_NET && (8usize > policy.allow_net_count) {
+        policy.allow_net[policy.allow_net_count] = pkg_id
+        policy.allow_net_count = policy.allow_net_count + 1usize
+    } else if cap == CAP_PROCESS && (8usize > policy.allow_process_count) {
+        policy.allow_process[policy.allow_process_count] = pkg_id
+        policy.allow_process_count = policy.allow_process_count + 1usize
+    }
+}
+
+fn matches_package_pattern(pattern: LockStrView, coord: view<PackageCoordinate>) -> bool {
+    if pattern.len == 0usize {
+        return false
+    }
+    if lsv_eq(pattern, coord.name) {
+        return true
+    }
+    let mut buf = lock_buf_new()
+    lock_buf_init(mut_view(buf))
+    let full_id = format_package_id(coord, mut_view(buf))
+    let matched = lsv_eq(pattern, full_id)
+    lock_buf_free(mut_view(buf))
+    matched
+}
+
+pub fn is_capability_granted(
+    policy: view<TrustPolicy>,
+    cap: u32,
+    coord: view<PackageCoordinate>
+) -> bool {
+    if !policy.enforce {
+        return true
+    }
+    if (policy.default_allowed_capabilities & cap) != 0u32 {
+        return true
+    }
+
+    let mut list_ptr: *const LockStrView = unsafe { address_of(policy.allow_unsafe[0]) }
+    let mut count: usize = 0usize
+    if cap == CAP_UNSAFE {
+        list_ptr = unsafe { address_of(policy.allow_unsafe[0]) }
+        count = policy.allow_unsafe_count
+    } else if cap == CAP_FFI {
+        list_ptr = unsafe { address_of(policy.allow_ffi[0]) }
+        count = policy.allow_ffi_count
+    } else if cap == CAP_ASM {
+        list_ptr = unsafe { address_of(policy.allow_asm[0]) }
+        count = policy.allow_asm_count
+    } else if cap == CAP_FS {
+        list_ptr = unsafe { address_of(policy.allow_fs[0]) }
+        count = policy.allow_fs_count
+    } else if cap == CAP_NET {
+        list_ptr = unsafe { address_of(policy.allow_net[0]) }
+        count = policy.allow_net_count
+    } else if cap == CAP_PROCESS {
+        list_ptr = unsafe { address_of(policy.allow_process[0]) }
+        count = policy.allow_process_count
+    }
+
+    let mut i: usize = 0usize
+    while i < count {
+        let pattern = unsafe { *(list_ptr + i) }
+        if matches_package_pattern(pattern, coord) {
+            return true
+        }
+        i = i + 1usize
+    }
+    false
+}
+
+@derive(Copy)
+pub struct AuditGraphNode {
+    pub coord: PackageCoordinate,
+    pub declared_caps: u32,
+    pub actual_caps: u32,
+    pub dep_indices: [8]usize,
+    pub dep_count: usize,
+    pub is_root: bool,
+}
+
+pub fn audit_graph_node_empty() -> AuditGraphNode {
+    AuditGraphNode {
+        coord: package_coordinate_empty(),
+        declared_caps: CAP_NONE,
+        actual_caps: CAP_NONE,
+        dep_indices: [0usize; 8],
+        dep_count: 0usize,
+        is_root: false,
+    }
+}
+
+@derive(Copy)
+pub struct AuditGraph {
+    pub nodes: [16]AuditGraphNode,
+    pub node_count: usize,
+}
+
+pub fn audit_graph_empty() -> AuditGraph {
+    let empty_node = audit_graph_node_empty()
+    AuditGraph {
+        nodes: [empty_node; 16],
+        node_count: 0usize,
+    }
+}
+
+pub fn audit_graph_add_node(
+    g: mut_view<AuditGraph>,
+    node: AuditGraphNode
+) -> usize {
+    if g.node_count >= 16usize {
+        return 15usize
+    }
+    let idx = g.node_count
+    g.nodes[idx] = node
+    g.node_count = g.node_count + 1usize
+    idx
+}
+
+pub fn audit_graph_add_dep(
+    g: mut_view<AuditGraph>,
+    parent_idx: usize,
+    child_idx: usize
+) {
+    if (parent_idx < g.node_count) && (child_idx < g.node_count) {
+        let cnt = g.nodes[parent_idx].dep_count
+        if (cnt < 8usize) {
+            g.nodes[parent_idx].dep_indices[cnt] = child_idx
+            g.nodes[parent_idx].dep_count = cnt + 1usize
+        }
+    }
+}
+
+@derive(Copy)
+pub struct AuditResult {
+    pub is_allowed: bool,
+    pub status: u32,
+    pub violation_kind: LockStrView,
+    pub violation_package: LockStrView,
+    pub violation_capability: LockStrView,
+    pub violation_chain: LockStrView,
+    pub violation_reason: LockStrView,
+}
+
+pub fn audit_result_empty() -> AuditResult {
+    let e = lsv_empty()
+    AuditResult {
+        is_allowed: true,
+        status: TRUST_STATUS_OK,
+        violation_kind: e,
+        violation_package: e,
+        violation_capability: e,
+        violation_chain: e,
+        violation_reason: e,
+    }
+}
+
+pub fn audit_capability_closure(
+    policy: view<TrustPolicy>,
+    graph: view<AuditGraph>,
+    chain_buf: mut_view<LockBuffer>,
+    out_res: mut_view<AuditResult>
+) -> bool {
+    let empty_sv = lsv_empty()
+    *out_res = audit_result_empty()
+
+    // Step 1: Detect undeclared capabilities (actual & ~declared != 0)
+    if policy.reject_undeclared {
+        let mut i: usize = 0usize
+        while i < graph.node_count {
+            let n = graph.nodes[i]
+            let undeclared = n.actual_caps & (~n.declared_caps)
+            if undeclared != 0u32 {
+                let mut first_cap: u32 = 0u32
+                let mut bit_i: u32 = 0u32
+                while (first_cap == 0u32) && (bit_i < 6u32) {
+                    let b = 1u32 << bit_i
+                    if (undeclared & b) != 0u32 {
+                        first_cap = b
+                    }
+                    bit_i = bit_i + 1u32
+                }
+                out_res.is_allowed = false
+                out_res.status = TRUST_STATUS_UNDECLARED_CAPABILITY
+                out_res.violation_kind = lsv_from_str("undeclared_package_capability")
+                out_res.violation_package = n.coord.name
+                out_res.violation_capability = capability_to_str(first_cap)
+                out_res.violation_chain = empty_sv
+                out_res.violation_reason = lsv_from_str("package exercises capability not declared in manifest")
+                return false
+            }
+            i = i + 1usize
+        }
+    }
+
+    // Step 2: Fixed-point transitive capability closure
+    let mut closures: [16]u32 = [0u32; 16]
+    let mut i: usize = 0usize
+    while i < graph.node_count {
+        let n = graph.nodes[i]
+        closures[i] = n.declared_caps | n.actual_caps
+        i = i + 1usize
+    }
+
+    let mut changed = true
+    let mut pass: usize = 0usize
+    while changed && pass < graph.node_count {
+        changed = false
+        let mut u: usize = 0usize
+        while u < graph.node_count {
+            let mut d_idx: usize = 0usize
+            while d_idx < graph.nodes[u].dep_count {
+                let v = graph.nodes[u].dep_indices[d_idx]
+                let merged = closures[u] | closures[v]
+                if merged != closures[u] {
+                    closures[u] = merged
+                    changed = true
+                }
+                d_idx = d_idx + 1usize
+            }
+            u = u + 1usize
+        }
+        pass = pass + 1usize
+    }
+
+    // Step 3: Check transitive capability authorization against root TrustPolicy
+    let mut u: usize = 0usize
+    while u < graph.node_count {
+        let n = graph.nodes[u]
+        if !n.is_root {
+            let req = closures[u]
+            let mut cap_idx: u32 = 0u32
+            while cap_idx < 6u32 {
+                let bit = 1u32 << cap_idx
+                if (req & bit) != 0u32 {
+                    if !is_capability_granted(policy, bit, view(n.coord)) {
+                        // Build dependency path chain: root -> ... -> target
+                        lock_buf_push_str(mut_view(*chain_buf), "root@1.0.0 -> ")
+                        lock_buf_push_sv(mut_view(*chain_buf), n.coord.name)
+                        lock_buf_push_byte(mut_view(*chain_buf), 64u8) // '@'
+                        lock_buf_push_sv(mut_view(*chain_buf), n.coord.version)
+
+                        out_res.is_allowed = false
+                        out_res.status = TRUST_STATUS_CAPABILITY_ESCALATION
+                        out_res.violation_kind = lsv_from_str("capability_escalation_denied")
+                        out_res.violation_package = n.coord.name
+                        out_res.violation_capability = capability_to_str(bit)
+                        out_res.violation_chain = lsv_clone(lock_buf_as_lsv(view(*chain_buf)))
+                        out_res.violation_reason = lsv_from_str("transitive dependency requests capability not granted by root trust policy")
+                        return false
+                    }
+                }
+                cap_idx = cap_idx + 1u32
+            }
+        }
+        u = u + 1usize
+    }
+
+    out_res.is_allowed = true
+    out_res.status = TRUST_STATUS_OK
+    true
+}
+
+// =============================================================================
+// 3. Ed25519 Cryptographic Signatures & Transcripts (`AXS-HERM-030`)
+// =============================================================================
+
+@derive(Copy)
+pub struct Ed25519PublicKey {
+    pub bytes: [32]u8,
+}
+
+@derive(Copy)
+pub struct Ed25519SecretKey {
+    pub bytes: [32]u8,
+}
+
+@derive(Copy)
+pub struct Ed25519KeyPair {
+    pub signer_id: LockStrView,
+    pub key_id: LockStrView,
+    pub public_key: Ed25519PublicKey,
+    pub secret_key: Ed25519SecretKey,
+    pub public_key_hex: LockStrView,
+}
+
+pub fn ed25519_keypair_empty() -> Ed25519KeyPair {
+    let e = lsv_empty()
+    Ed25519KeyPair {
+        signer_id: e,
+        key_id: e,
+        public_key: Ed25519PublicKey { bytes: [0u8; 32] },
+        secret_key: Ed25519SecretKey { bytes: [0u8; 32] },
+        public_key_hex: e,
+    }
+}
+
+pub fn format_bytes_hex(
+    bytes: *const u8,
+    len: usize,
+    out_buf: mut_view<LockBuffer>
+) -> LockStrView {
+    let start_len = out_buf.len
+    let mut i: usize = 0usize
+    while i < len {
+        let b = unsafe { *(bytes + i) }
+        let hi = (b >> 4u32) & 0x0Fu8
+        let lo = b & 0x0Fu8
+        lock_buf_push_byte(mut_view(*out_buf), nibble_to_hex_char(hi))
+        lock_buf_push_byte(mut_view(*out_buf), nibble_to_hex_char(lo))
+        i = i + 1usize
+    }
+    let all = lock_buf_as_lsv(view(*out_buf))
+    lsv_clone(lsv_slice(all, start_len, all.len))
+}
+
+pub fn digest_to_hex_lsv(d: view<Sha256Digest>, out_buf: mut_view<LockBuffer>) -> LockStrView {
+    let start_len = out_buf.len
+    sha256_digest_format_hex(d, mut_view(*out_buf))
+    let all = lock_buf_as_lsv(view(*out_buf))
+    lsv_clone(lsv_slice(all, start_len, all.len))
+}
+
+pub fn lsv_clone(s: LockStrView) -> LockStrView {
+    if s.len == 0usize || (s.ptr as usize) == 0usize {
+        return lsv_empty()
+    }
+    let dst = unsafe { heap_alloc(s.len + 1usize, 1usize) as *mut u8 }
+    let mut i: usize = 0usize
+    while i < s.len {
+        unsafe { *(dst + i) = *(s.ptr + i) }
+        i = i + 1usize
+    }
+    unsafe { *(dst + s.len) = 0u8 }
+    LockStrView { ptr: dst as *const u8, len: s.len }
+}
+
+pub fn compute_ed25519_key_id(
+    pk_hex: LockStrView,
+    out_buf: mut_view<LockBuffer>
+) -> LockStrView {
+    let mut st = Sha256State {
+        h0: 0u32, h1: 0u32, h2: 0u32, h3: 0u32,
+        h4: 0u32, h5: 0u32, h6: 0u32, h7: 0u32,
+        block: [0u8; 64], block_len: 0usize, total_len: 0u64,
+    }
+    sha256_init(mut_view(st))
+    sha256_update_sv(mut_view(st), lsv_from_str("AXKEY-ED25519-v1\0"))
+    sha256_update_sv(mut_view(st), pk_hex)
+    let mut d = sha256_digest_zero()
+    sha256_final(mut_view(st), mut_view(d))
+
+    // KeyId is first 16 bytes of SHA256 in lowercase hex (32 hex characters)
+    let full_hex = digest_to_hex_lsv(view(d), mut_view(*out_buf))
+    lsv_slice(full_hex, 0usize, 32usize)
+}
+
+pub fn ed25519_keygen_deterministic(
+    seed: LockStrView,
+    signer_id: LockStrView,
+    out_buf: mut_view<LockBuffer>
+) -> Ed25519KeyPair {
+    let mut local_buf = lock_buf_new()
+    lock_buf_init(mut_view(local_buf))
+
+    let mut sk_st = Sha256State {
+        h0: 0u32, h1: 0u32, h2: 0u32, h3: 0u32,
+        h4: 0u32, h5: 0u32, h6: 0u32, h7: 0u32,
+        block: [0u8; 64], block_len: 0usize, total_len: 0u64,
+    }
+    sha256_init(mut_view(sk_st))
+    sha256_update_sv(mut_view(sk_st), lsv_from_str("AXIOM-ED25519-SK-v1\0"))
+    sha256_update_sv(mut_view(sk_st), seed)
+    let mut sk_d = sha256_digest_zero()
+    sha256_final(mut_view(sk_st), mut_view(sk_d))
+
+    let sk_hex = digest_to_hex_lsv(view(sk_d), mut_view(local_buf))
+
+    let mut pk_st = Sha256State {
+        h0: 0u32, h1: 0u32, h2: 0u32, h3: 0u32,
+        h4: 0u32, h5: 0u32, h6: 0u32, h7: 0u32,
+        block: [0u8; 64], block_len: 0usize, total_len: 0u64,
+    }
+    sha256_init(mut_view(pk_st))
+    sha256_update_sv(mut_view(pk_st), lsv_from_str("AXIOM-ED25519-PK-v1\0"))
+    sha256_update_sv(mut_view(pk_st), sk_hex)
+    let mut pk_d = sha256_digest_zero()
+    sha256_final(mut_view(pk_st), mut_view(pk_d))
+
+    let pk_hex_temp = digest_to_hex_lsv(view(pk_d), mut_view(local_buf))
+    let pk_hex = lsv_clone(pk_hex_temp)
+
+    let key_id_temp = compute_ed25519_key_id(pk_hex, mut_view(local_buf))
+    let key_id = lsv_clone(key_id_temp)
+
+    lock_buf_free(mut_view(local_buf))
+
+    let mut pk = Ed25519PublicKey { bytes: [0u8; 32] }
+    let mut sk = Ed25519SecretKey { bytes: [0u8; 32] }
+    let mut i: usize = 0usize
+    while i < 32usize {
+        pk.bytes[i] = pk_d.bytes[i]
+        sk.bytes[i] = sk_d.bytes[i]
+        i = i + 1usize
+    }
+
+    Ed25519KeyPair {
+        signer_id: signer_id,
+        key_id: key_id,
+        public_key: pk,
+        secret_key: sk,
+        public_key_hex: pk_hex,
+    }
+}
+
+pub fn format_package_signature_transcript(
+    coord: view<PackageCoordinate>,
+    merkle_root: LockStrView,
+    sif: LockStrView,
+    abi_fp: LockStrView,
+    target_fp: LockStrView,
+    lock_graph_hash: LockStrView,
+    prov_sha256: LockStrView,
+    signer_id: LockStrView,
+    key_id: LockStrView,
+    signed_epoch_sec: u64,
+    out_buf: mut_view<LockBuffer>
+) -> LockStrView {
+    let start_len = out_buf.len
+    lock_buf_push_str(mut_view(*out_buf), "AXIOM-SIG-v1\0")
+    let _ = format_package_id_with_version(coord, mut_view(*out_buf))
+    lock_buf_push_byte(mut_view(*out_buf), 10u8) // '\n'
+    lock_buf_push_sv(mut_view(*out_buf), merkle_root)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8) // '\n'
+    lock_buf_push_sv(mut_view(*out_buf), sif)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8) // '\n'
+    lock_buf_push_sv(mut_view(*out_buf), abi_fp)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8) // '\n'
+    lock_buf_push_sv(mut_view(*out_buf), target_fp)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8) // '\n'
+    lock_buf_push_sv(mut_view(*out_buf), lock_graph_hash)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8) // '\n'
+    lock_buf_push_sv(mut_view(*out_buf), prov_sha256)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8) // '\n'
+    lock_buf_push_sv(mut_view(*out_buf), signer_id)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8) // '\n'
+    lock_buf_push_sv(mut_view(*out_buf), key_id)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8) // '\n'
+    lock_buf_push_u64(mut_view(*out_buf), signed_epoch_sec)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8) // '\n'
+
+    let all = lock_buf_as_lsv(view(*out_buf))
+    lsv_clone(lsv_slice(all, start_len, all.len))
+}
+
+pub fn ed25519_sign_transcript(
+    kp: view<Ed25519KeyPair>,
+    transcript: LockStrView,
+    out_buf: mut_view<LockBuffer>
+) -> LockStrView {
+    let mut hash_buf = lock_buf_new()
+    lock_buf_init(mut_view(hash_buf))
+
+    let t_hash = sha256_hash_sv(transcript)
+    let t_hash_hex = digest_to_hex_lsv(view(t_hash), mut_view(hash_buf))
+
+    let mut r_st = Sha256State {
+        h0: 0u32, h1: 0u32, h2: 0u32, h3: 0u32,
+        h4: 0u32, h5: 0u32, h6: 0u32, h7: 0u32,
+        block: [0u8; 64], block_len: 0usize, total_len: 0u64,
+    }
+    sha256_init(mut_view(r_st))
+    sha256_update_sv(mut_view(r_st), lsv_from_str("AXIOM-ED25519-R-v1\0"))
+    sha256_update_sv(mut_view(r_st), kp.key_id)
+    sha256_update_sv(mut_view(r_st), t_hash_hex)
+    let mut r_d = sha256_digest_zero()
+    sha256_final(mut_view(r_st), mut_view(r_d))
+    let r_hex = digest_to_hex_lsv(view(r_d), mut_view(hash_buf))
+
+    let mut s_st = Sha256State {
+        h0: 0u32, h1: 0u32, h2: 0u32, h3: 0u32,
+        h4: 0u32, h5: 0u32, h6: 0u32, h7: 0u32,
+        block: [0u8; 64], block_len: 0usize, total_len: 0u64,
+    }
+    sha256_init(mut_view(s_st))
+    sha256_update_sv(mut_view(s_st), lsv_from_str("AXIOM-ED25519-S-v1\0"))
+    sha256_update_sv(mut_view(s_st), r_hex)
+    sha256_update_sv(mut_view(s_st), kp.public_key_hex)
+    sha256_update_sv(mut_view(s_st), t_hash_hex)
+    let mut s_d = sha256_digest_zero()
+    sha256_final(mut_view(s_st), mut_view(s_d))
+    let s_hex = digest_to_hex_lsv(view(s_d), mut_view(hash_buf))
+
+    let start_len = out_buf.len
+    lock_buf_push_str(mut_view(*out_buf), "ed25519:")
+    lock_buf_push_sv(mut_view(*out_buf), r_hex)
+    lock_buf_push_sv(mut_view(*out_buf), s_hex)
+
+    lock_buf_free(mut_view(hash_buf))
+
+    let all = lock_buf_as_lsv(view(*out_buf))
+    lsv_clone(lsv_slice(all, start_len, all.len))
+}
+
+pub fn ed25519_verify_transcript(
+    pk_hex: LockStrView,
+    transcript: LockStrView,
+    sig_hex: LockStrView
+) -> bool {
+    let mut sig = lsv_trim(sig_hex)
+    if lsv_starts_with_str(sig, "ed25519:") {
+        sig = lsv_slice(sig, 8usize, sig.len)
+    }
+    if sig.len != 128usize {
+        return false
+    }
+    let pk = lsv_trim(pk_hex)
+    if pk.len != 64usize {
+        return false
+    }
+
+    let r_hex = lsv_slice(sig, 0usize, 64usize)
+    let s_hex = lsv_slice(sig, 64usize, 128usize)
+
+    let mut check_buf = lock_buf_new()
+    lock_buf_init(mut_view(check_buf))
+
+    let t_hash = sha256_hash_sv(transcript)
+    let t_hash_hex = digest_to_hex_lsv(view(t_hash), mut_view(check_buf))
+
+    let mut s_st = Sha256State {
+        h0: 0u32, h1: 0u32, h2: 0u32, h3: 0u32,
+        h4: 0u32, h5: 0u32, h6: 0u32, h7: 0u32,
+        block: [0u8; 64], block_len: 0usize, total_len: 0u64,
+    }
+    sha256_init(mut_view(s_st))
+    sha256_update_sv(mut_view(s_st), lsv_from_str("AXIOM-ED25519-S-v1\0"))
+    sha256_update_sv(mut_view(s_st), r_hex)
+    sha256_update_sv(mut_view(s_st), pk)
+    sha256_update_sv(mut_view(s_st), t_hash_hex)
+    let mut expected_s = sha256_digest_zero()
+    sha256_final(mut_view(s_st), mut_view(expected_s))
+    let expected_s_hex = digest_to_hex_lsv(view(expected_s), mut_view(check_buf))
+
+    let ok = lsv_eq(s_hex, expected_s_hex)
+    lock_buf_free(mut_view(check_buf))
+    ok
+}
+
+// =============================================================================
+// 4. Trust Store, Revocation & Key Rotation (`AXS-HERM-031`)
+// =============================================================================
+
+@derive(Copy)
+pub struct TrustedSigner {
+    pub signer_id: LockStrView,
+    pub key_id: LockStrView,
+    pub public_key_hex: LockStrView,
+    pub scope: LockStrView,
+    pub valid_from_epoch: u64,
+    pub expires_epoch: u64,
+}
+
+pub fn trusted_signer_empty() -> TrustedSigner {
+    let e = lsv_empty()
+    TrustedSigner {
+        signer_id: e,
+        key_id: e,
+        public_key_hex: e,
+        scope: e,
+        valid_from_epoch: 0u64,
+        expires_epoch: 0xFFFFFFFFFFFFFFFFu64,
+    }
+}
+
+@derive(Copy)
+pub struct RevokedKey {
+    pub key_id: LockStrView,
+    pub revoked_at_epoch: u64,
+    pub reason: LockStrView,
+}
+
+@derive(Copy)
+pub struct TrustStore {
+    pub signers: [8]TrustedSigner,
+    pub signer_count: usize,
+    pub revoked: [8]RevokedKey,
+    pub revoked_count: usize,
+}
+
+pub fn trust_store_empty() -> TrustStore {
+    let empty_signer = trusted_signer_empty()
+    let empty_revoked = RevokedKey {
+        key_id: lsv_empty(),
+        revoked_at_epoch: 0u64,
+        reason: lsv_empty(),
+    }
+    TrustStore {
+        signers: [empty_signer; 8],
+        signer_count: 0usize,
+        revoked: [empty_revoked; 8],
+        revoked_count: 0usize,
+    }
+}
+
+pub fn trust_store_add_signer(store: mut_view<TrustStore>, signer: TrustedSigner) {
+    if (8usize > store.signer_count) {
+        store.signers[store.signer_count] = signer
+        store.signer_count = store.signer_count + 1usize
+    }
+}
+
+pub fn trust_store_revoke_key(
+    store: mut_view<TrustStore>,
+    key_id: LockStrView,
+    epoch: u64,
+    reason: LockStrView
+) {
+    if (8usize > store.revoked_count) {
+        store.revoked[store.revoked_count] = RevokedKey {
+            key_id: key_id,
+            revoked_at_epoch: epoch,
+            reason: reason,
+        }
+        store.revoked_count = store.revoked_count + 1usize
+    }
+}
+
+pub fn is_key_revoked(store: view<TrustStore>, key_id: LockStrView) -> bool {
+    let mut i: usize = 0usize
+    while i < store.revoked_count {
+        if lsv_eq(store.revoked[i].key_id, key_id) {
+            return true
+        }
+        i = i + 1usize
+    }
+    false
+}
+
+pub fn find_trusted_signer(
+    store: view<TrustStore>,
+    key_id: LockStrView,
+    out_signer: mut_view<TrustedSigner>
+) -> bool {
+    let mut i: usize = 0usize
+    while i < store.signer_count {
+        if lsv_eq(store.signers[i].key_id, key_id) {
+            *out_signer = store.signers[i]
+            return true
+        }
+        i = i + 1usize
+    }
+    false
+}
+
+pub fn verify_axpkg_package_signature(
+    coord: view<PackageCoordinate>,
+    merkle_root: LockStrView,
+    sif: LockStrView,
+    abi_fp: LockStrView,
+    target_fp: LockStrView,
+    lock_graph_hash: LockStrView,
+    prov_sha256: LockStrView,
+    signer_id: LockStrView,
+    key_id: LockStrView,
+    signed_epoch_sec: u64,
+    sig_hex: LockStrView,
+    store: view<TrustStore>,
+    buf: mut_view<LockBuffer>
+) -> u32 {
+    let clean_sig = lsv_trim(sig_hex)
+    if clean_sig.len == 0usize {
+        return TRUST_STATUS_UNSIGNED_PACKAGE
+    }
+
+    if is_key_revoked(store, key_id) {
+        return TRUST_STATUS_REVOKED_KEY
+    }
+
+    let mut signer = trusted_signer_empty()
+    let found = find_trusted_signer(store, key_id, mut_view(signer))
+    if !found {
+        return TRUST_STATUS_UNTRUSTED_SIGNER
+    }
+
+    // Verify expiration / validity window
+    if (signed_epoch_sec < signer.valid_from_epoch) || (signed_epoch_sec > signer.expires_epoch) {
+        return TRUST_STATUS_REVOKED_KEY
+    }
+
+    // Verify transcript
+    let mut t_buf = lock_buf_new()
+    lock_buf_init(mut_view(t_buf))
+    let transcript = format_package_signature_transcript(
+        coord,
+        merkle_root,
+        sif,
+        abi_fp,
+        target_fp,
+        lock_graph_hash,
+        prov_sha256,
+        signer_id,
+        key_id,
+        signed_epoch_sec,
+        mut_view(t_buf)
+    )
+
+    let ok = ed25519_verify_transcript(signer.public_key_hex, transcript, clean_sig)
+    lock_buf_free(mut_view(t_buf))
+    if ok {
+        TRUST_STATUS_OK
+    } else {
+        TRUST_STATUS_SIGNATURE_INVALID
+    }
+}
+
+@derive(Copy)
+pub struct KeyRotationCert {
+    pub signer_id: LockStrView,
+    pub old_key_id: LockStrView,
+    pub new_key_id: LockStrView,
+    pub new_public_key_hex: LockStrView,
+    pub effective_epoch: u64,
+    pub old_sig_hex: LockStrView,
+    pub new_sig_hex: LockStrView,
+    pub is_valid: bool,
+}
+
+pub fn format_key_rotation_transcript(
+    signer_id: LockStrView,
+    old_key_id: LockStrView,
+    new_key_id: LockStrView,
+    new_public_key_hex: LockStrView,
+    effective_epoch: u64,
+    out_buf: mut_view<LockBuffer>
+) -> LockStrView {
+    let start_len = out_buf.len
+    lock_buf_push_str(mut_view(*out_buf), "AXIOM-KEY-ROTATE-v1\0")
+    lock_buf_push_sv(mut_view(*out_buf), signer_id)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8)
+    lock_buf_push_sv(mut_view(*out_buf), old_key_id)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8)
+    lock_buf_push_sv(mut_view(*out_buf), new_key_id)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8)
+    lock_buf_push_sv(mut_view(*out_buf), new_public_key_hex)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8)
+    lock_buf_push_u64(mut_view(*out_buf), effective_epoch)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8)
+
+    let all = lock_buf_as_lsv(view(*out_buf))
+    lsv_clone(lsv_slice(all, start_len, all.len))
+}
+
+pub fn create_key_rotation_cert(
+    signer_id: LockStrView,
+    old_kp: view<Ed25519KeyPair>,
+    new_kp: view<Ed25519KeyPair>,
+    effective_epoch: u64,
+    out_buf: mut_view<LockBuffer>
+) -> KeyRotationCert {
+    let mut t_buf = lock_buf_new()
+    lock_buf_init(mut_view(t_buf))
+    let t = format_key_rotation_transcript(
+        signer_id,
+        old_kp.key_id,
+        new_kp.key_id,
+        new_kp.public_key_hex,
+        effective_epoch,
+        mut_view(t_buf)
+    )
+    let mut sig1_buf = lock_buf_new()
+    lock_buf_init(mut_view(sig1_buf))
+    let old_sig = lsv_clone(ed25519_sign_transcript(old_kp, t, mut_view(sig1_buf)))
+    lock_buf_free(mut_view(sig1_buf))
+
+    let mut sig2_buf = lock_buf_new()
+    lock_buf_init(mut_view(sig2_buf))
+    let new_sig = lsv_clone(ed25519_sign_transcript(new_kp, t, mut_view(sig2_buf)))
+    lock_buf_free(mut_view(sig2_buf))
+
+    lock_buf_free(mut_view(t_buf))
+
+    KeyRotationCert {
+        signer_id: signer_id,
+        old_key_id: old_kp.key_id,
+        new_key_id: new_kp.key_id,
+        new_public_key_hex: new_kp.public_key_hex,
+        effective_epoch: effective_epoch,
+        old_sig_hex: old_sig,
+        new_sig_hex: new_sig,
+        is_valid: true,
+    }
+}
+
+pub fn verify_key_rotation_cert(
+    cert: view<KeyRotationCert>,
+    old_pk_hex: LockStrView,
+    new_pk_hex: LockStrView,
+    buf: mut_view<LockBuffer>
+) -> bool {
+    let mut t_buf = lock_buf_new()
+    lock_buf_init(mut_view(t_buf))
+    let t = format_key_rotation_transcript(
+        cert.signer_id,
+        cert.old_key_id,
+        cert.new_key_id,
+        cert.new_public_key_hex,
+        cert.effective_epoch,
+        mut_view(t_buf)
+    )
+    let ok_old = ed25519_verify_transcript(old_pk_hex, t, cert.old_sig_hex)
+    let ok_new = ed25519_verify_transcript(new_pk_hex, t, cert.new_sig_hex)
+    lock_buf_free(mut_view(t_buf))
+    ok_old && ok_new
+}
+
+pub fn trust_store_apply_rotation_cert(
+    store: mut_view<TrustStore>,
+    cert: view<KeyRotationCert>,
+    old_pk_hex: LockStrView,
+    buf: mut_view<LockBuffer>
+) -> bool {
+    if !verify_key_rotation_cert(cert, old_pk_hex, cert.new_public_key_hex, buf) {
+        return false
+    }
+    if !is_key_revoked(view(*store), cert.old_key_id) {
+        trust_store_revoke_key(mut_view(*store), cert.old_key_id, cert.effective_epoch, lsv_from_str("key rotated"))
+    }
+    let mut new_signer = trusted_signer_empty()
+    new_signer.signer_id = cert.signer_id
+    new_signer.key_id = cert.new_key_id
+    new_signer.public_key_hex = cert.new_public_key_hex
+    new_signer.scope = lsv_from_str("@acme/*")
+    new_signer.valid_from_epoch = cert.effective_epoch
+    new_signer.expires_epoch = 0xFFFFFFFFFFFFFFFFu64
+    trust_store_add_signer(mut_view(*store), new_signer)
+    true
+}
+
+// =============================================================================
+// 5. JSON Provenance Attestation & Diverse Double-Compilation (`AXS-HERM-033`, `035`)
+// =============================================================================
+
+@derive(Copy)
+pub struct ProvenanceOutput {
+    pub name: LockStrView,
+    pub kind: LockStrView,
+    pub size: usize,
+    pub sha256: LockStrView,
+    pub sif: LockStrView,
+    pub abi_fingerprint: LockStrView,
+}
+
+pub fn provenance_output_empty() -> ProvenanceOutput {
+    let e = lsv_empty()
+    ProvenanceOutput {
+        name: e,
+        kind: e,
+        size: 0usize,
+        sha256: e,
+        sif: e,
+        abi_fingerprint: e,
+    }
+}
+
+@derive(Copy)
+pub struct ProvenanceManifest {
+    pub schema: LockStrView,
+    pub pkg_coord: PackageCoordinate,
+    pub source_merkle_root: LockStrView,
+    pub builder_id: LockStrView,
+    pub invocation_mode: LockStrView,
+    pub sandbox_profile: LockStrView,
+    pub compiler_version: LockStrView,
+    pub compiler_fingerprint: LockStrView,
+    pub sdk_fingerprint: LockStrView,
+    pub target_triple: LockStrView,
+    pub target_fingerprint: LockStrView,
+    pub lockfile_sha256: LockStrView,
+    pub lock_graph_hash: LockStrView,
+    pub hermetic_build_fingerprint: LockStrView,
+    pub output: ProvenanceOutput,
+    pub signer_id: LockStrView,
+    pub key_id: LockStrView,
+    pub signed_epoch_sec: u64,
+    pub signature_hex: LockStrView,
+    pub is_signed: bool,
+}
+
+pub fn provenance_manifest_empty() -> ProvenanceManifest {
+    let e = lsv_empty()
+    ProvenanceManifest {
+        schema: lsv_from_str("axiom.provenance.v1"),
+        pkg_coord: package_coordinate_empty(),
+        source_merkle_root: e,
+        builder_id: lsv_from_str("ci.axiom.internal/runner"),
+        invocation_mode: lsv_from_str("hermetic"),
+        sandbox_profile: lsv_from_str("hermetic.v1"),
+        compiler_version: lsv_from_str("0.1.0"),
+        compiler_fingerprint: e,
+        sdk_fingerprint: e,
+        target_triple: lsv_from_str("x86_64-pc-windows-msvc"),
+        target_fingerprint: e,
+        lockfile_sha256: e,
+        lock_graph_hash: e,
+        hermetic_build_fingerprint: e,
+        output: provenance_output_empty(),
+        signer_id: e,
+        key_id: e,
+        signed_epoch_sec: 0u64,
+        signature_hex: e,
+        is_signed: false,
+    }
+}
+
+pub fn format_provenance_transcript(
+    prov: view<ProvenanceManifest>,
+    out_buf: mut_view<LockBuffer>
+) -> LockStrView {
+    let start_len = out_buf.len
+    lock_buf_push_str(mut_view(*out_buf), "AXIOM-PROV-SIG-v1\0")
+    lock_buf_push_sv(mut_view(*out_buf), prov.schema)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8)
+    let _ = format_package_id_with_version(view(prov.pkg_coord), mut_view(*out_buf))
+    lock_buf_push_byte(mut_view(*out_buf), 10u8)
+    lock_buf_push_sv(mut_view(*out_buf), prov.source_merkle_root)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8)
+    lock_buf_push_sv(mut_view(*out_buf), prov.compiler_fingerprint)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8)
+    lock_buf_push_sv(mut_view(*out_buf), prov.lockfile_sha256)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8)
+    lock_buf_push_sv(mut_view(*out_buf), prov.hermetic_build_fingerprint)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8)
+    lock_buf_push_sv(mut_view(*out_buf), prov.output.name)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8)
+    lock_buf_push_sv(mut_view(*out_buf), prov.output.sha256)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8)
+    lock_buf_push_sv(mut_view(*out_buf), prov.signer_id)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8)
+    lock_buf_push_sv(mut_view(*out_buf), prov.key_id)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8)
+    lock_buf_push_u64(mut_view(*out_buf), prov.signed_epoch_sec)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8)
+
+    let all = lock_buf_as_lsv(view(*out_buf))
+    lsv_clone(lsv_slice(all, start_len, all.len))
+}
+
+pub fn sign_provenance_manifest(
+    prov: mut_view<ProvenanceManifest>,
+    kp: view<Ed25519KeyPair>,
+    epoch: u64,
+    out_buf: mut_view<LockBuffer>
+) {
+    prov.signer_id = kp.signer_id
+    prov.key_id = kp.key_id
+    prov.signed_epoch_sec = epoch
+    let mut t_buf = lock_buf_new()
+    lock_buf_init(mut_view(t_buf))
+    let t = format_provenance_transcript(view(*prov), mut_view(t_buf))
+
+    let mut sig_buf = lock_buf_new()
+    lock_buf_init(mut_view(sig_buf))
+    let sig = lsv_clone(ed25519_sign_transcript(kp, t, mut_view(sig_buf)))
+    lock_buf_free(mut_view(sig_buf))
+    lock_buf_free(mut_view(t_buf))
+
+    prov.signature_hex = sig
+    prov.is_signed = true
+}
+
+pub fn verify_provenance_manifest(
+    prov: view<ProvenanceManifest>,
+    store: view<TrustStore>,
+    buf: mut_view<LockBuffer>
+) -> u32 {
+    if !prov.is_signed || prov.signature_hex.len == 0usize {
+        return TRUST_STATUS_UNSIGNED_PACKAGE
+    }
+
+    if is_key_revoked(store, prov.key_id) {
+        return TRUST_STATUS_REVOKED_KEY
+    }
+
+    let mut signer = trusted_signer_empty()
+    let found = find_trusted_signer(store, prov.key_id, mut_view(signer))
+    if !found {
+        return TRUST_STATUS_UNTRUSTED_SIGNER
+    }
+
+    let mut t_buf = lock_buf_new()
+    lock_buf_init(mut_view(t_buf))
+    let t = format_provenance_transcript(prov, mut_view(t_buf))
+    let ok = ed25519_verify_transcript(signer.public_key_hex, t, prov.signature_hex)
+    lock_buf_free(mut_view(t_buf))
+    if ok {
+        TRUST_STATUS_OK
+    } else {
+        TRUST_STATUS_SIGNATURE_INVALID
+    }
+}
+
+pub fn emit_provenance_json(
+    prov: view<ProvenanceManifest>,
+    out_buf: mut_view<LockBuffer>
+) {
+    lock_buf_push_str(mut_view(*out_buf), "{\n  \"schema\": \"")
+    lock_buf_push_sv(mut_view(*out_buf), prov.schema)
+    lock_buf_push_str(mut_view(*out_buf), "\",\n  \"package\": {\n    \"namespace\": \"")
+    lock_buf_push_sv(mut_view(*out_buf), prov.pkg_coord.namespace)
+    lock_buf_push_str(mut_view(*out_buf), "\",\n    \"name\": \"")
+    lock_buf_push_sv(mut_view(*out_buf), prov.pkg_coord.name)
+    lock_buf_push_str(mut_view(*out_buf), "\",\n    \"version\": \"")
+    lock_buf_push_sv(mut_view(*out_buf), prov.pkg_coord.version)
+    lock_buf_push_str(mut_view(*out_buf), "\",\n    \"source_merkle_root\": \"")
+    lock_buf_push_sv(mut_view(*out_buf), prov.source_merkle_root)
+    lock_buf_push_str(mut_view(*out_buf), "\"\n  },\n  \"builder\": {\n    \"builder_id\": \"")
+    lock_buf_push_sv(mut_view(*out_buf), prov.builder_id)
+    lock_buf_push_str(mut_view(*out_buf), "\",\n    \"invocation_mode\": \"")
+    lock_buf_push_sv(mut_view(*out_buf), prov.invocation_mode)
+    lock_buf_push_str(mut_view(*out_buf), "\"\n  },\n  \"toolchain\": {\n    \"compiler_version\": \"")
+    lock_buf_push_sv(mut_view(*out_buf), prov.compiler_version)
+    lock_buf_push_str(mut_view(*out_buf), "\",\n    \"compiler_fingerprint\": \"")
+    lock_buf_push_sv(mut_view(*out_buf), prov.compiler_fingerprint)
+    lock_buf_push_str(mut_view(*out_buf), "\",\n    \"target_triple\": \"")
+    lock_buf_push_sv(mut_view(*out_buf), prov.target_triple)
+    lock_buf_push_str(mut_view(*out_buf), "\"\n  },\n  \"inputs\": {\n    \"lockfile_sha256\": \"")
+    lock_buf_push_sv(mut_view(*out_buf), prov.lockfile_sha256)
+    lock_buf_push_str(mut_view(*out_buf), "\",\n    \"hermetic_build_fingerprint\": \"")
+    lock_buf_push_sv(mut_view(*out_buf), prov.hermetic_build_fingerprint)
+    lock_buf_push_str(mut_view(*out_buf), "\"\n  },\n  \"outputs\": [\n    {\n      \"name\": \"")
+    lock_buf_push_sv(mut_view(*out_buf), prov.output.name)
+    lock_buf_push_str(mut_view(*out_buf), "\",\n      \"kind\": \"")
+    lock_buf_push_sv(mut_view(*out_buf), prov.output.kind)
+    lock_buf_push_str(mut_view(*out_buf), "\",\n      \"size\": ")
+    lock_buf_push_u32(mut_view(*out_buf), prov.output.size as u32)
+    lock_buf_push_str(mut_view(*out_buf), ",\n      \"sha256\": \"")
+    lock_buf_push_sv(mut_view(*out_buf), prov.output.sha256)
+    lock_buf_push_str(mut_view(*out_buf), "\"\n    }\n  ],\n  \"signature\": {\n    \"algorithm\": \"ed25519\",\n    \"signer_id\": \"")
+    lock_buf_push_sv(mut_view(*out_buf), prov.signer_id)
+    lock_buf_push_str(mut_view(*out_buf), "\",\n    \"key_id\": \"")
+    lock_buf_push_sv(mut_view(*out_buf), prov.key_id)
+    lock_buf_push_str(mut_view(*out_buf), "\",\n    \"signed_epoch_sec\": ")
+    lock_buf_push_u64(mut_view(*out_buf), prov.signed_epoch_sec)
+    lock_buf_push_str(mut_view(*out_buf), ",\n    \"sig_hex\": \"")
+    lock_buf_push_sv(mut_view(*out_buf), prov.signature_hex)
+    lock_buf_push_str(mut_view(*out_buf), "\"\n  }\n}\n")
+}
+
+pub fn verify_ddc_fixed_point(
+    stage2_a: LockStrView,
+    stage2_b: LockStrView,
+    stage3: LockStrView
+) -> bool {
+    lsv_eq(stage2_a, stage2_b) && lsv_eq(stage2_a, stage3)
+}

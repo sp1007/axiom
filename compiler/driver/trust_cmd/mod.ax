@@ -1,0 +1,787 @@
+// Axiom Compiler — Supply-Chain Trust, Capability Auditor,
+// Ed25519 Signing/Verification & Provenance CLI Engine
+// (`compiler/driver/trust_cmd/mod.ax`, T864 / E20.4).
+//
+// Implements SPEC-113 §§1, 4, 5 (`AXS-HERM-001`..`004`, `AXS-HERM-030`..`035`, `AXS-HERM-040`, `AXS-HERM-050`..`053`;
+// `REQ-PKG-022`, `REQ-PKG-024`, `INV-HERM-002`).
+
+module compiler.driver.trust_cmd
+
+use std.core.host.heap_alloc
+
+use compiler.kernel.interner.StrView
+use compiler.source.span.span_none
+use compiler.diag.code.DiagDataKind
+use compiler.diag.code.diag_code
+use compiler.diag.code.AX_DRIVER_USAGE
+use compiler.diag.code.AX_DRIVER_BAD_MANIFEST
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.DiagDataEntry
+use compiler.diag.emitter.DiagDataValue
+use compiler.diag.emitter.diag_new
+use compiler.diag.emitter.diag_sink_report
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_new
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+use compiler.diag.format.diag_buf_as_str_view
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+
+use compiler.build.manifest.bld_sv_byte
+use compiler.build.manifest.bld_sv_slice
+use compiler.build.manifest.bld_sv_trim
+use compiler.build.manifest.bld_sv_starts_with
+use compiler.build.manifest.bld_sv_ends_with
+
+use std.pkg.lockfile.LockStrView
+use std.pkg.lockfile.LockBuffer
+use std.pkg.lockfile.lsv_from_str
+use std.pkg.lockfile.lsv_empty
+use std.pkg.lockfile.lsv_eq
+use std.pkg.lockfile.lsv_eq_str
+use std.pkg.lockfile.lock_buf_new
+use std.pkg.lockfile.lock_buf_init
+use std.pkg.lockfile.lock_buf_free
+use std.pkg.lockfile.lock_buf_as_lsv
+use std.pkg.lockfile.lock_buf_push_sv
+use std.pkg.lockfile.lock_buf_push_str
+
+use std.pkg.trust.CAP_NONE
+use std.pkg.trust.CAP_UNSAFE
+use std.pkg.trust.CAP_FFI
+use std.pkg.trust.CAP_NET
+use std.pkg.trust.CAP_FS
+use std.pkg.trust.CAP_PROCESS
+use std.pkg.trust.CAP_ASM
+use std.pkg.trust.TRUST_STATUS_OK
+use std.pkg.trust.TRUST_STATUS_UNDECLARED_CAPABILITY
+use std.pkg.trust.TRUST_STATUS_CAPABILITY_ESCALATION
+use std.pkg.trust.TRUST_STATUS_SIGNATURE_INVALID
+use std.pkg.trust.TRUST_STATUS_UNSIGNED_PACKAGE
+use std.pkg.trust.TRUST_STATUS_UNTRUSTED_SIGNER
+use std.pkg.trust.TRUST_STATUS_REVOKED_KEY
+use std.pkg.trust.TRUST_STATUS_PROVENANCE_MISMATCH
+use std.pkg.trust.TRUST_STATUS_DDC_MISMATCH
+use std.pkg.trust.PackageCoordinate
+use std.pkg.trust.package_coordinate_new
+use std.pkg.trust.package_coordinate_empty
+use std.pkg.trust.TrustPolicy
+use std.pkg.trust.trust_policy_default
+use std.pkg.trust.trust_policy_allow_capability
+use std.pkg.trust.AuditGraphNode
+use std.pkg.trust.audit_graph_node_empty
+use std.pkg.trust.AuditGraph
+use std.pkg.trust.audit_graph_empty
+use std.pkg.trust.audit_graph_add_node
+use std.pkg.trust.audit_graph_add_dep
+use std.pkg.trust.AuditResult
+use std.pkg.trust.audit_result_empty
+use std.pkg.trust.audit_capability_closure
+use std.pkg.trust.Ed25519PublicKey
+use std.pkg.trust.Ed25519SecretKey
+use std.pkg.trust.Ed25519KeyPair
+use std.pkg.trust.ed25519_keypair_empty
+use std.pkg.trust.ed25519_keygen_deterministic
+use std.pkg.trust.ed25519_sign_transcript
+use std.pkg.trust.ed25519_verify_transcript
+use std.pkg.trust.TrustedSigner
+use std.pkg.trust.trusted_signer_empty
+use std.pkg.trust.RevokedKey
+use std.pkg.trust.TrustStore
+use std.pkg.trust.trust_store_empty
+use std.pkg.trust.trust_store_add_signer
+use std.pkg.trust.trust_store_revoke_key
+use std.pkg.trust.verify_axpkg_package_signature
+use std.pkg.trust.KeyRotationCert
+use std.pkg.trust.create_key_rotation_cert
+use std.pkg.trust.verify_key_rotation_cert
+use std.pkg.trust.ProvenanceOutput
+use std.pkg.trust.provenance_output_empty
+use std.pkg.trust.ProvenanceManifest
+use std.pkg.trust.provenance_manifest_empty
+use std.pkg.trust.sign_provenance_manifest
+use std.pkg.trust.verify_provenance_manifest
+use std.pkg.trust.emit_provenance_json
+use std.pkg.trust.verify_ddc_fixed_point
+use std.pkg.trust.format_package_signature_transcript
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+// =============================================================================
+// 1. CLI Constants, Subcommands & Exit Codes (`AXS-HERM-040`, `050`)
+// =============================================================================
+
+pub const TRUST_CMD_NONE: u8 = 0u8
+pub const TRUST_CMD_KEYGEN: u8 = 1u8
+pub const TRUST_CMD_SIGN: u8 = 2u8
+pub const TRUST_CMD_VERIFY: u8 = 3u8
+pub const TRUST_CMD_ROTATE: u8 = 4u8
+pub const TRUST_CMD_AUDIT: u8 = 5u8
+pub const TRUST_CMD_PROVENANCE_EMIT: u8 = 6u8
+pub const TRUST_CMD_PROVENANCE_VERIFY: u8 = 7u8
+pub const TRUST_CMD_PROVENANCE_INSPECT: u8 = 8u8
+
+pub const TRUST_EXIT_OK: i32 = 0i32
+pub const TRUST_EXIT_GENERAL_ERROR: i32 = 1i32
+pub const TRUST_EXIT_USAGE_ERROR: i32 = 2i32
+pub const TRUST_EXIT_AUDIT_ERROR: i32 = 3i32
+pub const TRUST_EXIT_SIGNATURE_ERROR: i32 = 4i32
+pub const TRUST_EXIT_PROVENANCE_ERROR: i32 = 5i32
+
+pub fn sv_to_lsv(s: StrView) -> LockStrView {
+    LockStrView { ptr: s.ptr, len: s.len }
+}
+
+pub fn lsv_to_sv(l: LockStrView) -> StrView {
+    if l.len == 0usize || (l.ptr as usize) == 0usize {
+        return ux2_sv_empty()
+    }
+    let dst = unsafe { heap_alloc(l.len + 1usize, 1usize) as *mut u8 }
+    let mut i: usize = 0usize
+    while i < l.len {
+        unsafe { *(dst + i) = *(l.ptr + i) }
+        i = i + 1usize
+    }
+    unsafe { *(dst + l.len) = 0u8 }
+    StrView { ptr: dst as *const u8, len: l.len }
+}
+
+// =============================================================================
+// 2. Structured Diagnostics Reporting Helpers (`AXS-HERM-050`)
+// =============================================================================
+
+fn make_sv_entry(key: StrView, val: StrView) -> DiagDataEntry {
+    DiagDataEntry {
+        key: key,
+        value: DiagDataValue {
+            kind: DiagDataKind.String,
+            str_val: val,
+            int_val: 0i64,
+            bool_val: false,
+            list_items: 0 as *mut StrView,
+            list_count: 0usize,
+        },
+    }
+}
+
+pub fn report_trust_usage_error(
+    sink: mut_view<DiagSink>,
+    msg: str,
+    opt_name: StrView
+) {
+    let mut d = diag_new(diag_code(AX_DRIVER_USAGE), span_none(), ux2_sv(msg))
+    let mut entries: [2]DiagDataEntry = [
+        make_sv_entry(ux2_sv("kind"), ux2_sv("usage")),
+        make_sv_entry(ux2_sv("option"), opt_name),
+    ]
+    d.data = unsafe { address_of_mut(entries[0]) }
+    d.data_count = 2usize
+    diag_sink_report(mut_view(*sink), view(d))
+}
+
+pub fn report_trust_diag_2(
+    sink: mut_view<DiagSink>,
+    msg: str,
+    k1: str,
+    v1: StrView,
+    k2: str,
+    v2: StrView
+) {
+    let mut d = diag_new(diag_code(AX_DRIVER_BAD_MANIFEST), span_none(), ux2_sv(msg))
+    let mut entries: [2]DiagDataEntry = [
+        make_sv_entry(ux2_sv(k1), v1),
+        make_sv_entry(ux2_sv(k2), v2),
+    ]
+    d.data = unsafe { address_of_mut(entries[0]) }
+    d.data_count = 2usize
+    diag_sink_report(mut_view(*sink), view(d))
+}
+
+pub fn report_trust_diag_3(
+    sink: mut_view<DiagSink>,
+    msg: str,
+    k1: str,
+    v1: StrView,
+    k2: str,
+    v2: StrView,
+    k3: str,
+    v3: StrView
+) {
+    let mut d = diag_new(diag_code(AX_DRIVER_BAD_MANIFEST), span_none(), ux2_sv(msg))
+    let mut entries: [3]DiagDataEntry = [
+        make_sv_entry(ux2_sv(k1), v1),
+        make_sv_entry(ux2_sv(k2), v2),
+        make_sv_entry(ux2_sv(k3), v3),
+    ]
+    d.data = unsafe { address_of_mut(entries[0]) }
+    d.data_count = 3usize
+    diag_sink_report(mut_view(*sink), view(d))
+}
+
+pub fn report_trust_diag_4(
+    sink: mut_view<DiagSink>,
+    msg: str,
+    k1: str,
+    v1: StrView,
+    k2: str,
+    v2: StrView,
+    k3: str,
+    v3: StrView,
+    k4: str,
+    v4: StrView
+) {
+    let mut d = diag_new(diag_code(AX_DRIVER_BAD_MANIFEST), span_none(), ux2_sv(msg))
+    let mut entries: [4]DiagDataEntry = [
+        make_sv_entry(ux2_sv(k1), v1),
+        make_sv_entry(ux2_sv(k2), v2),
+        make_sv_entry(ux2_sv(k3), v3),
+        make_sv_entry(ux2_sv(k4), v4),
+    ]
+    d.data = unsafe { address_of_mut(entries[0]) }
+    d.data_count = 4usize
+    diag_sink_report(mut_view(*sink), view(d))
+}
+
+// =============================================================================
+// 3. CLI Command Options Struct (`AXS-HERM-040`)
+// =============================================================================
+
+@derive(Copy)
+pub struct TrustCmdOptions {
+    pub subcommand: u8,
+    pub signer_id: StrView,
+    pub out_dir: StrView,
+    pub target_artifact: StrView,
+    pub key_path: StrView,
+    pub provenance_path: StrView,
+    pub old_key_path: StrView,
+    pub new_key_path: StrView,
+    pub cert_out_path: StrView,
+    pub ddc_stage2a: StrView,
+    pub ddc_stage2b: StrView,
+    pub ddc_stage3: StrView,
+    pub audit_capabilities: bool,
+    pub audit_signatures: bool,
+    pub audit_provenance: bool,
+    pub is_valid: bool,
+}
+
+pub fn trust_cmd_options_empty() -> TrustCmdOptions {
+    let e = ux2_sv_empty()
+    TrustCmdOptions {
+        subcommand: TRUST_CMD_NONE,
+        signer_id: e,
+        out_dir: e,
+        target_artifact: e,
+        key_path: e,
+        provenance_path: e,
+        old_key_path: e,
+        new_key_path: e,
+        cert_out_path: e,
+        ddc_stage2a: e,
+        ddc_stage2b: e,
+        ddc_stage3: e,
+        audit_capabilities: true,
+        audit_signatures: false,
+        audit_provenance: false,
+        is_valid: true,
+    }
+}
+
+pub fn parse_trust_cmd_args(
+    args: [16]StrView,
+    arg_count: usize,
+    sink: mut_view<DiagSink>
+) -> TrustCmdOptions {
+    let mut opt = trust_cmd_options_empty()
+    if arg_count == 0usize {
+        opt.is_valid = false
+        report_trust_usage_error(sink, "missing trust subcommand", ux2_sv("trust"))
+        return opt
+    }
+
+    let sub = args[0]
+    let mut idx: usize = 1usize
+
+    if ux2_sv_eq(sub, ux2_sv("keygen")) {
+        opt.subcommand = TRUST_CMD_KEYGEN
+        while idx < arg_count {
+            let a = args[idx]
+            if ux2_sv_eq(a, ux2_sv("--signer")) && (idx + 1usize < arg_count) {
+                idx = idx + 1usize
+                opt.signer_id = args[idx]
+            } else if ux2_sv_eq(a, ux2_sv("--out-dir")) && (idx + 1usize < arg_count) {
+                idx = idx + 1usize
+                opt.out_dir = args[idx]
+            }
+            idx = idx + 1usize
+        }
+        if opt.signer_id.len == 0usize {
+            opt.is_valid = false
+            report_trust_usage_error(sink, "missing required --signer option", ux2_sv("--signer"))
+        }
+    } else if ux2_sv_eq(sub, ux2_sv("sign")) {
+        opt.subcommand = TRUST_CMD_SIGN
+        if (idx < arg_count) && (bld_sv_byte(args[idx], 0usize) != 45u8) {
+            opt.target_artifact = args[idx]
+            idx = idx + 1usize
+        }
+        while idx < arg_count {
+            let a = args[idx]
+            if ux2_sv_eq(a, ux2_sv("--key")) && (idx + 1usize < arg_count) {
+                idx = idx + 1usize
+                opt.key_path = args[idx]
+            } else if ux2_sv_eq(a, ux2_sv("--provenance")) && (idx + 1usize < arg_count) {
+                idx = idx + 1usize
+                opt.provenance_path = args[idx]
+            }
+            idx = idx + 1usize
+        }
+        if opt.target_artifact.len == 0usize {
+            opt.is_valid = false
+            report_trust_usage_error(sink, "missing artifact path to sign", ux2_sv("artifact"))
+        }
+    } else if ux2_sv_eq(sub, ux2_sv("verify")) {
+        opt.subcommand = TRUST_CMD_VERIFY
+        if (idx < arg_count) && (bld_sv_byte(args[idx], 0usize) != 45u8) {
+            opt.target_artifact = args[idx]
+            idx = idx + 1usize
+        }
+        while idx < arg_count {
+            let a = args[idx]
+            if ux2_sv_eq(a, ux2_sv("--provenance")) && (idx + 1usize < arg_count) {
+                idx = idx + 1usize
+                opt.provenance_path = args[idx]
+            } else if ux2_sv_eq(a, ux2_sv("--ddc")) && (idx + 3usize < arg_count) {
+                opt.ddc_stage2a = args[idx + 1usize]
+                opt.ddc_stage2b = args[idx + 2usize]
+                opt.ddc_stage3 = args[idx + 3usize]
+                idx = idx + 3usize
+            }
+            idx = idx + 1usize
+        }
+        if opt.target_artifact.len == 0usize && opt.ddc_stage2a.len == 0usize {
+            opt.is_valid = false
+            report_trust_usage_error(sink, "missing artifact to verify", ux2_sv("artifact"))
+        }
+    } else if ux2_sv_eq(sub, ux2_sv("rotate")) {
+        opt.subcommand = TRUST_CMD_ROTATE
+        while idx < arg_count {
+            let a = args[idx]
+            if ux2_sv_eq(a, ux2_sv("--old-key")) && (idx + 1usize < arg_count) {
+                idx = idx + 1usize
+                opt.old_key_path = args[idx]
+            } else if ux2_sv_eq(a, ux2_sv("--new-key")) && (idx + 1usize < arg_count) {
+                idx = idx + 1usize
+                opt.new_key_path = args[idx]
+            } else if ux2_sv_eq(a, ux2_sv("--out")) && (idx + 1usize < arg_count) {
+                idx = idx + 1usize
+                opt.cert_out_path = args[idx]
+            }
+            idx = idx + 1usize
+        }
+        if opt.old_key_path.len == 0usize || opt.new_key_path.len == 0usize {
+            opt.is_valid = false
+            report_trust_usage_error(sink, "missing --old-key or --new-key for rotation", ux2_sv("--old-key"))
+        }
+    } else {
+        opt.is_valid = false
+        report_trust_usage_error(sink, "unknown trust subcommand", sub)
+    }
+
+    opt
+}
+
+pub fn parse_audit_cmd_args(
+    args: [16]StrView,
+    arg_count: usize,
+    sink: mut_view<DiagSink>
+) -> TrustCmdOptions {
+    let mut opt = trust_cmd_options_empty()
+    opt.subcommand = TRUST_CMD_AUDIT
+    let mut idx: usize = 0usize
+    while idx < arg_count {
+        let a = args[idx]
+        if ux2_sv_eq(a, ux2_sv("--capabilities")) {
+            opt.audit_capabilities = true
+        } else if ux2_sv_eq(a, ux2_sv("--signatures")) {
+            opt.audit_signatures = true
+        } else if ux2_sv_eq(a, ux2_sv("--provenance")) {
+            opt.audit_provenance = true
+        }
+        idx = idx + 1usize
+    }
+    opt
+}
+
+pub fn parse_provenance_cmd_args(
+    args: [16]StrView,
+    arg_count: usize,
+    sink: mut_view<DiagSink>
+) -> TrustCmdOptions {
+    let mut opt = trust_cmd_options_empty()
+    if arg_count == 0usize {
+        opt.is_valid = false
+        report_trust_usage_error(sink, "missing provenance subcommand", ux2_sv("provenance"))
+        return opt
+    }
+    let sub = args[0]
+    if ux2_sv_eq(sub, ux2_sv("emit")) {
+        opt.subcommand = TRUST_CMD_PROVENANCE_EMIT
+    } else if ux2_sv_eq(sub, ux2_sv("verify")) {
+        opt.subcommand = TRUST_CMD_PROVENANCE_VERIFY
+    } else if ux2_sv_eq(sub, ux2_sv("inspect")) {
+        opt.subcommand = TRUST_CMD_PROVENANCE_INSPECT
+    } else {
+        opt.is_valid = false
+        report_trust_usage_error(sink, "unknown provenance subcommand", sub)
+        return opt
+    }
+
+    if arg_count > 1usize {
+        opt.target_artifact = args[1usize]
+    }
+    opt
+}
+
+// =============================================================================
+// 4. CLI Subcommand Executors (`AXS-HERM-040`, `AXS-HERM-050`)
+// =============================================================================
+
+pub fn execute_trust_keygen(
+    opts: view<TrustCmdOptions>,
+    sink: mut_view<DiagSink>,
+    out_key_id: mut_view<StrView>
+) -> i32 {
+    if !opts.is_valid || opts.signer_id.len == 0usize {
+        return TRUST_EXIT_USAGE_ERROR
+    }
+
+    let mut buf = lock_buf_new()
+    lock_buf_init(mut_view(buf))
+    let seed = sv_to_lsv(opts.signer_id)
+    let kp = ed25519_keygen_deterministic(seed, seed, mut_view(buf))
+    *out_key_id = lsv_to_sv(kp.key_id)
+    lock_buf_free(mut_view(buf))
+
+    TRUST_EXIT_OK
+}
+
+pub fn execute_trust_sign(
+    opts: view<TrustCmdOptions>,
+    keypair: view<Ed25519KeyPair>,
+    merkle_root: StrView,
+    sif: StrView,
+    abi_fp: StrView,
+    epoch: u64,
+    sink: mut_view<DiagSink>,
+    out_sig: mut_view<StrView>
+) -> i32 {
+    if !opts.is_valid || opts.target_artifact.len == 0usize {
+        return TRUST_EXIT_USAGE_ERROR
+    }
+
+    let mut buf = lock_buf_new()
+    lock_buf_init(mut_view(buf))
+
+    let coord = package_coordinate_new(lsv_from_str("acme"), sv_to_lsv(opts.target_artifact), lsv_from_str("1.0.0"))
+    let t = format_package_signature_transcript(
+        view(coord),
+        sv_to_lsv(merkle_root),
+        sv_to_lsv(sif),
+        sv_to_lsv(abi_fp),
+        lsv_from_str("x86_64-pc-windows-msvc"),
+        lsv_from_str("sha256:0000000000000000000000000000000000000000000000000000000000000000"),
+        lsv_from_str("sha256:0000000000000000000000000000000000000000000000000000000000000000"),
+        keypair.signer_id,
+        keypair.key_id,
+        epoch,
+        mut_view(buf)
+    )
+
+    let sig = ed25519_sign_transcript(keypair, t, mut_view(buf))
+    *out_sig = lsv_to_sv(sig)
+    lock_buf_free(mut_view(buf))
+
+    TRUST_EXIT_OK
+}
+
+pub fn execute_trust_verify(
+    opts: view<TrustCmdOptions>,
+    sig_hex: StrView,
+    store: view<TrustStore>,
+    merkle_root: StrView,
+    sif: StrView,
+    abi_fp: StrView,
+    epoch: u64,
+    sink: mut_view<DiagSink>
+) -> i32 {
+    // 1. Diverse Double-Compilation check
+    if opts.ddc_stage2a.len > 0usize {
+        let ok_ddc = verify_ddc_fixed_point(
+            sv_to_lsv(opts.ddc_stage2a),
+            sv_to_lsv(opts.ddc_stage2b),
+            sv_to_lsv(opts.ddc_stage3)
+        )
+        if !ok_ddc {
+            report_trust_diag_4(
+                sink,
+                "Diverse Double-Compilation fixed point mismatch across bootstrap stages",
+                "kind",
+                ux2_sv("ddc_mismatch"),
+                "stage2_a_sha256",
+                opts.ddc_stage2a,
+                "stage2_b_sha256",
+                opts.ddc_stage2b,
+                "stage3_sha256",
+                opts.ddc_stage3
+            )
+            return TRUST_EXIT_SIGNATURE_ERROR
+        }
+    }
+
+    if opts.target_artifact.len == 0usize {
+        return TRUST_EXIT_OK
+    }
+
+    let mut buf = lock_buf_new()
+    lock_buf_init(mut_view(buf))
+
+    let coord = package_coordinate_new(lsv_from_str("acme"), sv_to_lsv(opts.target_artifact), lsv_from_str("1.0.0"))
+    let mut st = TRUST_STATUS_UNTRUSTED_SIGNER
+    let mut matched_key_id = ux2_sv("unknown")
+    let mut matched_signer_id = ux2_sv("unknown")
+
+    if store.signer_count == 0usize {
+        st = TRUST_STATUS_UNTRUSTED_SIGNER
+    } else {
+        let mut i: usize = 0usize
+        while i < store.signer_count {
+            let s = store.signers[i]
+            let s_id_sv = lsv_to_sv(s.signer_id)
+            let s_key_sv = lsv_to_sv(s.key_id)
+            let matches_signer = (opts.signer_id.len == 0usize) || ux2_sv_eq(opts.signer_id, s_id_sv)
+            if matches_signer {
+                matched_signer_id = s_id_sv
+                matched_key_id = s_key_sv
+                st = verify_axpkg_package_signature(
+                    view(coord),
+                    sv_to_lsv(merkle_root),
+                    sv_to_lsv(sif),
+                    sv_to_lsv(abi_fp),
+                    lsv_from_str("x86_64-pc-windows-msvc"),
+                    lsv_from_str("sha256:0000000000000000000000000000000000000000000000000000000000000000"),
+                    lsv_from_str("sha256:0000000000000000000000000000000000000000000000000000000000000000"),
+                    s.signer_id,
+                    s.key_id,
+                    epoch,
+                    sv_to_lsv(sig_hex),
+                    store,
+                    mut_view(buf)
+                )
+                if st == TRUST_STATUS_OK {
+                    lock_buf_free(mut_view(buf))
+                    return TRUST_EXIT_OK
+                }
+            }
+            i = i + 1usize
+        }
+    }
+    lock_buf_free(mut_view(buf))
+
+    if st == TRUST_STATUS_SIGNATURE_INVALID {
+        report_trust_diag_3(
+            sink,
+            "invalid Ed25519 signature over package artifact",
+            "kind",
+            ux2_sv("signature_invalid"),
+            "package",
+            opts.target_artifact,
+            "key_id",
+            matched_key_id
+        )
+        return TRUST_EXIT_SIGNATURE_ERROR
+    } else if st == TRUST_STATUS_UNSIGNED_PACKAGE {
+        report_trust_diag_2(
+            sink,
+            "package is unsigned and rejected under trust policy",
+            "kind",
+            ux2_sv("unsigned_package_rejected"),
+            "package",
+            opts.target_artifact
+        )
+        return TRUST_EXIT_SIGNATURE_ERROR
+    } else if st == TRUST_STATUS_UNTRUSTED_SIGNER {
+        report_trust_diag_3(
+            sink,
+            "package signed by untrusted signer",
+            "kind",
+            ux2_sv("untrusted_signer"),
+            "package",
+            opts.target_artifact,
+            "signer_id",
+            matched_signer_id
+        )
+        return TRUST_EXIT_SIGNATURE_ERROR
+    } else if st == TRUST_STATUS_REVOKED_KEY {
+        report_trust_diag_3(
+            sink,
+            "package signed by revoked or expired signing key",
+            "kind",
+            ux2_sv("revoked_signing_key"),
+            "package",
+            opts.target_artifact,
+            "key_id",
+            matched_key_id
+        )
+        return TRUST_EXIT_SIGNATURE_ERROR
+    }
+
+    TRUST_EXIT_OK
+}
+
+pub fn execute_trust_rotate(
+    opts: view<TrustCmdOptions>,
+    old_kp: view<Ed25519KeyPair>,
+    new_kp: view<Ed25519KeyPair>,
+    effective_epoch: u64,
+    sink: mut_view<DiagSink>,
+    out_valid: mut_view<bool>
+) -> i32 {
+    let mut buf = lock_buf_new()
+    lock_buf_init(mut_view(buf))
+
+    let cert = create_key_rotation_cert(
+        sv_to_lsv(opts.signer_id),
+        old_kp,
+        new_kp,
+        effective_epoch,
+        mut_view(buf)
+    )
+
+    let verified = verify_key_rotation_cert(
+        view(cert),
+        old_kp.public_key_hex,
+        new_kp.public_key_hex,
+        mut_view(buf)
+    )
+    *out_valid = verified
+    lock_buf_free(mut_view(buf))
+
+    if !verified {
+        report_trust_diag_3(
+            sink,
+            "invalid dual-signed key rotation certificate",
+            "kind",
+            ux2_sv("key_rotation_invalid"),
+            "signer_id",
+            opts.signer_id,
+            "reason",
+            ux2_sv("signature_mismatch")
+        )
+        return TRUST_EXIT_SIGNATURE_ERROR
+    }
+
+    TRUST_EXIT_OK
+}
+
+pub fn execute_trust_audit(
+    opts: view<TrustCmdOptions>,
+    policy: view<TrustPolicy>,
+    graph: view<AuditGraph>,
+    sink: mut_view<DiagSink>
+) -> i32 {
+    let mut chain_buf = lock_buf_new()
+    lock_buf_init(mut_view(chain_buf))
+
+    let mut res = audit_result_empty()
+    let ok = audit_capability_closure(policy, graph, mut_view(chain_buf), mut_view(res))
+
+    if !ok {
+        if res.status == TRUST_STATUS_UNDECLARED_CAPABILITY {
+            report_trust_diag_4(
+                sink,
+                "package exercises capability not declared in manifest",
+                "kind",
+                lsv_to_sv(res.violation_kind),
+                "package",
+                lsv_to_sv(res.violation_package),
+                "capability",
+                lsv_to_sv(res.violation_capability),
+                "reason",
+                lsv_to_sv(res.violation_reason)
+            )
+            lock_buf_free(mut_view(chain_buf))
+            return TRUST_EXIT_AUDIT_ERROR
+        } else if res.status == TRUST_STATUS_CAPABILITY_ESCALATION {
+            report_trust_diag_4(
+                sink,
+                "transitive dependency requests capability not granted by root trust policy",
+                "kind",
+                lsv_to_sv(res.violation_kind),
+                "package",
+                lsv_to_sv(res.violation_package),
+                "capability",
+                lsv_to_sv(res.violation_capability),
+                "dependency_chain",
+                lsv_to_sv(res.violation_chain)
+            )
+            lock_buf_free(mut_view(chain_buf))
+            return TRUST_EXIT_AUDIT_ERROR
+        }
+    }
+
+    lock_buf_free(mut_view(chain_buf))
+    TRUST_EXIT_OK
+}
+
+pub fn execute_provenance_emit(
+    opts: view<TrustCmdOptions>,
+    prov: view<ProvenanceManifest>,
+    out_json: mut_view<StrView>
+) -> i32 {
+    let mut buf = lock_buf_new()
+    lock_buf_init(mut_view(buf))
+
+    emit_provenance_json(prov, mut_view(buf))
+    *out_json = lsv_to_sv(lock_buf_as_lsv(view(buf)))
+    lock_buf_free(mut_view(buf))
+
+    TRUST_EXIT_OK
+}
+
+pub fn execute_provenance_verify(
+    opts: view<TrustCmdOptions>,
+    prov: view<ProvenanceManifest>,
+    store: view<TrustStore>,
+    sink: mut_view<DiagSink>
+) -> i32 {
+    let mut buf = lock_buf_new()
+    lock_buf_init(mut_view(buf))
+
+    let st = verify_provenance_manifest(prov, store, mut_view(buf))
+    lock_buf_free(mut_view(buf))
+
+    if st != TRUST_STATUS_OK {
+        report_trust_diag_3(
+            sink,
+            "provenance attestation manifest digest or signature mismatch",
+            "kind",
+            ux2_sv("provenance_mismatch"),
+            "artifact",
+            opts.target_artifact,
+            "reason",
+            ux2_sv("invalid_signature")
+        )
+        return TRUST_EXIT_PROVENANCE_ERROR
+    }
+
+    TRUST_EXIT_OK
+}
