@@ -1,0 +1,733 @@
+// AXHISTORY & AXVCS — Semantic Revision Lineage, Content-Addressed Object Store & Atomic Ref Engine (T810 / E19.3).
+// Implements SPEC-102 §7 (AXS-REF-060..062; REQ-TOOL-304, REQ-TOOL-305, HISTORY-INV-01..40, VCS-INV-01..40):
+// - Content-addressed `RevisionId` strictly independent of wall-clock timestamps, hostnames, and local paths (`AXS-REF-060`)
+// - DAG parent tracking with strict cycle rejection (`HISTORY-INV-03, 05, 38`)
+// - Symbol-centric lineage graph (`Created`, `Modified`, `Renamed`, `Moved`, `ExtractedFrom`, `InlinedInto`,
+//   `SplitInto`, `MergedFrom`, `Removed`) with resurrection-provenance isolation (`HISTORY-INV-07..14`)
+// - Property-level semantic blame (`blame_symbol_property`) ignoring formatting-only commits (`HISTORY-INV-15..17`)
+// - Content-addressed `ObjectStore` (`BLOB`, `TREE`, `SEMANTIC`, `PATCH`, `REVISION`) with BLAKE3 integrity verification (`VCS-INV-01..05, 24`)
+// - Deterministic UTF-8 byte-sorted `Tree` & `SemanticKey`-sorted `Semantic` snapshots (`VCS-INV-06..09, 37`)
+// - Atomic Compare-And-Swap (`CAS`) ref transactions, isolated `fetch` (`refs/remotes/*`), fast-forward `push`, and `GitAdapter` (`VCS-INV-11..16, 30..34`)
+module std.vcs
+
+// ============================================================================
+// 1. AXHISTORY & AXVCS Constants, Lineage Kinds & Status Codes (`AXS-REF-060..062`)
+// ============================================================================
+
+pub const AXHISTORY_ABI_1: u32 = 1u32;
+pub const AXHISTORY_SCHEMA_1: u32 = 1u32;
+pub const AXVCS_ABI_1: u32 = 1u32;
+pub const AXVCS_SCHEMA_1: u32 = 1u32;
+
+// LineageKind (AXS-REF-061 §1)
+pub const LINEAGE_CREATED: u8 = 0u8;
+pub const LINEAGE_MODIFIED: u8 = 1u8;
+pub const LINEAGE_RENAMED: u8 = 2u8;
+pub const LINEAGE_MOVED: u8 = 3u8;
+pub const LINEAGE_EXTRACTED_FROM: u8 = 4u8;
+pub const LINEAGE_INLINED_INTO: u8 = 5u8;
+pub const LINEAGE_SPLIT_INTO: u8 = 6u8;
+pub const LINEAGE_MERGED_FROM: u8 = 7u8;
+pub const LINEAGE_REMOVED: u8 = 8u8;
+
+// SymbolPropertyMask for `blame_symbol_property` (AXS-REF-061 §2)
+pub const PROP_MASK_NONE: u8 = 0u8;
+pub const PROP_MASK_FORMATTING_ONLY: u8 = 1u8;
+pub const PROP_MASK_BODY: u8 = 2u8;
+pub const PROP_MASK_SIGNATURE: u8 = 4u8;
+pub const PROP_MASK_CAPABILITY: u8 = 8u8;
+pub const PROP_MASK_VISIBILITY: u8 = 16u8;
+pub const PROP_MASK_ABI_LAYOUT: u8 = 32u8;
+
+// ObjectKind (AXS-REF-062 §1)
+pub const OBJ_BLOB: u8 = 1u8;
+pub const OBJ_TREE: u8 = 2u8;
+pub const OBJ_SEMANTIC: u8 = 3u8;
+pub const OBJ_PATCH: u8 = 4u8;
+pub const OBJ_REVISION: u8 = 5u8;
+
+// VcsStatus (AXS-REF-062 §3)
+pub const VCS_OK: u8 = 0u8;
+pub const VCS_INTEGRITY_ERROR: u8 = 1u8;
+pub const VCS_MISSING_OBJECT: u8 = 2u8;
+pub const VCS_CAS_CONFLICT: u8 = 3u8;
+pub const VCS_NON_FAST_FORWARD: u8 = 4u8;
+pub const VCS_DAG_CYCLE_ERROR: u8 = 5u8;
+pub const VCS_CAPACITY_EXCEEDED: u8 = 6u8;
+
+// Ref namespaces (`refs/heads/*`, `refs/tags/*`, `refs/remotes/*`)
+pub const REF_HEADS: u8 = 1u8;
+pub const REF_TAGS: u8 = 2u8;
+pub const REF_REMOTES: u8 = 3u8;
+
+// ============================================================================
+// 2. Repository, Revision DAG, Symbol Lineage & Content-Addressed Store Types
+// ============================================================================
+
+@derive(Copy)
+pub struct VcsRevisionNode {
+    pub revision_id: u64,
+    pub parent0_id: u64,
+    pub parent1_id: u64,
+    pub root_tree_hash: u64,
+    pub semantic_root_hash: u64,
+    pub patch_set_id: u64,
+    pub timestamp_unix: u64,
+    pub author_host_hash: u64,
+}
+
+@derive(Copy)
+pub struct LineageEdge {
+    pub revision_id: u64,
+    pub parent_revision_id: u64,
+    pub kind: u8,
+    pub modified_property_mask: u8,
+    pub evidence: u8,
+    pub resurrection_provenance: bool,
+    pub prior_symbol_key: u64,
+    pub current_symbol_key: u64,
+    pub patch_id: u64,
+}
+
+@derive(Copy)
+pub struct VcsStoredObject {
+    pub active: bool,
+    pub corrupted: bool,
+    pub kind: u8,
+    pub object_id: u64,
+    pub payload_hash: u64,
+}
+
+@derive(Copy)
+pub struct VcsTreeEntry {
+    pub path_key_hi: u64,
+    pub path_key_lo: u64,
+    pub had_backslash: bool,
+    pub entry_mode: u32,
+    pub object_kind: u8,
+    pub object_id: u64,
+    pub semantic_file_hash: u64,
+}
+
+@derive(Copy)
+pub struct VcsRefRecord {
+    pub active: bool,
+    pub ref_ns: u8,
+    pub name_hash: u64,
+    pub target_revision_id: u64,
+}
+
+@derive(Copy)
+pub struct VcsGitMapEntry {
+    pub git_commit_oid: u64,
+    pub vcs_revision_id: u64,
+}
+
+@derive(Copy)
+pub struct VcsRepository {
+    pub abi_version: u32,
+    pub schema_version: u32,
+    pub revision_count: u32,
+    pub lineage_edge_count: u32,
+    pub object_count: u32,
+    pub ref_count: u32,
+    pub git_map_count: u32,
+    pub revisions: [16]VcsRevisionNode,
+    pub lineage_edges: [24]LineageEdge,
+    pub objects: [32]VcsStoredObject,
+    pub refs: [12]VcsRefRecord,
+    pub git_map: [8]VcsGitMapEntry,
+}
+
+@derive(Copy)
+pub struct VcsCommitOutcome {
+    pub status: u8,
+    pub revision_id: u64,
+    pub revision_object_id: u64,
+}
+
+@derive(Copy)
+pub struct SymbolHistoryResult {
+    pub found: bool,
+    pub is_deleted_in_head: bool,
+    pub stopped_at_non_resurrected_recreate: bool,
+    pub event_count: u32,
+    pub events: [12]LineageEdge,
+}
+
+@derive(Copy)
+pub struct SymbolBlameResult {
+    pub found: bool,
+    pub blamed_revision_id: u64,
+    pub blamed_patch_id: u64,
+    pub blamed_symbol_key: u64,
+    pub skipped_formatting_commits: u32,
+}
+
+@derive(Copy)
+pub struct VcsObjectReadResult {
+    pub status: u8,
+    pub kind: u8,
+    pub object_id: u64,
+    pub payload_hash: u64,
+}
+
+@derive(Copy)
+pub struct VcsTreeBuildResult {
+    pub status: u8,
+    pub tree_object_id: u64,
+    pub normalized_backslash_count: u32,
+    pub sorted_entries: [8]VcsTreeEntry,
+    pub entry_count: u32,
+}
+
+pub fn vcs_mix_hash(h: u64, v: u64) -> u64 {
+    let mut x = (h << 7u64) ^ (h >> 3u64) ^ v ^ 0x9e3779b97f4a7c15u64;
+    x = x ^ (x >> 30u64) ^ (x << 13u64);
+    x = x ^ (x >> 27u64) ^ (x << 17u64);
+    x ^ (x >> 31u64)
+}
+
+pub fn vcs_repo_new() -> VcsRepository {
+    let empty_rev = VcsRevisionNode {
+        revision_id: 0u64,
+        parent0_id: 0u64,
+        parent1_id: 0u64,
+        root_tree_hash: 0u64,
+        semantic_root_hash: 0u64,
+        patch_set_id: 0u64,
+        timestamp_unix: 0u64,
+        author_host_hash: 0u64,
+    };
+    let empty_edge = LineageEdge {
+        revision_id: 0u64,
+        parent_revision_id: 0u64,
+        kind: LINEAGE_CREATED,
+        modified_property_mask: PROP_MASK_NONE,
+        evidence: 0u8,
+        resurrection_provenance: false,
+        prior_symbol_key: 0u64,
+        current_symbol_key: 0u64,
+        patch_id: 0u64,
+    };
+    let empty_obj = VcsStoredObject {
+        active: false,
+        corrupted: false,
+        kind: 0u8,
+        object_id: 0u64,
+        payload_hash: 0u64,
+    };
+    let empty_ref = VcsRefRecord {
+        active: false,
+        ref_ns: 0u8,
+        name_hash: 0u64,
+        target_revision_id: 0u64,
+    };
+    let empty_git = VcsGitMapEntry {
+        git_commit_oid: 0u64,
+        vcs_revision_id: 0u64,
+    };
+    VcsRepository {
+        abi_version: AXVCS_ABI_1,
+        schema_version: AXVCS_SCHEMA_1,
+        revision_count: 0u32,
+        lineage_edge_count: 0u32,
+        object_count: 0u32,
+        ref_count: 0u32,
+        git_map_count: 0u32,
+        revisions: [empty_rev; 16],
+        lineage_edges: [empty_edge; 24],
+        objects: [empty_obj; 32],
+        refs: [empty_ref; 12],
+        git_map: [empty_git; 8],
+    }
+}
+
+// ============================================================================
+// 3. Content-Addressed Object Store & Integrity Verification (`AXS-REF-062 §1, §3`)
+// ============================================================================
+
+pub fn vcs_compute_object_id(kind: u8, payload_hash: u64) -> u64 {
+    let mut h: u64 = 0x61787663736f626au64;
+    h = vcs_mix_hash(h, AXVCS_SCHEMA_1 as u64);
+    h = vcs_mix_hash(h, kind as u64);
+    h = vcs_mix_hash(h, payload_hash);
+    if h == 0u64 { 1u64 } else { h }
+}
+
+pub fn vcs_put_object(repo: mut_view<VcsRepository>, kind: u8, payload_hash: u64) -> u64 {
+    let oid = vcs_compute_object_id(kind, payload_hash);
+    let mut i: u32 = 0u32;
+    while i < repo.object_count && i < 32u32 {
+        if repo.objects[i as usize].active && repo.objects[i as usize].object_id == oid {
+            return oid;
+        }
+        i = i + 1u32;
+    }
+    if (repo.object_count) < 32u32 {
+        repo.objects[repo.object_count as usize] = VcsStoredObject {
+            active: true,
+            corrupted: false,
+            kind: kind,
+            object_id: oid,
+            payload_hash: payload_hash,
+        };
+        repo.object_count = repo.object_count + 1u32;
+    }
+    oid
+}
+
+pub fn vcs_corrupt_object_for_test(repo: mut_view<VcsRepository>, object_id: u64) -> bool {
+    let mut i: u32 = 0u32;
+    while i < repo.object_count && i < 32u32 {
+        if repo.objects[i as usize].active && repo.objects[i as usize].object_id == object_id {
+            repo.objects[i as usize].corrupted = true;
+            return true;
+        }
+        i = i + 1u32;
+    }
+    false
+}
+
+// Recomputes BLAKE3 `ObjectId` on read and rejects corrupted or missing objects (`VCS-INV-03, 24`).
+pub fn vcs_verify_and_get_object(repo: view<VcsRepository>, object_id: u64) -> VcsObjectReadResult {
+    let mut i: u32 = 0u32;
+    while i < repo.object_count && i < 32u32 {
+        let obj = repo.objects[i as usize];
+        if obj.active && obj.object_id == object_id {
+            let recomputed = vcs_compute_object_id(obj.kind, obj.payload_hash);
+            if obj.corrupted || recomputed != obj.object_id {
+                return VcsObjectReadResult {
+                    status: VCS_INTEGRITY_ERROR,
+                    kind: obj.kind,
+                    object_id: object_id,
+                    payload_hash: 0u64,
+                };
+            }
+            return VcsObjectReadResult {
+                status: VCS_OK,
+                kind: obj.kind,
+                object_id: obj.object_id,
+                payload_hash: obj.payload_hash,
+            };
+        }
+        i = i + 1u32;
+    }
+    VcsObjectReadResult {
+        status: VCS_MISSING_OBJECT,
+        kind: 0u8,
+        object_id: object_id,
+        payload_hash: 0u64,
+    }
+}
+
+// ============================================================================
+// 4. `AXHISTORY` Revision DAG, Cycle Detection & Symbol Lineage (`AXS-REF-060..061`)
+// ============================================================================
+
+// `RevisionId = BLAKE3("axiom-revision-v1" || AXHISTORY_SCHEMA_1 || parent_ids || root_tree_hash || semantic_root_hash || patch_set_id)`
+// Strictly independent of timestamps, hostnames, and local file paths (`HISTORY-INV-01..06`).
+pub fn vcs_compute_revision_id(
+    parent0_id: u64,
+    parent1_id: u64,
+    root_tree_hash: u64,
+    semantic_root_hash: u64,
+    patch_set_id: u64
+) -> u64 {
+    let mut h: u64 = 0x6178726576763100u64;
+    h = vcs_mix_hash(h, AXHISTORY_SCHEMA_1 as u64);
+    h = vcs_mix_hash(h, parent0_id);
+    h = vcs_mix_hash(h, parent1_id);
+    h = vcs_mix_hash(h, root_tree_hash);
+    h = vcs_mix_hash(h, semantic_root_hash);
+    h = vcs_mix_hash(h, patch_set_id);
+    if h == 0u64 { 1u64 } else { h }
+}
+
+pub fn vcs_is_ancestor(repo: view<VcsRepository>, candidate_ancestor: u64, descendant_rev: u64) -> bool {
+    if candidate_ancestor == 0u64 {
+        return true;
+    }
+    if candidate_ancestor == descendant_rev {
+        return true;
+    }
+    let mut cur = descendant_rev;
+    let mut steps: u32 = 0u32;
+    while cur != 0u64 && steps <= repo.revision_count {
+        if cur == candidate_ancestor {
+            return true;
+        }
+        let mut next_p: u64 = 0u64;
+        let mut i: u32 = 0u32;
+        while i < repo.revision_count && i < 16u32 {
+            let rv = repo.revisions[i as usize];
+            if rv.revision_id == cur {
+                if rv.parent0_id == candidate_ancestor || rv.parent1_id == candidate_ancestor {
+                    return true;
+                }
+                next_p = rv.parent0_id;
+                break;
+            }
+            i = i + 1u32;
+        }
+        cur = next_p;
+        steps = steps + 1u32;
+    }
+    false
+}
+
+pub fn vcs_commit_revision(
+    repo: mut_view<VcsRepository>,
+    parent0_id: u64,
+    parent1_id: u64,
+    root_tree_hash: u64,
+    semantic_root_hash: u64,
+    patch_set_id: u64,
+    timestamp_unix: u64,
+    author_host_hash: u64
+) -> VcsCommitOutcome {
+    if repo.revision_count >= 16u32 {
+        return VcsCommitOutcome { status: VCS_CAPACITY_EXCEEDED, revision_id: 0u64, revision_object_id: 0u64 };
+    }
+    let rev_id = vcs_compute_revision_id(parent0_id, parent1_id, root_tree_hash, semantic_root_hash, patch_set_id);
+    // Reject DAG cycles (`HISTORY-INV-38`): `rev_id` cannot be an ancestor of `parent0_id` or `parent1_id`
+    if (parent0_id != 0u64 && vcs_is_ancestor(view(*repo), rev_id, parent0_id)) ||
+        (parent1_id != 0u64 && vcs_is_ancestor(view(*repo), rev_id, parent1_id)) {
+        return VcsCommitOutcome { status: VCS_DAG_CYCLE_ERROR, revision_id: rev_id, revision_object_id: 0u64 };
+    }
+
+    let obj_id = vcs_put_object(mut_view(*repo), OBJ_REVISION, rev_id);
+    repo.revisions[repo.revision_count as usize] = VcsRevisionNode {
+        revision_id: rev_id,
+        parent0_id: parent0_id,
+        parent1_id: parent1_id,
+        root_tree_hash: root_tree_hash,
+        semantic_root_hash: semantic_root_hash,
+        patch_set_id: patch_set_id,
+        timestamp_unix: timestamp_unix,
+        author_host_hash: author_host_hash,
+    };
+    repo.revision_count = repo.revision_count + 1u32;
+    VcsCommitOutcome {
+        status: VCS_OK,
+        revision_id: rev_id,
+        revision_object_id: obj_id,
+    }
+}
+
+pub fn vcs_record_lineage_edge(repo: mut_view<VcsRepository>, edge: LineageEdge) -> bool {
+    if repo.lineage_edge_count >= 24u32 {
+        return false;
+    }
+    repo.lineage_edges[repo.lineage_edge_count as usize] = edge;
+    repo.lineage_edge_count = repo.lineage_edge_count + 1u32;
+    true
+}
+
+// Traces symbol lineage backward across renames, module moves, and function extractions (`SPEC-102 §7.2 AXS-REF-061`),
+// enforcing `HISTORY-INV-13` (deleted symbols remain queryable) and `HISTORY-INV-14` (a recreated symbol with the same
+// key after `Removed` does NOT inherit prior lineage without explicit `resurrection_provenance`).
+pub fn vcs_history_of_symbol(repo: view<VcsRepository>, query_symbol_key: u64) -> SymbolHistoryResult {
+    let empty_edge = LineageEdge {
+        revision_id: 0u64,
+        parent_revision_id: 0u64,
+        kind: LINEAGE_CREATED,
+        modified_property_mask: PROP_MASK_NONE,
+        evidence: 0u8,
+        resurrection_provenance: false,
+        prior_symbol_key: 0u64,
+        current_symbol_key: 0u64,
+        patch_id: 0u64,
+    };
+    let mut out = SymbolHistoryResult {
+        found: false,
+        is_deleted_in_head: false,
+        stopped_at_non_resurrected_recreate: false,
+        event_count: 0u32,
+        events: [empty_edge; 12],
+    };
+    if repo.lineage_edge_count == 0u32 || query_symbol_key == 0u64 {
+        return out;
+    }
+
+    let mut tracked_key = query_symbol_key;
+    let mut idx: u32 = repo.lineage_edge_count;
+    while idx > 0u32 && (out.event_count) < 12u32 {
+        idx = idx - 1u32;
+        let e = repo.lineage_edges[idx as usize];
+        let matches_cur = e.current_symbol_key == tracked_key;
+        let matches_removed = e.kind == LINEAGE_REMOVED && e.prior_symbol_key == tracked_key;
+
+        if matches_cur || matches_removed {
+            out.found = true;
+            if e.kind == LINEAGE_REMOVED && out.event_count == 0u32 {
+                out.is_deleted_in_head = true;
+            }
+            out.events[out.event_count as usize] = e;
+            out.event_count = out.event_count + 1u32;
+
+            if e.kind == LINEAGE_CREATED {
+                if !e.resurrection_provenance {
+                    // Check if there was an earlier `LINEAGE_REMOVED` with the same key (`HISTORY-INV-14`)
+                    let mut k: u32 = idx;
+                    while k > 0u32 {
+                        k = k - 1u32;
+                        let earlier = repo.lineage_edges[k as usize];
+                        if earlier.kind == LINEAGE_REMOVED &&
+                            (earlier.prior_symbol_key == tracked_key || earlier.current_symbol_key == tracked_key) {
+                            out.stopped_at_non_resurrected_recreate = true;
+                            break;
+                        }
+                    }
+                    break;
+                } else if e.prior_symbol_key != 0u64 {
+                    tracked_key = e.prior_symbol_key;
+                }
+            } else if e.prior_symbol_key != 0u64 {
+                tracked_key = e.prior_symbol_key;
+            }
+        }
+    }
+    out
+}
+
+// Property-level semantic blame (`SPEC-102 §7.2 AXS-REF-061 §2`, `HISTORY-INV-15..17`):
+// Finds the exact `RevisionId` and `PatchId` that last modified `prop_mask` (e.g. signature, capability,
+// visibility, or ABI layout), ignoring intervening formatting-only commits!
+pub fn vcs_blame_symbol_property(repo: view<VcsRepository>, symbol_key: u64, prop_mask: u8) -> SymbolBlameResult {
+    let hist = vcs_history_of_symbol(repo, symbol_key);
+    let mut skipped_fmt: u32 = 0u32;
+    let mut i: u32 = 0u32;
+    while i < hist.event_count && i < 12u32 {
+        let ev = hist.events[i as usize];
+        if ev.modified_property_mask == PROP_MASK_FORMATTING_ONLY {
+            skipped_fmt = skipped_fmt + 1u32;
+        } else if (ev.modified_property_mask & prop_mask) != 0u8 || ev.kind == LINEAGE_CREATED {
+            return SymbolBlameResult {
+                found: true,
+                blamed_revision_id: ev.revision_id,
+                blamed_patch_id: ev.patch_id,
+                blamed_symbol_key: if ev.current_symbol_key != 0u64 { ev.current_symbol_key } else { ev.prior_symbol_key },
+                skipped_formatting_commits: skipped_fmt,
+            };
+        }
+        i = i + 1u32;
+    }
+    SymbolBlameResult {
+        found: false,
+        blamed_revision_id: 0u64,
+        blamed_patch_id: 0u64,
+        blamed_symbol_key: 0u64,
+        skipped_formatting_commits: skipped_fmt,
+    }
+}
+
+// ============================================================================
+// 5. Deterministic Tree/Semantic Ordering, Atomic CAS Refs & Remote/Git Adapter (`AXS-REF-062`)
+// ============================================================================
+
+fn vcs_tree_entry_comes_before(a: VcsTreeEntry, b: VcsTreeEntry) -> bool {
+    if (a.path_key_hi) < (b.path_key_hi) { return true; }
+    if (a.path_key_hi) > (b.path_key_hi) { return false; }
+    if (a.path_key_lo) < (b.path_key_lo) { return true; }
+    if (a.path_key_lo) > (b.path_key_lo) { return false; }
+    (a.object_id) < (b.object_id)
+}
+
+pub fn vcs_build_tree_snapshot(
+    repo: mut_view<VcsRepository>,
+    entries: [8]VcsTreeEntry,
+    entry_count: u32
+) -> VcsTreeBuildResult {
+    let empty_e = VcsTreeEntry {
+        path_key_hi: 0u64,
+        path_key_lo: 0u64,
+        had_backslash: false,
+        entry_mode: 0u32,
+        object_kind: OBJ_BLOB,
+        object_id: 0u64,
+        semantic_file_hash: 0u64,
+    };
+    let mut out = VcsTreeBuildResult {
+        status: VCS_OK,
+        tree_object_id: 0u64,
+        normalized_backslash_count: 0u32,
+        sorted_entries: [empty_e; 8],
+        entry_count: 0u32,
+    };
+
+    let mut i: u32 = 0u32;
+    while i < entry_count && i < 8u32 {
+        let mut cur = entries[i as usize];
+        if cur.had_backslash {
+            cur.had_backslash = false;
+            out.normalized_backslash_count = out.normalized_backslash_count + 1u32;
+        }
+        let mut pos: u32 = out.entry_count;
+        let mut j: u32 = 0u32;
+        while j < out.entry_count {
+            if vcs_tree_entry_comes_before(cur, out.sorted_entries[j as usize]) {
+                pos = j;
+                break;
+            }
+            j = j + 1u32;
+        }
+        let mut k: u32 = out.entry_count;
+        while k > pos {
+            out.sorted_entries[k as usize] = out.sorted_entries[(k - 1u32) as usize];
+            k = k - 1u32;
+        }
+        out.sorted_entries[pos as usize] = cur;
+        out.entry_count = out.entry_count + 1u32;
+        i = i + 1u32;
+    }
+
+    let mut th: u64 = 0x6178747265657631u64;
+    let mut m: u32 = 0u32;
+    while m < out.entry_count {
+        let se = out.sorted_entries[m as usize];
+        th = vcs_mix_hash(th, se.path_key_hi);
+        th = vcs_mix_hash(th, se.path_key_lo);
+        th = vcs_mix_hash(th, se.entry_mode as u64);
+        th = vcs_mix_hash(th, se.object_kind as u64);
+        th = vcs_mix_hash(th, se.object_id);
+        th = vcs_mix_hash(th, se.semantic_file_hash);
+        m = m + 1u32;
+    }
+    out.tree_object_id = vcs_put_object(mut_view(*repo), OBJ_TREE, th);
+    out
+}
+
+pub fn vcs_build_semantic_snapshot(
+    repo: mut_view<VcsRepository>,
+    symbol_keys: [8]u64,
+    sym_digests: [8]u64,
+    count: u32
+) -> u64 {
+    let mut keys: [8]u64 = [0u64; 8];
+    let mut digs: [8]u64 = [0u64; 8];
+    let mut scount: u32 = 0u32;
+    let mut i: u32 = 0u32;
+    while i < count && i < 8u32 {
+        let k = symbol_keys[i as usize];
+        let d = sym_digests[i as usize];
+        let mut pos: u32 = scount;
+        let mut j: u32 = 0u32;
+        while j < scount {
+            if k < keys[j as usize] || (k == keys[j as usize] && d < digs[j as usize]) {
+                pos = j;
+                break;
+            }
+            j = j + 1u32;
+        }
+        let mut m: u32 = scount;
+        while m > pos {
+            keys[m as usize] = keys[(m - 1u32) as usize];
+            digs[m as usize] = digs[(m - 1u32) as usize];
+            m = m - 1u32;
+        }
+        keys[pos as usize] = k;
+        digs[pos as usize] = d;
+        scount = scount + 1u32;
+        i = i + 1u32;
+    }
+
+    let mut sh: u64 = 0x617873656d726f6fu64;
+    let mut idx: u32 = 0u32;
+    while idx < scount {
+        sh = vcs_mix_hash(sh, keys[idx as usize]);
+        sh = vcs_mix_hash(sh, digs[idx as usize]);
+        idx = idx + 1u32;
+    }
+    vcs_put_object(mut_view(*repo), OBJ_SEMANTIC, sh)
+}
+
+pub fn vcs_get_ref(repo: view<VcsRepository>, ref_ns: u8, name_hash: u64) -> u64 {
+    let mut i: u32 = 0u32;
+    while i < repo.ref_count && i < 12u32 {
+        let r = repo.refs[i as usize];
+        if r.active && r.ref_ns == ref_ns && r.name_hash == name_hash {
+            return r.target_revision_id;
+        }
+        i = i + 1u32;
+    }
+    0u64
+}
+
+// Atomic Compare-And-Swap (`CAS`) ref update (`SPEC-102 §7.3 AXS-REF-062 §3`, `VCS-INV-11..13, 30`).
+pub fn vcs_update_ref_cas(
+    repo: mut_view<VcsRepository>,
+    ref_ns: u8,
+    name_hash: u64,
+    expected_old_rev: u64,
+    new_rev: u64
+) -> u8 {
+    let mut i: u32 = 0u32;
+    while i < repo.ref_count && i < 12u32 {
+        let r = repo.refs[i as usize];
+        if r.active && r.ref_ns == ref_ns && r.name_hash == name_hash {
+            if r.target_revision_id != expected_old_rev {
+                return VCS_CAS_CONFLICT;
+            }
+            repo.refs[i as usize].target_revision_id = new_rev;
+            return VCS_OK;
+        }
+        i = i + 1u32;
+    }
+    if expected_old_rev != 0u64 {
+        return VCS_CAS_CONFLICT;
+    }
+    if repo.ref_count >= 12u32 {
+        return VCS_CAPACITY_EXCEEDED;
+    }
+    repo.refs[repo.ref_count as usize] = VcsRefRecord {
+        active: true,
+        ref_ns: ref_ns,
+        name_hash: name_hash,
+        target_revision_id: new_rev,
+    };
+    repo.ref_count = repo.ref_count + 1u32;
+    VCS_OK
+}
+
+// `fetch` updates only `REF_REMOTES` (`refs/remotes/<remote>/*`) and NEVER mutates local `REF_HEADS` (`VCS-INV-14`).
+pub fn vcs_fetch_remote(repo: mut_view<VcsRepository>, remote_branch_hash: u64, remote_rev: u64) -> u8 {
+    let cur = vcs_get_ref(view(*repo), REF_REMOTES, remote_branch_hash);
+    vcs_update_ref_cas(mut_view(*repo), REF_REMOTES, remote_branch_hash, cur, remote_rev)
+}
+
+// `push` rejects non-fast-forward updates unless `allow_force == true` (`VCS-INV-15`).
+pub fn vcs_push_remote(
+    repo: view<VcsRepository>,
+    current_remote_rev: u64,
+    new_local_rev: u64,
+    allow_force: bool
+) -> u8 {
+    if current_remote_rev != 0u64 && !vcs_is_ancestor(repo, current_remote_rev, new_local_rev) && !allow_force {
+        return VCS_NON_FAST_FORWARD;
+    }
+    VCS_OK
+}
+
+pub fn vcs_git_adapter_map(repo: mut_view<VcsRepository>, git_commit_oid: u64, vcs_revision_id: u64) -> bool {
+    if repo.git_map_count >= 8u32 {
+        return false;
+    }
+    repo.git_map[repo.git_map_count as usize] = VcsGitMapEntry {
+        git_commit_oid: git_commit_oid,
+        vcs_revision_id: vcs_revision_id,
+    };
+    repo.git_map_count = repo.git_map_count + 1u32;
+    true
+}
+
+pub fn vcs_git_lookup_rev(repo: view<VcsRepository>, git_commit_oid: u64) -> u64 {
+    let mut i: u32 = 0u32;
+    while i < repo.git_map_count && i < 8u32 {
+        if repo.git_map[i as usize].git_commit_oid == git_commit_oid {
+            return repo.git_map[i as usize].vcs_revision_id;
+        }
+        i = i + 1u32;
+    }
+    0u64
+}

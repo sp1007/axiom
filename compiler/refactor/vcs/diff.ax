@@ -1,0 +1,693 @@
+// AXDIFF — Structural CST/AST & CompilerDB Semantic Symbol Difference Engine (T810 / E19.3).
+// Implements SPEC-102 §4 (AXS-REF-030..032; REQ-TOOL-301, DIFF-INV-01..40):
+// - Multi-layer difference separation (`Byte`, `Trivia`/`CST`, `Ast`, `Semantic`, `Api`, `Abi`)
+// - Nine-state `DiffStatus` & five-level `DiffEvidenceLevel` lattice (`Exact`, `Strong`, `Inferred`, `Heuristic`, `Unknown`)
+// - Four-pass CST/AST & `SymbolId`/`SemanticKey` matching (`FormattingOnly`, `TriviaOnly`, intra-module reorder `Moved`,
+//   cross-name `Renamed` / `RenamedAndModified`, cross-module `Moved` / `MovedAndModified`, and statement edit ops)
+// - Semantic signature, `view<T>`/`mut_view<T>` capability, error effect, visibility, `unsafe` surface, and `@repr` ABI layout diffing
+// - Deterministic sorting and content-addressed `.axdiff` digest (`diff_hash`)
+module compiler.refactor.vcs.diff
+
+use compiler.lsp.handlers.LspSemanticEngine
+
+// ============================================================================
+// 1. AXDIFF Constants, Comparison Modes, Statuses & Evidence Lattice (AXS-REF-030)
+// ============================================================================
+
+pub const AXDIFF_ABI_1: u32 = 1u32;
+pub const AXDIFF_SCHEMA_1: u32 = 1u32;
+
+// DiffMode (AXS-REF-030 §1)
+pub const DIFF_MODE_BYTE: u8 = 0u8;
+pub const DIFF_MODE_TRIVIA: u8 = 1u8;
+pub const DIFF_MODE_AST: u8 = 2u8;
+pub const DIFF_MODE_SEMANTIC: u8 = 3u8;
+pub const DIFF_MODE_API: u8 = 4u8;
+pub const DIFF_MODE_ABI: u8 = 5u8;
+
+// Nine-state DiffStatus (AXS-REF-030 §2, DIFF-INV-06..07)
+pub const DIFF_STATUS_IDENTICAL: u8 = 0u8;
+pub const DIFF_STATUS_CHANGED: u8 = 1u8;
+pub const DIFF_STATUS_ADDED: u8 = 2u8;
+pub const DIFF_STATUS_REMOVED: u8 = 3u8;
+pub const DIFF_STATUS_MOVED: u8 = 4u8;
+pub const DIFF_STATUS_RENAMED: u8 = 5u8;
+pub const DIFF_STATUS_UNKNOWN: u8 = 6u8;
+pub const DIFF_STATUS_UNAVAILABLE: u8 = 7u8;
+pub const DIFF_STATUS_INCOMPARABLE: u8 = 8u8;
+
+// DiffChangeKind (AXS-REF-030 §2)
+pub const DIFF_CHANGE_TRIVIA_ONLY: u8 = 0u8;
+pub const DIFF_CHANGE_FORMATTING_ONLY: u8 = 1u8;
+pub const DIFF_CHANGE_ADDED: u8 = 2u8;
+pub const DIFF_CHANGE_REMOVED: u8 = 3u8;
+pub const DIFF_CHANGE_MODIFIED: u8 = 4u8;
+pub const DIFF_CHANGE_MOVED: u8 = 5u8;
+pub const DIFF_CHANGE_RENAMED: u8 = 6u8;
+pub const DIFF_CHANGE_RENAMED_AND_MODIFIED: u8 = 7u8;
+pub const DIFF_CHANGE_MOVED_AND_MODIFIED: u8 = 8u8;
+pub const DIFF_CHANGE_TYPE_CHANGED: u8 = 9u8;
+pub const DIFF_CHANGE_SIGNATURE_CHANGED: u8 = 10u8;
+pub const DIFF_CHANGE_CAPABILITY_CHANGED: u8 = 11u8;
+pub const DIFF_CHANGE_EFFECT_CHANGED: u8 = 12u8;
+pub const DIFF_CHANGE_VISIBILITY_CHANGED: u8 = 13u8;
+pub const DIFF_CHANGE_LAYOUT_CHANGED: u8 = 14u8;
+pub const DIFF_CHANGE_TRAIT_IMPL_CHANGED: u8 = 15u8;
+pub const DIFF_CHANGE_UNSAFE_SURFACE_CHANGED: u8 = 16u8;
+
+// DiffSeverity (AXS-REF-030 §2)
+pub const DIFF_SEV_INFO: u8 = 0u8;
+pub const DIFF_SEV_NOTICE: u8 = 1u8;
+pub const DIFF_SEV_COMPATIBLE: u8 = 2u8;
+pub const DIFF_SEV_BREAKING: u8 = 3u8;
+pub const DIFF_SEV_SECURITY_RELEVANT: u8 = 4u8;
+pub const DIFF_SEV_UNKNOWN: u8 = 5u8;
+
+// DiffEvidenceLevel (AXS-REF-030 §2, DIFF-INV-10)
+pub const DIFF_EVIDENCE_EXACT: u8 = 0u8;
+pub const DIFF_EVIDENCE_STRONG: u8 = 1u8;
+pub const DIFF_EVIDENCE_INFERRED: u8 = 2u8;
+pub const DIFF_EVIDENCE_HEURISTIC: u8 = 3u8;
+pub const DIFF_EVIDENCE_UNKNOWN: u8 = 4u8;
+
+// AbiImpact (AXS-REF-032 §2)
+pub const ABI_IMPACT_NONE: u8 = 0u8;
+pub const ABI_IMPACT_COMPATIBLE: u8 = 1u8;
+pub const ABI_IMPACT_LAYOUT_CHANGED: u8 = 2u8;
+pub const ABI_IMPACT_BREAKING: u8 = 3u8;
+
+// AST structural edit operation kinds (AXS-REF-031 §4)
+pub const AST_OP_NONE: u8 = 0u8;
+pub const AST_OP_INSERT_NODE: u8 = 1u8;
+pub const AST_OP_DELETE_NODE: u8 = 2u8;
+pub const AST_OP_REPLACE_NODE: u8 = 3u8;
+pub const AST_OP_MOVE_NODE: u8 = 4u8;
+
+// ItemKind
+pub const DIFF_ITEM_FUNCTION: u8 = 1u8;
+pub const DIFF_ITEM_STRUCT: u8 = 2u8;
+pub const DIFF_ITEM_ENUM: u8 = 3u8;
+pub const DIFF_ITEM_TRAIT: u8 = 4u8;
+pub const DIFF_ITEM_IMPL: u8 = 5u8;
+pub const DIFF_ITEM_CONST: u8 = 6u8;
+pub const DIFF_ITEM_USE: u8 = 7u8;
+
+// Receiver / parameter capability classes (AXS-REF-032 §1)
+pub const RECEIVER_CAP_OWNED: u8 = 0u8;
+pub const RECEIVER_CAP_VIEW: u8 = 1u8;
+pub const RECEIVER_CAP_MUT_VIEW: u8 = 2u8;
+
+// ============================================================================
+// 2. Declaration Descriptors, Snapshot Inputs & Diff Report Structures
+// ============================================================================
+
+@derive(Copy)
+pub struct DiffItemDecl {
+    pub module_hash: u64,
+    pub semantic_key: u64,
+    pub name_hash: u64,
+    pub item_kind: u8,
+    pub is_pub: bool,
+    pub is_unsafe: bool,
+    pub receiver_cap: u8,
+    pub repr_kind: u8,
+    pub dice_similarity_pct: u8,
+    pub decl_order: u32,
+    pub span_lo: u32,
+    pub span_hi: u32,
+    pub sig_hash: u64,
+    pub body_ast_hash: u64,
+    pub trivia_hash: u64,
+    pub effect_hash: u64,
+    pub layout_size: u32,
+    pub layout_align: u32,
+    pub discriminant_hash: u64,
+    pub trait_impl_hash: u64,
+}
+
+@derive(Copy)
+pub struct DiffSnapshotInput {
+    pub available: bool,
+    pub comparable: bool,
+    pub has_parse_error: bool,
+    pub content_hash: u64,
+    pub ast_hash: u64,
+    pub comment_hash: u64,
+    pub item_count: u32,
+    pub items: [12]DiffItemDecl,
+}
+
+@derive(Copy)
+pub struct DiffChangeRecord {
+    pub status: u8,
+    pub change_kind: u8,
+    pub severity: u8,
+    pub evidence: u8,
+    pub abi_impact: u8,
+    pub item_kind: u8,
+    pub ast_edit_op: u8,
+    pub left_module_hash: u64,
+    pub right_module_hash: u64,
+    pub left_semantic_key: u64,
+    pub right_semantic_key: u64,
+    pub left_name_hash: u64,
+    pub right_name_hash: u64,
+    pub left_span_lo: u32,
+    pub right_span_lo: u32,
+}
+
+@derive(Copy)
+pub struct DiffReport {
+    pub abi_version: u32,
+    pub schema_version: u32,
+    pub mode: u8,
+    pub overall_status: u8,
+    pub overall_severity: u8,
+    pub abi_impact: u8,
+    pub formatting_only: bool,
+    pub trivia_only: bool,
+    pub semantic_change_count: u32,
+    pub breaking_change_count: u32,
+    pub moved_count: u32,
+    pub renamed_count: u32,
+    pub change_count: u32,
+    pub diff_hash: u64,
+    pub changes: [16]DiffChangeRecord,
+}
+
+pub fn axdiff_mix_hash(h: u64, v: u64) -> u64 {
+    let mut x = (h << 7u64) ^ (h >> 3u64) ^ v ^ 0x9e3779b97f4a7c15u64;
+    x = x ^ (x >> 30u64) ^ (x << 13u64);
+    x = x ^ (x >> 27u64) ^ (x << 17u64);
+    x ^ (x >> 31u64)
+}
+
+pub fn axdiff_item_decl_new(
+    module_hash: u64,
+    semantic_key: u64,
+    name_hash: u64,
+    item_kind: u8,
+    is_pub: bool,
+    is_unsafe: bool,
+    receiver_cap: u8,
+    repr_kind: u8,
+    dice_similarity_pct: u8,
+    decl_order: u32,
+    span_lo: u32,
+    span_hi: u32,
+    sig_hash: u64,
+    body_ast_hash: u64,
+    trivia_hash: u64,
+    effect_hash: u64,
+    layout_size: u32,
+    layout_align: u32,
+    discriminant_hash: u64,
+    trait_impl_hash: u64
+) -> DiffItemDecl {
+    DiffItemDecl {
+        module_hash: module_hash,
+        semantic_key: semantic_key,
+        name_hash: name_hash,
+        item_kind: item_kind,
+        is_pub: is_pub,
+        is_unsafe: is_unsafe,
+        receiver_cap: receiver_cap,
+        repr_kind: repr_kind,
+        dice_similarity_pct: dice_similarity_pct,
+        decl_order: decl_order,
+        span_lo: span_lo,
+        span_hi: span_hi,
+        sig_hash: sig_hash,
+        body_ast_hash: body_ast_hash,
+        trivia_hash: trivia_hash,
+        effect_hash: effect_hash,
+        layout_size: layout_size,
+        layout_align: layout_align,
+        discriminant_hash: discriminant_hash,
+        trait_impl_hash: trait_impl_hash,
+    }
+}
+
+pub fn axdiff_snapshot_empty(content_hash: u64, ast_hash: u64, comment_hash: u64) -> DiffSnapshotInput {
+    let empty_item = axdiff_item_decl_new(
+        0u64, 0u64, 0u64, 0u8, false, false, 0u8, 0u8, 100u8,
+        0u32, 0u32, 0u32, 0u64, 0u64, 0u64, 0u64, 0u32, 0u32, 0u64, 0u64
+    );
+    DiffSnapshotInput {
+        available: true,
+        comparable: true,
+        has_parse_error: false,
+        content_hash: content_hash,
+        ast_hash: ast_hash,
+        comment_hash: comment_hash,
+        item_count: 0u32,
+        items: [empty_item; 12],
+    }
+}
+
+pub fn axdiff_snapshot_add_item(snap: mut_view<DiffSnapshotInput>, item: DiffItemDecl) -> bool {
+    if snap.item_count >= 12u32 {
+        return false;
+    }
+    snap.items[snap.item_count as usize] = item;
+    snap.item_count = snap.item_count + 1u32;
+    true
+}
+
+// Deterministic ordering for `.axdiff` records (`SPEC-102 §4.3 AXS-REF-032 §3`, `DIFF-INV-34..35`):
+// `(module_path, ChangeKind ordinal, left_semantic_key, right_semantic_key, left_span.lo, right_span.lo)`.
+pub fn axdiff_change_comes_before(a: DiffChangeRecord, b: DiffChangeRecord) -> bool {
+    let am = if a.left_module_hash != 0u64 { a.left_module_hash } else { a.right_module_hash };
+    let bm = if b.left_module_hash != 0u64 { b.left_module_hash } else { b.right_module_hash };
+    if am < bm { return true; }
+    if am > bm { return false; }
+    if (a.change_kind) < (b.change_kind) { return true; }
+    if (a.change_kind) > (b.change_kind) { return false; }
+    if (a.left_semantic_key) < (b.left_semantic_key) { return true; }
+    if (a.left_semantic_key) > (b.left_semantic_key) { return false; }
+    if (a.right_semantic_key) < (b.right_semantic_key) { return true; }
+    if (a.right_semantic_key) > (b.right_semantic_key) { return false; }
+    if (a.left_span_lo) < (b.left_span_lo) { return true; }
+    if (a.left_span_lo) > (b.left_span_lo) { return false; }
+    (a.right_span_lo) < (b.right_span_lo)
+}
+
+fn axdiff_insert_change(rep: mut_view<DiffReport>, rec: DiffChangeRecord) {
+    if rep.change_count >= 16u32 {
+        return;
+    }
+    let mut pos: u32 = rep.change_count;
+    let mut i: u32 = 0u32;
+    while i < rep.change_count {
+        if axdiff_change_comes_before(rec, rep.changes[i as usize]) {
+            pos = i;
+            break;
+        }
+        i = i + 1u32;
+    }
+    let mut k: u32 = rep.change_count;
+    while k > pos {
+        rep.changes[k as usize] = rep.changes[(k - 1u32) as usize];
+        k = k - 1u32;
+    }
+    rep.changes[pos as usize] = rec;
+    rep.change_count = rep.change_count + 1u32;
+
+    if (rec.severity) > (rep.overall_severity) {
+        rep.overall_severity = rec.severity;
+    }
+    if (rec.abi_impact) > (rep.abi_impact) {
+        rep.abi_impact = rec.abi_impact;
+    }
+    if rec.change_kind != DIFF_CHANGE_TRIVIA_ONLY && rec.change_kind != DIFF_CHANGE_FORMATTING_ONLY {
+        rep.semantic_change_count = rep.semantic_change_count + 1u32;
+    }
+    if rec.severity == DIFF_SEV_BREAKING || rec.severity == DIFF_SEV_SECURITY_RELEVANT {
+        rep.breaking_change_count = rep.breaking_change_count + 1u32;
+    }
+    if rec.status == DIFF_STATUS_MOVED {
+        rep.moved_count = rep.moved_count + 1u32;
+    }
+    if rec.status == DIFF_STATUS_RENAMED {
+        rep.renamed_count = rep.renamed_count + 1u32;
+    }
+}
+
+fn axdiff_finalize_hash(rep: mut_view<DiffReport>) {
+    let mut h: u64 = 0x4158444946465631u64;
+    h = axdiff_mix_hash(h, rep.schema_version as u64);
+    h = axdiff_mix_hash(h, rep.mode as u64);
+    h = axdiff_mix_hash(h, rep.overall_status as u64);
+    let mut i: u32 = 0u32;
+    while i < rep.change_count {
+        let c = rep.changes[i as usize];
+        h = axdiff_mix_hash(h, c.status as u64);
+        h = axdiff_mix_hash(h, c.change_kind as u64);
+        h = axdiff_mix_hash(h, c.severity as u64);
+        h = axdiff_mix_hash(h, c.evidence as u64);
+        h = axdiff_mix_hash(h, c.abi_impact as u64);
+        h = axdiff_mix_hash(h, c.left_module_hash);
+        h = axdiff_mix_hash(h, c.right_module_hash);
+        h = axdiff_mix_hash(h, c.left_semantic_key);
+        h = axdiff_mix_hash(h, c.right_semantic_key);
+        h = axdiff_mix_hash(h, c.left_span_lo as u64);
+        h = axdiff_mix_hash(h, c.right_span_lo as u64);
+        i = i + 1u32;
+    }
+    rep.diff_hash = h;
+}
+
+// ============================================================================
+// 3. Four-Pass CST/AST & `SymbolId` Semantic Comparison Engine (`AXS-REF-031..032`)
+// ============================================================================
+
+pub fn axdiff_compare_snapshots(
+    eng: mut_view<LspSemanticEngine>,
+    left: view<DiffSnapshotInput>,
+    right: view<DiffSnapshotInput>,
+    mode: u8
+) -> DiffReport {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let empty_rec = DiffChangeRecord {
+        status: DIFF_STATUS_IDENTICAL,
+        change_kind: DIFF_CHANGE_TRIVIA_ONLY,
+        severity: DIFF_SEV_INFO,
+        evidence: DIFF_EVIDENCE_EXACT,
+        abi_impact: ABI_IMPACT_NONE,
+        item_kind: 0u8,
+        ast_edit_op: AST_OP_NONE,
+        left_module_hash: 0u64,
+        right_module_hash: 0u64,
+        left_semantic_key: 0u64,
+        right_semantic_key: 0u64,
+        left_name_hash: 0u64,
+        right_name_hash: 0u64,
+        left_span_lo: 0u32,
+        right_span_lo: 0u32,
+    };
+    let mut rep = DiffReport {
+        abi_version: AXDIFF_ABI_1,
+        schema_version: AXDIFF_SCHEMA_1,
+        mode: mode,
+        overall_status: DIFF_STATUS_IDENTICAL,
+        overall_severity: DIFF_SEV_INFO,
+        abi_impact: ABI_IMPACT_NONE,
+        formatting_only: false,
+        trivia_only: false,
+        semantic_change_count: 0u32,
+        breaking_change_count: 0u32,
+        moved_count: 0u32,
+        renamed_count: 0u32,
+        change_count: 0u32,
+        diff_hash: 0u64,
+        changes: [empty_rec; 16],
+    };
+
+    // Enforce nine-state lattice (`DIFF-INV-06..07`): never collapse `Unavailable`, `Incomparable`, or `Unknown` into `Identical`!
+    if !left.available || !right.available {
+        rep.overall_status = DIFF_STATUS_UNAVAILABLE;
+        rep.overall_severity = DIFF_SEV_UNKNOWN;
+        axdiff_finalize_hash(mut_view(rep));
+        return rep;
+    }
+    if !left.comparable || !right.comparable {
+        rep.overall_status = DIFF_STATUS_INCOMPARABLE;
+        rep.overall_severity = DIFF_SEV_UNKNOWN;
+        axdiff_finalize_hash(mut_view(rep));
+        return rep;
+    }
+    if (left.has_parse_error || right.has_parse_error) && mode >= DIFF_MODE_AST {
+        rep.overall_status = DIFF_STATUS_UNKNOWN;
+        rep.overall_severity = DIFF_SEV_UNKNOWN;
+        axdiff_finalize_hash(mut_view(rep));
+        return rep;
+    }
+
+    // Pass 1: Fast exact & formatting/trivia-equivalence check (`AXS-REF-031 §1`, `DIFF-INV-05`)
+    if left.content_hash == right.content_hash {
+        rep.overall_status = DIFF_STATUS_IDENTICAL;
+        axdiff_finalize_hash(mut_view(rep));
+        return rep;
+    }
+    if left.ast_hash != 0u64 && left.ast_hash == right.ast_hash {
+        let is_fmt_only = left.comment_hash == right.comment_hash;
+        rep.overall_status = DIFF_STATUS_CHANGED;
+        rep.formatting_only = is_fmt_only;
+        rep.trivia_only = !is_fmt_only;
+        let rec = DiffChangeRecord {
+            status: DIFF_STATUS_CHANGED,
+            change_kind: if is_fmt_only { DIFF_CHANGE_FORMATTING_ONLY } else { DIFF_CHANGE_TRIVIA_ONLY },
+            severity: DIFF_SEV_INFO,
+            evidence: DIFF_EVIDENCE_EXACT,
+            abi_impact: ABI_IMPACT_NONE,
+            item_kind: 0u8,
+            ast_edit_op: AST_OP_NONE,
+            left_module_hash: 0u64,
+            right_module_hash: 0u64,
+            left_semantic_key: 0u64,
+            right_semantic_key: 0u64,
+            left_name_hash: 0u64,
+            right_name_hash: 0u64,
+            left_span_lo: 0u32,
+            right_span_lo: 0u32,
+        };
+        axdiff_insert_change(mut_view(rep), rec);
+        axdiff_finalize_hash(mut_view(rep));
+        return rep;
+    }
+
+    let mut left_paired: [12]bool = [false; 12];
+    let mut right_paired: [12]bool = [false; 12];
+
+    // Pass 2: Exact `SymbolId` / `SemanticKey` anchoring (`AXS-REF-031 §2`, `DIFF-INV-09, 12`)
+    let mut li: u32 = 0u32;
+    while li < left.item_count && li < 12u32 {
+        let a = left.items[li as usize];
+        let mut ri: u32 = 0u32;
+        while ri < right.item_count && ri < 12u32 {
+            if !right_paired[ri as usize] {
+                let b = right.items[ri as usize];
+                if a.semantic_key != 0u64 && a.semantic_key == b.semantic_key && a.module_hash == b.module_hash {
+                    left_paired[li as usize] = true;
+                    right_paired[ri as usize] = true;
+                    let layout_changed = a.layout_size != b.layout_size ||
+                        a.layout_align != b.layout_align ||
+                        a.repr_kind != b.repr_kind ||
+                        a.discriminant_hash != b.discriminant_hash;
+                    let unsafe_changed = a.is_unsafe != b.is_unsafe;
+                    let vis_changed = a.is_pub != b.is_pub;
+                    let cap_changed = a.receiver_cap != b.receiver_cap;
+                    let eff_changed = a.effect_hash != b.effect_hash;
+                    let trait_changed = a.trait_impl_hash != b.trait_impl_hash;
+                    let sig_changed = a.sig_hash != b.sig_hash;
+                    let body_changed = a.body_ast_hash != b.body_ast_hash;
+
+                    if !layout_changed && !unsafe_changed && !vis_changed && !cap_changed && !eff_changed && !trait_changed && !sig_changed && !body_changed {
+                        if a.decl_order != b.decl_order {
+                            // Intra-module declaration reordering (`DIFF-INV-12`)
+                            let rec = DiffChangeRecord {
+                                status: DIFF_STATUS_MOVED,
+                                change_kind: DIFF_CHANGE_MOVED,
+                                severity: DIFF_SEV_INFO,
+                                evidence: DIFF_EVIDENCE_EXACT,
+                                abi_impact: ABI_IMPACT_NONE,
+                                item_kind: a.item_kind,
+                                ast_edit_op: AST_OP_MOVE_NODE,
+                                left_module_hash: a.module_hash,
+                                right_module_hash: b.module_hash,
+                                left_semantic_key: a.semantic_key,
+                                right_semantic_key: b.semantic_key,
+                                left_name_hash: a.name_hash,
+                                right_name_hash: b.name_hash,
+                                left_span_lo: a.span_lo,
+                                right_span_lo: b.span_lo,
+                            };
+                            axdiff_insert_change(mut_view(rep), rec);
+                        } else if a.trivia_hash != b.trivia_hash && mode == DIFF_MODE_TRIVIA {
+                            let rec = DiffChangeRecord {
+                                status: DIFF_STATUS_CHANGED,
+                                change_kind: DIFF_CHANGE_TRIVIA_ONLY,
+                                severity: DIFF_SEV_INFO,
+                                evidence: DIFF_EVIDENCE_EXACT,
+                                abi_impact: ABI_IMPACT_NONE,
+                                item_kind: a.item_kind,
+                                ast_edit_op: AST_OP_NONE,
+                                left_module_hash: a.module_hash,
+                                right_module_hash: b.module_hash,
+                                left_semantic_key: a.semantic_key,
+                                right_semantic_key: b.semantic_key,
+                                left_name_hash: a.name_hash,
+                                right_name_hash: b.name_hash,
+                                left_span_lo: a.span_lo,
+                                right_span_lo: b.span_lo,
+                            };
+                            axdiff_insert_change(mut_view(rep), rec);
+                        }
+                    } else {
+                        let mut ckind = DIFF_CHANGE_MODIFIED;
+                        let mut sev = DIFF_SEV_COMPATIBLE;
+                        let mut abi = ABI_IMPACT_NONE;
+                        if layout_changed {
+                            ckind = DIFF_CHANGE_LAYOUT_CHANGED;
+                            sev = DIFF_SEV_BREAKING;
+                            abi = ABI_IMPACT_BREAKING;
+                        } else if unsafe_changed {
+                            ckind = DIFF_CHANGE_UNSAFE_SURFACE_CHANGED;
+                            sev = DIFF_SEV_SECURITY_RELEVANT;
+                            abi = ABI_IMPACT_BREAKING;
+                        } else if vis_changed {
+                            ckind = DIFF_CHANGE_VISIBILITY_CHANGED;
+                            sev = if a.is_pub && !b.is_pub { DIFF_SEV_BREAKING } else { DIFF_SEV_COMPATIBLE };
+                        } else if cap_changed {
+                            ckind = DIFF_CHANGE_CAPABILITY_CHANGED;
+                            sev = DIFF_SEV_BREAKING;
+                        } else if eff_changed {
+                            ckind = DIFF_CHANGE_EFFECT_CHANGED;
+                            sev = DIFF_SEV_BREAKING;
+                        } else if trait_changed {
+                            ckind = DIFF_CHANGE_TRAIT_IMPL_CHANGED;
+                            sev = DIFF_SEV_BREAKING;
+                        } else if sig_changed {
+                            ckind = DIFF_CHANGE_SIGNATURE_CHANGED;
+                            sev = DIFF_SEV_BREAKING;
+                        }
+                        let rec = DiffChangeRecord {
+                            status: DIFF_STATUS_CHANGED,
+                            change_kind: ckind,
+                            severity: sev,
+                            evidence: DIFF_EVIDENCE_EXACT,
+                            abi_impact: abi,
+                            item_kind: a.item_kind,
+                            ast_edit_op: AST_OP_REPLACE_NODE,
+                            left_module_hash: a.module_hash,
+                            right_module_hash: b.module_hash,
+                            left_semantic_key: a.semantic_key,
+                            right_semantic_key: b.semantic_key,
+                            left_name_hash: a.name_hash,
+                            right_name_hash: b.name_hash,
+                            left_span_lo: a.span_lo,
+                            right_span_lo: b.span_lo,
+                        };
+                        axdiff_insert_change(mut_view(rep), rec);
+                    }
+                    break;
+                }
+            }
+            ri = ri + 1u32;
+        }
+        li = li + 1u32;
+    }
+
+    // Pass 3: Cross-name (`RENAMED`) and cross-module (`MOVED`) structural matching (`AXS-REF-031 §3`, `DIFF-INV-10..12`)
+    li = 0u32;
+    while li < left.item_count && li < 12u32 {
+        if !left_paired[li as usize] {
+            let a = left.items[li as usize];
+            let mut ri: u32 = 0u32;
+            while ri < right.item_count && ri < 12u32 {
+                if !right_paired[ri as usize] {
+                    let b = right.items[ri as usize];
+                    if a.item_kind == b.item_kind {
+                        let same_mod = a.module_hash == b.module_hash;
+                        let same_name = a.name_hash == b.name_hash;
+                        let same_sig = a.sig_hash == b.sig_hash;
+                        let same_body = a.body_ast_hash == b.body_ast_hash;
+                        let sim_ok = b.dice_similarity_pct >= 75u8;
+
+                        if same_mod && !same_name && (same_body || (same_sig && sim_ok)) {
+                            left_paired[li as usize] = true;
+                            right_paired[ri as usize] = true;
+                            let modified = !same_body || !same_sig;
+                            // `DIFF-INV-10`: Structural/inferred rename match is `Strong` or `Inferred`, NEVER `Exact`!
+                            let ev = if same_body && same_sig { DIFF_EVIDENCE_STRONG } else { DIFF_EVIDENCE_INFERRED };
+                            let rec = DiffChangeRecord {
+                                status: DIFF_STATUS_RENAMED,
+                                change_kind: if modified { DIFF_CHANGE_RENAMED_AND_MODIFIED } else { DIFF_CHANGE_RENAMED },
+                                severity: if a.is_pub { DIFF_SEV_BREAKING } else { DIFF_SEV_NOTICE },
+                                evidence: ev,
+                                abi_impact: ABI_IMPACT_NONE,
+                                item_kind: a.item_kind,
+                                ast_edit_op: AST_OP_REPLACE_NODE,
+                                left_module_hash: a.module_hash,
+                                right_module_hash: b.module_hash,
+                                left_semantic_key: a.semantic_key,
+                                right_semantic_key: b.semantic_key,
+                                left_name_hash: a.name_hash,
+                                right_name_hash: b.name_hash,
+                                left_span_lo: a.span_lo,
+                                right_span_lo: b.span_lo,
+                            };
+                            axdiff_insert_change(mut_view(rep), rec);
+                            break;
+                        } else if !same_mod && same_name && same_sig && (same_body || sim_ok) {
+                            left_paired[li as usize] = true;
+                            right_paired[ri as usize] = true;
+                            let modified = !same_body;
+                            let ev = if same_body { DIFF_EVIDENCE_STRONG } else { DIFF_EVIDENCE_INFERRED };
+                            let rec = DiffChangeRecord {
+                                status: DIFF_STATUS_MOVED,
+                                change_kind: if modified { DIFF_CHANGE_MOVED_AND_MODIFIED } else { DIFF_CHANGE_MOVED },
+                                severity: DIFF_SEV_NOTICE,
+                                evidence: ev,
+                                abi_impact: ABI_IMPACT_NONE,
+                                item_kind: a.item_kind,
+                                ast_edit_op: AST_OP_MOVE_NODE,
+                                left_module_hash: a.module_hash,
+                                right_module_hash: b.module_hash,
+                                left_semantic_key: a.semantic_key,
+                                right_semantic_key: b.semantic_key,
+                                left_name_hash: a.name_hash,
+                                right_name_hash: b.name_hash,
+                                left_span_lo: a.span_lo,
+                                right_span_lo: b.span_lo,
+                            };
+                            axdiff_insert_change(mut_view(rep), rec);
+                            break;
+                        }
+                    }
+                }
+                ri = ri + 1u32;
+            }
+        }
+        li = li + 1u32;
+    }
+
+    // Pass 4: Remaining unpaired items -> `REMOVED` (`AST_OP_DELETE_NODE`) and `ADDED` (`AST_OP_INSERT_NODE`)
+    li = 0u32;
+    while li < left.item_count && li < 12u32 {
+        if !left_paired[li as usize] {
+            let a = left.items[li as usize];
+            let rec = DiffChangeRecord {
+                status: DIFF_STATUS_REMOVED,
+                change_kind: DIFF_CHANGE_REMOVED,
+                severity: if a.is_pub { DIFF_SEV_BREAKING } else { DIFF_SEV_COMPATIBLE },
+                evidence: DIFF_EVIDENCE_EXACT,
+                abi_impact: if a.is_pub { ABI_IMPACT_BREAKING } else { ABI_IMPACT_NONE },
+                item_kind: a.item_kind,
+                ast_edit_op: AST_OP_DELETE_NODE,
+                left_module_hash: a.module_hash,
+                right_module_hash: 0u64,
+                left_semantic_key: a.semantic_key,
+                right_semantic_key: 0u64,
+                left_name_hash: a.name_hash,
+                right_name_hash: 0u64,
+                left_span_lo: a.span_lo,
+                right_span_lo: 0u32,
+            };
+            axdiff_insert_change(mut_view(rep), rec);
+        }
+        li = li + 1u32;
+    }
+
+    let mut rj: u32 = 0u32;
+    while rj < right.item_count && rj < 12u32 {
+        if !right_paired[rj as usize] {
+            let b = right.items[rj as usize];
+            let rec = DiffChangeRecord {
+                status: DIFF_STATUS_ADDED,
+                change_kind: DIFF_CHANGE_ADDED,
+                severity: DIFF_SEV_COMPATIBLE,
+                evidence: DIFF_EVIDENCE_EXACT,
+                abi_impact: ABI_IMPACT_COMPATIBLE,
+                item_kind: b.item_kind,
+                ast_edit_op: AST_OP_INSERT_NODE,
+                left_module_hash: 0u64,
+                right_module_hash: b.module_hash,
+                left_semantic_key: 0u64,
+                right_semantic_key: b.semantic_key,
+                left_name_hash: 0u64,
+                right_name_hash: b.name_hash,
+                left_span_lo: 0u32,
+                right_span_lo: b.span_lo,
+            };
+            axdiff_insert_change(mut_view(rep), rec);
+        }
+        rj = rj + 1u32;
+    }
+
+    if rep.change_count > 0u32 {
+        rep.overall_status = DIFF_STATUS_CHANGED;
+    }
+    axdiff_finalize_hash(mut_view(rep));
+    rep
+}

@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T219, T752, T755, T756, T759, T805, T809]
 priority: 200
-status: doing
+status: done
 attempts: 1
 paths: [compiler/refactor/vcs, std/vcs, compiler/driver/refactor_cmd, tests/run/semantic_vcs]
 spec: [spec/SPEC-102-refactoring-engine-semantic-vcs.md, 0101, tasks/1059, tasks/1060, tasks/1061, tasks/1062, tasks/1063, tasks/1064]
 covers: [REQ-TOOL-301, REQ-TOOL-302, REQ-TOOL-303, REQ-TOOL-304, REQ-TOOL-305]
 started: 2026-11-08 16:34:39
-agent: T810-impl
+finished: 2026-11-08 17:06:04
 ---
 # T810 — E19.3 Semantic AST diff/merge/patch & lineage history engine (AXDIFF, AXMERGE, AXPATCH, AXHISTORY, AXVCS)
 
@@ -43,3 +43,4 @@ Implement the semantic-aware `AXDIFF`, `AXMERGE`, `AXPATCH`, `AXHISTORY`, and `A
 ## Log
 - 2026-11-03 09:50:00 created by T219 (P19 phase planning)
 - 2026-11-08 16:34:39 started (attempt 1) T810-impl
+- 2026-11-08 17:06:04 accepted by QA -> done

@@ -1,0 +1,378 @@
+// `axiomc refactor`, `axiomc diff`, `axiomc merge`, `axiomc patch`, and `axiomc history` CLI Driver Entrypoints (T810 / E19.3).
+// Implements SPEC-102 §7.4 (AXS-REF-063; REQ-TOOL-183, REQ-TOOL-186, REQ-TOOL-301..305):
+// - CLI subcommands & option parsing (`refactor`, `diff`, `merge`, `patch`, `history`, `--mode`, `--check`, `--dry-run`, `--json`)
+// - Normative exit codes (`0` clean/ok, `1` diff/conflict/semantic-gate error, `2` `AX_DRIVER_USAGE` / `AX_DRIVER_UNKNOWN_OPTION`, `3` `AX_ICE_INTERNAL`)
+// - Zero-codegen firewall enforcement across all semantic refactoring & VCS CLI commands (`REQ-TOOL-185`)
+module compiler.driver.refactor_cmd
+
+use std.vcs.VcsRepository
+use std.vcs.PROP_MASK_SIGNATURE
+use std.vcs.PROP_MASK_CAPABILITY
+use std.vcs.PROP_MASK_VISIBILITY
+use std.vcs.PROP_MASK_ABI_LAYOUT
+use std.vcs.vcs_history_of_symbol
+use std.vcs.vcs_blame_symbol_property
+
+use compiler.lsp.protocol.LspStrView
+use compiler.lsp.protocol.lsp_str_view
+use compiler.lsp.vfs.VfsWorkspace
+use compiler.lsp.vfs.vfs_hash_str
+use compiler.lsp.handlers.LspSemanticEngine
+
+use compiler.refactor.vcs.diff.DIFF_MODE_BYTE
+use compiler.refactor.vcs.diff.DIFF_MODE_TRIVIA
+use compiler.refactor.vcs.diff.DIFF_MODE_AST
+use compiler.refactor.vcs.diff.DIFF_MODE_SEMANTIC
+use compiler.refactor.vcs.diff.DIFF_MODE_API
+use compiler.refactor.vcs.diff.DIFF_MODE_ABI
+use compiler.refactor.vcs.diff.DIFF_STATUS_IDENTICAL
+use compiler.refactor.vcs.diff.DIFF_STATUS_UNAVAILABLE
+use compiler.refactor.vcs.diff.DIFF_STATUS_INCOMPARABLE
+use compiler.refactor.vcs.diff.DiffSnapshotInput
+use compiler.refactor.vcs.diff.DiffReport
+use compiler.refactor.vcs.diff.axdiff_compare_snapshots
+
+use compiler.refactor.vcs.merge.MERGE_STATUS_CLEAN
+use compiler.refactor.vcs.merge.MergeInputBundle
+use compiler.refactor.vcs.merge.MergeResult
+use compiler.refactor.vcs.merge.axmerge_three_way
+
+use compiler.refactor.vcs.patch.PATCH_STATUS_APPLIED_CLEAN
+use compiler.refactor.vcs.patch.PATCH_STATUS_APPLIED_RELOCATED
+use compiler.refactor.vcs.patch.AxPatch
+use compiler.refactor.vcs.patch.PatchWorkspaceState
+use compiler.refactor.vcs.patch.PatchApplyResult
+use compiler.refactor.vcs.patch.axpatch_apply_transaction
+use compiler.refactor.vcs.patch.axpatch_reverse
+
+// ============================================================================
+// 1. CLI Subcommands, Exit Codes & Diagnostic Area Codes (`AXS-REF-063`)
+// ============================================================================
+
+pub const CMD_UNKNOWN: u8 = 0u8;
+pub const CMD_REFACTOR: u8 = 1u8;
+pub const CMD_DIFF: u8 = 2u8;
+pub const CMD_MERGE: u8 = 3u8;
+pub const CMD_PATCH: u8 = 4u8;
+pub const CMD_HISTORY: u8 = 5u8;
+
+pub const PATCH_SUBCMD_APPLY: u8 = 1u8;
+pub const PATCH_SUBCMD_REVERSE: u8 = 2u8;
+pub const PATCH_SUBCMD_CHECK: u8 = 3u8;
+pub const PATCH_SUBCMD_REBASE: u8 = 4u8;
+
+pub const EXIT_OK: i32 = 0i32;
+pub const EXIT_DIFF_OR_CONFLICT: i32 = 1i32;
+pub const EXIT_CLI_USAGE_ERROR: i32 = 2i32;
+pub const EXIT_ICE_INTERNAL: i32 = 3i32;
+
+pub const DIAG_DRIVER_USAGE: u32 = 9001u32;
+pub const DIAG_DRIVER_UNKNOWN_OPTION: u32 = 9002u32;
+pub const DIAG_IO_READ_FAILED: u32 = 8001u32;
+pub const DIAG_ICE_INTERNAL: u32 = 9999u32;
+
+@derive(Copy)
+pub struct RefactorCliConfig {
+    pub command: u8,
+    pub patch_subcmd: u8,
+    pub diff_mode: u8,
+    pub blame_prop_mask: u8,
+    pub check_only: bool,
+    pub dry_run: bool,
+    pub json_output: bool,
+    pub invalid_arg_count: u32,
+    pub diag_code: u32,
+}
+
+@derive(Copy)
+pub struct RefactorCliOutcome {
+    pub exit_code: i32,
+    pub diag_code: u32,
+    pub json_mode: bool,
+    pub codegen_invocations: u32,
+    pub output_summary: LspStrView,
+    pub result_hash: u64,
+}
+
+pub fn refactor_cmd_config_default() -> RefactorCliConfig {
+    RefactorCliConfig {
+        command: CMD_DIFF,
+        patch_subcmd: PATCH_SUBCMD_APPLY,
+        diff_mode: DIFF_MODE_SEMANTIC,
+        blame_prop_mask: 0u8,
+        check_only: false,
+        dry_run: false,
+        json_output: false,
+        invalid_arg_count: 0u32,
+        diag_code: 0u32,
+    }
+}
+
+pub fn refactor_cmd_parse_arg(cfg: mut_view<RefactorCliConfig>, arg: str) -> bool {
+    let h = vfs_hash_str(arg);
+    if h == vfs_hash_str("refactor") {
+        cfg.command = CMD_REFACTOR;
+        return true;
+    }
+    if h == vfs_hash_str("diff") {
+        cfg.command = CMD_DIFF;
+        return true;
+    }
+    if h == vfs_hash_str("merge") {
+        cfg.command = CMD_MERGE;
+        return true;
+    }
+    if h == vfs_hash_str("patch") {
+        cfg.command = CMD_PATCH;
+        return true;
+    }
+    if h == vfs_hash_str("history") {
+        cfg.command = CMD_HISTORY;
+        return true;
+    }
+    if h == vfs_hash_str("apply") {
+        cfg.patch_subcmd = PATCH_SUBCMD_APPLY;
+        return true;
+    }
+    if h == vfs_hash_str("reverse") {
+        cfg.patch_subcmd = PATCH_SUBCMD_REVERSE;
+        return true;
+    }
+    if h == vfs_hash_str("check") {
+        cfg.patch_subcmd = PATCH_SUBCMD_CHECK;
+        cfg.dry_run = true;
+        return true;
+    }
+    if h == vfs_hash_str("rebase") {
+        cfg.patch_subcmd = PATCH_SUBCMD_REBASE;
+        return true;
+    }
+    if h == vfs_hash_str("--mode=byte") {
+        cfg.diff_mode = DIFF_MODE_BYTE;
+        return true;
+    }
+    if h == vfs_hash_str("--mode=trivia") {
+        cfg.diff_mode = DIFF_MODE_TRIVIA;
+        return true;
+    }
+    if h == vfs_hash_str("--mode=ast") {
+        cfg.diff_mode = DIFF_MODE_AST;
+        return true;
+    }
+    if h == vfs_hash_str("--mode=semantic") {
+        cfg.diff_mode = DIFF_MODE_SEMANTIC;
+        return true;
+    }
+    if h == vfs_hash_str("--mode=api") {
+        cfg.diff_mode = DIFF_MODE_API;
+        return true;
+    }
+    if h == vfs_hash_str("--mode=abi") {
+        cfg.diff_mode = DIFF_MODE_ABI;
+        return true;
+    }
+    if h == vfs_hash_str("--blame=sig") {
+        cfg.blame_prop_mask = PROP_MASK_SIGNATURE;
+        return true;
+    }
+    if h == vfs_hash_str("--blame=cap") {
+        cfg.blame_prop_mask = PROP_MASK_CAPABILITY;
+        return true;
+    }
+    if h == vfs_hash_str("--blame=vis") {
+        cfg.blame_prop_mask = PROP_MASK_VISIBILITY;
+        return true;
+    }
+    if h == vfs_hash_str("--blame=abi") {
+        cfg.blame_prop_mask = PROP_MASK_ABI_LAYOUT;
+        return true;
+    }
+    if h == vfs_hash_str("--check") {
+        cfg.check_only = true;
+        return true;
+    }
+    if h == vfs_hash_str("--dry-run") {
+        cfg.dry_run = true;
+        return true;
+    }
+    if h == vfs_hash_str("--json") {
+        cfg.json_output = true;
+        return true;
+    }
+    cfg.invalid_arg_count = cfg.invalid_arg_count + 1u32;
+    cfg.diag_code = DIAG_DRIVER_UNKNOWN_OPTION;
+    false
+}
+
+// ============================================================================
+// 2. CLI Subcommand Execution Routers (`axiomc diff`, `merge`, `patch`, `history`)
+// ============================================================================
+
+pub fn refactor_cmd_run_diff(
+    eng: mut_view<LspSemanticEngine>,
+    cfg: view<RefactorCliConfig>,
+    left: view<DiffSnapshotInput>,
+    right: view<DiffSnapshotInput>
+) -> RefactorCliOutcome {
+    if cfg.invalid_arg_count > 0u32 || cfg.command != CMD_DIFF {
+        return RefactorCliOutcome {
+            exit_code: EXIT_CLI_USAGE_ERROR,
+            diag_code: if cfg.diag_code != 0u32 { cfg.diag_code } else { DIAG_DRIVER_USAGE },
+            json_mode: cfg.json_output,
+            codegen_invocations: 0u32,
+            output_summary: lsp_str_view("{\"error\":\"AX_DRIVER_UNKNOWN_OPTION\"}"),
+            result_hash: 0u64,
+        };
+    }
+    let rep: DiffReport = axdiff_compare_snapshots(mut_view(*eng), left, right, cfg.diff_mode);
+    if rep.overall_status == DIFF_STATUS_UNAVAILABLE || rep.overall_status == DIFF_STATUS_INCOMPARABLE {
+        return RefactorCliOutcome {
+            exit_code: EXIT_DIFF_OR_CONFLICT,
+            diag_code: DIAG_IO_READ_FAILED,
+            json_mode: cfg.json_output,
+            codegen_invocations: 0u32,
+            output_summary: lsp_str_view("{\"schema\":1,\"status\":\"unavailable\"}"),
+            result_hash: rep.diff_hash,
+        };
+    }
+    let has_breaking_or_check_diff = rep.breaking_change_count > 0u32 ||
+        (cfg.check_only && rep.overall_status != DIFF_STATUS_IDENTICAL && rep.semantic_change_count > 0u32);
+    let ec = if has_breaking_or_check_diff { EXIT_DIFF_OR_CONFLICT } else { EXIT_OK };
+    let msg = if cfg.json_output {
+        "{\"schema\":1,\"tool\":\"axdiff\",\"status\":\"ok\"}"
+    } else {
+        "AXDIFF completed"
+    };
+    RefactorCliOutcome {
+        exit_code: ec,
+        diag_code: 0u32,
+        json_mode: cfg.json_output,
+        codegen_invocations: 0u32,
+        output_summary: lsp_str_view(msg),
+        result_hash: rep.diff_hash,
+    }
+}
+
+pub fn refactor_cmd_run_merge(
+    eng: mut_view<LspSemanticEngine>,
+    cfg: view<RefactorCliConfig>,
+    bundle: view<MergeInputBundle>
+) -> RefactorCliOutcome {
+    if cfg.invalid_arg_count > 0u32 || cfg.command != CMD_MERGE {
+        return RefactorCliOutcome {
+            exit_code: EXIT_CLI_USAGE_ERROR,
+            diag_code: if cfg.diag_code != 0u32 { cfg.diag_code } else { DIAG_DRIVER_USAGE },
+            json_mode: cfg.json_output,
+            codegen_invocations: 0u32,
+            output_summary: lsp_str_view("{\"error\":\"AX_DRIVER_USAGE\"}"),
+            result_hash: 0u64,
+        };
+    }
+    let mres: MergeResult = axmerge_three_way(mut_view(*eng), bundle);
+    let ec = if mres.status == MERGE_STATUS_CLEAN && mres.verified_by_compiler_db {
+        EXIT_OK
+    } else {
+        EXIT_DIFF_OR_CONFLICT
+    };
+    let diag = if mres.conflict_count > 0u32 { mres.conflicts[0].compiler_diag_code } else { 0u32 };
+    let msg = if cfg.json_output {
+        if ec == EXIT_OK {
+            "{\"schema\":1,\"tool\":\"axmerge\",\"status\":\"clean\"}"
+        } else {
+            "{\"schema\":1,\"tool\":\"axmerge\",\"status\":\"conflicted\"}"
+        }
+    } else {
+        "AXMERGE completed"
+    };
+    RefactorCliOutcome {
+        exit_code: ec,
+        diag_code: diag,
+        json_mode: cfg.json_output,
+        codegen_invocations: 0u32,
+        output_summary: lsp_str_view(msg),
+        result_hash: mres.merge_hash,
+    }
+}
+
+pub fn refactor_cmd_run_patch(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    cfg: view<RefactorCliConfig>,
+    patch: view<AxPatch>,
+    ws_state: view<PatchWorkspaceState>
+) -> RefactorCliOutcome {
+    if cfg.invalid_arg_count > 0u32 || cfg.command != CMD_PATCH {
+        return RefactorCliOutcome {
+            exit_code: EXIT_CLI_USAGE_ERROR,
+            diag_code: if cfg.diag_code != 0u32 { cfg.diag_code } else { DIAG_DRIVER_USAGE },
+            json_mode: cfg.json_output,
+            codegen_invocations: ws.codegen_invocations,
+            output_summary: lsp_str_view("{\"error\":\"AX_DRIVER_USAGE\"}"),
+            result_hash: 0u64,
+        };
+    }
+    if cfg.patch_subcmd == PATCH_SUBCMD_REVERSE {
+        let rev = axpatch_reverse(patch);
+        return RefactorCliOutcome {
+            exit_code: EXIT_OK,
+            diag_code: 0u32,
+            json_mode: cfg.json_output,
+            codegen_invocations: ws.codegen_invocations,
+            output_summary: lsp_str_view("{\"schema\":1,\"tool\":\"axpatch\",\"op\":\"reverse\"}"),
+            result_hash: rev.patch_id,
+        };
+    }
+    let pres: PatchApplyResult = axpatch_apply_transaction(
+        mut_view(*eng),
+        mut_view(*ws),
+        patch,
+        ws_state,
+        cfg.dry_run
+    );
+    let ok = (pres.status == PATCH_STATUS_APPLIED_CLEAN || pres.status == PATCH_STATUS_APPLIED_RELOCATED) && pres.verified_by_compiler_db;
+    RefactorCliOutcome {
+        exit_code: if ok { EXIT_OK } else { EXIT_DIFF_OR_CONFLICT },
+        diag_code: 0u32,
+        json_mode: cfg.json_output,
+        codegen_invocations: ws.codegen_invocations,
+        output_summary: lsp_str_view("{\"schema\":1,\"tool\":\"axpatch\"}"),
+        result_hash: pres.resulting_ast_hash,
+    }
+}
+
+pub fn refactor_cmd_run_history(
+    cfg: view<RefactorCliConfig>,
+    repo: view<VcsRepository>,
+    symbol_key: u64
+) -> RefactorCliOutcome {
+    if cfg.invalid_arg_count > 0u32 || cfg.command != CMD_HISTORY {
+        return RefactorCliOutcome {
+            exit_code: EXIT_CLI_USAGE_ERROR,
+            diag_code: if cfg.diag_code != 0u32 { cfg.diag_code } else { DIAG_DRIVER_USAGE },
+            json_mode: cfg.json_output,
+            codegen_invocations: 0u32,
+            output_summary: lsp_str_view("{\"error\":\"AX_DRIVER_USAGE\"}"),
+            result_hash: 0u64,
+        };
+    }
+    if cfg.blame_prop_mask != 0u8 {
+        let bl = vcs_blame_symbol_property(repo, symbol_key, cfg.blame_prop_mask);
+        return RefactorCliOutcome {
+            exit_code: if bl.found { EXIT_OK } else { EXIT_DIFF_OR_CONFLICT },
+            diag_code: 0u32,
+            json_mode: cfg.json_output,
+            codegen_invocations: 0u32,
+            output_summary: lsp_str_view("{\"schema\":1,\"tool\":\"axhistory\",\"mode\":\"blame\"}"),
+            result_hash: bl.blamed_revision_id,
+        };
+    }
+    let hist = vcs_history_of_symbol(repo, symbol_key);
+    RefactorCliOutcome {
+        exit_code: if hist.found { EXIT_OK } else { EXIT_DIFF_OR_CONFLICT },
+        diag_code: 0u32,
+        json_mode: cfg.json_output,
+        codegen_invocations: 0u32,
+        output_summary: lsp_str_view("{\"schema\":1,\"tool\":\"axhistory\",\"mode\":\"lineage\"}"),
+        result_hash: hist.event_count as u64,
+    }
+}

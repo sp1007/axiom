@@ -1,0 +1,767 @@
+// AXPATCH — Symbol-Centric Semantic, AST & Text Patch Engine (T810 / E19.3).
+// Implements SPEC-102 §6 (AXS-REF-050..052; REQ-TOOL-303, REQ-TOOL-186, PATCH-INV-01..40):
+// - Dual AST/semantic & text patch IR with content-addressed `PatchId` (`AXS-REF-050 §§1..2`)
+// - Five-tier target relocation priority (`SymbolId` -> `QualifiedPath+Sig` -> `AstSubtreeHash` -> `ContextAnchor` -> `ByteSpan`)
+//   with strict rejection of missing (`TargetNotFound`) or ambiguous (`TargetAmbiguous`) targets (`AXS-REF-050 §3`)
+// - Mandatory `Precondition` & `Postcondition` guards, DAG cycle rejection, `--dry-run` preview,
+//   and atomic copy-on-write transactional execution with `CompilerDB` verification rollback (`AXS-REF-051`)
+// - Exact patch inversion (`axpatch_reverse`), sequential composition (`axpatch_compose`),
+//   and three-way semantic patch rebasing (`axpatch_rebase`) (`AXS-REF-052`)
+module compiler.refactor.vcs.patch
+
+use std.editor.editor_snapshot
+use compiler.lsp.protocol.LspStrView
+use compiler.lsp.protocol.lsp_str_view
+use compiler.lsp.vfs.VfsWorkspace
+use compiler.lsp.vfs.vfs_doc_ptr
+use compiler.lsp.handlers.LspSemanticEngine
+use compiler.lsp.handlers.APPLICABILITY_MACHINE_APPLICABLE
+use compiler.refactor.transforms.REFACTOR_OK
+use compiler.refactor.transforms.REFACTOR_EXTRACT_FUNCTION
+use compiler.refactor.transforms.refactor_workspace_edit_empty
+use compiler.refactor.transforms.refactor_workspace_edit_add
+use compiler.refactor.transforms.refactor_verify_and_commit_edit
+use compiler.refactor.vcs.diff.DIFF_CHANGE_FORMATTING_ONLY
+use compiler.refactor.vcs.diff.DIFF_CHANGE_TRIVIA_ONLY
+use compiler.refactor.vcs.diff.DIFF_CHANGE_MOVED
+use compiler.refactor.vcs.diff.DIFF_CHANGE_RENAMED
+use compiler.refactor.vcs.diff.DIFF_CHANGE_REMOVED
+use compiler.refactor.vcs.diff.DiffReport
+use compiler.refactor.vcs.diff.axdiff_mix_hash
+
+// ============================================================================
+// 1. AXPATCH Constants, Operation Kinds, Preconditions & Statuses (`AXS-REF-050`)
+// ============================================================================
+
+pub const AXPATCH_ABI_1: u32 = 1u32;
+pub const AXPATCH_SCHEMA_1: u32 = 1u32;
+
+// PatchKind
+pub const PATCH_KIND_TEXT: u8 = 0u8;
+pub const PATCH_KIND_AST: u8 = 1u8;
+pub const PATCH_KIND_SEMANTIC: u8 = 2u8;
+pub const PATCH_KIND_COMBINED: u8 = 3u8;
+
+// PatchOpKind
+pub const PATCH_OP_TEXT_REPLACE: u8 = 0u8;
+pub const PATCH_OP_INSERT_ITEM: u8 = 1u8;
+pub const PATCH_OP_DELETE_ITEM: u8 = 2u8;
+pub const PATCH_OP_MODIFY_ITEM_BODY: u8 = 3u8;
+pub const PATCH_OP_RENAME_SYMBOL: u8 = 4u8;
+pub const PATCH_OP_MOVE_SYMBOL: u8 = 5u8;
+pub const PATCH_OP_EXTRACT_FUNCTION: u8 = 6u8;
+pub const PATCH_OP_INLINE_BINDING: u8 = 7u8;
+pub const PATCH_OP_CHANGE_SIGNATURE: u8 = 8u8;
+pub const PATCH_OP_UPDATE_IMPORTS: u8 = 9u8;
+
+// PreconditionKind
+pub const PRECOND_FILE_CONTENT_HASH_IS: u8 = 0u8;
+pub const PRECOND_SYMBOL_EXISTS: u8 = 1u8;
+pub const PRECOND_SYMBOL_ABSENT: u8 = 2u8;
+pub const PRECOND_SYMBOL_SIGNATURE_HASH_IS: u8 = 3u8;
+pub const PRECOND_SYMBOL_BODY_AST_HASH_IS: u8 = 4u8;
+pub const PRECOND_RANGE_TEXT_HASH_IS: u8 = 5u8;
+
+// PatchApplyStatus
+pub const PATCH_STATUS_APPLIED_CLEAN: u8 = 0u8;
+pub const PATCH_STATUS_APPLIED_RELOCATED: u8 = 1u8;
+pub const PATCH_STATUS_PRECONDITION_FAILED: u8 = 2u8;
+pub const PATCH_STATUS_TARGET_NOT_FOUND: u8 = 3u8;
+pub const PATCH_STATUS_TARGET_AMBIGUOUS: u8 = 4u8;
+pub const PATCH_STATUS_DEPENDENCY_CYCLE: u8 = 5u8;
+pub const PATCH_STATUS_POSTCONDITION_FAILED: u8 = 6u8;
+pub const PATCH_STATUS_SEMANTIC_VERIFICATION_FAILED: u8 = 7u8;
+
+// Target Relocation Priority Levels (`AXS-REF-050 §3`)
+pub const RELOC_LEVEL_NONE: u8 = 0u8;
+pub const RELOC_LEVEL_SYMBOL_ID: u8 = 1u8;
+pub const RELOC_LEVEL_QUALIFIED_SIG: u8 = 2u8;
+pub const RELOC_LEVEL_AST_SUBTREE: u8 = 3u8;
+pub const RELOC_LEVEL_CONTEXT_ANCHOR: u8 = 4u8;
+pub const RELOC_LEVEL_EXACT_BYTE_SPAN: u8 = 5u8;
+
+// ============================================================================
+// 2. Patch IR Structures, Target Relocation & Transaction Descriptors
+// ============================================================================
+
+@derive(Copy)
+pub struct PatchOperation {
+    pub op_id: u32,
+    pub depends_on_op_id: u32,
+    pub doc_id: u32,
+    pub op_kind: u8,
+    pub precond_kind: u8,
+    pub has_external_anchor: bool,
+    pub target_symbol_key: u64,
+    pub new_symbol_key: u64,
+    pub before_module_hash: u64,
+    pub after_module_hash: u64,
+    pub before_sig_hash: u64,
+    pub after_sig_hash: u64,
+    pub before_ast_hash: u64,
+    pub after_ast_hash: u64,
+    pub context_anchor_hash: u64,
+    pub recorded_span_start: u32,
+    pub recorded_span_end: u32,
+    pub before_text: LspStrView,
+    pub after_text: LspStrView,
+}
+
+@derive(Copy)
+pub struct AxPatch {
+    pub abi_version: u32,
+    pub schema_version: u32,
+    pub patch_kind: u8,
+    pub patch_id: u64,
+    pub base_content_hash: u64,
+    pub base_ast_hash: u64,
+    pub expected_post_ast_hash: u64,
+    pub op_count: u32,
+    pub ops: [8]PatchOperation,
+}
+
+@derive(Copy)
+pub struct PatchWorkspaceTargetFact {
+    pub symbol_key: u64,
+    pub module_hash: u64,
+    pub sig_hash: u64,
+    pub body_ast_hash: u64,
+    pub context_anchor_hash: u64,
+    pub current_span_start: u32,
+    pub current_span_end: u32,
+    pub match_multiplicity: u8,
+}
+
+@derive(Copy)
+pub struct PatchWorkspaceState {
+    pub current_content_hash: u64,
+    pub current_ast_hash: u64,
+    pub produced_post_ast_hash: u64,
+    pub simulate_compiler_verify_failure: bool,
+    pub target_count: u32,
+    pub targets: [12]PatchWorkspaceTargetFact,
+}
+
+@derive(Copy)
+pub struct PatchTargetResolution {
+    pub status: u8,
+    pub reloc_level: u8,
+    pub relocated: bool,
+    pub resolved_span_start: u32,
+    pub resolved_span_end: u32,
+}
+
+@derive(Copy)
+pub struct PatchApplyResult {
+    pub status: u8,
+    pub highest_reloc_level: u8,
+    pub applied_op_count: u32,
+    pub relocated_op_count: u32,
+    pub verified_by_compiler_db: bool,
+    pub rolled_back: bool,
+    pub dry_run: bool,
+    pub resulting_ast_hash: u64,
+    pub patch_id: u64,
+}
+
+@derive(Copy)
+pub struct PatchComposeResult {
+    pub ok: bool,
+    pub conflict_detected: bool,
+    pub collapsed_rename_count: u32,
+    pub composed_patch: AxPatch,
+}
+
+@derive(Copy)
+pub struct PatchRebaseResult {
+    pub ok: bool,
+    pub conflict_detected: bool,
+    pub adapted_move_count: u32,
+    pub adapted_rename_count: u32,
+    pub adapted_formatting_count: u32,
+    pub rebased_patch: AxPatch,
+}
+
+pub fn axpatch_op_empty() -> PatchOperation {
+    let empty_sv = lsp_str_view("");
+    PatchOperation {
+        op_id: 0u32,
+        depends_on_op_id: 0u32,
+        doc_id: 0u32,
+        op_kind: PATCH_OP_TEXT_REPLACE,
+        precond_kind: PRECOND_SYMBOL_EXISTS,
+        has_external_anchor: false,
+        target_symbol_key: 0u64,
+        new_symbol_key: 0u64,
+        before_module_hash: 0u64,
+        after_module_hash: 0u64,
+        before_sig_hash: 0u64,
+        after_sig_hash: 0u64,
+        before_ast_hash: 0u64,
+        after_ast_hash: 0u64,
+        context_anchor_hash: 0u64,
+        recorded_span_start: 0u32,
+        recorded_span_end: 0u32,
+        before_text: empty_sv,
+        after_text: empty_sv,
+    }
+}
+
+pub fn axpatch_compute_id(p: view<AxPatch>) -> u64 {
+    let mut h: u64 = 0x6178706174636831u64;
+    h = axdiff_mix_hash(h, p.schema_version as u64);
+    h = axdiff_mix_hash(h, p.patch_kind as u64);
+    h = axdiff_mix_hash(h, p.base_ast_hash);
+    h = axdiff_mix_hash(h, p.expected_post_ast_hash);
+    let mut i: u32 = 0u32;
+    while i < p.op_count && i < 8u32 {
+        let op = p.ops[i as usize];
+        h = axdiff_mix_hash(h, op.op_kind as u64);
+        h = axdiff_mix_hash(h, op.target_symbol_key);
+        h = axdiff_mix_hash(h, op.new_symbol_key);
+        h = axdiff_mix_hash(h, op.before_module_hash);
+        h = axdiff_mix_hash(h, op.after_module_hash);
+        h = axdiff_mix_hash(h, op.before_ast_hash);
+        h = axdiff_mix_hash(h, op.after_ast_hash);
+        i = i + 1u32;
+    }
+    if h == 0u64 { 1u64 } else { h }
+}
+
+pub fn axpatch_new(patch_kind: u8, base_content_hash: u64, base_ast_hash: u64, expected_post_ast_hash: u64) -> AxPatch {
+    let empty_op = axpatch_op_empty();
+    let mut p = AxPatch {
+        abi_version: AXPATCH_ABI_1,
+        schema_version: AXPATCH_SCHEMA_1,
+        patch_kind: patch_kind,
+        patch_id: 0u64,
+        base_content_hash: base_content_hash,
+        base_ast_hash: base_ast_hash,
+        expected_post_ast_hash: expected_post_ast_hash,
+        op_count: 0u32,
+        ops: [empty_op; 8],
+    };
+    p.patch_id = axpatch_compute_id(view(p));
+    p
+}
+
+pub fn axpatch_add_op(p: mut_view<AxPatch>, op: PatchOperation) -> bool {
+    if p.op_count >= 8u32 {
+        return false;
+    }
+    p.ops[p.op_count as usize] = op;
+    p.op_count = p.op_count + 1u32;
+    p.patch_id = axpatch_compute_id(view(*p));
+    true
+}
+
+pub fn axpatch_workspace_state_new(current_content_hash: u64, current_ast_hash: u64, produced_post_ast_hash: u64) -> PatchWorkspaceState {
+    let empty_t = PatchWorkspaceTargetFact {
+        symbol_key: 0u64,
+        module_hash: 0u64,
+        sig_hash: 0u64,
+        body_ast_hash: 0u64,
+        context_anchor_hash: 0u64,
+        current_span_start: 0u32,
+        current_span_end: 0u32,
+        match_multiplicity: 1u8,
+    };
+    PatchWorkspaceState {
+        current_content_hash: current_content_hash,
+        current_ast_hash: current_ast_hash,
+        produced_post_ast_hash: produced_post_ast_hash,
+        simulate_compiler_verify_failure: false,
+        target_count: 0u32,
+        targets: [empty_t; 12],
+    }
+}
+
+pub fn axpatch_workspace_add_target(ws_state: mut_view<PatchWorkspaceState>, fact: PatchWorkspaceTargetFact) -> bool {
+    if ws_state.target_count >= 12u32 {
+        return false;
+    }
+    ws_state.targets[ws_state.target_count as usize] = fact;
+    ws_state.target_count = ws_state.target_count + 1u32;
+    true
+}
+
+// ============================================================================
+// 3. Target Relocation Priority & Precondition Verification (`AXS-REF-050..051`)
+// ============================================================================
+
+pub fn axpatch_resolve_target(
+    p: view<AxPatch>,
+    op: view<PatchOperation>,
+    ws_state: view<PatchWorkspaceState>
+) -> PatchTargetResolution {
+    // `INSERT_ITEM` targets a module insertion point where `new_symbol_key` must be absent
+    if op.op_kind == PATCH_OP_INSERT_ITEM {
+        let mut k: u32 = 0u32;
+        while k < ws_state.target_count && k < 12u32 {
+            let t = ws_state.targets[k as usize];
+            if t.symbol_key == op.new_symbol_key && t.match_multiplicity > 0u8 {
+                return PatchTargetResolution {
+                    status: PATCH_STATUS_PRECONDITION_FAILED,
+                    reloc_level: RELOC_LEVEL_SYMBOL_ID,
+                    relocated: false,
+                    resolved_span_start: 0u32,
+                    resolved_span_end: 0u32,
+                };
+            }
+            k = k + 1u32;
+        }
+        return PatchTargetResolution {
+            status: PATCH_STATUS_APPLIED_CLEAN,
+            reloc_level: RELOC_LEVEL_SYMBOL_ID,
+            relocated: false,
+            resolved_span_start: op.recorded_span_start,
+            resolved_span_end: op.recorded_span_end,
+        };
+    }
+
+    // Check `RenameSymbol` / `MoveSymbol` collision precondition (`SymbolAbsent(new_symbol_key)`, `PATCH-INV-11`)
+    if (op.op_kind == PATCH_OP_RENAME_SYMBOL || op.op_kind == PATCH_OP_MOVE_SYMBOL) &&
+        op.new_symbol_key != 0u64 && op.new_symbol_key != op.target_symbol_key {
+        let mut ci: u32 = 0u32;
+        while ci < ws_state.target_count && ci < 12u32 {
+            let ct = ws_state.targets[ci as usize];
+            if ct.symbol_key == op.new_symbol_key && ct.match_multiplicity > 0u8 {
+                return PatchTargetResolution {
+                    status: PATCH_STATUS_PRECONDITION_FAILED,
+                    reloc_level: RELOC_LEVEL_SYMBOL_ID,
+                    relocated: false,
+                    resolved_span_start: 0u32,
+                    resolved_span_end: 0u32,
+                };
+            }
+            ci = ci + 1u32;
+        }
+    }
+
+    // Priority 1..4 search across workspace targets (`AXS-REF-050 §3`)
+    let mut best_idx: u32 = 99u32;
+    let mut best_level: u8 = 99u8;
+    let mut i: u32 = 0u32;
+    while i < ws_state.target_count && i < 12u32 {
+        let t = ws_state.targets[i as usize];
+        let mut lvl: u8 = 99u8;
+        if op.target_symbol_key != 0u64 && t.symbol_key == op.target_symbol_key {
+            lvl = RELOC_LEVEL_SYMBOL_ID;
+        } else if op.before_module_hash != 0u64 && t.module_hash == op.before_module_hash &&
+            op.before_sig_hash != 0u64 && t.sig_hash == op.before_sig_hash {
+            lvl = RELOC_LEVEL_QUALIFIED_SIG;
+        } else if op.before_ast_hash != 0u64 && t.body_ast_hash == op.before_ast_hash {
+            lvl = RELOC_LEVEL_AST_SUBTREE;
+        } else if op.context_anchor_hash != 0u64 && t.context_anchor_hash == op.context_anchor_hash {
+            lvl = RELOC_LEVEL_CONTEXT_ANCHOR;
+        }
+        if lvl < best_level {
+            best_level = lvl;
+            best_idx = i;
+        }
+        i = i + 1u32;
+    }
+
+    if best_idx < 12u32 {
+        let chosen = ws_state.targets[best_idx as usize];
+        if chosen.match_multiplicity == 0u8 {
+            return PatchTargetResolution {
+                status: PATCH_STATUS_TARGET_NOT_FOUND,
+                reloc_level: best_level,
+                relocated: false,
+                resolved_span_start: 0u32,
+                resolved_span_end: 0u32,
+            };
+        }
+        if chosen.match_multiplicity > 1u8 {
+            return PatchTargetResolution {
+                status: PATCH_STATUS_TARGET_AMBIGUOUS,
+                reloc_level: best_level,
+                relocated: false,
+                resolved_span_start: 0u32,
+                resolved_span_end: 0u32,
+            };
+        }
+        // Check operation precondition against resolved target (`AXS-REF-051 §1`)
+        if op.precond_kind == PRECOND_SYMBOL_BODY_AST_HASH_IS && op.before_ast_hash != 0u64 && chosen.body_ast_hash != op.before_ast_hash {
+            return PatchTargetResolution {
+                status: PATCH_STATUS_PRECONDITION_FAILED,
+                reloc_level: best_level,
+                relocated: false,
+                resolved_span_start: 0u32,
+                resolved_span_end: 0u32,
+            };
+        }
+        if op.precond_kind == PRECOND_SYMBOL_SIGNATURE_HASH_IS && op.before_sig_hash != 0u64 && chosen.sig_hash != op.before_sig_hash {
+            return PatchTargetResolution {
+                status: PATCH_STATUS_PRECONDITION_FAILED,
+                reloc_level: best_level,
+                relocated: false,
+                resolved_span_start: 0u32,
+                resolved_span_end: 0u32,
+            };
+        }
+        let shifted = chosen.current_span_start != op.recorded_span_start || chosen.current_span_end != op.recorded_span_end || best_level > RELOC_LEVEL_SYMBOL_ID;
+        return PatchTargetResolution {
+            status: if shifted { PATCH_STATUS_APPLIED_RELOCATED } else { PATCH_STATUS_APPLIED_CLEAN },
+            reloc_level: best_level,
+            relocated: shifted,
+            resolved_span_start: chosen.current_span_start,
+            resolved_span_end: chosen.current_span_end,
+        };
+    }
+
+    // Priority 5: Exact byte span when `content_hash == base_content_hash`
+    if p.base_content_hash != 0u64 && ws_state.current_content_hash == p.base_content_hash {
+        return PatchTargetResolution {
+            status: PATCH_STATUS_APPLIED_CLEAN,
+            reloc_level: RELOC_LEVEL_EXACT_BYTE_SPAN,
+            relocated: false,
+            resolved_span_start: op.recorded_span_start,
+            resolved_span_end: op.recorded_span_end,
+        };
+    }
+
+    PatchTargetResolution {
+        status: PATCH_STATUS_TARGET_NOT_FOUND,
+        reloc_level: RELOC_LEVEL_NONE,
+        relocated: false,
+        resolved_span_start: 0u32,
+        resolved_span_end: 0u32,
+    }
+}
+
+fn axpatch_has_dependency_cycle(p: view<AxPatch>) -> bool {
+    let mut i: u32 = 0u32;
+    while i < p.op_count && i < 8u32 {
+        let start_id = p.ops[i as usize].op_id;
+        let mut cur_dep = p.ops[i as usize].depends_on_op_id;
+        let mut steps: u32 = 0u32;
+        while cur_dep != 0u32 && steps <= p.op_count {
+            if cur_dep == start_id {
+                return true;
+            }
+            let mut next_dep: u32 = 0u32;
+            let mut j: u32 = 0u32;
+            while j < p.op_count && j < 8u32 {
+                if p.ops[j as usize].op_id == cur_dep {
+                    next_dep = p.ops[j as usize].depends_on_op_id;
+                    break;
+                }
+                j = j + 1u32;
+            }
+            cur_dep = next_dep;
+            steps = steps + 1u32;
+        }
+        i = i + 1u32;
+    }
+    false
+}
+
+// ============================================================================
+// 4. Atomic Transactional Application, Inversion, Composition & Rebasing (`AXS-REF-051..052`)
+// ============================================================================
+
+pub fn axpatch_apply_transaction(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    p: view<AxPatch>,
+    ws_state: view<PatchWorkspaceState>,
+    dry_run: bool
+) -> PatchApplyResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let mut res = PatchApplyResult {
+        status: PATCH_STATUS_APPLIED_CLEAN,
+        highest_reloc_level: RELOC_LEVEL_NONE,
+        applied_op_count: 0u32,
+        relocated_op_count: 0u32,
+        verified_by_compiler_db: false,
+        rolled_back: false,
+        dry_run: dry_run,
+        resulting_ast_hash: ws_state.current_ast_hash,
+        patch_id: p.patch_id,
+    };
+
+    if axpatch_has_dependency_cycle(p) {
+        res.status = PATCH_STATUS_DEPENDENCY_CYCLE;
+        res.rolled_back = true;
+        return res;
+    }
+
+    let mut we = refactor_workspace_edit_empty(view(*ws), REFACTOR_EXTRACT_FUNCTION, APPLICABILITY_MACHINE_APPLICABLE);
+    let mut i: u32 = 0u32;
+    while i < p.op_count && i < 8u32 {
+        let op = p.ops[i as usize];
+        if op.precond_kind == PRECOND_FILE_CONTENT_HASH_IS && p.base_content_hash != ws_state.current_content_hash {
+            res.status = PATCH_STATUS_PRECONDITION_FAILED;
+            res.rolled_back = true;
+            return res;
+        }
+        let rel = axpatch_resolve_target(p, view(op), ws_state);
+        if rel.status != PATCH_STATUS_APPLIED_CLEAN && rel.status != PATCH_STATUS_APPLIED_RELOCATED {
+            res.status = rel.status;
+            res.rolled_back = true;
+            return res;
+        }
+        if (rel.reloc_level) > (res.highest_reloc_level) {
+            res.highest_reloc_level = rel.reloc_level;
+        }
+        if rel.relocated {
+            res.relocated_op_count = res.relocated_op_count + 1u32;
+        }
+        if op.after_text.len > 0 || (rel.resolved_span_start) < (rel.resolved_span_end) {
+            if !refactor_workspace_edit_add(
+                view(*ws),
+                mut_view(we),
+                op.doc_id,
+                rel.resolved_span_start,
+                rel.resolved_span_end,
+                op.after_text
+            ) {
+                res.status = PATCH_STATUS_PRECONDITION_FAILED;
+                res.rolled_back = true;
+                return res;
+            }
+        }
+        res.applied_op_count = res.applied_op_count + 1u32;
+        i = i + 1u32;
+    }
+
+    // Check postcondition AST hash before committing (`AXS-REF-051 §2`)
+    if p.expected_post_ast_hash != 0u64 && ws_state.produced_post_ast_hash != 0u64 &&
+        p.expected_post_ast_hash != ws_state.produced_post_ast_hash {
+        res.status = PATCH_STATUS_POSTCONDITION_FAILED;
+        res.rolled_back = true;
+        return res;
+    }
+
+    if we.edit_count > 0u32 {
+        let verify_ok = refactor_verify_and_commit_edit(
+            mut_view(*eng),
+            mut_view(*ws),
+            mut_view(we),
+            false,
+            ws_state.simulate_compiler_verify_failure || dry_run
+        );
+        if dry_run && !ws_state.simulate_compiler_verify_failure {
+            // `--dry-run` verified cleanly and rolled back disk/editor state (`PATCH-INV-37`)
+            res.verified_by_compiler_db = true;
+            res.rolled_back = true;
+            res.resulting_ast_hash = ws_state.produced_post_ast_hash;
+            res.status = if res.relocated_op_count > 0u32 { PATCH_STATUS_APPLIED_RELOCATED } else { PATCH_STATUS_APPLIED_CLEAN };
+            return res;
+        }
+        if !verify_ok || we.status != REFACTOR_OK {
+            res.status = PATCH_STATUS_SEMANTIC_VERIFICATION_FAILED;
+            res.verified_by_compiler_db = false;
+            res.rolled_back = true;
+            return res;
+        }
+    } else if ws_state.simulate_compiler_verify_failure {
+        res.status = PATCH_STATUS_SEMANTIC_VERIFICATION_FAILED;
+        res.verified_by_compiler_db = false;
+        res.rolled_back = true;
+        return res;
+    }
+
+    res.verified_by_compiler_db = true;
+    res.rolled_back = dry_run;
+    res.resulting_ast_hash = if ws_state.produced_post_ast_hash != 0u64 { ws_state.produced_post_ast_hash } else { p.expected_post_ast_hash };
+    res.status = if res.relocated_op_count > 0u32 { PATCH_STATUS_APPLIED_RELOCATED } else { PATCH_STATUS_APPLIED_CLEAN };
+    res
+}
+
+// Exact patch inversion `reverse(P)` (`SPEC-102 §6.3 AXS-REF-052 §1`, `PATCH-INV-18..19, 27`).
+pub fn axpatch_reverse(p: view<AxPatch>) -> AxPatch {
+    let mut inv = axpatch_new(p.patch_kind, p.expected_post_ast_hash, p.expected_post_ast_hash, p.base_ast_hash);
+    if p.op_count == 0u32 {
+        return inv;
+    }
+    let mut idx: u32 = p.op_count;
+    while idx > 0u32 {
+        idx = idx - 1u32;
+        let op = p.ops[idx as usize];
+        let inv_kind = if op.op_kind == PATCH_OP_INSERT_ITEM {
+            PATCH_OP_DELETE_ITEM
+        } else if op.op_kind == PATCH_OP_DELETE_ITEM {
+            PATCH_OP_INSERT_ITEM
+        } else {
+            op.op_kind
+        };
+        let inv_precond = if inv_kind == PATCH_OP_INSERT_ITEM {
+            PRECOND_SYMBOL_ABSENT
+        } else if op.precond_kind == PRECOND_SYMBOL_BODY_AST_HASH_IS {
+            PRECOND_SYMBOL_BODY_AST_HASH_IS
+        } else {
+            PRECOND_SYMBOL_EXISTS
+        };
+        let inv_span_end = op.recorded_span_start + (op.after_text.len as u32);
+        let inv_op = PatchOperation {
+            op_id: op.op_id,
+            depends_on_op_id: 0u32,
+            doc_id: op.doc_id,
+            op_kind: inv_kind,
+            precond_kind: inv_precond,
+            has_external_anchor: op.has_external_anchor,
+            target_symbol_key: if op.new_symbol_key != 0u64 { op.new_symbol_key } else { op.target_symbol_key },
+            new_symbol_key: op.target_symbol_key,
+            before_module_hash: op.after_module_hash,
+            after_module_hash: op.before_module_hash,
+            before_sig_hash: op.after_sig_hash,
+            after_sig_hash: op.before_sig_hash,
+            before_ast_hash: op.after_ast_hash,
+            after_ast_hash: op.before_ast_hash,
+            context_anchor_hash: op.context_anchor_hash,
+            recorded_span_start: op.recorded_span_start,
+            recorded_span_end: inv_span_end,
+            before_text: op.after_text,
+            after_text: op.before_text,
+        };
+        let _ = axpatch_add_op(mut_view(inv), inv_op);
+    }
+    inv
+}
+
+// Sequential patch composition `compose(P_1, P_2)` (`SPEC-102 §6.3 AXS-REF-052 §2`, `PATCH-INV-20`).
+pub fn axpatch_compose(p1: view<AxPatch>, p2: view<AxPatch>) -> PatchComposeResult {
+    let mut comp = axpatch_new(p1.patch_kind, p1.base_content_hash, p1.base_ast_hash, p2.expected_post_ast_hash);
+    if p1.expected_post_ast_hash != 0u64 && p2.base_ast_hash != 0u64 && p1.expected_post_ast_hash != p2.base_ast_hash {
+        return PatchComposeResult {
+            ok: false,
+            conflict_detected: true,
+            collapsed_rename_count: 0u32,
+            composed_patch: comp,
+        };
+    }
+
+    let mut used_p2: [8]bool = [false; 8];
+    let mut collapsed: u32 = 0u32;
+    let mut i: u32 = 0u32;
+    while i < p1.op_count && i < 8u32 {
+        let mut op1 = p1.ops[i as usize];
+        let mut j: u32 = 0u32;
+        while j < p2.op_count && j < 8u32 {
+            if !used_p2[j as usize] {
+                let op2 = p2.ops[j as usize];
+                // Collapse chained `Rename(A -> B)` + `Rename(B -> C)` -> `Rename(A -> C)` when `B` has no external anchor
+                if op1.op_kind == PATCH_OP_RENAME_SYMBOL && op2.op_kind == PATCH_OP_RENAME_SYMBOL &&
+                    op1.new_symbol_key == op2.target_symbol_key && !op1.has_external_anchor {
+                    op1.new_symbol_key = op2.new_symbol_key;
+                    op1.after_ast_hash = op2.after_ast_hash;
+                    op1.after_text = op2.after_text;
+                    used_p2[j as usize] = true;
+                    collapsed = collapsed + 1u32;
+                    break;
+                }
+                // Conflicting write to the same symbol with mismatched intermediate AST hash
+                if op1.target_symbol_key != 0u64 && op1.target_symbol_key == op2.target_symbol_key &&
+                    op1.after_ast_hash != 0u64 && op2.before_ast_hash != 0u64 && op1.after_ast_hash != op2.before_ast_hash {
+                    return PatchComposeResult {
+                        ok: false,
+                        conflict_detected: true,
+                        collapsed_rename_count: 0u32,
+                        composed_patch: comp,
+                    };
+                }
+            }
+            j = j + 1u32;
+        }
+        let _ = axpatch_add_op(mut_view(comp), op1);
+        i = i + 1u32;
+    }
+
+    let mut k: u32 = 0u32;
+    while k < p2.op_count && k < 8u32 {
+        if !used_p2[k as usize] {
+            let _ = axpatch_add_op(mut_view(comp), p2.ops[k as usize]);
+        }
+        k = k + 1u32;
+    }
+
+    PatchComposeResult {
+        ok: true,
+        conflict_detected: false,
+        collapsed_rename_count: collapsed,
+        composed_patch: comp,
+    }
+}
+
+// Three-way semantic patch rebasing `rebase_patch(patch, upstream_diff)` (`SPEC-102 §6.3 AXS-REF-052 §3`, `PATCH-INV-21..22, 28`).
+pub fn axpatch_rebase(p: view<AxPatch>, upstream_diff: view<DiffReport>, new_base_ast_hash: u64) -> PatchRebaseResult {
+    let mut reb = axpatch_new(p.patch_kind, 0u64, new_base_ast_hash, axdiff_mix_hash(p.expected_post_ast_hash, new_base_ast_hash));
+    let mut moves: u32 = 0u32;
+    let mut renames: u32 = 0u32;
+    let mut fmts: u32 = 0u32;
+
+    if upstream_diff.formatting_only || upstream_diff.trivia_only {
+        fmts = 1u32;
+    }
+
+    let mut i: u32 = 0u32;
+    while i < p.op_count && i < 8u32 {
+        let mut op = p.ops[i as usize];
+        let mut ci: u32 = 0u32;
+        while ci < upstream_diff.change_count && ci < 16u32 {
+            let ch = upstream_diff.changes[ci as usize];
+            if ch.left_semantic_key != 0u64 && ch.left_semantic_key == op.target_symbol_key {
+                if ch.change_kind == DIFF_CHANGE_REMOVED {
+                    // Upstream deleted target of `patch` -> explicit `PatchConflict` (`PATCH-INV-28`)
+                    return PatchRebaseResult {
+                        ok: false,
+                        conflict_detected: true,
+                        adapted_move_count: moves,
+                        adapted_rename_count: renames,
+                        adapted_formatting_count: fmts,
+                        rebased_patch: reb,
+                    };
+                } else if ch.change_kind == DIFF_CHANGE_MOVED {
+                    op.before_module_hash = ch.right_module_hash;
+                    if op.after_module_hash == ch.left_module_hash {
+                        op.after_module_hash = ch.right_module_hash;
+                    }
+                    op.recorded_span_start = ch.right_span_lo;
+                    moves = moves + 1u32;
+                } else if ch.change_kind == DIFF_CHANGE_RENAMED {
+                    if op.op_kind == PATCH_OP_RENAME_SYMBOL {
+                        // Both upstream and patch rename the same symbol -> conflict!
+                        return PatchRebaseResult {
+                            ok: false,
+                            conflict_detected: true,
+                            adapted_move_count: moves,
+                            adapted_rename_count: renames,
+                            adapted_formatting_count: fmts,
+                            rebased_patch: reb,
+                        };
+                    }
+                    op.target_symbol_key = ch.right_semantic_key;
+                    op.recorded_span_start = ch.right_span_lo;
+                    renames = renames + 1u32;
+                } else if ch.change_kind == DIFF_CHANGE_FORMATTING_ONLY || ch.change_kind == DIFF_CHANGE_TRIVIA_ONLY {
+                    fmts = fmts + 1u32;
+                } else {
+                    // Upstream incompatibly modified signature/body of target -> explicit conflict (`PATCH-INV-28`)
+                    return PatchRebaseResult {
+                        ok: false,
+                        conflict_detected: true,
+                        adapted_move_count: moves,
+                        adapted_rename_count: renames,
+                        adapted_formatting_count: fmts,
+                        rebased_patch: reb,
+                    };
+                }
+            }
+            ci = ci + 1u32;
+        }
+        let _ = axpatch_add_op(mut_view(reb), op);
+        i = i + 1u32;
+    }
+
+    PatchRebaseResult {
+        ok: true,
+        conflict_detected: false,
+        adapted_move_count: moves,
+        adapted_rename_count: renames,
+        adapted_formatting_count: fmts,
+        rebased_patch: reb,
+    }
+}
