@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T219, T752, T755, T756, T759, T800, T804]
 priority: 198
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-102-refactoring-engine-semantic-vcs.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-100-lsp-server-ide-engine.md, spec/SPEC-101-canonical-formatter.md, 0101, tasks/0448, tasks/1059, tasks/1060, tasks/1061, tasks/1062, tasks/1063, tasks/1064]
 covers: [REQ-TOOL-183, REQ-TOOL-186, REQ-TOOL-301, REQ-TOOL-302, REQ-TOOL-303, REQ-TOOL-304, REQ-TOOL-305]
+started: 2026-11-08 15:09:44
+finished: 2026-11-08 15:28:47
 ---
 # T808 — E19.3 Canonical semantic refactoring engine & AST-aware AXDIFF/AXMERGE/AXPATCH/AXHISTORY/AXVCS specification (SPEC-102)
 
@@ -41,3 +43,5 @@ Consolidate the canonical specification for Axiom's `CompilerDB`-verified refact
 
 ## Log
 - 2026-11-03 09:50:00 created by T219 (P19 phase planning)
+- 2026-11-08 15:09:44 started (attempt 1) T808-impl
+- 2026-11-08 15:28:47 accepted by QA -> done
