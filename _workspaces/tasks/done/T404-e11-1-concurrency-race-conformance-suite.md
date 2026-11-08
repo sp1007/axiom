@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T400, T089, T401, T402, T403]
 priority: 125
-status: doing
+status: done
 attempts: 1
 paths: [tests/conformance/p11/e11_1_concurrency]
 spec: [spec/SPEC-30-concurrency.md, 0079, 0091, 0105, 0126, 0136, tasks/0298, tasks/0488, tasks/0685]
 covers: [REQ-CONC-016, REQ-CONC-018, REQ-CONC-085, REQ-CONC-086, REQ-CONC-087, REQ-CONC-089, REQ-CONC-094, REQ-CONC-158, REQ-CONC-159, REQ-CONC-160, REQ-CONC-161, REQ-CONC-162, REQ-CONC-163, REQ-CONC-164, REQ-CONC-176, REQ-CONC-181, REQ-CONC-182, REQ-CONC-183, REQ-CONC-192, REQ-CONC-193, REQ-CONC-197, REQ-CONC-202, REQ-CONC-203, REQ-CONC-204, REQ-CONC-205, REQ-CONC-206, REQ-CONC-207]
 started: 2026-11-08 10:59:48
-agent: T404-impl
+finished: 2026-11-08 12:15:06
 ---
 # T404 — E11.1 — Concurrency & data-race conformance suite
 
@@ -42,3 +42,4 @@ Verify the `E11.1` exit criterion ('race conformance suite green') with an exhau
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
 - 2026-11-08 10:59:48 started (attempt 1) T404-impl
+- 2026-11-08 12:15:06 accepted by QA -> done

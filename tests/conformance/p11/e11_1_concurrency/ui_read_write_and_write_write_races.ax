@@ -1,0 +1,148 @@
+// test: ui
+// Covers: AXS-CONC-030, AXS-CONC-032, AXS-CONC-033, AXS-CONC-037
+// Covers: ACONC-20, ACONC-25, ACONC-28, ACONC-30, ACONCUR-147, ACONCUR-148, ACONCUR-149, ACONCUR-150, ACONCUR-151, ACONCUR-152, ACONCUR-153, ACONCUR-154, ACONCUR-155, ACONCUR-177, ACONCUR-178
+// Covers: REQ-CONC-018, REQ-CONC-089, REQ-CONC-094, REQ-CONC-164, REQ-CONC-193
+// E11.1 negative UI conformance: READ/WRITE, WRITE/READ, and WRITE/WRITE race
+// patterns across scalars, struct fields, containing places, tuples, overlapping
+// slices, dynamic indices (`UNKNOWN` disjointness), Arc<T> without Mutex, and
+// `unsafe` safe-view re-entry.
+
+module test_ui_read_write_and_write_write_races
+
+struct Pair {
+    pub a: i32,
+    pub b: i32,
+}
+
+struct Cell {
+    pub val: i32,
+}
+
+struct Arc<T> {
+    pub inner: T,
+}
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+fn par_join<A: FnOnce, B: FnOnce>(left: A, right: B) -> i32 {
+    left() + right()
+}
+
+fn spawn_scoped<F: FnOnce>(f: F) -> i32 {
+    f()
+}
+
+pub fn reject_scalar_read_write_and_write_write() {
+    let mut x: i32 = 10;
+    let mv1 = mut_view(x);
+    let mv2 = mut_view(x);
+    let v = view(x);
+
+    // 1. WRITE/WRITE conflict on same scalar across par_join (AXS-CONC-030).
+    let _a = par_join(
+        || -> i32 { *mv1 = 1; *mv1 },
+        || -> i32 { *mv2 = 2; *mv2 } //~ ERROR AX_CONC_SHARED_MUT
+    );
+
+    // 2. WRITE/READ conflict on same scalar across par_join (AXS-CONC-030).
+    let _b = par_join(
+        || -> i32 { *mv1 = 3; *mv1 },
+        || -> i32 { *v } //~ ERROR AX_CONC_SHARED_MUT
+    );
+
+    // 3. READ/WRITE conflict on same scalar across par_join (AXS-CONC-030).
+    let _c = par_join(
+        || -> i32 { *v },
+        || -> i32 { *mv1 = 4; *mv1 } //~ ERROR AX_CONC_SHARED_MUT
+    );
+
+    // 4. Sibling spawn_scoped tasks in the same scope conflicting on view + mut_view.
+    let _d = spawn_scoped(|| -> i32 { *v });
+    let _e = spawn_scoped(|| -> i32 { *mv1 = 5; *mv1 }); //~ ERROR AX_CONC_SHARED_MUT
+}
+
+pub fn reject_field_tuple_slice_and_arc_overlaps(i: usize, j: usize) {
+    let mut p = Pair { a: 1, b: 2 };
+    let mva1 = mut_view(p.a);
+    let va2 = view(p.a);
+    // 5. Same struct field `p.a` WRITE/READ conflict (AXS-CONC-032).
+    let _r1 = par_join(
+        || -> i32 { *mva1 = 11; *mva1 },
+        || -> i32 { *va2 } //~ ERROR AX_CONC_SHARED_MUT
+    );
+
+    let vp_whole = view(p);
+    let mvb = mut_view(p.b);
+    // 6. Whole struct `p` READ vs field `p.b` WRITE (`CONTAINS` conflict, AXS-CONC-032).
+    let _r2 = par_join(
+        || -> i32 { let whole = *vp_whole; whole.a },
+        || -> i32 { *mvb = 22; *mvb } //~ ERROR AX_CONC_SHARED_MUT
+    );
+
+    let mut tup = (10, 20);
+    let mvt0 = mut_view(tup.0);
+    let vt0 = view(tup.0);
+    // 7. Same tuple field `.0` WRITE/READ conflict (AXS-CONC-032).
+    let _r3 = par_join(
+        || -> i32 { *mvt0 = 1; *mvt0 },
+        || -> i32 { *vt0 } //~ ERROR AX_CONC_SHARED_MUT
+    );
+
+    let mut arr: [4]i32 = [1, 2, 3, 4];
+    let s_left = mut_view(arr[0..3]);
+    let s_right = view(arr[2..4]);
+    // 8. Overlapping constant slice ranges `[0..3]` and `[2..4]` (`OVERLAP`, AXS-CONC-033).
+    let _r4 = par_join(
+        || -> i32 { let _ = s_left; 1 },
+        || -> i32 { let _ = s_right; 2 } //~ ERROR AX_CONC_SHARED_MUT
+    );
+
+    let dyn_i = mut_view(arr[i]);
+    let dyn_j = mut_view(arr[j]);
+    // 9. Dynamic array indices `arr[i]` and `arr[j]` have `UNKNOWN` disjointness (AXS-CONC-033, ACONCUR-153).
+    let _r5 = par_join(
+        || -> i32 { *dyn_i = 10; *dyn_i },
+        || -> i32 { *dyn_j = 20; *dyn_j } //~ ERROR AX_CONC_SHARED_MUT
+    );
+
+    let dyn_s1 = mut_view(arr[0..i]);
+    let dyn_s2 = view(arr[j..4]);
+    // 10. Dynamic slice ranges `arr[0..i]` and `arr[j..4]` have `UNKNOWN` disjointness (AXS-CONC-033).
+    let _r6 = par_join(
+        || -> i32 { let _ = dyn_s1; 1 },
+        || -> i32 { let _ = dyn_s2; 2 } //~ ERROR AX_CONC_SHARED_MUT
+    );
+
+    // 11. Arc<T> without Mutex/RwLock does not allow concurrent mutation:
+    let mut a = Arc { inner: 10 };
+    let ma1 = mut_view(a);
+    let ma2 = mut_view(a);
+    let _r7 = par_join(
+        || -> i32 { (*ma1).inner = 1; 1 },
+        || -> i32 { (*ma2).inner = 2; 2 } //~ ERROR AX_CONC_SHARED_MUT
+    );
+}
+
+pub fn reject_unsafe_reentry_violations() {
+    let mut x: i32 = 100;
+    let p: *mut i32 = unsafe { address_of_mut(x) };
+    // 12. Re-establishing safe mut_view from raw pointer inside `unsafe` re-engages race check (AXS-CONC-037, ACONCUR-178).
+    let mv1: mut_view<i32> = unsafe { mut_view(*p) };
+    let mv2: mut_view<i32> = unsafe { mut_view(*p) };
+    let _a = par_join(
+        || -> i32 { *mv1 = 10; *mv1 },
+        || -> i32 { *mv2 = 20; *mv2 } //~ ERROR AX_CONC_SHARED_MUT
+    );
+
+    // 13. Re-establishing safe view<Cell> from raw pointer inside `unsafe` re-engages Share check (AXS-CONC-037).
+    let cell = Cell { val: 5 };
+    let pc: *const Cell = unsafe { address_of(cell) };
+    let vc: view<Cell> = unsafe { view(*pc) };
+    let _b = spawn_scoped(|| -> i32 {
+        let _ = *vc; //~ ERROR AX_CONC_VIEW_NOT_SHARE
+        1
+    });
+}
+
+pub fn main() {}
