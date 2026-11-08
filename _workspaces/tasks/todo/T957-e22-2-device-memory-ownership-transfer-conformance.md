@@ -22,7 +22,7 @@ Certify E22.2 exit criteria with an end-to-end conformance suite covering GPU ad
 ## Scope
 - Create `tests/conformance/p22/e22_2_device_memory_ownership` covering all positive and negative rules in `spec/SPEC-131-device-memory-cross-device-ownership.md`.
 - Verify that `DeviceBuffer<T>`, `DeviceView<T>`, and `DeviceMutView<T>` obey the exact same ownership, non-aliasing, and deterministic `Drop` rules as CPU `Vec<T>`/`view<T>`/`mut_view<T>` without introducing a second ownership model (`AGPU-20`, `AGPU-50`).
-- Verify negative compile-time rejection of: passing host views/slices directly to `@kernel` parameters expecting device memory (`AGPU-21`), dereferencing device pointers on host, dereferencing host pointers in `@kernel`, dropping or relocating a `DeviceBuffer` while a `DeviceView` or un-awaited `GpuEvent` is live (`0139 §XX.41`), and unauthorized cross-GPU peer access (`APAR-63-64`).
+- Verify negative compile-time rejection of: passing host views/slices directly to `@kernel` parameters expecting device memory (`AGPU-21`), dereferencing device pointers on host, dereferencing host pointers in `@kernel`, dropping or relocating a `DeviceBuffer` while a `DeviceView` or un-awaited `GpuEvent` is live (`0139 §XX.41`), and unauthorized cross-GPU peer access (`APAR-63-64`), plus positive conformance tests for `ShardedDeviceBuffer<T>`, `peer_copy_async`, and multi-GPU `all_reduce` / `all_gather` / `broadcast` collective synchronization.
 - Verify LIR inspection (`--emit=lir`) preserves non-zero GPU address spaces (`Device`, `Shared`, `Constant`, `Local`, `Private`) and `domain = Gpu` (`0162 §32-33`).
 
 ## Acceptance

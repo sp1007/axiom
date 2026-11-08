@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T220, T681, T685, T318]
 priority: 204
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-111-package-manager-resolution-lockfiles.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-110-build-graph-driver.md, 0098, tasks/0412, tasks/0446, tasks/0661, tasks/1065]
 covers: [REQ-ECO-8736, REQ-PKG-022, REQ-PKG-024, REQ-PKG-025]
+started: 2026-11-08 18:22:53
+finished: 2026-11-08 18:41:56
 ---
 # T854 — E20.2 Canonical AXPACKAGE package manager, deterministic SemVer resolver, feature unification & axiom.lock specification (SPEC-111)
 
@@ -43,3 +45,5 @@ Consolidate the canonical specification for Axiom's `AXPACKAGE` package identity
 
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
+- 2026-11-08 18:22:53 started (attempt 1) T854-impl
+- 2026-11-08 18:41:56 accepted by QA -> done
