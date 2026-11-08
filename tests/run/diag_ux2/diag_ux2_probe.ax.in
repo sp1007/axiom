@@ -1,0 +1,485 @@
+// Direct verification probe for `compiler.diag.ux2`, `compiler.diag.explain`, and
+// `compiler.driver.explain_cmd` (T813 / E19.4: SPEC-103, REQ-TOOL-185, REQ-TOOL-186, REQ-TOOL-298, INV-DIAG-009).
+
+module main
+
+use host_intrinsics.stdio
+use host_intrinsics.write
+
+use compiler.kernel.id.FileId
+use compiler.kernel.interner.StrView
+use compiler.source.span.Span
+use compiler.source.span.span_new
+use compiler.source.manager.SourceDatabase
+use compiler.source.manager.source_db_free
+use compiler.diag.code.diag_code
+use compiler.diag.code.AX_NAME_UNRESOLVED
+use compiler.diag.code.AX_TYPE_MISMATCH
+use compiler.diag.code.AX_TYPE_ASSIGN_IMMUTABLE
+use compiler.diag.code.AX_MOVE_USE_AFTER_MOVE
+use compiler.diag.code.AX_CONC_NOT_SEND
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+use compiler.diag.format.diag_buf_as_str_view
+use compiler.query.db.CompilerDB
+use compiler.query.db.SourceFileId
+use compiler.query.db.ModuleId
+use compiler.query.db.DefId
+use compiler.query.db.PackageId
+use compiler.query.db.SymbolId
+use compiler.query.db.SemanticKey
+use compiler.query.db.ITEM_NS_VALUE
+use compiler.query.db.ITEM_KIND_FN
+use compiler.query.db.DURABILITY_LOW
+use compiler.query.db.fingerprint128_eq
+use compiler.query.db.semantic_key_new
+use compiler.query.db.query_db_empty
+use compiler.query.db.query_db_init
+use compiler.query.db.query_db_free
+use compiler.query.db.query_db_set_source_file_input
+use compiler.query.db.query_db_set_module_tree_input
+use compiler.query.db.query_db_register_def
+
+use compiler.diag.ux2.CausalRole
+use compiler.diag.ux2.CausalProvenanceChain
+use compiler.diag.ux2.Ux2Applicability
+use compiler.diag.ux2.Ux2Fix
+use compiler.diag.ux2.Ux2FixCandidate
+use compiler.diag.ux2.Ux2FixEngineConfig
+use compiler.diag.ux2.Diagnostic2
+use compiler.diag.ux2.Ux2DiagTracker
+use compiler.diag.ux2.AX_CAP_CONTAINER_RELOC
+use compiler.diag.ux2.AX_UNSAFE_UNNECESSARY_IMPL
+use compiler.diag.ux2.TAINT_TYPE_NAME
+use compiler.diag.ux2.FIX_STATUS_CONVERGED
+use compiler.diag.ux2.FIX_STATUS_ROLLED_BACK
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_source_db_new
+use compiler.diag.ux2.ux2_source_db_add_memory
+use compiler.diag.ux2.ux2_sv_eq
+use compiler.diag.ux2.ux2_sv_contains
+use compiler.diag.ux2.ux2_utf8_display_cols
+use compiler.diag.ux2.ux2_check_no_internal_id_leak
+use compiler.diag.ux2.causal_chain_empty
+use compiler.diag.ux2.causal_chain_push
+use compiler.diag.ux2.ux2_verify_causal_completeness
+use compiler.diag.ux2.ux2_compute_fingerprint
+use compiler.diag.ux2.ux2_validate_fix_safety
+use compiler.diag.ux2.ux2_fix_single
+use compiler.diag.ux2.ux2_fix_assign_immutable
+use compiler.diag.ux2.ux2_fix_unnecessary_unsafe_impl
+use compiler.diag.ux2.ux2_fix_unresolved_import
+use compiler.diag.ux2.ux2_fix_move_pass_view
+use compiler.diag.ux2.ux2_fix_nonexhaustive_match
+use compiler.diag.ux2.diagnostic2_new
+use compiler.diag.ux2.ux2_tracker_new
+use compiler.diag.ux2.ux2_emit_root_error_and_taint
+use compiler.diag.ux2.ux2_try_emit_dependent_diag
+use compiler.diag.ux2.ux2_try_emit_ownership_violation
+use compiler.diag.ux2.ux2_reinitialize_local
+use compiler.diag.ux2.ux2_render_terminal
+use compiler.diag.ux2.ux2_render_json_v1
+use compiler.diag.ux2.ux2_fix_config_default
+use compiler.diag.ux2.ux2_apply_fixes_transactional
+
+use compiler.diag.explain.ExplainEntry
+use compiler.diag.explain.explain_entry_empty
+use compiler.diag.explain.explain_entry_count
+use compiler.diag.explain.explain_lookup_code
+use compiler.diag.explain.explain_verify_all_areas_covered
+
+use compiler.driver.explain_cmd.ExplainCliConfig
+use compiler.driver.explain_cmd.FixCliConfig
+use compiler.driver.explain_cmd.explain_cli_default
+use compiler.driver.explain_cmd.explain_cmd_parse_arg
+use compiler.driver.explain_cmd.explain_cmd_execute
+use compiler.driver.explain_cmd.fix_cli_default
+use compiler.driver.explain_cmd.fix_cmd_parse_arg
+use compiler.driver.explain_cmd.fix_cmd_execute
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+fn out_str(s: str) {
+    let sv = ux2_sv(s)
+    let _ = unsafe { write(stdio(1), sv.ptr, sv.len) }
+}
+
+fn out_bool(b: bool) {
+    if b {
+        out_str("true")
+    } else {
+        out_str("false")
+    }
+}
+
+fn out_u32(v: u32) {
+    let mut buf: [16]u8 = [0u8; 16]
+    if v == 0u32 {
+        buf[0] = 48u8
+        let _ = unsafe { write(stdio(1), address_of<u8>(buf[0]), 1) }
+        return
+    }
+    let mut x = v
+    let mut n: usize = 0
+    while x > 0u32 {
+        buf[15 - n] = 48u8 + ((x % 10u32) as u8)
+        x = x / 10u32
+        n = n + 1
+    }
+    let _ = unsafe { write(stdio(1), address_of<u8>(buf[16 - n]), n) }
+}
+
+fn mk_span(fv: u32, st: u32, en: u32) -> Span {
+    span_new(FileId { v: fv }, st, en)
+}
+
+fn run_causal_and_fingerprint_probe() -> bool {
+    let src_text = ux2_sv("pub fn bad(b: Buffer) -> i32 {\n    let buf = b\n    let a = consume(buf)\n    read_view(view(buf))\n}\n")
+    let mut sdb = ux2_source_db_new()
+    let fid = ux2_source_db_add_memory(mut_view(sdb), ux2_sv("bad_move.ax"), src_text)
+    let fv = fid.v
+
+    // 1. Build MOVE causal provenance chain (`Origin -> Transfer -> Violation`)
+    let mut move_chain = causal_chain_empty()
+    causal_chain_push(mut_view(move_chain), CausalRole.Origin, mk_span(fv, 35u32, 42u32), SymbolId { v: 1u32 }, ux2_sv("`buf` declared as owning `Buffer`"))
+    causal_chain_push(mut_view(move_chain), CausalRole.Transfer, mk_span(fv, 59u32, 71u32), SymbolId { v: 1u32 }, ux2_sv("ownership moved into `consume`"))
+    causal_chain_push(mut_view(move_chain), CausalRole.Violation, mk_span(fv, 86u32, 95u32), SymbolId { v: 1u32 }, ux2_sv("`buf` used after move"))
+    let move_complete = ux2_verify_causal_completeness(diag_code(AX_MOVE_USE_AFTER_MOVE), view(move_chain))
+
+    // 2. Build CAP container relocation causal chain (`Origin -> BorrowShared -> ContainerMutation -> Violation`)
+    let mut cap_chain = causal_chain_empty()
+    cap_chain.region_expr = ux2_sv("v[0]")
+    cap_chain.owner_symbol = ux2_sv("v")
+    causal_chain_push(mut_view(cap_chain), CausalRole.Origin, mk_span(fv, 10u32, 14u32), SymbolId { v: 2u32 }, ux2_sv("`v` owns Vec<i32>"))
+    causal_chain_push(mut_view(cap_chain), CausalRole.BorrowShared, mk_span(fv, 35u32, 42u32), SymbolId { v: 3u32 }, ux2_sv("`elem` borrows `v[0]`"))
+    causal_chain_push(mut_view(cap_chain), CausalRole.ContainerMutation, mk_span(fv, 59u32, 71u32), SymbolId { v: 2u32 }, ux2_sv("`Vec.push` may reallocate `v`"))
+    causal_chain_push(mut_view(cap_chain), CausalRole.Violation, mk_span(fv, 86u32, 95u32), SymbolId { v: 3u32 }, ux2_sv("`elem` dereferenced after relocation"))
+    let cap_complete = ux2_verify_causal_completeness(diag_code(AX_CAP_CONTAINER_RELOC), view(cap_chain))
+
+    // 3. Build CONC obligation chain (`ObligationOrigin -> Violation` + structural derivation path)
+    let mut conc_chain = causal_chain_empty()
+    conc_chain.derivation_path = ux2_sv("WorkerState -> handle: Rc<Socket>")
+    causal_chain_push(mut_view(conc_chain), CausalRole.ObligationOrigin, mk_span(fv, 10u32, 20u32), SymbolId { v: 4u32 }, ux2_sv("required by `Thread.spawn`"))
+    causal_chain_push(mut_view(conc_chain), CausalRole.Violation, mk_span(fv, 59u32, 71u32), SymbolId { v: 4u32 }, ux2_sv("`Rc<Socket>` is `!Send`"))
+    let conc_complete = ux2_verify_causal_completeness(diag_code(AX_CONC_NOT_SEND), view(conc_chain))
+
+    // 4. Deterministic 128-bit `DiagnosticFingerprint` invariance across line shifts above item (`AXS-DIAG-003`)
+    let sk = semantic_key_new(ux2_sv("pkg"), ux2_sv("bad_move"), ITEM_NS_VALUE, 0u32, ux2_sv("bad"), ux2_sv_empty())
+    let fp1 = ux2_compute_fingerprint(diag_code(AX_MOVE_USE_AFTER_MOVE), view(sk), 0u32, mk_span(fv, 86u32, 95u32), 42u64)
+    let fp2 = ux2_compute_fingerprint(diag_code(AX_MOVE_USE_AFTER_MOVE), view(sk), 200u32, mk_span(fv, 286u32, 295u32), 42u64)
+    let fp_stable = fingerprint128_eq(fp1, fp2) && (fp1.lo != 0u64 || fp1.hi != 0u64)
+
+    // 5. Render Terminal & JSON v1 + check Unicode display columns & no internal ID leakage
+    let mut d2 = diagnostic2_new(
+        diag_code(AX_MOVE_USE_AFTER_MOVE),
+        mk_span(fv, 86u32, 95u32),
+        ux2_sv("use of moved value `buf`"),
+        fp1,
+        move_chain,
+        ux2_sv("SPEC-10 AXS-OWN-002")
+    )
+    d2.fix = ux2_fix_move_pass_view(mk_span(fv, 67u32, 70u32), ux2_sv("view(buf)"), true)
+    d2.has_fix = true
+
+    let mut term_buf = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    let mut json_buf = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    diag_buf_init(mut_view(term_buf))
+    diag_buf_init(mut_view(json_buf))
+    ux2_render_terminal(view(d2), view(sdb), mut_view(term_buf))
+    ux2_render_json_v1(view(d2), 0u32, mut_view(json_buf))
+
+    let term_sv = diag_buf_as_str_view(view(term_buf))
+    let json_sv = diag_buf_as_str_view(view(json_buf))
+    let render_ok = ux2_sv_contains(term_sv, ux2_sv("[1] created here")) &&
+        ux2_sv_contains(term_sv, ux2_sv("[2] moved here")) &&
+        ux2_sv_contains(term_sv, ux2_sv("[3] used here")) &&
+        ux2_sv_contains(json_sv, ux2_sv("\"causal_steps\":3")) &&
+        ux2_sv_contains(json_sv, ux2_sv("\"applicability\":\"machine-applicable\"")) &&
+        ux2_check_no_internal_id_leak(term_sv, false) &&
+        !ux2_check_no_internal_id_leak(ux2_sv("mismatched TypeId(1847)"), false)
+
+    let vn = ux2_sv("Xin chào")
+    let vn_cols = ux2_utf8_display_cols(vn.ptr, vn.len)
+
+    out_str("probe[causal_and_fp] move_ok=")
+    out_bool(move_complete)
+    out_str(" cap_ok=")
+    out_bool(cap_complete)
+    out_str(" conc_ok=")
+    out_bool(conc_complete)
+    out_str(" fp_stable=")
+    out_bool(fp_stable)
+    out_str(" render_ok=")
+    out_bool(render_ok)
+    out_str(" vn_cols=")
+    out_u32(vn_cols)
+    out_str("\n")
+
+    diag_buf_free(mut_view(json_buf))
+    diag_buf_free(mut_view(term_buf))
+    source_db_free(mut_view(sdb))
+
+    move_complete && cap_complete && conc_complete && fp_stable && render_ok && vn_cols == 8u32
+}
+
+fn run_poison_taint_probe() -> bool {
+    let mut tracker = ux2_tracker_new()
+    let fv: u32 = 1u32
+    let sk = semantic_key_new(ux2_sv("pkg"), ux2_sv("m"), ITEM_NS_VALUE, 0u32, ux2_sv("f"), ux2_sv_empty())
+    let fp_root = ux2_compute_fingerprint(diag_code(AX_NAME_UNRESOLVED), view(sk), 0u32, mk_span(fv, 10u32, 18u32), 1u64)
+
+    let d_root = diagnostic2_new(
+        diag_code(AX_NAME_UNRESOLVED),
+        mk_span(fv, 10u32, 18u32),
+        ux2_sv("unresolved binding `bad_var`"),
+        fp_root,
+        causal_chain_empty(),
+        ux2_sv("SPEC-03 AXS-SEM-001")
+    )
+    // Emit root error on sym_id 1 (`bad_var`)
+    let root_emitted = ux2_emit_root_error_and_taint(mut_view(tracker), 1u32, TAINT_TYPE_NAME, d_root)
+
+    // Dependent operations on poisoned `sym_id 1` (`bad_var.field`, `bad_var + 1`) must be suppressed (`REQ-TOOL-298`)
+    let d_dep1 = diagnostic2_new(
+        diag_code(AX_TYPE_MISMATCH),
+        mk_span(fv, 20u32, 30u32),
+        ux2_sv("cascading type mismatch 1"),
+        ux2_compute_fingerprint(diag_code(AX_TYPE_MISMATCH), view(sk), 0u32, mk_span(fv, 20u32, 30u32), 2u64),
+        causal_chain_empty(),
+        ux2_sv_empty()
+    )
+    let dep1_emitted = ux2_try_emit_dependent_diag(mut_view(tracker), 1u32, d_dep1)
+    let dep2_emitted = ux2_try_emit_dependent_diag(mut_view(tracker), 1u32, d_dep1)
+
+    // Unpoisoned sibling symbol `sym_id 2` in the same function MUST still report genuine error (`AXS-DIAG-004 §3`)
+    let d_sibling = diagnostic2_new(
+        diag_code(AX_TYPE_MISMATCH),
+        mk_span(fv, 40u32, 50u32),
+        ux2_sv("genuine sibling error"),
+        ux2_compute_fingerprint(diag_code(AX_TYPE_MISMATCH), view(sk), 0u32, mk_span(fv, 40u32, 50u32), 3u64),
+        causal_chain_empty(),
+        ux2_sv_empty()
+    )
+    let sibling_emitted = ux2_try_emit_dependent_diag(mut_view(tracker), 2u32, d_sibling)
+
+    // Ownership poison on `local_id 5`: first use-after-move emits, second use-after-move is suppressed,
+    // re-initialization (`ux2_reinitialize_local`) clears taint so a third violation after new move emits!
+    let d_move1 = diagnostic2_new(
+        diag_code(AX_MOVE_USE_AFTER_MOVE),
+        mk_span(fv, 60u32, 68u32),
+        ux2_sv("use after move 1"),
+        ux2_compute_fingerprint(diag_code(AX_MOVE_USE_AFTER_MOVE), view(sk), 0u32, mk_span(fv, 60u32, 68u32), 4u64),
+        causal_chain_empty(),
+        ux2_sv_empty()
+    )
+    let d_move2 = diagnostic2_new(
+        diag_code(AX_MOVE_USE_AFTER_MOVE),
+        mk_span(fv, 72u32, 80u32),
+        ux2_sv("use after move 2"),
+        ux2_compute_fingerprint(diag_code(AX_MOVE_USE_AFTER_MOVE), view(sk), 0u32, mk_span(fv, 72u32, 80u32), 5u64),
+        causal_chain_empty(),
+        ux2_sv_empty()
+    )
+    let d_move3 = diagnostic2_new(
+        diag_code(AX_MOVE_USE_AFTER_MOVE),
+        mk_span(fv, 90u32, 98u32),
+        ux2_sv("use after move after reinit"),
+        ux2_compute_fingerprint(diag_code(AX_MOVE_USE_AFTER_MOVE), view(sk), 0u32, mk_span(fv, 90u32, 98u32), 6u64),
+        causal_chain_empty(),
+        ux2_sv_empty()
+    )
+    let m1 = ux2_try_emit_ownership_violation(mut_view(tracker), 5u32, d_move1)
+    let m2 = ux2_try_emit_ownership_violation(mut_view(tracker), 5u32, d_move2)
+    ux2_reinitialize_local(mut_view(tracker), 5u32)
+    let m3 = ux2_try_emit_ownership_violation(mut_view(tracker), 5u32, d_move3)
+
+    let ok = root_emitted && !dep1_emitted && !dep2_emitted && sibling_emitted &&
+        m1 && !m2 && m3 &&
+        tracker.diag_count == 4u32 && tracker.suppressed_cascade_count == 3u32
+
+    out_str("probe[poison_taint] emitted=")
+    out_u32(tracker.diag_count)
+    out_str(" suppressed=")
+    out_u32(tracker.suppressed_cascade_count)
+    out_str(" reinit_ok=")
+    out_bool(m1 && !m2 && m3)
+    out_str("\n")
+
+    ok
+}
+
+fn run_fix_engine_probe() -> bool {
+    let mut db = query_db_empty()
+    query_db_init(mut_view(db), 1u64)
+    let src = ux2_sv("pub fn inc() -> i32 {\n    let count = 0\n    count = count + 1\n    count\n}\n")
+    let sf_id = SourceFileId { v: 1u32 }
+    let mod_id = ModuleId { v: 1u32 }
+    let def_id = DefId { v: 1u32 }
+    let fv: u32 = 1u32
+    let sk = semantic_key_new(ux2_sv("pkg"), ux2_sv("fix_me"), ITEM_NS_VALUE, 0u32, ux2_sv("inc"), ux2_sv_empty())
+    let _ = query_db_set_source_file_input(mut_view(db), sf_id, ux2_sv("fix_me.ax"), src, DURABILITY_LOW)
+    let _ = query_db_set_module_tree_input(mut_view(db), mod_id, PackageId { v: 1u32 }, ModuleId { v: 0u32 }, ux2_sv("fix_me"), sf_id, DURABILITY_LOW)
+    let _ = query_db_register_def(mut_view(db), def_id, mod_id, ITEM_KIND_FN, true, 0u32, 1u32, sk)
+
+    // 1. Validate safety rules (`AXS-DIAG-011`): unsafe-introducing MachineApplicable fix MUST be rejected (`ADIAG-26`)
+    let unsafe_fix = ux2_fix_single(
+        ux2_sv("wrap in unsafe"),
+        Ux2Applicability.MachineApplicable,
+        mk_span(fv, 26u32, 29u32),
+        ux2_sv("unsafe { }"),
+        true
+    )
+    let bad_syntax_fix = ux2_fix_single(
+        ux2_sv("use ::"),
+        Ux2Applicability.MachineApplicable,
+        mk_span(fv, 26u32, 29u32),
+        ux2_sv("std::Vec"),
+        false
+    )
+    let mut_fix = ux2_fix_assign_immutable(mk_span(fv, 26u32, 29u32), ux2_sv("let mut"))
+    let safety_ok = !ux2_validate_fix_safety(view(unsafe_fix), src) &&
+        !ux2_validate_fix_safety(view(bad_syntax_fix), src) &&
+        ux2_validate_fix_safety(view(mut_fix), src)
+
+    // 2. Transactional `axiomc fix` convergence: upgrade `let count = 0` -> `let mut count = 0`
+    let cand = Ux2FixCandidate {
+        code: diag_code(AX_TYPE_ASSIGN_IMMUTABLE),
+        fingerprint: ux2_compute_fingerprint(diag_code(AX_TYPE_ASSIGN_IMMUTABLE), view(sk), 0u32, mk_span(fv, 26u32, 29u32), 1u64),
+        fix: mut_fix,
+        resolves_on_iteration: 1u32,
+        introduces_new_error: false,
+    }
+    let mut final_buf = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    let mut out_stdout = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    let mut out_stderr = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    diag_buf_init(mut_view(final_buf))
+    diag_buf_init(mut_view(out_stdout))
+    diag_buf_init(mut_view(out_stderr))
+
+    let mut fcfg = fix_cli_default()
+    let _ = fix_cmd_parse_arg(mut_view(fcfg), ux2_sv("--json"))
+    let rc_fix = fix_cmd_execute(
+        mut_view(db),
+        mod_id,
+        def_id,
+        view(fcfg),
+        src,
+        unsafe { address_of<Ux2FixCandidate>(cand) },
+        1u32,
+        0u32,
+        mut_view(final_buf),
+        mut_view(out_stdout),
+        mut_view(out_stderr)
+    )
+    let fixed_sv = diag_buf_as_str_view(view(final_buf))
+    let converged_ok = rc_fix == 0i32 &&
+        ux2_sv_contains(fixed_sv, ux2_sv("let mut count = 0")) &&
+        ux2_sv_contains(diag_buf_as_str_view(view(out_stdout)), ux2_sv("\"applied_fixes\":1"))
+
+    // 3. Rollback test: if a candidate fix introduces a new error, `ux2_apply_fixes_transactional` rolls back
+    let bad_cand = Ux2FixCandidate {
+        code: diag_code(AX_TYPE_ASSIGN_IMMUTABLE),
+        fingerprint: cand.fingerprint,
+        fix: mut_fix,
+        resolves_on_iteration: 1u32,
+        introduces_new_error: true,
+    }
+    let mut rb_buf = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    diag_buf_init(mut_view(rb_buf))
+    let rb_rep = ux2_apply_fixes_transactional(
+        mut_view(db),
+        mod_id,
+        def_id,
+        view(fcfg.engine),
+        src,
+        unsafe { address_of<Ux2FixCandidate>(bad_cand) },
+        1u32,
+        0u32,
+        mut_view(rb_buf)
+    )
+    let rollback_ok = rb_rep.status == FIX_STATUS_ROLLED_BACK &&
+        rb_rep.rolled_back_count == 1u32 &&
+        ux2_sv_eq(diag_buf_as_str_view(view(rb_buf)), src)
+
+    out_str("probe[fix_engine] safety_ok=")
+    out_bool(safety_ok)
+    out_str(" converged_ok=")
+    out_bool(converged_ok)
+    out_str(" rollback_ok=")
+    out_bool(rollback_ok)
+    out_str(" codegen_invoked=")
+    out_bool(rb_rep.codegen_invoked)
+    out_str("\n")
+
+    diag_buf_free(mut_view(rb_buf))
+    diag_buf_free(mut_view(out_stderr))
+    diag_buf_free(mut_view(out_stdout))
+    diag_buf_free(mut_view(final_buf))
+    query_db_free(mut_view(db))
+
+    safety_ok && converged_ok && rollback_ok && !rb_rep.codegen_invoked
+}
+
+fn run_explain_cli_probe() -> bool {
+    let all_areas_ok = explain_verify_all_areas_covered()
+    let total_entries = explain_entry_count()
+
+    let mut out_stdout = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    let mut out_stderr = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    diag_buf_init(mut_view(out_stdout))
+    diag_buf_init(mut_view(out_stderr))
+
+    // 1. `axiomc explain AX_MOVE_USE_AFTER_MOVE --json`
+    let mut cfg1 = explain_cli_default()
+    let _ = explain_cmd_parse_arg(mut_view(cfg1), ux2_sv("AX_MOVE_USE_AFTER_MOVE"))
+    let _ = explain_cmd_parse_arg(mut_view(cfg1), ux2_sv("--json"))
+    let rc1 = explain_cmd_execute(view(cfg1), mut_view(out_stdout), mut_view(out_stderr))
+    let json_ok = rc1 == 0i32 &&
+        ux2_sv_contains(diag_buf_as_str_view(view(out_stdout)), ux2_sv("\"code\":\"AX_MOVE_USE_AFTER_MOVE\"")) &&
+        ux2_sv_contains(diag_buf_as_str_view(view(out_stdout)), ux2_sv("SPEC-10 AXS-OWN-002"))
+
+    // 2. Corpus shorthand alias lookup: `E_USE_AFTER_MOVE` -> `AX_MOVE_USE_AFTER_MOVE`
+    let mut e_alias = explain_entry_empty()
+    let alias_ok = explain_lookup_code(ux2_sv("E_USE_AFTER_MOVE"), mut_view(e_alias)) &&
+        ux2_sv_eq(e_alias.code, ux2_sv("AX_MOVE_USE_AFTER_MOVE"))
+
+    // 3. Unknown code `AX_NOT_A_REAL_CODE` -> exit code 2 + `AX_DRIVER_USAGE` on stderr (`AXS-DIAG-020 §1`)
+    out_stdout.len = 0
+    out_stderr.len = 0
+    let mut cfg_bad = explain_cli_default()
+    let _ = explain_cmd_parse_arg(mut_view(cfg_bad), ux2_sv("AX_NOT_A_REAL_CODE"))
+    let rc_bad = explain_cmd_execute(view(cfg_bad), mut_view(out_stdout), mut_view(out_stderr))
+    let unknown_code_ok = rc_bad == 2i32 &&
+        ux2_sv_contains(diag_buf_as_str_view(view(out_stderr)), ux2_sv("AX_DRIVER_USAGE"))
+
+    out_str("probe[explain_cli] all_areas_ok=")
+    out_bool(all_areas_ok)
+    out_str(" entries=")
+    out_u32(total_entries)
+    out_str(" json_ok=")
+    out_bool(json_ok)
+    out_str(" alias_ok=")
+    out_bool(alias_ok)
+    out_str(" unknown_exit2=")
+    out_bool(unknown_code_ok)
+    out_str("\n")
+
+    diag_buf_free(mut_view(out_stderr))
+    diag_buf_free(mut_view(out_stdout))
+
+    all_areas_ok && total_entries == 37u32 && json_ok && alias_ok && unknown_code_ok
+}
+
+pub fn main() -> i32 {
+    let ok1 = run_causal_and_fingerprint_probe()
+    let ok2 = run_poison_taint_probe()
+    let ok3 = run_fix_engine_probe()
+    let ok4 = run_explain_cli_probe()
+    if !ok1 || !ok2 || !ok3 || !ok4 {
+        return 1
+    }
+    out_str("DIAG-UX2-PROBE-PASS\n")
+    0
+}

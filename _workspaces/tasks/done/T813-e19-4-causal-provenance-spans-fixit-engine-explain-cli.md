@@ -8,13 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T219, T752, T755, T756, T759, T812]
 priority: 203
-status: doing
+status: done
 attempts: 1
 paths: [compiler/diag/ux2, compiler/diag/explain, compiler/driver/explain_cmd, tests/run/diag_ux2]
 spec: [spec/SPEC-103-diagnostics-ux-ai-interface.md, spec/diagnostics.md, 0101, 0146, tasks/0360, tasks/0374, tasks/0421, tasks/0693]
 covers: [REQ-TOOL-185, REQ-TOOL-186, REQ-TOOL-298]
 started: 2026-11-08 16:23:13
-agent: T813-impl
+finished: 2026-11-08 17:12:47
 ---
 # T813 — E19.4 Diagnostics UX 2.0: causal provenance spans, cascading suppression, fix-it applicator & axiomc explain
 
@@ -43,3 +43,4 @@ Implement Diagnostics UX 2.0 causal provenance rendering, root-cause cascading s
 ## Log
 - 2026-11-03 09:50:00 created by T219 (P19 phase planning)
 - 2026-11-08 16:23:13 started (attempt 1) T813-impl
+- 2026-11-08 17:12:47 accepted by QA -> done

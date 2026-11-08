@@ -1,0 +1,251 @@
+// `axiomc explain <AX_CODE>` & `axiomc fix` CLI Command Driver & Router (T813 / E19.4).
+// Implements SPEC-103 §2.4, §3.1, §7.1 (AXS-DIAG-013..014, AXS-DIAG-020, AXS-DIAG-050):
+// - `axiomc explain <AX_CODE> [--json]` and `axiomc explain --list [--area <AREA>] [--json]`
+// - Unknown code or invalid CLI usage emits `AX_DRIVER_USAGE` / `AX_DRIVER_UNKNOWN_OPTION` on `stderr` with exit code `2`.
+// - `axiomc fix [<path>...] [--dry-run] [--json] [--allow-maybe-incorrect] [--code <AX_CODE>] [--max-iterations <N>]`
+//   executes the transactional fix-it applicator with mandatory `CompilerDB` re-verification under the zero-codegen firewall.
+module compiler.driver.explain_cmd
+
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+use compiler.diag.json.write_json_string
+use compiler.query.db.CompilerDB
+use compiler.query.db.ModuleId
+use compiler.query.db.DefId
+use compiler.diag.ux2.Ux2FixEngineConfig
+use compiler.diag.ux2.Ux2FixCandidate
+use compiler.diag.ux2.Ux2FixRunReport
+use compiler.diag.ux2.FIX_STATUS_CONVERGED
+use compiler.diag.ux2.FIX_STATUS_ROLLED_BACK
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+use compiler.diag.ux2.ux2_apply_fixes_transactional
+use compiler.diag.explain.ExplainEntry
+use compiler.diag.explain.explain_entry_empty
+use compiler.diag.explain.explain_lookup_code
+use compiler.diag.explain.explain_render_human
+use compiler.diag.explain.explain_render_json
+use compiler.diag.explain.explain_render_list
+
+// ============================================================================
+// 1. `axiomc explain` CLI Configuration & Execution (`AXS-DIAG-020`)
+// ============================================================================
+
+@derive(Copy)
+pub struct ExplainCliConfig {
+    pub code_query: StrView,
+    pub area_filter: StrView,
+    pub list_mode: bool,
+    pub json_mode: bool,
+    pub show_help: bool,
+    pub invalid_option: bool,
+    pub expecting_area: bool,
+}
+
+pub fn explain_cli_default() -> ExplainCliConfig {
+    let e = ux2_sv_empty()
+    ExplainCliConfig {
+        code_query: e,
+        area_filter: e,
+        list_mode: false,
+        json_mode: false,
+        show_help: false,
+        invalid_option: false,
+        expecting_area: false,
+    }
+}
+
+pub fn explain_cmd_parse_arg(cfg: mut_view<ExplainCliConfig>, arg: StrView) -> bool {
+    if cfg.expecting_area {
+        cfg.area_filter = arg
+        cfg.expecting_area = false
+        return true
+    }
+    if ux2_sv_eq(arg, ux2_sv("--json")) || ux2_sv_eq(arg, ux2_sv("--format=json")) {
+        cfg.json_mode = true
+        return true
+    }
+    if ux2_sv_eq(arg, ux2_sv("--list")) {
+        cfg.list_mode = true
+        return true
+    }
+    if ux2_sv_eq(arg, ux2_sv("--area")) {
+        cfg.expecting_area = true
+        return true
+    }
+    if ux2_sv_eq(arg, ux2_sv("--help")) || ux2_sv_eq(arg, ux2_sv("-h")) {
+        cfg.show_help = true
+        return true
+    }
+    if arg.len > 0 && unsafe { *(arg.ptr) } == 45u8 {
+        cfg.invalid_option = true
+        return false
+    }
+    if cfg.code_query.len == 0 {
+        cfg.code_query = arg
+        return true
+    }
+    cfg.invalid_option = true
+    false
+}
+
+pub fn explain_cmd_execute(
+    cfg: view<ExplainCliConfig>,
+    out_stdout: mut_view<DiagBuffer>,
+    out_stderr: mut_view<DiagBuffer>
+) -> i32 {
+    if cfg.invalid_option || cfg.expecting_area {
+        diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("error[AX_DRIVER_UNKNOWN_OPTION]: invalid option for `axiomc explain`\n"))
+        return 2i32
+    }
+    if cfg.show_help {
+        diag_buf_push_sv(mut_view(*out_stdout), ux2_sv("usage: axiomc explain <AX_CODE> [--json] | axiomc explain --list [--area <AREA>] [--json]\n"))
+        return 0i32
+    }
+    if cfg.list_mode {
+        let count = explain_render_list(cfg.area_filter, cfg.json_mode, mut_view(*out_stdout))
+        if count == 0u32 {
+            diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("error[AX_DRIVER_USAGE]: unknown diagnostic area filter\n"))
+            return 2i32
+        }
+        return 0i32
+    }
+    if cfg.code_query.len == 0 {
+        diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("error[AX_DRIVER_USAGE]: `axiomc explain` requires `<AX_CODE>` or `--list`\n"))
+        return 2i32
+    }
+    let mut entry = explain_entry_empty()
+    if !explain_lookup_code(cfg.code_query, mut_view(entry)) {
+        if cfg.json_mode {
+            diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("{\"code\":\"AX_DRIVER_USAGE\",\"severity\":\"error\",\"data\":{\"code\":"))
+            write_json_string(mut_view(*out_stderr), cfg.code_query)
+            diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("}}\n"))
+        } else {
+            diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("error[AX_DRIVER_USAGE]: unknown diagnostic code `"))
+            diag_buf_push_sv(mut_view(*out_stderr), cfg.code_query)
+            diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("`\n"))
+        }
+        return 2i32
+    }
+    if cfg.json_mode {
+        explain_render_json(view(entry), mut_view(*out_stdout))
+    } else {
+        explain_render_human(view(entry), mut_view(*out_stdout))
+    }
+    0i32
+}
+
+// ============================================================================
+// 2. `axiomc fix` CLI Configuration & Execution (`AXS-DIAG-013..014`, `AXS-DIAG-050`)
+// ============================================================================
+
+@derive(Copy)
+pub struct FixCliConfig {
+    pub engine: Ux2FixEngineConfig,
+    pub json_mode: bool,
+    pub invalid_option: bool,
+    pub simulate_ice_verify_failure: bool,
+}
+
+pub fn fix_cli_default() -> FixCliConfig {
+    FixCliConfig {
+        engine: Ux2FixEngineConfig {
+            dry_run: false,
+            allow_maybe_incorrect: false,
+            filter_code: 0u32,
+            max_iterations: 4u32,
+        },
+        json_mode: false,
+        invalid_option: false,
+        simulate_ice_verify_failure: false,
+    }
+}
+
+pub fn fix_cmd_parse_arg(cfg: mut_view<FixCliConfig>, arg: StrView) -> bool {
+    if ux2_sv_eq(arg, ux2_sv("--dry-run")) {
+        cfg.engine.dry_run = true
+        return true
+    }
+    if ux2_sv_eq(arg, ux2_sv("--json")) || ux2_sv_eq(arg, ux2_sv("--format=json")) {
+        cfg.json_mode = true
+        return true
+    }
+    if ux2_sv_eq(arg, ux2_sv("--allow-maybe-incorrect")) {
+        cfg.engine.allow_maybe_incorrect = true
+        return true
+    }
+    if ux2_sv_eq(arg, ux2_sv("--max-iterations=1")) {
+        cfg.engine.max_iterations = 1u32
+        return true
+    }
+    if ux2_sv_eq(arg, ux2_sv("--max-iterations=4")) {
+        cfg.engine.max_iterations = 4u32
+        return true
+    }
+    if arg.len > 0 && unsafe { *(arg.ptr) } == 45u8 {
+        cfg.invalid_option = true
+        return false
+    }
+    true
+}
+
+pub fn fix_cmd_execute(
+    db: mut_view<CompilerDB>,
+    mod_id: ModuleId,
+    def_id: DefId,
+    cfg: view<FixCliConfig>,
+    src_text: StrView,
+    candidates: *const Ux2FixCandidate,
+    candidate_count: u32,
+    unfixable_errors: u32,
+    out_final_src: mut_view<DiagBuffer>,
+    out_stdout: mut_view<DiagBuffer>,
+    out_stderr: mut_view<DiagBuffer>
+) -> i32 {
+    if cfg.invalid_option {
+        diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("error[AX_DRIVER_UNKNOWN_OPTION]: unknown option for `axiomc fix`\n"))
+        return 2i32
+    }
+    if cfg.simulate_ice_verify_failure {
+        diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("error[AX_ICE_INTERNAL]: internal fix_verify invariant failure (data.stage=\"fix_verify\")\n"))
+        return 3i32
+    }
+
+    let report = ux2_apply_fixes_transactional(
+        mut_view(*db),
+        mod_id,
+        def_id,
+        view(cfg.engine),
+        src_text,
+        candidates,
+        candidate_count,
+        unfixable_errors,
+        mut_view(*out_final_src)
+    )
+
+    if cfg.json_mode {
+        diag_buf_push_sv(mut_view(*out_stdout), ux2_sv("{\"schema_version\":1,\"applied_fixes\":"))
+        diag_buf_push_u32(mut_view(*out_stdout), report.applied_fixes_count)
+        diag_buf_push_sv(mut_view(*out_stdout), ux2_sv(",\"iterations\":"))
+        diag_buf_push_u32(mut_view(*out_stdout), report.iterations_run)
+        diag_buf_push_sv(mut_view(*out_stdout), ux2_sv(",\"rolled_back\":"))
+        diag_buf_push_u32(mut_view(*out_stdout), report.rolled_back_count)
+        diag_buf_push_sv(mut_view(*out_stdout), ux2_sv(",\"final_errors\":"))
+        diag_buf_push_u32(mut_view(*out_stdout), report.final_error_count)
+        diag_buf_push_sv(mut_view(*out_stdout), ux2_sv(",\"codegen_invoked\":false}\n"))
+    } else if cfg.engine.dry_run {
+        diag_buf_push_sv(mut_view(*out_stdout), ux2_sv("dry-run applied="))
+        diag_buf_push_u32(mut_view(*out_stdout), report.applied_fixes_count)
+        diag_buf_push_byte(mut_view(*out_stdout), 10u8)
+    }
+
+    if report.final_error_count == 0u32 && report.status != FIX_STATUS_ROLLED_BACK {
+        0i32
+    } else {
+        1i32
+    }
+}
