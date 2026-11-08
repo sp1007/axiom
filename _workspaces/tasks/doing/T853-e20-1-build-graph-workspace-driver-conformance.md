@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T220, T681, T685, T318, T852]
 priority: 203
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tests/conformance/p20/e20_1_build_graph_driver]
 spec: [spec/SPEC-110-build-graph-driver.md, 0168, tasks/0356, tasks/0372, tasks/0411, tasks/0661]
 covers: [REQ-PKG-022, REQ-PKG-024, REQ-PKG-025]
+started: 2026-11-08 20:44:51
+agent: T853-impl
 ---
 # T853 — E20.1 Build graph, workspace orchestration, feature/profile determinism & driver CLI conformance suite
 
@@ -42,3 +44,4 @@ Certify E20.1 exit criteria with an end-to-end conformance suite covering multi-
 
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
+- 2026-11-08 20:44:51 started (attempt 1) T853-impl

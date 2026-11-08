@@ -1,0 +1,628 @@
+// Axiom Compiler — ABI Stability Verification & Boundary Typechecker (compiler/abi/stability/mod.ax)
+// Implements SPEC-114 §§1..2 & §6 (AXS-ABI-001..017, AXS-ABI-030, AXS-ABI-050; REQ-ECO-8734, REQ-PKG-024, INV-SABI-001).
+
+module compiler.abi.stability
+
+use compiler.kernel.hash.ax_hash_bytes
+use compiler.kernel.hash.ax_hash_u64
+use compiler.kernel.hash.ax_hash_combine
+use compiler.kernel.interner.StrView
+use compiler.source.span.Span
+use compiler.source.span.span_none
+use compiler.diag.code.DiagCode
+use compiler.diag.code.diag_code
+use compiler.diag.code.DiagDataKind
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.DiagDataEntry
+use compiler.diag.emitter.DiagDataValue
+use compiler.diag.emitter.diag_new
+use compiler.diag.emitter.diag_sink_report
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+use compiler.diag.ux2.ux2_sv_contains
+
+// =============================================================================
+// 1. Diagnostic Codes Owned by SPEC-114 (§6, AXS-ABI-050)
+// =============================================================================
+
+pub const AX_ABI_UNSTABLE_TYPE: u32 = 220u32
+pub const AX_ABI_EXTENSIBLE_MISSING_HEADER: u32 = 221u32
+pub const AX_ABI_OPAQUE_BY_VALUE: u32 = 222u32
+pub const AX_ABI_SYMBOL_VERSION_DUPLICATE: u32 = 223u32
+pub const AX_ABI_BREAKING_CHANGE: u32 = 224u32
+pub const AX_ABI_SEMVER_MISMATCH: u32 = 225u32
+pub const AX_FFI_GENERIC_EXPORT: u32 = 226u32
+
+pub fn abi_diag_code_name(code_raw: u32) -> StrView {
+    if code_raw == AX_ABI_UNSTABLE_TYPE {
+        return ux2_sv("AX_ABI_UNSTABLE_TYPE")
+    }
+    if code_raw == AX_ABI_EXTENSIBLE_MISSING_HEADER {
+        return ux2_sv("AX_ABI_EXTENSIBLE_MISSING_HEADER")
+    }
+    if code_raw == AX_ABI_OPAQUE_BY_VALUE {
+        return ux2_sv("AX_ABI_OPAQUE_BY_VALUE")
+    }
+    if code_raw == AX_ABI_SYMBOL_VERSION_DUPLICATE {
+        return ux2_sv("AX_ABI_SYMBOL_VERSION_DUPLICATE")
+    }
+    if code_raw == AX_ABI_BREAKING_CHANGE {
+        return ux2_sv("AX_ABI_BREAKING_CHANGE")
+    }
+    if code_raw == AX_ABI_SEMVER_MISMATCH {
+        return ux2_sv("AX_ABI_SEMVER_MISMATCH")
+    }
+    if code_raw == AX_FFI_GENERIC_EXPORT {
+        return ux2_sv("AX_FFI_GENERIC_EXPORT")
+    }
+    ux2_sv("AX_ABI_UNKNOWN")
+}
+
+// =============================================================================
+// 2. ABI Tiers & Calling Conventions (AXS-ABI-001, AXS-ABI-023)
+// =============================================================================
+
+pub const ABI_TIER_INTERNAL: u8 = 1u8
+pub const ABI_TIER_PACKAGE: u8 = 2u8
+pub const ABI_TIER_STABLE: u8 = 3u8
+
+pub const CALL_CONV_C: u8 = 0u8
+pub const CALL_CONV_WIN64: u8 = 1u8
+pub const CALL_CONV_SYSV64: u8 = 2u8
+pub const CALL_CONV_AAPCS64: u8 = 3u8
+
+pub fn call_conv_name(cc: u8) -> StrView {
+    if cc == CALL_CONV_C {
+        return ux2_sv("C")
+    }
+    if cc == CALL_CONV_WIN64 {
+        return ux2_sv("Win64")
+    }
+    if cc == CALL_CONV_SYSV64 {
+        return ux2_sv("SysV64")
+    }
+    if cc == CALL_CONV_AAPCS64 {
+        return ux2_sv("AAPCS64")
+    }
+    ux2_sv("unknown")
+}
+
+// =============================================================================
+// 3. Stable Type System & Rejection Reasons (AXS-ABI-010..017)
+// =============================================================================
+
+pub const STABLE_TYPE_I8: u8 = 0u8
+pub const STABLE_TYPE_U8: u8 = 1u8
+pub const STABLE_TYPE_I16: u8 = 2u8
+pub const STABLE_TYPE_U16: u8 = 3u8
+pub const STABLE_TYPE_I32: u8 = 4u8
+pub const STABLE_TYPE_U32: u8 = 5u8
+pub const STABLE_TYPE_I64: u8 = 6u8
+pub const STABLE_TYPE_U64: u8 = 7u8
+pub const STABLE_TYPE_ISIZE: u8 = 8u8
+pub const STABLE_TYPE_USIZE: u8 = 9u8
+pub const STABLE_TYPE_F32: u8 = 10u8
+pub const STABLE_TYPE_F64: u8 = 11u8
+pub const STABLE_TYPE_BOOL: u8 = 12u8
+pub const STABLE_TYPE_RAW_PTR: u8 = 13u8
+pub const STABLE_TYPE_STABLE_VIEW: u8 = 14u8
+pub const STABLE_TYPE_STABLE_MUT_VIEW: u8 = 15u8
+pub const STABLE_TYPE_STABLE_STR: u8 = 16u8
+pub const STABLE_TYPE_STRUCT: u8 = 17u8
+pub const STABLE_TYPE_ENUM: u8 = 18u8
+pub const STABLE_TYPE_OPAQUE_HANDLE: u8 = 19u8
+pub const STABLE_TYPE_FN_PTR: u8 = 20u8
+pub const STABLE_TYPE_UNSTABLE: u8 = 21u8
+
+// Unstable type rejection taxonomy (AXS-ABI-017)
+pub const UNSTABLE_CLOSURE_CAPTURING: u8 = 1u8
+pub const UNSTABLE_UNREPR_ADT: u8 = 2u8
+pub const UNSTABLE_UNINSTANTIATED_GENERIC: u8 = 3u8
+pub const UNSTABLE_BARE_VIEW: u8 = 4u8
+pub const UNSTABLE_BARE_STR: u8 = 5u8
+pub const UNSTABLE_RAW_SLICE_BY_VAL: u8 = 6u8
+pub const UNSTABLE_BARE_DYN_TRAIT: u8 = 7u8
+pub const UNSTABLE_OWNED_COLLECTION: u8 = 8u8
+pub const UNSTABLE_OPAQUE_BY_VAL: u8 = 9u8
+
+pub fn unstable_reason_message(reason: u8) -> StrView {
+    if reason == UNSTABLE_CLOSURE_CAPTURING {
+        return ux2_sv("capturing closure cannot cross @abi(stable) boundary; closure environment is unversioned")
+    }
+    if reason == UNSTABLE_UNREPR_ADT {
+        return ux2_sv("ADT lacks @repr(C), @repr(transparent), or @repr(u8..u64); internal layout subject to reordering")
+    }
+    if reason == UNSTABLE_UNINSTANTIATED_GENERIC {
+        return ux2_sv("uninstantiated generic type parameter cannot cross dynamic binary boundary")
+    }
+    if reason == UNSTABLE_BARE_VIEW {
+        return ux2_sv("bare view<T> or mut_view<T> fat pointer cannot cross @abi(stable) boundary; use StableView<T> or StableMutView<T>")
+    }
+    if reason == UNSTABLE_BARE_STR {
+        return ux2_sv("bare Str fat pointer cannot cross @abi(stable) boundary; use StableStr")
+    }
+    if reason == UNSTABLE_RAW_SLICE_BY_VAL {
+        return ux2_sv("raw slice passed by value exceeds 8 bytes without stable struct wrapper")
+    }
+    if reason == UNSTABLE_BARE_DYN_TRAIT {
+        return ux2_sv("bare dyn Trait fat pointer cannot cross @abi(stable) boundary; use stable vtable struct")
+    }
+    if reason == UNSTABLE_OWNED_COLLECTION {
+        return ux2_sv("bare owned collection (String/Vec) cannot cross dynamic library boundary without AllocatorVTable; use StableBuffer")
+    }
+    if reason == UNSTABLE_OPAQUE_BY_VAL {
+        return ux2_sv("@opaque handle type cannot be passed or instantiated by value outside its defining module")
+    }
+    ux2_sv("unstable type across @abi(stable) boundary")
+}
+
+// =============================================================================
+// 4. Stable Type & Member Data Models (AXS-ABI-010..016)
+// =============================================================================
+
+@derive(Copy)
+pub struct StableFieldDesc {
+    pub name: StrView,
+    pub type_name: StrView,
+    pub type_kind: u8,
+    pub size: u32,
+    pub align: u32,
+    pub offset: u32,
+    pub is_pub: bool,
+}
+
+pub fn stable_field_desc_default(name: StrView, type_name: StrView, type_kind: u8, size: u32, align: u32) -> StableFieldDesc {
+    StableFieldDesc {
+        name: name,
+        type_name: type_name,
+        type_kind: type_kind,
+        size: size,
+        align: align,
+        offset: 0u32,
+        is_pub: true,
+    }
+}
+
+@derive(Copy)
+pub struct StableVariantDesc {
+    pub name: StrView,
+    pub tag: u64,
+    pub has_payload: bool,
+    pub payload_size: u32,
+    pub payload_align: u32,
+    pub payload_offset: u32,
+}
+
+pub fn stable_variant_desc_default(name: StrView, tag: u64) -> StableVariantDesc {
+    StableVariantDesc {
+        name: name,
+        tag: tag,
+        has_payload: false,
+        payload_size: 0u32,
+        payload_align: 1u32,
+        payload_offset: 0u32,
+    }
+}
+
+@derive(Copy)
+pub struct StableTypeContract {
+    pub type_kind: u8,
+    pub type_name: StrView,
+    pub defining_module: StrView,
+    pub size: u32,
+    pub align: u32,
+    pub is_repr_c: bool,
+    pub is_opaque: bool,
+    pub is_extensible: bool,
+    pub has_abi_header: bool,
+    pub declared_version: u32,
+    pub unstable_reason: u8,
+    pub field_count: u32,
+}
+
+pub fn stable_type_contract_scalar(type_kind: u8, name: StrView, size: u32, align: u32) -> StableTypeContract {
+    StableTypeContract {
+        type_kind: type_kind,
+        type_name: name,
+        defining_module: ux2_sv("std.core"),
+        size: size,
+        align: align,
+        is_repr_c: true,
+        is_opaque: false,
+        is_extensible: false,
+        has_abi_header: false,
+        declared_version: 1u32,
+        unstable_reason: 0u8,
+        field_count: 0u32,
+    }
+}
+
+pub fn stable_type_contract_ptr(elem_name: StrView, is_opaque: bool, def_mod: StrView) -> StableTypeContract {
+    StableTypeContract {
+        type_kind: STABLE_TYPE_RAW_PTR,
+        type_name: elem_name,
+        defining_module: def_mod,
+        size: 8u32,
+        align: 8u32,
+        is_repr_c: true,
+        is_opaque: is_opaque,
+        is_extensible: false,
+        has_abi_header: false,
+        declared_version: 1u32,
+        unstable_reason: 0u8,
+        field_count: 0u32,
+    }
+}
+
+pub fn stable_type_contract_opaque(name: StrView, def_mod: StrView) -> StableTypeContract {
+    StableTypeContract {
+        type_kind: STABLE_TYPE_OPAQUE_HANDLE,
+        type_name: name,
+        defining_module: def_mod,
+        size: 0u32,
+        align: 0u32,
+        is_repr_c: false,
+        is_opaque: true,
+        is_extensible: false,
+        has_abi_header: false,
+        declared_version: 1u32,
+        unstable_reason: 0u8,
+        field_count: 0u32,
+    }
+}
+
+pub fn stable_type_contract_unstable(name: StrView, reason: u8) -> StableTypeContract {
+    StableTypeContract {
+        type_kind: STABLE_TYPE_UNSTABLE,
+        type_name: name,
+        defining_module: ux2_sv_empty(),
+        size: 0u32,
+        align: 0u32,
+        is_repr_c: false,
+        is_opaque: false,
+        is_extensible: false,
+        has_abi_header: false,
+        declared_version: 0u32,
+        unstable_reason: reason,
+        field_count: 0u32,
+    }
+}
+
+// =============================================================================
+// 5. Function Boundary, Params & Symbol Version Entries (AXS-ABI-004, AXS-ABI-030)
+// =============================================================================
+
+@derive(Copy)
+pub struct StableParamContract {
+    pub name: StrView,
+    pub ty: StableTypeContract,
+    pub is_by_value: bool,
+}
+
+pub fn stable_param_contract_default(name: StrView, ty: StableTypeContract, is_by_value: bool) -> StableParamContract {
+    StableParamContract {
+        name: name,
+        ty: ty,
+        is_by_value: is_by_value,
+    }
+}
+
+@derive(Copy)
+pub struct StableFnContract {
+    pub name: StrView,
+    pub module_path: StrView,
+    pub is_abi_stable: bool,
+    pub is_pub: bool,
+    pub is_generic: bool,
+    pub generic_param_count: u32,
+    pub abi_version: StrView,
+    pub symbol_version: StrView,
+    pub is_default_version: bool,
+    pub call_conv: u8,
+    pub param_count: u32,
+    pub ret_type: StableTypeContract,
+}
+
+pub fn stable_fn_contract_default(name: StrView, module_path: StrView) -> StableFnContract {
+    StableFnContract {
+        name: name,
+        module_path: module_path,
+        is_abi_stable: true,
+        is_pub: true,
+        is_generic: false,
+        generic_param_count: 0u32,
+        abi_version: ux2_sv("1.0"),
+        symbol_version: ux2_sv("1.0"),
+        is_default_version: true,
+        call_conv: CALL_CONV_WIN64,
+        param_count: 0u32,
+        ret_type: stable_type_contract_scalar(STABLE_TYPE_U32, ux2_sv("u32"), 4u32, 4u32),
+    }
+}
+
+@derive(Copy)
+pub struct SymbolVersionEntry {
+    pub name: StrView,
+    pub module_path: StrView,
+    pub version: StrView,
+    pub is_default: bool,
+}
+
+pub fn symbol_version_entry_new(name: StrView, mod_path: StrView, ver: StrView, is_def: bool) -> SymbolVersionEntry {
+    SymbolVersionEntry {
+        name: name,
+        module_path: mod_path,
+        version: ver,
+        is_default: is_def,
+    }
+}
+
+// =============================================================================
+// 6. C-Compatible Struct Layout Verifier (AXS-ABI-011)
+// =============================================================================
+
+pub fn align_to(offset: u32, align: u32) -> u32 {
+    if align <= 1u32 {
+        return offset
+    }
+    let mask = align - 1u32
+    (offset + mask) & (0xFFFFFFFFu32 ^ mask)
+}
+
+pub fn compute_c_field_offset(prev_offset: u32, prev_size: u32, current_align: u32) -> u32 {
+    let next_raw = prev_offset + prev_size
+    align_to(next_raw, current_align)
+}
+
+pub fn compute_c_struct_total_size(last_offset: u32, last_size: u32, max_align: u32) -> u32 {
+    let raw = last_offset + last_size
+    align_to(raw, max_align)
+}
+
+// =============================================================================
+// 7. Boundary Validation & Diagnostics Engine (AXS-ABI-004..017, AXS-ABI-030)
+// =============================================================================
+
+@intrinsic unsafe fn address_of_mut<T>(mut val: T) -> *mut T { 0 as *mut T }
+
+fn make_str_data_entry(key: StrView, val: StrView) -> DiagDataEntry {
+    DiagDataEntry {
+        key: key,
+        value: DiagDataValue {
+            kind: DiagDataKind.String,
+            str_val: val,
+            int_val: 0i64,
+            bool_val: false,
+            list_items: 0 as *mut StrView,
+            list_count: 0usize,
+        },
+    }
+}
+
+pub fn report_abi_diag_1(
+    sink: mut_view<DiagSink>,
+    code_raw: u32,
+    msg: str,
+    k1: str,
+    v1: StrView
+) {
+    let mut d = diag_new(diag_code(code_raw), span_none(), ux2_sv(msg))
+    let mut entries: [1]DiagDataEntry = [make_str_data_entry(ux2_sv(k1), v1)]
+    d.data = unsafe { address_of_mut(entries[0]) }
+    d.data_count = 1usize
+    diag_sink_report(mut_view(*sink), view(d))
+}
+
+pub fn report_abi_diag_2(
+    sink: mut_view<DiagSink>,
+    code_raw: u32,
+    msg: str,
+    k1: str,
+    v1: StrView,
+    k2: str,
+    v2: StrView
+) {
+    let mut d = diag_new(diag_code(code_raw), span_none(), ux2_sv(msg))
+    let mut entries: [2]DiagDataEntry = [
+        make_str_data_entry(ux2_sv(k1), v1),
+        make_str_data_entry(ux2_sv(k2), v2)
+    ]
+    d.data = unsafe { address_of_mut(entries[0]) }
+    d.data_count = 2usize
+    diag_sink_report(mut_view(*sink), view(d))
+}
+
+// Extensible struct header verification (AXS-ABI-011):
+// Extensible struct MUST begin with canonical `AbiHeader` or `abi_version: u32, struct_size: u32`.
+pub fn validate_extensible_struct_header(
+    contract: view<StableTypeContract>,
+    field0_name: StrView,
+    field0_type: StrView,
+    field1_name: StrView,
+    field1_type: StrView,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if !contract.is_extensible {
+        return true
+    }
+
+    let has_header_struct = ux2_sv_eq(field0_name, ux2_sv("header")) &&
+        (ux2_sv_eq(field0_type, ux2_sv("AbiHeader")) || ux2_sv_eq(field0_type, ux2_sv("abi_header")))
+
+    let has_inline_fields = (ux2_sv_eq(field0_name, ux2_sv("abi_version")) || ux2_sv_eq(field0_name, ux2_sv("version"))) &&
+        ux2_sv_eq(field0_type, ux2_sv("u32")) &&
+        (ux2_sv_eq(field1_name, ux2_sv("struct_size")) || ux2_sv_eq(field1_name, ux2_sv("size"))) &&
+        ux2_sv_eq(field1_type, ux2_sv("u32"))
+
+    if has_header_struct || has_inline_fields {
+        return true
+    }
+
+    report_abi_diag_2(
+        mut_view(*sink),
+        AX_ABI_EXTENSIBLE_MISSING_HEADER,
+        "extensible @abi(stable) struct must begin with 'header: AbiHeader' or 'abi_version: u32, struct_size: u32'",
+        "struct",
+        contract.type_name,
+        "first_field",
+        field0_name
+    )
+    false
+}
+
+// Opaque handle by-value verification (AXS-ABI-013):
+// Outside the defining module, an @opaque type cannot be instantiated or passed/returned by value.
+pub fn validate_opaque_handle_usage(
+    ty: view<StableTypeContract>,
+    is_by_value: bool,
+    current_module: StrView,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if !ty.is_opaque || !is_by_value {
+        return true
+    }
+
+    if ux2_sv_eq(current_module, ty.defining_module) {
+        return true
+    }
+
+    report_abi_diag_2(
+        mut_view(*sink),
+        AX_ABI_OPAQUE_BY_VALUE,
+        "@opaque handle type cannot be passed, returned, or instantiated by value outside its defining module; pass via pointer (*mut T)",
+        "type",
+        ty.type_name,
+        "defining_module",
+        ty.defining_module
+    )
+    false
+}
+
+// Stable boundary function typecheck (AXS-ABI-004, AXS-ABI-016, AXS-ABI-017):
+pub fn validate_stable_boundary_fn(
+    f: view<StableFnContract>,
+    params: view<[8]StableParamContract>,
+    param_count: usize,
+    current_module: StrView,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if !f.is_abi_stable {
+        return true
+    }
+
+    let mut valid = true
+
+    // Rule 1: Generic exports across stable boundary are prohibited (AXS-ABI-016)
+    if f.is_generic || f.generic_param_count > 0u32 {
+        report_abi_diag_1(
+            mut_view(*sink),
+            AX_FFI_GENERIC_EXPORT,
+            "cannot export unmonomorphized generic function across @abi(stable) boundary; export concrete specialization or use vtable",
+            "function",
+            f.name
+        )
+        valid = false
+    }
+
+    // Rule 2: Inspect all parameters
+    let mut i: usize = 0usize
+    while i < param_count && i < 8usize {
+        let p = (*params)[i]
+        if p.ty.type_kind == STABLE_TYPE_UNSTABLE {
+            let msg = unstable_reason_message(p.ty.unstable_reason)
+            report_abi_diag_2(
+                mut_view(*sink),
+                AX_ABI_UNSTABLE_TYPE,
+                "unstable type in @abi(stable) function parameter",
+                "param",
+                p.name,
+                "reason",
+                msg
+            )
+            valid = false
+        }
+
+        if p.ty.is_opaque && p.is_by_value {
+            if !validate_opaque_handle_usage(view(p.ty), true, current_module, mut_view(*sink)) {
+                valid = false
+            }
+        }
+        i = i + 1usize
+    }
+
+    // Rule 3: Inspect return type
+    if f.ret_type.type_kind == STABLE_TYPE_UNSTABLE {
+        let msg = unstable_reason_message(f.ret_type.unstable_reason)
+        report_abi_diag_2(
+            mut_view(*sink),
+            AX_ABI_UNSTABLE_TYPE,
+            "unstable type in @abi(stable) function return",
+            "function",
+            f.name,
+            "reason",
+            msg
+        )
+        valid = false
+    }
+
+    if f.ret_type.is_opaque {
+        if !validate_opaque_handle_usage(view(f.ret_type), true, current_module, mut_view(*sink)) {
+            valid = false
+        }
+    }
+
+    valid
+}
+
+// Symbol version uniqueness and default multiplicity verifier (AXS-ABI-030):
+pub fn validate_symbol_versions(
+    entries: view<[8]SymbolVersionEntry>,
+    count: usize,
+    sink: mut_view<DiagSink>
+) -> bool {
+    let mut valid = true
+    let mut i: usize = 0usize
+    while i < count && i < 8usize {
+        let a = (*entries)[i]
+        let mut j: usize = i + 1usize
+        while j < count && j < 8usize {
+            let b = (*entries)[j]
+            let same_ident = ux2_sv_eq(a.name, b.name) && ux2_sv_eq(a.module_path, b.module_path)
+            if same_ident {
+                // Duplicate version string
+                if ux2_sv_eq(a.version, b.version) {
+                    report_abi_diag_2(
+                        mut_view(*sink),
+                        AX_ABI_SYMBOL_VERSION_DUPLICATE,
+                        "duplicate @symbol_version for the same function and module path",
+                        "symbol",
+                        a.name,
+                        "version",
+                        a.version
+                    )
+                    valid = false
+                }
+                // Multiple default implementations
+                if a.is_default && b.is_default {
+                    report_abi_diag_1(
+                        mut_view(*sink),
+                        AX_ABI_SYMBOL_VERSION_DUPLICATE,
+                        "multiple @symbol_version exports marked default = true in the same symbol group",
+                        "symbol",
+                        a.name
+                    )
+                    valid = false
+                }
+            }
+            j = j + 1usize
+        }
+        i = i + 1usize
+    }
+    valid
+}
