@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T220, T681, T685, T318]
 priority: 216
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-114-abi-stability-versioning-binary-compat.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-24-artifact-format-module-interfaces.md, spec/SPEC-50-unsafe-ub-ffi.md, 0104, tasks/0452, tasks/0583, tasks/0739, tasks/0661, tasks/1065]
 covers: [REQ-ECO-8734, REQ-PKG-022, REQ-PKG-024]
+started: 2026-11-08 20:00:56
+finished: 2026-11-08 20:32:40
 ---
 # T866 — E20.5 Canonical Axiom ABI stability tiers, versioned symbol contracts, AbiFingerprint/ApiFingerprint & binary compatibility specification (SPEC-114)
 
@@ -44,3 +46,5 @@ Consolidate the canonical specification for Axiom's three ABI tiers (`Internal`,
 
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
+- 2026-11-08 20:00:56 started (attempt 1) T866-impl
+- 2026-11-08 20:32:40 accepted by QA -> done
