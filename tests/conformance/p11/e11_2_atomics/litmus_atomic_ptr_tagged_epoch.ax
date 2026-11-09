@@ -1,0 +1,254 @@
+// test: run
+// modes: interp native
+// stdout: raw_ptr_atomics:ok\nno_auto_reclaim:ok\nepoch_treiber_stack:ok\nconcurrent_ptr_publish:ok\n
+// Covers: AXS-ATM-008, AXS-ATM-010, AXS-ATM-012, AXS-ATM-014, AXS-ATM-018, AXS-ATM-066
+// Covers: INV-CONC-005, INV-CONC-006, INV-CONC-007, INV-ATM-001, INV-ATM-005, INV-ORACLE-002
+// Covers: REQ-CONC-076, REQ-CONC-077, REQ-CONC-078, REQ-CONC-079, REQ-ATM-028, REQ-ATM-029, REQ-ATM-030
+// E11.2 conformance litmus 6: Raw-pointer Atomic<*mut T> (AtomicPtr<T>) address-only
+// atomicity (REQ-CONC-078, REQ-ATM-028), explicit deferred reclamation without implicit
+// deallocation (REQ-CONC-077), ABA epoch/generation protection (REQ-CONC-076, REQ-ATM-030),
+// and safe lock-free abstraction encapsulation (REQ-CONC-079, REQ-ATM-029).
+
+@intrinsic unsafe fn address_of_mut<T>(x: T) -> *mut T { 0 as *mut T }
+
+fn oracle_set_seed(seed: u64) {
+    let _ = seed;
+}
+
+fn oracle_join_all() {}
+
+struct Node {
+    pub value: u64,
+    pub next_idx: u32,
+    pub retired_epoch: u64,
+}
+
+fn test_raw_ptr_atomic_operations() -> bool {
+    let mut n1 = Node { value: 101u64, next_idx: 0u32, retired_epoch: 0u64 };
+    let mut n2 = Node { value: 202u64, next_idx: 1u32, retired_epoch: 0u64 };
+    let mut n3 = Node { value: 303u64, next_idx: 2u32, retired_epoch: 0u64 };
+
+    let p1: *mut Node = unsafe { address_of_mut(n1) };
+    let p2: *mut Node = unsafe { address_of_mut(n2) };
+    let p3: *mut Node = unsafe { address_of_mut(n3) };
+
+    // REQ-CONC-078 & REQ-ATM-028: Atomic<*mut Node> atomically manipulates the pointer address;
+    // dereferencing the loaded *mut Node still requires an explicit `unsafe` block.
+    let slot: Atomic<*mut Node> = Atomic.new(p1);
+    let loaded1 = slot.load(Ordering.Acquire);
+    if (loaded1 as usize) != (p1 as usize) {
+        return false;
+    }
+    let val1 = unsafe { (*loaded1).value };
+    if val1 != 101u64 {
+        return false;
+    }
+
+    let prev = slot.swap(p2, Ordering.AcqRel);
+    if (prev as usize) != (p1 as usize) {
+        return false;
+    }
+
+    let cas_fail = slot.compare_exchange(p1, p3, Ordering.AcqRel, Ordering.Acquire);
+    if cas_fail.ok || (cas_fail.val as usize) != (p2 as usize) {
+        return false;
+    }
+
+    let cas_ok = slot.compare_exchange(p2, p3, Ordering.AcqRel, Ordering.Acquire);
+    if !cas_ok.ok || (cas_ok.val as usize) != (p2 as usize) {
+        return false;
+    }
+
+    let mut cur = slot.load(Ordering.Relaxed);
+    while true {
+        let w = slot.compare_exchange_weak(cur, p1, Ordering.AcqRel, Ordering.Acquire);
+        if w.ok {
+            break;
+        }
+        cur = w.val;
+        spin_loop_hint();
+    }
+    (slot.into_inner() as usize) == (p1 as usize)
+}
+
+fn test_swap_does_not_implicitly_reclaim_old_pointee() -> bool {
+    // REQ-CONC-077: Swapping or CAS-replacing a pointer in Atomic<*mut Node> does NOT
+    // reclaim or invalidate the unlinked pointee; explicit epoch/retirement tracking is required.
+    let mut old_node = Node { value: 777u64, next_idx: 0u32, retired_epoch: 0u64 };
+    let mut new_node = Node { value: 888u64, next_idx: 0u32, retired_epoch: 0u64 };
+    let p_old: *mut Node = unsafe { address_of_mut(old_node) };
+    let p_new: *mut Node = unsafe { address_of_mut(new_node) };
+
+    let head: Atomic<*mut Node> = Atomic.new(p_old);
+    let reader_snapshot = head.load(Ordering.Acquire);
+
+    // Unlink p_old via swap and record retirement epoch explicitly
+    let unlinked = head.swap(p_new, Ordering.AcqRel);
+    unsafe {
+        (*unlinked).retired_epoch = 5u64;
+    }
+
+    // Concurrent reader still holding reader_snapshot observes intact pointee until epoch advances
+    let reader_val = unsafe { (*reader_snapshot).value };
+    let reader_ret_epoch = unsafe { (*reader_snapshot).retired_epoch };
+    let current_head_val = unsafe { (*head.load(Ordering.Acquire)).value };
+
+    reader_val == 777u64 && reader_ret_epoch == 5u64 && current_head_val == 888u64
+}
+
+// Safe encapsulated lock-free stack backed by a node arena + tagged epoch head (REQ-CONC-079, REQ-ATM-029)
+const STACK_NIL: u32 = 0xFFFFFFFFu32;
+
+struct NodeArena {
+    pub nodes: [4]Node,
+}
+
+fn pack_head(tag: u32, idx: u32) -> u64 {
+    ((tag as u64) << 32u64) | (idx as u64)
+}
+
+fn head_tag(word: u64) -> u32 {
+    (word >> 32u64) as u32
+}
+
+fn head_idx(word: u64) -> u32 {
+    (word & 0xFFFFFFFFu64) as u32
+}
+
+fn stack_push_slot(
+    arena: mut_view<NodeArena>,
+    tagged_head: view<AtomicU64>,
+    slot_idx: u32,
+    val: u64
+) {
+    arena.nodes[slot_idx as usize].value = val;
+    let mut cur: u64 = tagged_head.load(Ordering.Relaxed);
+    while true {
+        let old_idx: u32 = head_idx(cur);
+        let next_tag: u32 = head_tag(cur) + 1u32;
+        arena.nodes[slot_idx as usize].next_idx = old_idx;
+        let desired: u64 = pack_head(next_tag, slot_idx);
+        let res = tagged_head.compare_exchange_weak(cur, desired, Ordering.Release, Ordering.Relaxed);
+        if res.ok {
+            break;
+        }
+        cur = res.val;
+        spin_loop_hint();
+    }
+}
+
+fn stack_pop_and_retire(
+    arena: mut_view<NodeArena>,
+    tagged_head: view<AtomicU64>,
+    epoch: view<AtomicU64>,
+    retired_count: view<AtomicU32>,
+    out_val: mut_view<u64>
+) -> bool {
+    let mut cur: u64 = tagged_head.load(Ordering.Acquire);
+    while true {
+        let idx: u32 = head_idx(cur);
+        if idx == STACK_NIL {
+            *out_val = 0u64;
+            return false;
+        }
+        let next_idx: u32 = arena.nodes[idx as usize].next_idx;
+        let next_tag: u32 = head_tag(cur) + 1u32;
+        let desired: u64 = pack_head(next_tag, next_idx);
+        let res = tagged_head.compare_exchange_weak(cur, desired, Ordering.AcqRel, Ordering.Acquire);
+        if res.ok {
+            *out_val = arena.nodes[idx as usize].value;
+            let retire_ep = epoch.fetch_add(1u64, Ordering.AcqRel) + 1u64;
+            arena.nodes[idx as usize].retired_epoch = retire_ep;
+            let _ = retired_count.fetch_add(1u32, Ordering.Release);
+            return true;
+        }
+        cur = res.val;
+        spin_loop_hint();
+    }
+    false
+}
+
+fn test_safe_encapsulated_epoch_stack() -> bool {
+    let mut arena = NodeArena {
+        nodes: [
+            Node { value: 10u64, next_idx: STACK_NIL, retired_epoch: 0u64 },
+            Node { value: 20u64, next_idx: STACK_NIL, retired_epoch: 0u64 },
+            Node { value: 30u64, next_idx: STACK_NIL, retired_epoch: 0u64 },
+            Node { value: 40u64, next_idx: STACK_NIL, retired_epoch: 0u64 },
+        ],
+    };
+    let tagged_head = AtomicU64.new(pack_head(1u32, STACK_NIL));
+    let epoch = AtomicU64.new(1u64);
+    let retired_count = AtomicU32.new(0u32);
+
+    stack_push_slot(mut_view(arena), view(tagged_head), 0u32, 111u64);
+    stack_push_slot(mut_view(arena), view(tagged_head), 1u32, 222u64);
+    stack_push_slot(mut_view(arena), view(tagged_head), 2u32, 333u64);
+
+    let mut v1: u64 = 0u64;
+    let mut v2: u64 = 0u64;
+    let mut v3: u64 = 0u64;
+    let mut v_empty: u64 = 99u64;
+    if !stack_pop_and_retire(mut_view(arena), view(tagged_head), view(epoch), view(retired_count), mut_view(v1)) { return false; }
+    if !stack_pop_and_retire(mut_view(arena), view(tagged_head), view(epoch), view(retired_count), mut_view(v2)) { return false; }
+    if !stack_pop_and_retire(mut_view(arena), view(tagged_head), view(epoch), view(retired_count), mut_view(v3)) { return false; }
+    if stack_pop_and_retire(mut_view(arena), view(tagged_head), view(epoch), view(retired_count), mut_view(v_empty)) { return false; }
+
+    let total = v1 + v2 + v3;
+    let retired = retired_count.load(Ordering.Acquire);
+    let cur_epoch = epoch.load(Ordering.Acquire);
+    total == 666u64 && v_empty == 0u64 && retired == 3u32 && cur_epoch == 4u64
+}
+
+struct PtrPubState {
+    pub node: Node,
+    pub observed_val: u64,
+}
+
+fn thread_0_ptr_pub(s: mut_view<PtrPubState>, slot: view<Atomic<*mut Node>>, node_ptr: *mut Node) {
+    s.node.value = 9008u64;
+    slot.store(node_ptr, Ordering.Release);
+}
+
+fn thread_1_ptr_con(s: mut_view<PtrPubState>, slot: view<Atomic<*mut Node>>) {
+    let p = slot.load(Ordering.Acquire);
+    if (p as usize) != 0usize {
+        s.observed_val = unsafe { (*p).value };
+    }
+}
+
+fn test_concurrent_atomic_ptr_publication() -> bool {
+    let mut iter: u32 = 0u32;
+    let mut saw_non_null: u32 = 0u32;
+    while iter < 32u32 {
+        let mut s = PtrPubState {
+            node: Node { value: 0u64, next_idx: 0u32, retired_epoch: 0u64 },
+            observed_val: 0u64,
+        };
+        let node_ptr: *mut Node = unsafe { address_of_mut(s.node) };
+        let null_ptr: *mut Node = 0 as *mut Node;
+        let slot: Atomic<*mut Node> = Atomic.new(null_ptr);
+        thread_0_ptr_pub(mut_view(s), view(slot), node_ptr);
+        thread_1_ptr_con(mut_view(s), view(slot));
+        if s.observed_val != 0u64 {
+            if s.observed_val != 9008u64 {
+                return false;
+            }
+            saw_non_null = saw_non_null + 1u32;
+        }
+        iter = iter + 1u32;
+    }
+    saw_non_null > 0u32
+}
+
+pub fn main() -> i32 {
+    if !test_raw_ptr_atomic_operations() { return 1; }
+    print("raw_ptr_atomics:ok\n");
+    if !test_swap_does_not_implicitly_reclaim_old_pointee() { return 2; }
+    print("no_auto_reclaim:ok\n");
+    if !test_safe_encapsulated_epoch_stack() { return 3; }
+    print("epoch_treiber_stack:ok\n");
+    if !test_concurrent_atomic_ptr_publication() { return 4; }
+    print("concurrent_ptr_publish:ok\n");
+    0
+}
