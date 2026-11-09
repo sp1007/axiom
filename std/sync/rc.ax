@@ -1,0 +1,238 @@
+module std.sync.rc
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic fn needs_drop<T>() -> bool { false }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+@intrinsic unsafe fn drop_in_place<T>(p: *mut T) {}
+@intrinsic fn forget<T>(val: T) {}
+@intrinsic fn panic(msg: str) {}
+
+@repr(C)
+pub struct RcInner<T> {
+    pub strong: usize,
+    pub weak: usize,
+    pub data: T,
+}
+
+pub struct Rc<T> {
+    pub ptr: *mut RcInner<T>,
+}
+
+impl<T> !Send for Rc<T> {}
+impl<T> !Share for Rc<T> {}
+impl<T> !Copy for Rc<T> {}
+
+pub struct RcWeak<T> {
+    pub ptr: *mut RcInner<T>,
+}
+
+impl<T> !Send for RcWeak<T> {}
+impl<T> !Share for RcWeak<T> {}
+impl<T> !Copy for RcWeak<T> {}
+
+impl<T> Rc<T> {
+    pub fn new(val: T) -> Rc<T> {
+        let sz = size_of<RcInner<T>>();
+        let al = align_of<RcInner<T>>();
+        let alloc_sz = if sz < 128 { 128 } else { sz };
+        let raw = unsafe { heap_alloc(alloc_sz, al) };
+        if (raw as usize) == 0 {
+            panic("Rc.new: out of memory");
+        }
+        let p = raw as *mut RcInner<T>;
+        unsafe {
+            *p = RcInner {
+                strong: 1usize,
+                weak: 1usize,
+                data: val,
+            };
+        }
+        Rc { ptr: p }
+    }
+
+    pub fn new_from_ptr(p_val: *const T, bytes: usize) -> Rc<T> {
+        let al = align_of<RcInner<T>>();
+        let alloc_sz = if bytes + 16usize < 128usize { 128usize } else { bytes + 16usize };
+        let raw = unsafe { heap_alloc(alloc_sz, al) };
+        if (raw as usize) == 0 {
+            panic("Rc.new_from_ptr: out of memory");
+        }
+        let p = raw as *mut RcInner<T>;
+        unsafe {
+            (*p).strong = 1usize;
+            (*p).weak = 1usize;
+            let p_dst = address_of_mut((*p).data) as *mut u8;
+            ptr_copy_nonoverlapping(p_val as *const u8, p_dst, bytes);
+        }
+        Rc { ptr: p }
+    }
+
+    pub fn clone(self: view<Rc<T>>) -> Rc<T> {
+        unsafe {
+            let cur = (*self.ptr).strong;
+            if cur == 0xFFFFFFFFFFFFFFFFusize {
+                panic("Rc.clone: refcount overflow");
+            }
+            (*self.ptr).strong = cur + 1usize;
+        }
+        Rc { ptr: self.ptr }
+    }
+
+    pub fn as_ptr(self: view<Rc<T>>) -> *const T {
+        unsafe { address_of((*self.ptr).data) }
+    }
+
+    pub fn get_ptr(self: view<Rc<T>>) -> *const T {
+        unsafe { address_of((*self.ptr).data) }
+    }
+
+    pub fn as_mut_ptr(self: mut_view<Rc<T>>) -> *mut T {
+        unsafe {
+            if (*self.ptr).strong == 1usize && (*self.ptr).weak == 1usize {
+                address_of_mut((*self.ptr).data)
+            } else {
+                0 as *mut T
+            }
+        }
+    }
+
+    pub fn strong_count(self: view<Rc<T>>) -> usize {
+        unsafe { (*self.ptr).strong }
+    }
+
+    pub fn weak_count(self: view<Rc<T>>) -> usize {
+        unsafe {
+            let w = (*self.ptr).weak;
+            if w > 0usize { w - 1usize } else { 0usize }
+        }
+    }
+
+    pub fn downgrade(self: view<Rc<T>>) -> RcWeak<T> {
+        unsafe {
+            let cur = (*self.ptr).weak;
+            if cur == 0xFFFFFFFFFFFFFFFFusize {
+                panic("Rc.downgrade: weak count overflow");
+            }
+            (*self.ptr).weak = cur + 1usize;
+        }
+        RcWeak { ptr: self.ptr }
+    }
+
+    pub fn try_unwrap(mut self: Rc<T>) -> Result<T, Rc<T>> {
+        unsafe {
+            if (*self.ptr).strong == 1usize {
+                let p = self.ptr;
+                self.ptr = 0 as *mut RcInner<T>;
+                let mut tmp: [1]T = [*address_of_mut((*p).data)];
+                let w = (*p).weak - 1usize;
+                (*p).weak = w;
+                if w == 0usize {
+                    let sz = size_of<RcInner<T>>();
+                    let al = align_of<RcInner<T>>();
+                    let alloc_sz = if sz < 128 { 128 } else { sz };
+                    heap_free(p as *mut u8, alloc_sz, al);
+                }
+                Result.Ok(tmp[0])
+            } else {
+                Result.Err(self)
+            }
+        }
+    }
+}
+
+pub fn rc_new<T>(val: T) -> Rc<T> {
+    Rc.new(val)
+}
+
+impl<T> Drop for Rc<T> {
+    fn drop(self: mut_view<Rc<T>>) {
+        if self.ptr as usize != 0 {
+            let p = self.ptr;
+            self.ptr = 0 as *mut RcInner<T>;
+            unsafe {
+                let cur = (*p).strong;
+                if cur > 1usize {
+                    (*p).strong = cur - 1usize;
+                } else if cur == 1usize {
+                    (*p).strong = 0usize;
+                    if needs_drop<T>() {
+                        drop_in_place<T>(address_of_mut((*p).data));
+                    }
+                    let w = (*p).weak - 1usize;
+                    (*p).weak = w;
+                    if w == 0usize {
+                        let sz = size_of<RcInner<T>>();
+                        let al = align_of<RcInner<T>>();
+                        let alloc_sz = if sz < 128 { 128 } else { sz };
+                        heap_free(p as *mut u8, alloc_sz, al);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<T> RcWeak<T> {
+    pub fn clone(self: view<RcWeak<T>>) -> RcWeak<T> {
+        unsafe {
+            let cur = (*self.ptr).weak;
+            if cur == 0xFFFFFFFFFFFFFFFFusize {
+                panic("RcWeak.clone: weak count overflow");
+            }
+            (*self.ptr).weak = cur + 1usize;
+        }
+        RcWeak { ptr: self.ptr }
+    }
+
+    pub fn upgrade(self: view<RcWeak<T>>) -> Option<Rc<T>> {
+        unsafe {
+            let s = (*self.ptr).strong;
+            if s > 0usize {
+                (*self.ptr).strong = s + 1usize;
+                Option.Some(Rc { ptr: self.ptr })
+            } else {
+                Option.None
+            }
+        }
+    }
+
+    pub fn strong_count(self: view<RcWeak<T>>) -> usize {
+        unsafe { (*self.ptr).strong }
+    }
+
+    pub fn weak_count(self: view<RcWeak<T>>) -> usize {
+        unsafe {
+            let w = (*self.ptr).weak;
+            if w > 0usize { w - 1usize } else { 0usize }
+        }
+    }
+}
+
+impl<T> Drop for RcWeak<T> {
+    fn drop(self: mut_view<RcWeak<T>>) {
+        if self.ptr as usize != 0 {
+            let p = self.ptr;
+            self.ptr = 0 as *mut RcInner<T>;
+            unsafe {
+                let w = (*p).weak;
+                if w > 1usize {
+                    (*p).weak = w - 1usize;
+                } else if w == 1usize {
+                    (*p).weak = 0usize;
+                    let sz = size_of<RcInner<T>>();
+                    let al = align_of<RcInner<T>>();
+                    let alloc_sz = if sz < 128 { 128 } else { sz };
+                    heap_free(p as *mut u8, alloc_sz, al);
+                }
+            }
+        }
+    }
+}

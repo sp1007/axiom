@@ -1,0 +1,226 @@
+module std.sync.arc
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.sync.atomic.fence
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+@intrinsic unsafe fn drop_in_place<T>(p: *mut T) {}
+@intrinsic fn forget<T>(val: T) {}
+@intrinsic fn panic(msg: str) {}
+
+@repr(C)
+pub struct ArcInner<T> {
+    pub strong: Atomic<usize>,
+    pub weak: Atomic<usize>,
+    pub data: T,
+}
+
+pub struct Arc<T> {
+    pub ptr: *mut ArcInner<T>,
+}
+
+unsafe impl<T: Send + Share> Send for Arc<T> {}
+unsafe impl<T: Send + Share> Share for Arc<T> {}
+impl<T> !Copy for Arc<T> {}
+
+pub struct Weak<T> {
+    pub ptr: *mut ArcInner<T>,
+}
+
+unsafe impl<T: Send + Share> Send for Weak<T> {}
+unsafe impl<T: Send + Share> Share for Weak<T> {}
+impl<T> !Copy for Weak<T> {}
+
+impl<T> Arc<T> {
+    pub fn new(val: T) -> Arc<T> {
+        let sz = size_of<ArcInner<T>>();
+        let al = align_of<ArcInner<T>>();
+        let alloc_sz = if sz < 128 { 128 } else { sz };
+        let raw = unsafe { heap_alloc(alloc_sz, al) };
+        if (raw as usize) == 0 {
+            panic("Arc.new: out of memory");
+        }
+        let p = raw as *mut ArcInner<T>;
+        unsafe {
+            *p = ArcInner {
+                strong: Atomic.new(1usize),
+                weak: Atomic.new(1usize),
+                data: val,
+            };
+        }
+        Arc { ptr: p }
+    }
+
+    pub fn new_from_ptr(p_val: *const T, bytes: usize) -> Arc<T> {
+        let al = align_of<ArcInner<T>>();
+        let alloc_sz = if bytes + 16usize < 128usize { 128usize } else { bytes + 16usize };
+        let raw = unsafe { heap_alloc(alloc_sz, al) };
+        if (raw as usize) == 0 {
+            panic("Arc.new_from_ptr: out of memory");
+        }
+        let p = raw as *mut ArcInner<T>;
+        unsafe {
+            (*p).strong = Atomic.new(1usize);
+            (*p).weak = Atomic.new(1usize);
+            let p_dst = address_of_mut((*p).data) as *mut u8;
+            ptr_copy_nonoverlapping(p_val as *const u8, p_dst, bytes);
+        }
+        Arc { ptr: p }
+    }
+
+    pub fn clone(self: view<Arc<T>>) -> Arc<T> {
+        let old = unsafe { (*self.ptr).strong.fetch_add(1usize, Ordering.Relaxed) };
+        if old > 0x7FFFFFFFFFFFFFFFusize {
+            panic("Arc.clone: refcount overflow");
+        }
+        Arc { ptr: self.ptr }
+    }
+
+    pub fn as_ptr(self: view<Arc<T>>) -> *const T {
+        unsafe { address_of((*self.ptr).data) }
+    }
+
+    pub fn get_ptr(self: view<Arc<T>>) -> *const T {
+        unsafe { address_of((*self.ptr).data) }
+    }
+
+    pub fn as_mut_ptr(self: mut_view<Arc<T>>) -> *mut T {
+        unsafe {
+            if (*self.ptr).strong.load(Ordering.Acquire) == 1usize &&
+               (*self.ptr).weak.load(Ordering.Acquire) == 1usize {
+                address_of_mut((*self.ptr).data)
+            } else {
+                0 as *mut T
+            }
+        }
+    }
+
+    pub fn val(self: view<Arc<T>>) -> T where T: Copy {
+        unsafe { *address_of((*self.ptr).data) }
+    }
+
+    pub fn strong_count(self: view<Arc<T>>) -> usize {
+        unsafe { (*self.ptr).strong.load(Ordering.Relaxed) }
+    }
+
+    pub fn weak_count(self: view<Arc<T>>) -> usize {
+        let w = unsafe { (*self.ptr).weak.load(Ordering.Relaxed) };
+        if w > 0usize { w - 1usize } else { 0usize }
+    }
+
+    pub fn downgrade(self: view<Arc<T>>) -> Weak<T> {
+        let cur = unsafe { (*self.ptr).weak.fetch_add(1usize, Ordering.Relaxed) };
+        if cur > 0x7FFFFFFFFFFFFFFFusize {
+            panic("Arc.downgrade: weak count overflow");
+        }
+        Weak { ptr: self.ptr }
+    }
+
+    pub fn try_unwrap(mut self: Arc<T>) -> Result<T, Arc<T>> {
+        let cas = unsafe {
+            (*self.ptr).strong.compare_exchange(1usize, 0usize, Ordering.Acquire, Ordering.Relaxed)
+        };
+        if cas.ok {
+            let p = self.ptr;
+            self.ptr = 0 as *mut ArcInner<T>;
+            let p_data = unsafe { address_of_mut((*p).data) };
+            let val = unsafe { *p_data };
+            let w_prev = unsafe { (*p).weak.fetch_sub(1usize, Ordering.Release) };
+            if w_prev == 1usize {
+                fence(Ordering.Acquire);
+                let sz = size_of<ArcInner<T>>();
+                let al = align_of<ArcInner<T>>();
+                let alloc_sz = if sz < 128 { 128 } else { sz };
+                unsafe { heap_free(p as *mut u8, alloc_sz, al); }
+            }
+            Result.Ok(val)
+        } else {
+            Result.Err(self)
+        }
+    }
+}
+
+pub fn arc_new<T>(val: T) -> Arc<T> {
+    Arc.new(val)
+}
+
+impl<T> Drop for Arc<T> {
+    fn drop(self: mut_view<Arc<T>>) {
+        if self.ptr as usize != 0 {
+            let p = self.ptr;
+            self.ptr = 0 as *mut ArcInner<T>;
+            let prev = unsafe { (*p).strong.fetch_sub(1usize, Ordering.Release) };
+            if prev == 1usize {
+                fence(Ordering.Acquire);
+                unsafe { drop_in_place<T>(address_of_mut((*p).data)); }
+                let w_prev = unsafe { (*p).weak.fetch_sub(1usize, Ordering.Release) };
+                if w_prev == 1usize {
+                    fence(Ordering.Acquire);
+                    let sz = size_of<ArcInner<T>>();
+                    let al = align_of<ArcInner<T>>();
+                    let alloc_sz = if sz < 128 { 128 } else { sz };
+                    unsafe { heap_free(p as *mut u8, alloc_sz, al); }
+                }
+            }
+        }
+    }
+}
+
+impl<T> Weak<T> {
+    pub fn clone(self: view<Weak<T>>) -> Weak<T> {
+        let cur = unsafe { (*self.ptr).weak.fetch_add(1usize, Ordering.Relaxed) };
+        if cur > 0x7FFFFFFFFFFFFFFFusize {
+            panic("Weak.clone: weak count overflow");
+        }
+        Weak { ptr: self.ptr }
+    }
+
+    pub fn upgrade(self: view<Weak<T>>) -> Option<Arc<T>> {
+        let mut cur = unsafe { (*self.ptr).strong.load(Ordering.Relaxed) };
+        while cur > 0usize {
+            let cas = unsafe {
+                (*self.ptr).strong.compare_exchange_weak(cur, cur + 1usize, Ordering.Acquire, Ordering.Relaxed)
+            };
+            if cas.ok {
+                return Option.Some(Arc { ptr: self.ptr });
+            }
+            cur = cas.val;
+        }
+        Option.None
+    }
+
+    pub fn strong_count(self: view<Weak<T>>) -> usize {
+        unsafe { (*self.ptr).strong.load(Ordering.Relaxed) }
+    }
+
+    pub fn weak_count(self: view<Weak<T>>) -> usize {
+        let w = unsafe { (*self.ptr).weak.load(Ordering.Relaxed) };
+        if w > 0usize { w - 1usize } else { 0usize }
+    }
+}
+
+impl<T> Drop for Weak<T> {
+    fn drop(self: mut_view<Weak<T>>) {
+        if self.ptr as usize != 0 {
+            let p = self.ptr;
+            self.ptr = 0 as *mut ArcInner<T>;
+            let w_prev = unsafe { (*p).weak.fetch_sub(1usize, Ordering.Release) };
+            if w_prev == 1usize {
+                fence(Ordering.Acquire);
+                let sz = size_of<ArcInner<T>>();
+                let al = align_of<ArcInner<T>>();
+                let alloc_sz = if sz < 128 { 128 } else { sz };
+                unsafe { heap_free(p as *mut u8, alloc_sz, al); }
+            }
+        }
+    }
+}

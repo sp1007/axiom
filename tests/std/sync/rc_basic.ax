@@ -1,0 +1,380 @@
+// test: run
+// modes: interp native
+// timeout: 60
+// covers: REQ-CONC-070
+// stdout: OK rc_basic 42 100 1 1 777\n
+
+module std.sys.windows.heap
+
+@link("kernel32")
+extern "system" {
+    fn GetProcessHeap() -> *mut u8;
+    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;
+    fn HeapReAlloc(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8, dwBytes: usize) -> *mut u8;
+    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;
+}
+
+pub unsafe fn __ax_host_heap_alloc(size: usize, align: usize) -> *mut u8 {
+    if size == 0 {
+        return 0 as *mut u8;
+    }
+    let h = GetProcessHeap();
+    if h as usize == 0 {
+        return 0 as *mut u8;
+    }
+    let alloc_bytes: usize = if size < 16 { 16 } else { size };
+    HeapAlloc(h, 8u32, alloc_bytes)
+}
+
+pub unsafe fn __ax_host_heap_realloc(p: *mut u8, old_size: usize, new_size: usize, align: usize) -> *mut u8 {
+    if p as usize == 0 {
+        return __ax_host_heap_alloc(new_size, align);
+    }
+    if new_size == 0 {
+        return 0 as *mut u8;
+    }
+    let h = GetProcessHeap();
+    if h as usize == 0 {
+        return 0 as *mut u8;
+    }
+    let alloc_bytes: usize = if new_size < 16 { 16 } else { new_size };
+    HeapReAlloc(h, 8u32, p, alloc_bytes)
+}
+
+pub unsafe fn __ax_host_heap_free(p: *mut u8, size: usize, align: usize) {
+    if p as usize != 0 {
+        let h = GetProcessHeap();
+        if h as usize != 0 {
+            HeapFree(h, 0u32, p);
+        }
+    }
+}
+
+module std.sync.rc
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic fn needs_drop<T>() -> bool { false }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+@intrinsic unsafe fn drop_in_place<T>(p: *mut T) {}
+@intrinsic fn forget<T>(val: T) {}
+@intrinsic fn panic(msg: str) {}
+
+@repr(C)
+pub struct RcInner<T> {
+    pub strong: usize,
+    pub weak: usize,
+    pub data: T,
+}
+
+pub struct Rc<T> {
+    pub ptr: *mut RcInner<T>,
+}
+
+impl<T> !Send for Rc<T> {}
+impl<T> !Share for Rc<T> {}
+impl<T> !Copy for Rc<T> {}
+
+pub struct RcWeak<T> {
+    pub ptr: *mut RcInner<T>,
+}
+
+impl<T> !Send for RcWeak<T> {}
+impl<T> !Share for RcWeak<T> {}
+impl<T> !Copy for RcWeak<T> {}
+
+impl<T> Rc<T> {
+    pub fn new(val: T) -> Rc<T> {
+        let sz = size_of<RcInner<T>>();
+        let al = align_of<RcInner<T>>();
+        let alloc_sz = if sz < 128 { 128 } else { sz };
+        let raw = unsafe { heap_alloc(alloc_sz, al) };
+        if (raw as usize) == 0 {
+            panic("Rc.new: out of memory");
+        }
+        let p = raw as *mut RcInner<T>;
+        unsafe {
+            *p = RcInner {
+                strong: 1usize,
+                weak: 1usize,
+                data: val,
+            };
+        }
+        Rc { ptr: p }
+    }
+
+    pub fn new_from_ptr(p_val: *const T, bytes: usize) -> Rc<T> {
+        let al = align_of<RcInner<T>>();
+        let alloc_sz = if bytes + 16usize < 128usize { 128usize } else { bytes + 16usize };
+        let raw = unsafe { heap_alloc(alloc_sz, al) };
+        if (raw as usize) == 0 {
+            panic("Rc.new_from_ptr: out of memory");
+        }
+        let p = raw as *mut RcInner<T>;
+        unsafe {
+            (*p).strong = 1usize;
+            (*p).weak = 1usize;
+            let p_dst = address_of_mut((*p).data) as *mut u8;
+            ptr_copy_nonoverlapping(p_val as *const u8, p_dst, bytes);
+        }
+        Rc { ptr: p }
+    }
+
+    pub fn clone(self: view<Rc<T>>) -> Rc<T> {
+        unsafe {
+            let cur = (*self.ptr).strong;
+            if cur == 0xFFFFFFFFFFFFFFFFusize {
+                panic("Rc.clone: refcount overflow");
+            }
+            (*self.ptr).strong = cur + 1usize;
+        }
+        Rc { ptr: self.ptr }
+    }
+
+    pub fn as_ptr(self: view<Rc<T>>) -> *const T {
+        unsafe { address_of((*self.ptr).data) }
+    }
+
+    pub fn get_ptr(self: view<Rc<T>>) -> *const T {
+        unsafe { address_of((*self.ptr).data) }
+    }
+
+    pub fn as_mut_ptr(self: mut_view<Rc<T>>) -> *mut T {
+        unsafe {
+            if (*self.ptr).strong == 1usize && (*self.ptr).weak == 1usize {
+                address_of_mut((*self.ptr).data)
+            } else {
+                0 as *mut T
+            }
+        }
+    }
+
+    pub fn strong_count(self: view<Rc<T>>) -> usize {
+        unsafe { (*self.ptr).strong }
+    }
+
+    pub fn weak_count(self: view<Rc<T>>) -> usize {
+        unsafe {
+            let w = (*self.ptr).weak;
+            if w > 0usize { w - 1usize } else { 0usize }
+        }
+    }
+
+    pub fn downgrade(self: view<Rc<T>>) -> RcWeak<T> {
+        unsafe {
+            let cur = (*self.ptr).weak;
+            if cur == 0xFFFFFFFFFFFFFFFFusize {
+                panic("Rc.downgrade: weak count overflow");
+            }
+            (*self.ptr).weak = cur + 1usize;
+        }
+        RcWeak { ptr: self.ptr }
+    }
+
+    pub fn try_unwrap(mut self: Rc<T>) -> Result<T, Rc<T>> {
+        unsafe {
+            if (*self.ptr).strong == 1usize {
+                let p = self.ptr;
+                self.ptr = 0 as *mut RcInner<T>;
+                let mut tmp: [1]T = [*address_of_mut((*p).data)];
+                let w = (*p).weak - 1usize;
+                (*p).weak = w;
+                if w == 0usize {
+                    let sz = size_of<RcInner<T>>();
+                    let al = align_of<RcInner<T>>();
+                    let alloc_sz = if sz < 128 { 128 } else { sz };
+                    heap_free(p as *mut u8, alloc_sz, al);
+                }
+                Result.Ok(tmp[0])
+            } else {
+                Result.Err(self)
+            }
+        }
+    }
+}
+
+pub fn rc_new<T>(val: T) -> Rc<T> {
+    Rc.new(val)
+}
+
+impl<T> Drop for Rc<T> {
+    fn drop(self: mut_view<Rc<T>>) {
+        if self.ptr as usize != 0 {
+            let p = self.ptr;
+            self.ptr = 0 as *mut RcInner<T>;
+            unsafe {
+                let cur = (*p).strong;
+                if cur > 1usize {
+                    (*p).strong = cur - 1usize;
+                } else if cur == 1usize {
+                    (*p).strong = 0usize;
+                    if needs_drop<T>() {
+                        drop_in_place<T>(address_of_mut((*p).data));
+                    }
+                    let w = (*p).weak - 1usize;
+                    (*p).weak = w;
+                    if w == 0usize {
+                        let sz = size_of<RcInner<T>>();
+                        let al = align_of<RcInner<T>>();
+                        let alloc_sz = if sz < 128 { 128 } else { sz };
+                        heap_free(p as *mut u8, alloc_sz, al);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<T> RcWeak<T> {
+    pub fn clone(self: view<RcWeak<T>>) -> RcWeak<T> {
+        unsafe {
+            let cur = (*self.ptr).weak;
+            if cur == 0xFFFFFFFFFFFFFFFFusize {
+                panic("RcWeak.clone: weak count overflow");
+            }
+            (*self.ptr).weak = cur + 1usize;
+        }
+        RcWeak { ptr: self.ptr }
+    }
+
+    pub fn upgrade(self: view<RcWeak<T>>) -> Option<Rc<T>> {
+        unsafe {
+            let s = (*self.ptr).strong;
+            if s > 0usize {
+                (*self.ptr).strong = s + 1usize;
+                Option.Some(Rc { ptr: self.ptr })
+            } else {
+                Option.None
+            }
+        }
+    }
+
+    pub fn strong_count(self: view<RcWeak<T>>) -> usize {
+        unsafe { (*self.ptr).strong }
+    }
+
+    pub fn weak_count(self: view<RcWeak<T>>) -> usize {
+        unsafe {
+            let w = (*self.ptr).weak;
+            if w > 0usize { w - 1usize } else { 0usize }
+        }
+    }
+}
+
+impl<T> Drop for RcWeak<T> {
+    fn drop(self: mut_view<RcWeak<T>>) {
+        if self.ptr as usize != 0 {
+            let p = self.ptr;
+            self.ptr = 0 as *mut RcInner<T>;
+            unsafe {
+                let w = (*p).weak;
+                if w > 1usize {
+                    (*p).weak = w - 1usize;
+                } else if w == 1usize {
+                    (*p).weak = 0usize;
+                    let sz = size_of<RcInner<T>>();
+                    let al = align_of<RcInner<T>>();
+                    let alloc_sz = if sz < 128 { 128 } else { sz };
+                    heap_free(p as *mut u8, alloc_sz, al);
+                }
+            }
+        }
+    }
+}
+
+module main
+
+use std.core.option.Option
+use std.core.result.Result
+use std.sync.rc.Rc
+
+fn check(cond: bool) {
+    if !cond {
+        loop {}
+    }
+}
+
+pub fn main() -> i32 {
+    let rc1 = Rc.new(42i64);
+    check(view(rc1).strong_count() == 1usize);
+    check(view(rc1).weak_count() == 0usize);
+    let val1 = unsafe { *(view(rc1).as_ptr()) };
+    check(val1 == 42i64);
+
+    let rc2 = view(rc1).clone();
+    check(view(rc1).strong_count() == 2usize);
+    check(view(rc2).strong_count() == 2usize);
+    check(unsafe { *(view(rc2).as_ptr()) } == 42i64);
+
+    let mut rc1_mut = rc1;
+    let mut_p = mut_view(rc1_mut).as_mut_ptr();
+    check((mut_p as usize) == 0usize);
+
+    drop(rc2);
+    check(view(rc1_mut).strong_count() == 1usize);
+
+    let mut_p2 = mut_view(rc1_mut).as_mut_ptr();
+    check((mut_p2 as usize) != 0usize);
+    unsafe {
+        *mut_p2 = 100i64;
+    }
+    let val_after_mut = unsafe { *(view(rc1_mut).as_ptr()) };
+    check(val_after_mut == 100i64);
+
+    let weak1 = view(rc1_mut).downgrade();
+    check(view(rc1_mut).weak_count() == 1usize);
+    check(view(weak1).strong_count() == 1usize);
+
+    let rc3 = match view(weak1).upgrade() {
+        Option.Some(r) => r,
+        Option.None => loop {},
+    };
+    check(view(rc1_mut).strong_count() == 2usize);
+    drop(rc3);
+
+    {
+        let rc_drop = Rc.new(42i64);
+        check(view(rc_drop).strong_count() == 1usize);
+        let rc_drop2 = view(rc_drop).clone();
+        check(view(rc_drop).strong_count() == 2usize);
+        drop(rc_drop2);
+        check(view(rc_drop).strong_count() == 1usize);
+    }
+
+    let weak_survivor = {
+        let rc_temp = Rc.new(999i64);
+        view(rc_temp).downgrade()
+    };
+    match view(weak_survivor).upgrade() {
+        Option.Some(_r) => check(false),
+        Option.None => {},
+    }
+    check(view(weak_survivor).strong_count() == 0usize);
+
+    let rc_unwrap = Rc.new(777i64);
+    let unwrapped = match rc_unwrap.try_unwrap() {
+        Result.Ok(v) => v,
+        Result.Err(_r) => -1i64,
+    };
+    check(unwrapped == 777i64);
+
+    print("OK rc_basic ");
+    print_int(val1);
+    print(" ");
+    print_int(val_after_mut);
+    print(" ");
+    print_int(view(rc1_mut).strong_count() as i64);
+    print(" ");
+    print_int(view(rc1_mut).weak_count() as i64);
+    print(" ");
+    print_int(unwrapped);
+    print("\n");
+    0
+}
