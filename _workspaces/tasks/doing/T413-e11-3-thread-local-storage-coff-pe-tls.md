@@ -16,6 +16,7 @@ spec: [spec/SPEC-32-threads-sync.md, spec/SPEC-04-core-extensibility.md, 0136, 0
 covers: [REQ-CONC-030, REQ-CONC-110]
 started: 2026-11-09 14:59:11
 unblocks: 1
+timeout_min: 300
 agent: T413-impl
 ---
 # T413 — E11.3 — @thread_local statics, COFF/PE .tls emission & thread-local storage

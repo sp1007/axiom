@@ -1,0 +1,57 @@
+---
+id: T976
+title: E22.7 Canonical WebGPU runtime & WGSL codegen specification (SPEC-136)
+phase: P22-gpu-heterogeneous-computing
+owner: axiom-architect
+reviewer: axiom-qa
+model: opus
+gate_model: sonnet
+depends: [T222, T311, T312, T316, T958, T962, T971]
+priority: 246
+status: todo
+attempts: 0
+paths: [spec/SPEC-136-webgpu-wgsl-backend.md]
+locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
+spec: [tasks/0846, 0096, 0139, 0162]
+covers: [REQ-ECO-5958, REQ-GPU-007]
+---
+# T976 — E22.7 Canonical WebGPU runtime & WGSL codegen specification (SPEC-136)
+
+## Goal
+Consolidate the canonical specification for Axiom's WebGPU Shading Language (`WGSL`) codegen backend, `std.sys.gpu.webgpu` host/browser runtime, and WebAssembly (`wasm32`) GPU bridge into `spec/SPEC-136-webgpu-wgsl-backend.md` (`AXS-WGPU-*` rule IDs per BOOTSTRAP-615 `docs/base/tasks/0846 §13, §47, §217`).
+
+## Scope
+- Write `spec/SPEC-136-webgpu-wgsl-backend.md` starting with a Vietnamese `## Tóm tắt` section and numbered `AXS-WGPU-NNN` rules citing `0846 §13, §47, §217` and `REQ-ECO-5958`.
+- Specify the WGSL target representation in the compiler (`TargetDesc.Wgpu`, `ObjectFormat.Wgsl`, `CallConv.GpuKernel`):
+  - Function entry-point decorators: `@compute`, `@vertex`, `@fragment`.
+  - Built-in variable attributes: `@builtin(global_invocation_id)`, `@builtin(local_invocation_id)`, `@builtin(workgroup_id)`, `@builtin(num_workgroups)`, `@builtin(position)`.
+  - Address space and access mode mapping (`REQ-GPU-054`): `var<storage, read_write>`, `var<storage, read>`, `var<uniform>`, `var<workgroup>`, and `var<private>`.
+  - Workgroup size decorator: `@workgroup_size(x, y, z)`.
+  - Barriers and atomics: `workgroupBarrier()`, `storageBarrier()`, and `atomic<u32>` / `atomicAdd` / `atomicExchange`.
+- Specify the WGSL resource binding ABI:
+  - Deterministic binding decorators: `@group(0) @binding(i)`.
+  - Storage buffer bindings, uniform buffer bindings, texture views, and samplers.
+  - Struct layout alignment rules complying with WGSL host-shareable struct alignment requirements.
+- Specify the WebGPU runtime substrate (`std/sys/gpu/webgpu`):
+  - In WebAssembly (`wasm32`, `E16.6`): bridge to JavaScript `navigator.gpu` via exported C/WASM imports (`requestAdapter`, `requestDevice`, `createShaderModule`, `createComputePipeline`, `createCommandEncoder`, `queue.submit`).
+  - In native execution: optionally bind to native WebGPU C ABI (`webgpu.h` / `wgpu-native` / `Dawn`) for portable cross-platform execution.
+  - Asynchronous device and adapter acquisition pattern mapped to Axiom `Future<GpuDevice>` or callback polling.
+- Update `spec/INDEX.md`, `spec/diagnostics.md`, and `spec/invariants.md`.
+
+## Acceptance
+- [ ] `spec/SPEC-136-webgpu-wgsl-backend.md` exists with a Vietnamese `## Tóm tắt`, numbered `AXS-WGPU-NNN` rules, positive/negative canonical Axiom examples (`=` and `.` syntax), and source citations.
+- [ ] `python .claude/skills/axiom-tasks/scripts/reqcov.py --strict` and `python .claude/skills/axiom-tasks/scripts/harness_check.py` exit 0.
+- [ ] Report `_workspaces/reports/T976-report.md` with exact `## Files changed`.
+
+## Out of scope
+- Implementation of the WGSL emitter (`T977`) and WebGPU host bridge (`T978`).
+- Editing `docs/` or `bootstrap/axiom0/` (frozen at `axiom0-frozen`).
+
+## Notes
+- Phase P22 (`P22-gpu-heterogeneous-computing`), opens Epic E22.7.
+- `bootstrap/axiom0` is frozen at tag `axiom0-frozen` (ROADMAP R3); all compiler and library changes live in `compiler/` and `std/`.
+- Build and test inside the task snapshot (`python tools/build_axiomc.py --out build-snap-T976/build` and `python tools/axtest.py --compiler build-snap-T976/build/axiomc2.exe --exclude-requires axiom0-internal`).
+- All Axiom source code and examples use canonical syntax (`axiom-syntax`): `=` for binding/assignment (no `:=`, no `var`), `.` for module/type paths (no `::`).
+
+## Log
+- 2026-11-09 21:45:00 created by architect (ADR-0038 WebGPU expansion)

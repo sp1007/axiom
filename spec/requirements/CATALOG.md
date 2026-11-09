@@ -1429,7 +1429,7 @@
 | REQ-FFI-065 | ffi | v1-full | Safe axiom → explicit unsafe → explicit abi → native machine contract. | 0138 §Trạng thái sau Part XIX | - | T504 |
 | REQ-FFI-066 | ffi | v1-full | A semantic model of axiom, nhiều execution domains — not create out a “ngôn ngữ gpu thứ hai”. | 0138 §Part XX — GPU · Accelerator · Device Memory · Kernel | - | T515 |
 | REQ-GPU-006 | gpu | post-v1 | One language semantics, many execution domains. | 0139 §# Part XX — GPU · Accelerator · Device Memory · Kernel | - | T950, T951, T953 |
-| REQ-GPU-007 | gpu | post-v1 | - gpu kernel is axiom function has ràng buộc execution domain. - not needs ngôn ngữ kernel riêng. - ownership/view still has ý nghĩa trên gpu. - host ↔ device transfer must explicit. - not for kernel vô tình keep reference tới host memory. - not to gpu operation đang run is hủy tài nguyên a way unsafe. - gpu synchronization tích hợp with memory model. - gpu atomics dùng cùng semantics with cpu atomics, bổ sung scope. - compiler has thể optimize/fuse/vectorize/kernel-specialize. - not bắt buộc cuda/opencl runtime. - axiom has thể target cuda/ptx, spir-v, metal, vulkan, directx, rocm/amdgcn... thông qua backend. - has thể mở rộng sang npu/dsp/accelerator mà not sửa semantic core. | 0139 §XX.1. Mục tiêu | - | T950, T954, T958, T962, T965 |
+| REQ-GPU-007 | gpu | post-v1 | - gpu kernel is axiom function has ràng buộc execution domain. - not needs ngôn ngữ kernel riêng. - ownership/view still has ý nghĩa trên gpu. - host ↔ device transfer must explicit. - not for kernel vô tình keep reference tới host memory. - not to gpu operation đang run is hủy tài nguyên a way unsafe. - gpu synchronization tích hợp with memory model. - gpu atomics dùng cùng semantics with cpu atomics, bổ sung scope. - compiler has thể optimize/fuse/vectorize/kernel-specialize. - not bắt buộc cuda/opencl runtime. - axiom has thể target cuda/ptx, spir-v, metal, vulkan, directx, rocm/amdgcn... thông qua backend. - has thể mở rộng sang npu/dsp/accelerator mà not sửa semantic core. | 0139 §XX.1. Mục tiêu | - |  T950, T954, T958, T962, T965, T966, T967, T968, T969, T970, T976  |
 | REQ-GPU-008 | gpu | post-v1 | `@kernel` is not magic runtime. | 0139 §XX.2. Execution Domain | - | T950, T951, T953 |
 | REQ-GPU-009 | gpu | post-v1 | Nó is semantic declaration to compiler biết function this must thỏa kernel legality rules. | 0139 §XX.2. Execution Domain | - | T950, T951, T953 |
 | REQ-GPU-010 | gpu | post-v1 | A `@kernel` must not tùy tiện gọi all api of axiom. | 0139 §XX.4. Kernel Legality | - | T950, T951, T953 |
@@ -1445,7 +1445,7 @@
 | REQ-GPU-020 | gpu | post-v1 | Is operation library/device chứ is not implicit type conversion. | 0139 §XX.13. Transfer Không Phải Copy Value Bình Thường | - | T954, T955, T956, T957 |
 | REQ-GPU-021 | gpu | post-v1 | Must not has hidden assumption. | 0139 §XX.16. Event và Ownership | - | T954, T955, T956, T957 |
 | REQ-GPU-022 | gpu | post-v1 | Then relocation must is chặn or backend must update abstraction mà not make invalid capability. | 0139 §XX.17. Relocation và GPU Operation | - | T954, T955, T956, T957 |
-| REQ-GPU-023 | gpu | post-v1 | Compiler must not di chuyển memory operation qua barrier if make change synchronization semantics. | 0139 §XX.20. Barrier | - | T950, T952, T953, T958, T959, T960, T961 |
+| REQ-GPU-023 | gpu | post-v1 | Compiler must not di chuyển memory operation qua barrier if make change synchronization semantics. | 0139 §XX.20. Barrier | - |  T950, T952, T953, T958, T959, T960, T961, T966, T981  |
 | REQ-GPU-024 | gpu | post-v1 | Kernel parameter must have representation mà target hỗ trợ. | 0139 §XX.25. Kernel Parameter Restrictions | - | T950, T951, T953, T958, T959 |
 | REQ-GPU-025 | gpu | post-v1 | Core semantics not yêu cầu gpu kernel must have heap. | 0139 §XX.27. Dynamic Allocation trong Kernel | - | T950, T951, T953 |
 | REQ-GPU-026 | gpu | post-v1 | Must not âm thầm chuyển allocation về host. | 0139 §XX.27. Dynamic Allocation trong Kernel | - | T950, T951, T953 |
@@ -1457,8 +1457,8 @@
 | REQ-GPU-032 | gpu | post-v1 | Compiler specialization must not observable. | 0139 §XX.36. Kernel Specialization | - | T950, T951, T958, T959, T961 |
 | REQ-GPU-033 | gpu | post-v1 | Điểm this giúp compiler is not xây a memory-safety model riêng for gpu. | 0139 §XX.38. GPU và Ownership | - | T954, T955, T957 |
 | REQ-GPU-034 | gpu | post-v1 | But gpu operation not bắt buộc must sử dụng async runtime. | 0139 §XX.39. GPU và Async | - | T954, T956, T957, T962, T964, T965 |
-| REQ-GPU-035 | gpu | post-v1 | Cross-domain synchronization must explicit. | 0139 §XX.40. Memory Ordering Across CPU/GPU | - | T954, T956, T957, T962, T963, T965 |
-| REQ-GPU-036 | gpu | post-v1 | Semantic contract of event must define happens-before. | 0139 §XX.40. Memory Ordering Across CPU/GPU | - | T954, T956, T957, T962, T963, T965 |
+| REQ-GPU-035 | gpu | post-v1 | Cross-domain synchronization must explicit. | 0139 §XX.40. Memory Ordering Across CPU/GPU | - |  T962, T963, T965, T969  |
+| REQ-GPU-036 | gpu | post-v1 | Semantic contract of event must define happens-before. | 0139 §XX.40. Memory Ordering Across CPU/GPU | - |  T962, T963, T965, T969  |
 | REQ-GPU-037 | gpu | post-v1 | A kernel must not gọi dependency host-only. | 0139 §XX.44. Normative Invariants | - | T950, T951, T953 |
 | REQ-GPU-038 | gpu | post-v1 | Device allocation must have owner/storage contract rõ ràng. | 0139 §XX.44. Normative Invariants | - | T954, T955, T956, T957 |
 | REQ-GPU-039 | gpu | post-v1 | Conversion must be compiler prove or nằm in unsafe/system abstraction. | 0139 §XX.44. Normative Invariants | - | T954, T955, T957 |
@@ -1467,7 +1467,7 @@
 | REQ-GPU-042 | gpu | post-v1 | Gpu operation must not truy cập resource đã mất hiệu lực. | 0139 §XX.44. Normative Invariants | - | T954, T955, T956, T957 |
 | REQ-GPU-043 | gpu | post-v1 | Relocatable device storage must tôn trọng capability lifetime. | 0139 §XX.44. Normative Invariants | - | T954, T955, T956, T957 |
 | REQ-GPU-044 | gpu | post-v1 | Barrier/event/fence semantics must be biểu diễn in program or abstraction contract. | 0139 §XX.44. Normative Invariants | - | T950, T952, T953, T954, T956 |
-| REQ-GPU-045 | gpu | post-v1 | Kernel must not create invalid divergent collective synchronization. | 0139 §XX.44. Normative Invariants | - | T950, T952, T953, T958, T959, T961 |
+| REQ-GPU-045 | gpu | post-v1 | Kernel must not create invalid divergent collective synchronization. | 0139 §XX.44. Normative Invariants | - |  T950, T952, T953, T958, T959, T961, T980, T981, T984  |
 | REQ-GPU-046 | gpu | post-v1 | Agpu-46 — kernel parameters must be device-representable | 0139 §XX.44. Normative Invariants | - | T950, T951, T953, T958, T959, T961 |
 | REQ-GPU-047 | gpu | post-v1 | Agpu-51 — kernel fusion must preserve observable semantics | 0139 §XX.44. Normative Invariants | - | T958, T959, T961 |
 | REQ-GPU-048 | gpu | post-v1 | Agpu-57 — device apis must preserve common ownership semantics | 0139 §XX.44. Normative Invariants | - | T954, T955, T956, T957 |
@@ -2270,8 +2270,8 @@
 | REQ-CORE-233 | backend | v1-core | The target legalizer must split vector operations when the target architecture lacks native support for the vector width. | 0162 §30 | - | T113 | 
 | REQ-OPT-013 | optimizer | v1-full | Auto-vectorization must be performed by the optimizer before LIR lowering without requiring mandatory source annotations. | 0162 §31 | - | T616 |
 | REQ-LIR-013 | lir | v1-core | LIR must preserve distinct address spaces (Generic, Host, Device, Shared, Local, Private, Constant, External). | 0162 §32 | - | T113 | 
-| REQ-GPU-054 | gpu | post-v1 | GPU backends must not collapse GPU device address spaces into a generic address space. | 0162 §32 | - | T955, T958, T959, T960, T961 |
-| REQ-GPU-055 | gpu | post-v1 | LIR functions targeting GPU kernels must specify an execution domain of GPU and memory operations targeting device address spaces. | 0162 §33 | - | T952, T955, T958, T959, T960, T961 |
+| REQ-GPU-054 | gpu | post-v1 | GPU backends must not collapse GPU device address spaces into a generic address space. | 0162 §32 | - |  T955, T958, T959, T960, T961, T966, T968, T977  |
+| REQ-GPU-055 | gpu | post-v1 | LIR functions targeting GPU kernels must specify an execution domain of GPU and memory operations targeting device address spaces. | 0162 §33 | - |  T952, T955, T958, T959, T960, T961, T966, T968, T977  |
 | REQ-CORE-234 | backend | v1-core | Target properties and CPU features must be encapsulated in FunctionTargetInfo rather than hard-coded into generic optimizer passes. | 0162 §34 | - | T113 | 
 | REQ-CORE-235 | backend | v1-core | The target legalizer must rewrite unsupported types and operations in LIR into legal target sequences before machine instruction selection. | 0162 §35 | - | T113 | 
 | REQ-CORE-236 | machine-ir | v1-core | Machine IR must represent physical and virtual registers, target instructions, register constraints, immediates, addressing modes, flags, and implicit operands. | 0162 §36 | - | T113 | 
@@ -6428,7 +6428,7 @@
 | REQ-OWN-245 | ownership | post-v1 | Tensor storage shall obey Axiom ownership semantics where large tensors do not implement `Copy`, moving a tensor transfers ownership, and duplicating tensor storage requires explicit `.clone()`. | tasks/0459 §200.13-14, ATENSOR-21, ATENSOR-31; tasks/0468 §209.10, ATENSOR-21-22 | - | EPIC(E24.0) |
 |REQ-CAP-133|capability|v1-full|Tensor views (`TensorView`, `TensorMutView`) shall obey capability, provenance, and lifetime rules without performing implicit data copies; mutable tensor views require provably disjoint regions or exclusive capability.|tasks/0459 §200.9-11, ATENSOR-22, ATENSOR-28; tasks/0468 §209.11-12, ATENSOR-23-24, ATENSOR-30-32|-|T502|
 | REQ-LAY-293 | layout | post-v1 | Tensor layout metadata (shape, stride, format) shall remain distinct from logical tensor semantics; broadcasting operations shall produce non-copying virtual views without implicitly materializing storage. | tasks/0459 §200.8, §200.12, ATENSOR-26-27, ATENSOR-32; tasks/0468 §209.6, §209.9, ATENSOR-25, ATENSOR-29, ATENSOR-32 | - | EPIC(E24.0) |
-| REQ-GPU-061 | gpu | post-v1 | Tensor storage domains (CPU, GPU, NPU/accelerator) shall remain distinct, prohibiting implicit cross-device data transfers and requiring explicit transfer operations (`tensor.to(device)`, `tensor.to_async(device)`). | tasks/0459 §200.15-17, ATENSOR-29, ATENSOR-42-44; tasks/0468 §209.14-16, ATENSOR-35-36, ATENSOR-53-56 | - | T954, T956, T957 |
+| REQ-GPU-061 | gpu | post-v1 | Tensor storage domains (CPU, GPU, NPU/accelerator) shall remain distinct, prohibiting implicit cross-device data transfers and requiring explicit transfer operations (`tensor.to(device)`, `tensor.to_async(device)`). | tasks/0459 §200.15-17, ATENSOR-29, ATENSOR-42-44; tasks/0468 §209.14-16, ATENSOR-35-36, ATENSOR-53-56 | - |  T954, T956, T957, T980, T982  |
 | REQ-TYP-339 | types | post-v1 | Eager execution tensors (`Tensor<T>`) and lazy graph tensors (`GraphTensor<T>`) shall have distinct semantic types; graph optimization, operator fusion, and memory planning may reuse storage buffers only after proving lifetime non-overlap and effect preservation. | tasks/0459 §200.20-27, ATENSOR-33-36; tasks/0468 §209.20-27, ATENSOR-40-43, ATENSOR-51, ATENSOR-61 | - | EPIC(E24.0) |
 | REQ-MIR-130 | mir | post-v1 | Automatic differentiation shall lower to ordinary verified Axiom MIR functions that undergo type, ownership, capability, and GPU verification; gradients shall be first-class owned values and stop-gradient shall be explicit. | tasks/0459 §200.28-38, ATENSOR-38-41; tasks/0468 §209.28-38, ATENSOR-44-48 | - | EPIC(E24.0) |
 | REQ-CAP-134 | capability | v1-full | In-place tensor mutations (`x += y`) shall require exclusive mutable capability and shall be rejected when live read views exist, without compiler insertion of silent cloning. | tasks/0459 §200.39-40, ATENSOR-30; tasks/0468 §209.39-40, ATENSOR-52 | - | T500 |
@@ -6483,7 +6483,7 @@
 | REQ-SIMD-332 | simd | v1-full | Floating-point fused multiply-add (FMA) contractions and SIMD mathematical operations shall be applied only when permitted by the active numerical profile. | tasks/0469 §210.24, AMATH-60-61 | - | T459 |
 | REQ-CONC-154 | concurrency | v1-full | Parallel execution shall not weaken ownership verification; concurrent mutable access requires proven disjointness or explicit synchronization, and unknown aliasing shall never be treated as independent parallel access. | tasks/0470 §211.3, §211.20, §211.23-24, APAR-20, APAR-22-24 | - | T402 |
 | REQ-OPT-354 | optimizer | v1-full | Automatic loop parallelization and compiler-derived parallelism shall require dependency analysis and shall preserve observable program semantics. | tasks/0470 §211.25-26, APAR-25-26 | - | T611 |
-| REQ-GPU-062 | gpu | post-v1 | SIMT GPU execution shall remain distinct from CPU threading; warp-level and wave-level execution behavior shall not be assumed portable across architectures unless explicitly declared. | tasks/0470 §211.31-32, APAR-31-32 | - | T950, T952, T953 |
+| REQ-GPU-062 | gpu | post-v1 | SIMT GPU execution shall remain distinct from CPU threading; warp-level and wave-level execution behavior shall not be assumed portable across architectures unless explicitly declared. | tasks/0470 §211.31-32, APAR-31-32 | - |  T950, T952, T953, T980, T981, T984  |
 | REQ-CONC-155 | concurrency | v1-full | Structured parallel scopes shall not implicitly detach child tasks; detached execution shall be explicit, and parallel cancellation shall be cooperative by default. | tasks/0470 §211.35-37, APAR-35-37 | - | T422 |
 | REQ-CAP-142 | capability | v1-full | Independent computational regions and chunked mutable iterations may execute concurrently when capability analysis proves disjointness of accessed data. | tasks/0470 §211.49, §211.51, APAR-49, APAR-51 | - | T500 |
 | REQ-GPU-063 | gpu | post-v1 | Multi-GPU systems shall treat each device as an independent execution and storage domain; peer GPU memory access shall require explicit platform capability. | tasks/0470 §211.63-64, APAR-63-64 | - | T954, T956, T957 |
@@ -14209,7 +14209,7 @@
 | REQ-ECO-160 | ecosystem | post-v1 | Chained fixups: Nếu deployment profile sử dụng chained fixups, final image phải contain valid chain information. | 0805 §583.78 | - | EPIC(E24.9) |
 | REQ-ECO-161 | ecosystem | post-v1 | Code signature: Platform-required signing data là post-link artifact. | 0805 §583.79 | - | EPIC(E24.9) |
 | REQ-ECO-162 | ecosystem | post-v1 | Signature ordering: Signing phải diễn ra sau final image bytes/layout. | 0805 §583.80 | - | EPIC(E24.9) |
-| REQ-ECO-163 | ecosystem | post-v1 | iOS restrictions: iOS target có thể yêu cầu signing/provisioning/platform metadata ngoài compiler semantics. | 0805 §583.81 | - | EPIC(E24.9) |
+| REQ-ECO-163 | ecosystem | post-v1 | iOS restrictions: iOS target có thể yêu cầu signing/provisioning/platform metadata ngoài compiler semantics. | 0805 §583.81 | - |  T697, T699  |
 | REQ-ECO-164 | ecosystem | post-v1 | Virtual address: Mỗi loadable segment có virtual address range. | 0805 §583.82 | - | EPIC(E24.9) |
 | REQ-ECO-165 | ecosystem | post-v1 | Page alignment: Mapped regions phải page-aligned theo OS/ABI. | 0805 §583.83 | - | EPIC(E24.9) |
 | REQ-ECO-166 | ecosystem | post-v1 | Protection: Default: code     → R-X rodata   → R-- data     → RW- bss      → RW- | 0805 §583.84 | - | EPIC(E24.9) |
@@ -14564,7 +14564,7 @@
 | REQ-ECO-515 | ecosystem | post-v1 | Windows Unicode: Wide-character process APIs được chuyển sang Axiom UTF-8 representation. | 0807 §585.35 | - | EPIC(E24.9) |
 | REQ-ECO-516 | ecosystem | post-v1 | Windows subsystem: Image builder `584` quyết định: Console GUI Native/other target mode Startup semantics phải match subsystem. | 0807 §585.36 | - | EPIC(E24.9) |
 | REQ-ECO-517 | ecosystem | post-v1 | macOS bootstrap: Mach-O entry phải chuyển sang Axiom startup trong đúng ABI/register state. | 0807 §585.37 | - | EPIC(E24.9) |
-| REQ-ECO-518 | ecosystem | post-v1 | iOS bootstrap: iOS application startup không được giả định giống command-line process. Axiom runtime phải phân biệt: Application Extension Framework | 0807 §585.38 | - | EPIC(E24.9) |
+| REQ-ECO-518 | ecosystem | post-v1 | iOS bootstrap: iOS application startup không được giả định giống command-line process. Axiom runtime phải phân biệt: Application Extension Framework | 0807 §585.38 | - |  T697, T699  |
 | REQ-ECO-519 | ecosystem | post-v1 | Android bootstrap: Android native process startup phải match Android ABI/API contract. | 0807 §585.39 | - | EPIC(E24.9) |
 | REQ-ECO-520 | ecosystem | post-v1 | WASM startup: WASM không có OS process entry. WASM instantiate ↓ imports initialized ↓ start function ↓ Axiom runtime | 0807 §585.40 | - | EPIC(E24.9) |
 | REQ-ECO-521 | ecosystem | post-v1 | WASI: WASI-hosted Axiom có thể map: args env stdin stdout filesystem clock random thành capability-backed runtime services. | 0807 §585.41 | - | EPIC(E24.9) |
@@ -15024,12 +15024,12 @@
 | REQ-ECO-975 | ecosystem | post-v1 | Toolchain definition: Một Axiom toolchain hoàn chỉnh gồm: Toolchain { compiler linker object_tools runtime stdlib target_database target_sdks sysroots debug_support package_metadata } | 0810 §588.1 | - | EPIC(E24.9) |
 | REQ-ECO-976 | ecosystem | post-v1 | Toolchain không đồng nghĩa compiler: Compiler chỉ là một thành phần. Toolchain phải cung cấp toàn bộ environment cần để build target. | 0810 §588.2 | - | EPIC(E24.9) |
 | REQ-ECO-977 | ecosystem | post-v1 | Toolchain identity: ToolchainIdentity { compiler_version language_edition runtime_version stdlib_version target_db_version sdk_versions } | 0810 §588.3 | - | EPIC(E24.9) |
-| REQ-ECO-978 | ecosystem | post-v1 | Target identity: Mỗi target có canonical ID: x86_64-pc-windows x86_64-unknown-linux aarch64-apple-macos aarch64-apple-ios aarch64-linux-android wasm32-unknown-axiom Tên cụ thể có thể mở rộng nhưng phải canonical và machine-readable. | 0810 §588.4 | - | EPIC(E24.9) |
+| REQ-ECO-978 | ecosystem | post-v1 | Target identity: Mỗi target có canonical ID: x86_64-pc-windows x86_64-unknown-linux aarch64-apple-macos aarch64-apple-ios aarch64-linux-android wasm32-unknown-axiom Tên cụ thể có thể mở rộng nhưng phải canonical và machine-readable. | 0810 §588.4 | - |  T697, T698  |
 | REQ-ECO-979 | ecosystem | post-v1 | Target triple: Target triple được mở rộng thành target descriptor: TargetDescriptor { architecture vendor os environment abi object_format cpu_baseline features endianness pointer_width } | 0810 §588.5 | - | EPIC(E24.9) |
 | REQ-ECO-980 | ecosystem | post-v1 | Target database: Target DB là nguồn canonical cho: - ISA; - ABI; - calling convention; - object format; - linker policy; - startup; - runtime; - platform SDK; - default CPU; - feature set. | 0810 §588.6 | - | EPIC(E24.9) |
 | REQ-ECO-981 | ecosystem | post-v1 | Target DB versioning: Target DB phải versioned độc lập với compiler. | 0810 §588.7 | - | EPIC(E24.9) |
 | REQ-ECO-982 | ecosystem | post-v1 | Target DB compatibility: Compiler chỉ sử dụng target descriptor tương thích với backend/compiler version. | 0810 §588.8 | - | EPIC(E24.9) |
-| REQ-ECO-983 | ecosystem | post-v1 | Target aliases: Có thể có aliases: windows-x64 linux-x64 linux-arm64 macos-arm64 ios-arm64 android-arm64 wasm nhưng compiler phải canonicalize về target ID. | 0810 §588.9 | - | EPIC(E24.9) |
+| REQ-ECO-983 | ecosystem | post-v1 | Target aliases: Có thể có aliases: windows-x64 linux-x64 linux-arm64 macos-arm64 ios-arm64 android-arm64 wasm nhưng compiler phải canonicalize về target ID. | 0810 §588.9 | - |  T697, T698  |
 | REQ-ECO-984 | ecosystem | post-v1 | Target feature resolution: target + cpu + features ↓ ResolvedTarget | 0810 §588.10 | - | EPIC(E24.9) |
 | REQ-ECO-985 | ecosystem | post-v1 | CPU baseline: Mỗi target phải xác định baseline instruction set. | 0810 §588.11 | - | EPIC(E24.9) |
 | REQ-ECO-986 | ecosystem | post-v1 | CPU tuning: Có thể chỉ định: --cpu=native --cpu=generic --cpu=<model> `native` chỉ có ý nghĩa khi compiler đang chạy trên cùng host architecture. | 0810 §588.12 | - | EPIC(E24.9) |
@@ -15089,7 +15089,7 @@
 | REQ-ECO-1040 | ecosystem | post-v1 | Windows SDK integration: Windows target có thể consume Windows SDK metadata/libs mà không sử dụng MSVC linker. | 0810 §588.66 | - | EPIC(E24.9) |
 | REQ-ECO-1041 | ecosystem | post-v1 | Linux system integration: Linux target có thể link system libraries theo ABI và sysroot. | 0810 §588.67 | - | EPIC(E24.9) |
 | REQ-ECO-1042 | ecosystem | post-v1 | macOS SDK integration: macOS target phải pin SDK version và deployment target. | 0810 §588.68 | - | EPIC(E24.9) |
-| REQ-ECO-1043 | ecosystem | post-v1 | iOS SDK integration: iOS target phải pin: platform deployment target SDK architecture code-signing policy | 0810 §588.69 | - | EPIC(E24.9) |
+| REQ-ECO-1043 | ecosystem | post-v1 | iOS SDK integration: iOS target phải pin: platform deployment target SDK architecture code-signing policy | 0810 §588.69 | - |  T697, T698  |
 | REQ-ECO-1044 | ecosystem | post-v1 | WASM SDK: WASM target không dùng native sysroot. Thay vào đó: WASM imports WASI / host API runtime metadata | 0810 §588.70 | - | EPIC(E24.9) |
 | REQ-ECO-1045 | ecosystem | post-v1 | WASI target: WASI được mô hình hóa như target runtime/API contract. | 0810 §588.71 | - | EPIC(E24.9) |
 | REQ-ECO-1046 | ecosystem | post-v1 | SDK target capabilities: Target DB phải expose: supports_dynamic_linking supports_tls supports_threads supports_gui supports_signing supports_debug supports_unwind | 0810 §588.72 | - | EPIC(E24.9) |
@@ -15132,7 +15132,7 @@
 | REQ-ECO-1083 | ecosystem | post-v1 | Universal binary ordering: Slice ordering phải deterministic. | 0810 §588.109 | - | EPIC(E24.9) |
 | REQ-ECO-1084 | ecosystem | post-v1 | Target SDK package layout: Canonical: sdk/ └── <target>/ ├── include/ ├── lib/ ├── frameworks/ ├── metadata/ ├── sysroot/ └── manifest | 0810 §588.110 | - | EPIC(E24.9) |
 | REQ-ECO-1085 | ecosystem | post-v1 | Target runtime layout: runtime/ └── <target>/ ├── core ├── alloc ├── std └── startup | 0810 §588.111 | - | EPIC(E24.9) |
-| REQ-ECO-1086 | ecosystem | post-v1 | Compiler target layout: targets/ ├── x86_64-linux ├── x86_64-windows ├── aarch64-linux ├── aarch64-macos ├── aarch64-ios └── wasm32 | 0810 §588.112 | - | EPIC(E24.9) |
+| REQ-ECO-1086 | ecosystem | post-v1 | Compiler target layout: targets/ ├── x86_64-linux ├── x86_64-windows ├── aarch64-linux ├── aarch64-macos ├── aarch64-ios └── wasm32 | 0810 §588.112 | - |  T697, T698  |
 | REQ-ECO-1087 | ecosystem | post-v1 | Target descriptor format: Descriptor phải machine-readable, versioned và deterministic. | 0810 §588.113 | - | EPIC(E24.9) |
 | REQ-ECO-1088 | ecosystem | post-v1 | Target extension: Adding a new target không được yêu cầu sửa parser/type system nếu backend abstractions đủ. | 0810 §588.114 | - | EPIC(E24.9) |
 | REQ-ECO-1089 | ecosystem | post-v1 | Target plugin: Target backend có thể được distributed separately nhưng phải follow compiler plugin/security policy. | 0810 §588.115 | - | EPIC(E24.9) |
@@ -15166,7 +15166,7 @@
 | REQ-ECO-1117 | ecosystem | post-v1 | SDK-to-linker compatibility: Linker phải biết SDK relocation/import/export requirements. | 0810 §588.143 | - | EPIC(E24.9) |
 | REQ-ECO-1118 | ecosystem | post-v1 | SDK-to-image compatibility: Image builder phải biết target image requirements. | 0810 §588.144 | - | EPIC(E24.9) |
 | REQ-ECO-1119 | ecosystem | post-v1 | Platform signing: Signing tools có thể nằm ngoài compiler nhưng phải ở post-link boundary. | 0810 §588.145 | - | EPIC(E24.9) |
-| REQ-ECO-1120 | ecosystem | post-v1 | Signing SDK: iOS/Windows/macOS signing integration phải không làm compiler phụ thuộc proprietary compiler. | 0810 §588.146 | - | EPIC(E24.9) |
+| REQ-ECO-1120 | ecosystem | post-v1 | Signing SDK: iOS/Windows/macOS signing integration phải không làm compiler phụ thuộc proprietary compiler. | 0810 §588.146 | - |  T697  |
 | REQ-ECO-1121 | ecosystem | post-v1 | Signing boundary: Compile ↓ Link ↓ Image ↓ Verify ↓ Sign ↓ Package | 0810 §588.147 | - | EPIC(E24.9) |
 | REQ-ECO-1122 | ecosystem | post-v1 | Package boundary: Installer/application packaging không được thay đổi executable semantics sau verification. | 0810 §588.148 | - | EPIC(E24.9) |
 | REQ-ECO-1123 | ecosystem | post-v1 | Package reproducibility: Packaging có deterministic mode. | 0810 §588.149 | - | EPIC(E24.9) |
@@ -15679,7 +15679,7 @@
 | REQ-ECO-1630 | ecosystem | post-v1 | Function ABI identity: Function identity gồm: calling convention parameter ABI return ABI symbol ABI | 0813 §591.92 | - | EPIC(E24.9) |
 | REQ-ECO-1631 | ecosystem | post-v1 | ABI mismatch: Resolver/linker phải reject incompatible native package. | 0813 §591.93 | - | EPIC(E24.9) |
 | REQ-ECO-1632 | ecosystem | post-v1 | ABI evolution: ABI version change phải được phản ánh trong package metadata. | 0813 §591.94 | - | EPIC(E24.9) |
-| REQ-ECO-1633 | ecosystem | post-v1 | Target matrix: Một package có thể có: Package ├── source ├── linux-x64 ├── windows-x64 ├── macos-arm64 ├── ios-arm64 └── wasm32 | 0813 §591.95 | - | EPIC(E24.9) |
+| REQ-ECO-1633 | ecosystem | post-v1 | Target matrix: Một package có thể có: Package ├── source ├── linux-x64 ├── windows-x64 ├── macos-arm64 ├── ios-arm64 └── wasm32 | 0813 §591.95 | - |  T697  |
 | REQ-ECO-1634 | ecosystem | post-v1 | Variant selection: Resolver chọn variant phù hợp target. | 0813 §591.96 | - | EPIC(E24.9) |
 | REQ-ECO-1635 | ecosystem | post-v1 | Variant fallback: Nếu binary variant không tồn tại: binary unavailable hoặc build source nếu source variant được phép. | 0813 §591.97 | - | EPIC(E24.9) |
 | REQ-ECO-1636 | ecosystem | post-v1 | Source fallback policy: Fallback phải explicit theo package policy. | 0813 §591.98 | - | EPIC(E24.9) |
@@ -16325,8 +16325,8 @@
 | REQ-ECO-2276 | ecosystem | post-v1 | Self-contained application: Application có thể bundle runtime components cần thiết. | 0815 §593.18 | - | EPIC(E24.9) |
 | REQ-ECO-2277 | ecosystem | post-v1 | System runtime: Application có thể depend on OS-provided runtime. Manifest phải khai báo requirement. | 0815 §593.19 | - | EPIC(E24.9) |
 | REQ-ECO-2278 | ecosystem | post-v1 | Runtime compatibility: Runtime dependency phải kiểm tra: ABI architecture platform feature set | 0815 §593.20 | - | EPIC(E24.9) |
-| REQ-ECO-2279 | ecosystem | post-v1 | Deployment target: Target descriptor từ `588` được reuse. linux-x64 linux-arm64 macos-x64 macos-arm64 ios-arm64 android-arm64 wasm32 | 0815 §593.21 | - | EPIC(E24.9) |
-| REQ-ECO-2280 | ecosystem | post-v1 | Platform variant: Một application có thể có nhiều platform variants. App ├── Windows ├── Linux ├── macOS ├── iOS ├── Android └── WASM | 0815 §593.22 | - | EPIC(E24.9) |
+| REQ-ECO-2279 | ecosystem | post-v1 | Deployment target: Target descriptor từ `588` được reuse. linux-x64 linux-arm64 macos-x64 macos-arm64 ios-arm64 android-arm64 wasm32 | 0815 §593.21 | - |  T697  |
+| REQ-ECO-2280 | ecosystem | post-v1 | Platform variant: Một application có thể có nhiều platform variants. App ├── Windows ├── Linux ├── macOS ├── iOS ├── Android └── WASM | 0815 §593.22 | - |  T697, T699  |
 | REQ-ECO-2281 | ecosystem | post-v1 | Variant identity: Mỗi variant có identity riêng. | 0815 §593.23 | - | EPIC(E24.9) |
 | REQ-ECO-2282 | ecosystem | post-v1 | Universal application: Nếu platform cho phép, package có thể chứa nhiều architecture. | 0815 §593.24 | - | EPIC(E24.9) |
 | REQ-ECO-2283 | ecosystem | post-v1 | Universal binary: Universal binary phải ghi rõ architecture slices. | 0815 §593.25 | - | EPIC(E24.9) |
@@ -20004,7 +20004,7 @@
 | REQ-ECO-5955 | ecosystem | post-v1 | Config Migration ≠ State Migration: Hai migration system độc lập: Configuration Migration Application State Migration State migration thuộc `BOOTSTRAP-600`. | 0826 §601.109 | - | EPIC(E24.9) |
 | REQ-ECO-5956 | ecosystem | post-v1 | Runtime Feature Flags: Configuration có thể định nghĩa: feature gpu_backend: bool = true Feature flag không được biến thành dynamic code loading. | 0826 §601.110 | - | EPIC(E24.9) |
 | REQ-ECO-5957 | ecosystem | post-v1 | Compile-Time Feature: Compile-time: when feature("gpu") là compiler/build feature. Runtime flag: config.gpu_backend là runtime behavior. Không đánh đồng hai loại. | 0826 §601.111 | - | EPIC(E24.9) |
-| REQ-ECO-5958 | ecosystem | post-v1 | Capability Discovery: Application có thể kiểm tra: runtime.capabilities() Ví dụ: GPU AVX2 AVX-512 Vulkan Metal DirectX WASM Configuration có thể yêu cầu capability: require capability GPU | 0826 §601.112 | - | EPIC(E24.9) |
+| REQ-ECO-5958 | ecosystem | post-v1 | Capability Discovery: Application có thể kiểm tra: runtime.capabilities() Ví dụ: GPU AVX2 AVX-512 Vulkan Metal DirectX WASM Configuration có thể yêu cầu capability: require capability GPU | 0826 §601.112 | - |  T962, T963, T967, T969, T976, T978, T980  |
 | REQ-ECO-5959 | ecosystem | post-v1 | Capability Failure: Nếu deployment yêu cầu capability không tồn tại: startup failure với typed diagnostic. | 0826 §601.113 | - | EPIC(E24.9) |
 | REQ-ECO-5960 | ecosystem | post-v1 | Configuration and Native Targets: Configuration runtime phải hoạt động nhất quán trên: Windows Linux macOS iOS Android WASM trong phạm vi platform capabilities. | 0826 §601.114 | - | EPIC(E24.9) |
 | REQ-ECO-5961 | ecosystem | post-v1 | Restricted Platforms: Trên iOS/WASM, filesystem/config paths có thể khác. Axiom runtime phải expose logical locations thay vì giả định filesystem layout. | 0826 §601.115 | - | EPIC(E24.9) |
@@ -22927,8 +22927,8 @@
 | REQ-STD-173 | std-lib | v1-full | Axiom must provide native storage, filesystem, memory mapping, and durable data APIs. | 0840 (§1) | - | T074b, T321, T908, T909, T911, T920, T921, T922, T923 |
 | REQ-STD-174 | std-lib | v1-full | Axiom must provide native serialization and binary data models. | 0841 (§1) | - | T074b, T321, T924, T925, T926, T927 |
 | REQ-STD-175 | std-lib | v1-full | Axiom must provide native compression, archiving, and content-addressed storage capabilities. | 0842 (§1), 0844 (§1) | - | T321, T924, T926, T927 |
-| REQ-GPU-064 | gpu | v1-full | Axiom must provide APIs for hardware devices, GPU accelerators, and OS resource IO. | 0843 (§1), 0845 (§1) | - | T322, T962, T963, T964, T965 |
-| REQ-GPU-065 | gpu | v1-full | Axiom must provide Native Graphics, Windowing, Display Composition, Rendering Pipeline & GPU Command Runtime capabilities. | 0846 (§1) | - | T322, T962, T963, T964, T965 |
+| REQ-GPU-064 | gpu | v1-full | Axiom must provide APIs for hardware devices, GPU accelerators, and OS resource IO. | 0843 (§1), 0845 (§1) | - |  T322, T962, T963, T964, T965, T966, T967, T969, T973, T978, T981  |
+| REQ-GPU-065 | gpu | v1-full | Axiom must provide Native Graphics, Windowing, Display Composition, Rendering Pipeline & GPU Command Runtime capabilities. | 0846 (§1) | - |  T322, T962, T963, T964, T965, T968, T970, T971, T972, T973, T974, T975, T977, T979, T983  |
 | REQ-STD-176 | std-lib | v1-full | Axiom must provide robust Unicode, text layout, and internationalization capabilities. | 0850 (§1) | - | T071 |
 | REQ-ECO-8733 | ecosystem | post-v1 | Axiom ecosystem must enable UI state synchronization, reactive data binding, and application layout routing. | 0853 (§243), 0855 (§1) | - | T324 |
 | REQ-ECO-8734 | ecosystem | v1-full | Axiom must enable dynamic plugins, hot-reloading, and safe dependency isolation across module boundaries. | 0856 (§1) | - | T320, T866, T867, T868, T869, T870, T871, T872, T873 |
@@ -30037,7 +30037,7 @@
 | REQ-OWN-4398 | unknown | post-v1 | Linker phải ensure section/segment mapping valid. | 1037 §53. | - | EPIC(E24.0) |
 | REQ-OWN-4399 | unknown | post-v1 | AXLINKER phải generate target-specific GOT/PLT-like structures khi required. | 1037 §55. | - | EPIC(E24.0) |
 | REQ-OWN-4400 | unknown | post-v1 | AXLINKER phải support:<br><br>```text<br>Mach header<br>load commands<br>segments<br>sections<br>symbol tables<br>dyld metadata<br>exports<br>imports<br>code signatures metadata hooks<br>TLS/thread data<br>``` | 1037 §58. | - | EPIC(E24.0) |
-| REQ-OWN-4401 | unknown | post-v1 | iOS artifact generation phải respect:<br><br>```text<br>Mach-O<br>platform metadata<br>minimum OS version<br>architecture<br>signing metadata boundary<br>``` | 1037 §60. | - | EPIC(E24.0) |
+| REQ-OWN-4401 | unknown | post-v1 | iOS artifact generation phải respect:<br><br>```text<br>Mach-O<br>platform metadata<br>minimum OS version<br>architecture<br>signing metadata boundary<br>``` | 1037 §60. | - |  T697, T698  |
 | REQ-OWN-4402 | unknown | post-v1 | Search order must be deterministic. | 1037 §75. | - | EPIC(E24.0) |
 | REQ-OWN-4403 | unknown | post-v1 | linker phải produce deterministic diagnostic rather than silently selecting arbitrary path. | 1037 §76. | - | EPIC(E24.0) |
 | REQ-OWN-4404 | unknown | post-v1 | ICF must preserve address-sensitive semantics. | 1037 §87. | - | EPIC(E24.0) |
@@ -30427,7 +30427,7 @@
 | REQ-OWN-4788 | unknown | post-v1 | AXBINARY phải emit non-executable stack by default. | 1040 §57. | - | EPIC(E24.0) |
 | REQ-OWN-4789 | unknown | post-v1 | AXBINARY không trở thành package manager. | 1040 §75. | - | EPIC(E24.0) |
 | REQ-OWN-4790 | unknown | post-v1 | `.app`, framework bundle và signing workflow thuộc platform/package layers. | 1040 §75. | - | EPIC(E24.0) |
-| REQ-OWN-4791 | unknown | post-v1 | AXBINARY phải nhận:<br><br>```text<br>platform = ios<br>``` | 1040 §76. | - | EPIC(E24.0) |
+| REQ-OWN-4791 | unknown | post-v1 | AXBINARY phải nhận:<br><br>```text<br>platform = ios<br>``` | 1040 §76. | - |  T697, T698  |
 | REQ-OWN-4792 | unknown | post-v1 | AXBINARY **không sign executable**. | 1040 §77. | - | EPIC(E24.0) |
 | REQ-OWN-4793 | unknown | post-v1 | Pipeline:<br><br>```text<br>AXBINARY<br>↓<br>unsigned Mach-O<br>↓<br>AXTRUST / platform signing<br>``` | 1040 §77. | - | EPIC(E24.0) |
 | REQ-OWN-4794 | unknown | post-v1 | WASM section ordering phải tuân thủ format specification. | 1040 §82. | - | EPIC(E24.0) |
@@ -31642,7 +31642,7 @@
 | REQ-OWN-6003 | unknown | post-v1 | phải có explicit mode. | 1047 §105. | - | EPIC(E24.0) |
 | REQ-OWN-6004 | unknown | post-v1 | Các test core phải chạy được trong profile phù hợp. | 1047 §106. | - | EPIC(E24.0) |
 | REQ-OWN-6005 | unknown | post-v1 | Axiom phải có suite:<br><br>```text<br>no libc<br>no OS runtime<br>no heap<br>minimal runtime<br>``` | 1047 §107. | - | EPIC(E24.0) |
-| REQ-OWN-6006 | unknown | post-v1 | iOS/Android test có thể cần simulator/device. | 1047 §109. | - | EPIC(E24.0) |
+| REQ-OWN-6006 | unknown | post-v1 | iOS/Android test có thể cần simulator/device. | 1047 §109. | - |  T697, T699  |
 | REQ-OWN-6007 | unknown | post-v1 | AXTEST interface:<br><br>```text<br>TargetExecutor {<br>   prepare()<br>   deploy()<br>   launch()<br>   collect()<br>   cleanup()<br>}<br>``` | 1047 §109. | - | EPIC(E24.0) |
 | REQ-OWN-6008 | unknown | post-v1 | AXTEST không hard-code simulator implementation. | 1047 §109. | - | EPIC(E24.0) |
 | REQ-OWN-6009 | unknown | post-v1 | Không bắt buộc database server. | 1047 §110. | - | EPIC(E24.0) |

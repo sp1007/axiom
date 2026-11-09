@@ -13,7 +13,7 @@ attempts: 0
 paths: [spec/SPEC-133-host-runtime-vulkan-d3d12-compute.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md, spec/SPEC-04-core-extensibility.md]
 spec: [spec/SPEC-130-execution-domains-kernel-model.md, spec/SPEC-131-device-memory-cross-device-ownership.md, spec/SPEC-132-gpu-ir-spirv-codegen-backend.md, spec/SPEC-04-core-extensibility.md, 0096, 0139, tasks/0626, tasks/0843, tasks/0845, tasks/0846]
-covers: [REQ-GPU-007, REQ-GPU-034, REQ-GPU-035, REQ-GPU-036, REQ-GPU-041, REQ-GPU-064, REQ-GPU-065]
+covers: [REQ-ECO-5958, REQ-GPU-007, REQ-GPU-034, REQ-GPU-035, REQ-GPU-036, REQ-GPU-041, REQ-GPU-064, REQ-GPU-065]
 ---
 # T962 — E22.4 Canonical heterogeneous host runtime, Vulkan/D3D12 compute dispatch & device discovery specification (SPEC-133)
 

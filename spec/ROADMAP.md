@@ -104,13 +104,13 @@ P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (o
 | P13 low-level & security | T500–T533 | T213 | T313 | P10 |
 | P14 language completion: comptime 2.0, reflection, generators, dyn | T058, T550–T572 | T214 | T314 | P10 |
 | P15 optimizer 2.0 + regalloc | T063, T064, T600–T629 | T215 | T315 | P10 (E15.5 needs P12) |
-| P16 targets & platforms | T066, T650–T696 | T216 | T316 | P13 |
+| P16 targets & platforms | T066, T650–T699 | T216 | T316 | P13 |
 | P17 debugging & introspection | T068, T700–T726 | T217 | T317 | P16 |
 | P18 compiler architecture 2.0 + Windows artifact kinds | T067, T750–T776 | T218 | T318 | P10 |
 | P19 developer tooling | T800–T819 | T219 | T319 | P18 |
 | P20 build & packages | T850–T877 | T220 | T320 | P16, P18 |
 | P21 std completion | T900–T935 | T221 | T321 | P11, P13 |
-| P22 GPU & heterogeneous | T950–T965 | T222 | T322 | P11, P12, P16 |
+| P22 GPU & heterogeneous | T950–T984 | T222 | T322 | P11, P12, P16 |
 | P23 v1.0 release | T091, T1000–T1010 | T223 | T323 | P11–P22 |
 | P24 ecosystem (post-v1) | — | T224 (deferred) | T324 (deferred) | P23 + owner decision |
 
@@ -237,10 +237,11 @@ Exit: differential green at -O2; benchmark targets met and tracked in CI.
   (Mach-O universal x64+arm64 first; bundle formats elsewhere), never implicit. Src tasks/0453 §194.29. *(T689–T692)*
 - **E16.12 Windows on ARM64** — PE/COFF ARM64, Windows ARM64 ABI, reuse of the AArch64 backend.
   Src 0181 0193 tasks/0453. *(T693–T696)*
+- **E16.13 iOS AArch64 & iOS Simulator Mach-O target** — Mach-O 64-bit arm64 (`aarch64-apple-ios`) and arm64 simulator (`aarch64-apple-ios-sim`), `LC_BUILD_VERSION` load commands, iOS SDK sysroot discovery, UIKit event loop / `UIApplication` & `CAMetalLayer` window surface shim, code-signing/entitlements boundary, and simulator execution harness. Src 0193, 0196, 0217, 0220, 0587, 0804, 0805, 0807, 0810, 0846 §13, ADR-0038. *(T697–T699)*
 Exit: full run suite on each tier-1 target (Windows x64, Windows ARM64, Linux x64, Linux AArch64,
-macOS AArch64); WASM/RISC-V tier-2; the artifact matrix below is green.
+macOS AArch64); WASM/RISC-V/iOS tier-2; the artifact matrix below is green.
 
-Artifact matrix (E16.10–E16.12; ✔ = must be produced *and* consumed with tests):
+Artifact matrix (E16.10–E16.13; ✔ = must be produced *and* consumed with tests):
 
 | Target | executable | static lib | dynamic lib | notes |
 |---|---|---|---|---|
@@ -249,6 +250,8 @@ Artifact matrix (E16.10–E16.12; ✔ = must be produced *and* consumed with tes
 | x86_64-linux | ELF (E16.9) | `.a` | `.so` (E16.2) | static first |
 | aarch64-linux | ELF | `.a` | `.so` | E16.3 |
 | aarch64-macos | Mach-O | `.a` | `.dylib` | E16.4; universal with x86_64 (E16.11) |
+| aarch64-ios | Mach-O 64-bit | `.a` | `.dylib` (Framework) | E16.13 |
+| aarch64-ios-sim | Mach-O 64-bit (simulator) | `.a` | `.dylib` (Framework) | E16.13 |
 | aarch64-android | ELF PIE | `.a` | `.so` (JNI) | E16.5 |
 | wasm32 | `.wasm` module | object archive | — (component model later) | E16.6, tier-2 |
 | riscv64-linux | ELF | `.a` | `.so` | E16.7, tier-2 |
@@ -319,11 +322,15 @@ Exit: multi-package workspace builds reproducibly from lockfile on two machines.
 Exit: std API reference complete; std conformance suite on all tier-1 targets.
 
 ### P22 — GPU & heterogeneous computing
-- **E22.1 Execution domains & kernel model** — Src 0096 0139 0120 tasks/0299. *(T950–T953)*
-- **E22.2 Device memory & ownership across devices** — Src 0120 tasks/0626. *(T954–T957)*
-- **E22.3 GPU codegen backend (SPIR-V first unless ADR decides otherwise)** — Src tasks/0626. *(T958–T961)*
-- **E22.4 Host runtime (Vulkan/D3D12 compute)** — Src tasks/0626. *(T962–T965)*
-Exit: kernel conformance examples run on a GPU with oracle-checked results.
+- **E22.1 Execution domains & kernel model** — Execution domain boundaries, `@kernel` legality, thread grid/block SIMT intrinsics, host-device cross-domain ownership rules. Src 0096 0139 0120 tasks/0299. *(T950–T953)*
+- **E22.2 Device memory & ownership across devices** — Address space capabilities, `DeviceBuffer<T>`, explicit host-device transfers, async event lifetime tracking. Src 0120 tasks/0626. *(T954–T957)*
+- **E22.3 GPU codegen backend (SPIR-V & HLSL/DXIL)** — AGIR lowering, kernel fusion, CFG structurization, SPIR-V 1.6 binary emitter, and native Windows `AGIR -> HLSL` + DXIL container emission with `dxcompiler.dll` & root signature reflection. Src tasks/0626, 0846 §44–50, ADR-0038. *(T958–T961, T966)*
+- **E22.4 Host runtime (Vulkan/D3D12 compute)** — Heterogeneous device discovery, `DeviceManager`, Vulkan and D3D12 compute command recording, pipeline state, queue submission. Src tasks/0626, 0846 §5–9, §37–43. *(T962–T965)*
+- **E22.5 Apple Metal backend & MSL codegen** — Metal Shading Language (`AGIR -> MSL`, `.metal`) source emitter, argument buffer reflection, Apple Metal host driver (`std/sys/gpu/metal`) for macOS (`NSWindow`/`CAMetalLayer`) and iOS (`UIView`/`CAMetalLayer`) via Objective-C runtime / `Metal.framework` (`MTLDevice`, `MTLCommandQueue`, `MTLLibrary`, `MTLComputePipelineState`, `MTLRenderPipelineState`, `MTLSharedEvent`), and Apple Silicon zero-copy `UnifiedBuffer` fast-path. Src 0096, 0139, 0846 §13, §44–48, ADR-0038. *(T967–T970)*
+- **E22.6 Native raster graphics pipeline, surface/swapchain & software rasterizer fallback** — Graphics shader stages in AGIR (`@vertex`, `@fragment`) with type-checked inter-stage interface, textures (`Texture1D/2D/3D/Cube`, `StorageTexture`), samplers, `GraphicsPipeline` (vertex layouts, primitive topology, rasterizer state, blend, depth/stencil, MSAA, MRT), `RenderPass`, multi-backend native `Surface` & `Swapchain` lifecycle (Win32 `HWND`, macOS/iOS `CAMetalLayer`, Linux Wayland/X11, Android `ANativeWindow`, HTMLCanvas; VSync/Mailbox, resize/recreation, sRGB/HDR), and the deterministic CPU Software Rasterizer fallback (`std/sys/gpu/software`, 0846 §78–79) for pixel-perfect headless CI verification. Src 0846 §10–56, §78–90, §230–240, ADR-0038. *(T971–T975)*
+- **E22.7 WebGPU backend & WGSL codegen** — WebGPU Shading Language (`AGIR -> WGSL`) source emitter, address-space mapping, WGSL syntax validator, and `std/sys/gpu/webgpu` host/WASM bridge (`navigator.gpu` / native WebGPU C ABI) enabling seamless GPU compute and graphics on `wasm32` (`E16.6`) and native platforms. Src 0846 §13, §47, §217, ADR-0038. *(T976–T979)*
+- **E22.8 GPU AI acceleration (subgroups, f16/bf16, cooperative matrix) & runtime shader hot-reload** — Capability-gated SIMT Subgroup collectives (`subgroup_size`, `subgroup_shuffle`, `subgroup_broadcast`, `subgroup_ballot`, `subgroup_reduce_add/min/max`), half-precision `f16` and `bf16` device storage & compute, Cooperative Matrix / Tensor Core MMA (`TileMatrix<T, M, N, K>`, `mma_sync`) lowering across SPIR-V (`OpTypeCooperativeMatrixKHR`), HLSL/DXIL WaveMMA, and Apple MSL (`simdgroup_matrix`), plus safe runtime live shader and pipeline hot-reload (`std/gpu/hot_reload`, 0846 §252–254) with ABI compatibility verification and atomic frame-boundary swapping. Src 0096, 0139, tasks/0459, tasks/0468, tasks/0470, 0826 §601.112, 0846 §252–254, ADR-0038. *(T980–T984)*
+Exit: kernel and graphics conformance examples run on physical GPU (Vulkan, D3D12, Metal, WebGPU) and CPU software fallback with bit-for-bit oracle-checked results.
 
 ### P23 — v1.0 conformance, freeze, release
 - **E23.1 Full conformance suite & compiler qualification** — Src 0017 0145 0150 tasks/0602. *(T1000–T1003)*
@@ -424,3 +431,4 @@ Exit (phase): defined by T224 per epic when the owner schedules P24.
 | 2026-11-03 | T223 P23 phase expansion (`P23-v1-0-conformance-freeze-releas`): expanded E23.1–E23.3 into 11 new tasks `T1000`–`T1010` alongside refined `T091` (12 tasks total across 3 epics: E23.1 4 tasks `T1000–T1003`; E23.2 4 tasks `T091, T1004–T1006`; E23.3 4 tasks `T1007–T1010`, all depending on P11–P22 gates `T311`–`T322`), converted `EPIC(E23.2)` (`REQ-CNF-001`) plus 15 P23 catalogue rows (`REQ-TOOL-001`, `REQ-CORE-021`, `REQ-TOOL-003`, `REQ-CORE-022`, `REQ-CONC-097`, `REQ-CAP-055`, `REQ-CORE-3133`–`REQ-CORE-3138`, `REQ-PKG-022`, `REQ-TST-112`, `REQ-ECO-8736`) in `spec/requirements/CATALOG.md` to concrete task IDs (`T091`, `T1000`–`T1010`, `T323`), leaving 0 `EPIC(...)` rows in `v1-core` and `v1-full`, and wired `T323` (`depends: [T223, T311–T322, T091, T1000–T1010]`) | T223 |
 | 2026-11-06 | T610 unblock: clarified `SPEC-72 AXS-LOOP-011` (`OPT_INST_DISCRIMINANT` memory-read hoisting gate in `loops_can_hoist_inst`) and `AXS-BCE-004` / `AXS-LOOP-011` (whole-aggregate `OPT_INST_AGGREGATE` / `inst.mem_def != MEM_SSA_NONE` with `place.proj_count == 0` clobber checks in `bce_inst_clobbers_len_state` and `loops_region_clobbered_in_loop`); added `T610` to `T064` `depends:` to serialize `compiler/opt` path ownership | ADR-0037 |
 | 2026-11-08 | T409 unblock: new P11 prerequisite fix task T429 (`owner: axiom-backend`) fixes sub-64-bit atomic MI size=8 overwrite in `compiler/driver/pipeline.ax` and struct-embedded `Atomic<T>` Pass-1a resolution in `compiler/types/typeck.ax`; T409 depends on T429 | unblock-T409 |
+| 2026-11-09 | GPU & cross-platform expansion (ADR-0038, owner instruction "tiến hành đi"): expanded P16 with E16.13 iOS target (`T697–T699`) and P22 with E22.3 HLSL/DXIL (`T966`), E22.5 Apple Metal (`T967–T970`), E22.6 Raster Graphics & Software Rasterizer (`T971–T975`), E22.7 WebGPU (`T976–T979`), E22.8 GPU AI Acceleration & Hot-Reload (`T980–T984`); mapped all REQ-GPU-* and REQ-ECO-5958; wired P16 gate `T316` and P22 gate `T322` | owner directive / ADR-0038 |
