@@ -1,0 +1,1109 @@
+module std.sync.channel
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.core.host.futex_wait
+use std.core.host.futex_wake
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic fn needs_drop<T>() -> bool { false }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn drop_in_place<T>(p: *mut T) {}
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+@intrinsic fn panic(msg: str) {}
+
+// -----------------------------------------------------------------------------
+// Channel Errors
+// -----------------------------------------------------------------------------
+
+pub struct SendError<T> {
+    pub val: T,
+}
+
+pub enum TrySendError<T> {
+    Full(T),
+    Disconnected(T),
+}
+
+@derive(Copy)
+pub enum RecvError {
+    Disconnected,
+}
+
+@derive(Copy)
+pub enum TryRecvError {
+    Empty,
+    Disconnected,
+}
+
+// -----------------------------------------------------------------------------
+// Synchronization Helpers (Futex Spin/Wait and Wake)
+// -----------------------------------------------------------------------------
+
+fn channel_lock(p_lock: *const Atomic<u32>) {
+    let mut c = unsafe { (*p_lock).compare_exchange(0u32, 1u32, Ordering.Acquire, Ordering.Relaxed) };
+    if !c.ok {
+        if c.val != 2u32 {
+            c.val = unsafe { (*p_lock).swap(2u32, Ordering.Acquire) };
+        }
+        while c.val != 0u32 {
+            unsafe {
+                futex_wait(p_lock as *const u32, 2u32, 0xFFFFFFFFFFFFFFFFu64);
+            }
+            c.val = unsafe { (*p_lock).swap(2u32, Ordering.Acquire) };
+        }
+    }
+}
+
+fn channel_unlock(p_lock: *const Atomic<u32>) {
+    let prev = unsafe { (*p_lock).swap(0u32, Ordering.Release) };
+    if prev == 2u32 {
+        unsafe {
+            futex_wake(p_lock as *const u32, 1u32);
+        }
+    }
+}
+
+fn channel_wake_one(p_seq: *const Atomic<u32>) {
+    unsafe {
+        (*p_seq).fetch_add(1u32, Ordering.Release);
+        futex_wake(p_seq as *const u32, 1u32);
+    }
+}
+
+fn channel_wake_all(p_seq: *const Atomic<u32>) {
+    unsafe {
+        (*p_seq).fetch_add(1u32, Ordering.Release);
+        futex_wake(p_seq as *const u32, 0x7FFFFFFFu32);
+    }
+}
+
+fn channel_noop_drop(p: *mut u8) -> () {}
+
+// -----------------------------------------------------------------------------
+// Bounded Channel
+// -----------------------------------------------------------------------------
+
+@repr(C)
+pub struct ChannelSlot<T> {
+    pub data: T,
+}
+
+@repr(C)
+pub struct BoundedInner<T> {
+    pub lock: Atomic<u32>,
+    pub senders: Atomic<usize>,
+    pub receivers: Atomic<usize>,
+    pub closed: Atomic<u32>,
+    pub not_empty_seq: Atomic<u32>,
+    pub not_full_seq: Atomic<u32>,
+    pub head: usize,
+    pub tail: usize,
+    pub len: usize,
+    pub capacity: usize,
+    pub slot_size: usize,
+    pub has_drop: bool,
+    pub drop_fn: fn(*mut u8) -> (),
+    pub buffer: *mut *mut ChannelSlot<T>,
+}
+
+@repr(C)
+pub struct Sender<T> {
+    pub inner: *mut BoundedInner<T>,
+}
+
+@repr(C)
+pub struct Receiver<T> {
+    pub inner: *mut BoundedInner<T>,
+}
+
+pub struct ChannelPair<T> {
+    pub tx: Sender<T>,
+    pub rx: Receiver<T>,
+}
+
+pub type Channel<T> = ChannelPair<T>
+
+unsafe impl<T: Send> Send for Sender<T> {}
+unsafe impl<T: Send> Share for Sender<T> {}
+impl<T> !Copy for Sender<T> {}
+
+unsafe impl<T: Send> Send for Receiver<T> {}
+unsafe impl<T: Send> Share for Receiver<T> {}
+impl<T> !Copy for Receiver<T> {}
+
+impl<T> Sender<T> {
+    pub fn send(self: view<Sender<T>>, msg: T) -> Result<(), SendError<T>> {
+        let p_inner = self.inner;
+        let p_lock = unsafe { address_of((*p_inner).lock) };
+        let p_closed = unsafe { address_of((*p_inner).closed) };
+        let p_receivers = unsafe { address_of((*p_inner).receivers) };
+        let p_not_empty = unsafe { address_of((*p_inner).not_empty_seq) };
+        let p_not_full = unsafe { address_of((*p_inner).not_full_seq) };
+
+        channel_lock(p_lock);
+
+        while unsafe { (*p_closed).load(Ordering.Relaxed) == 0u32 && (*p_receivers).load(Ordering.Relaxed) > 0usize && (*p_inner).len == (*p_inner).capacity } {
+            let seq_val = unsafe { (*p_not_full).load(Ordering.Relaxed) };
+            channel_unlock(p_lock);
+            unsafe {
+                futex_wait(p_not_full as *const u32, seq_val, 0xFFFFFFFFFFFFFFFFu64);
+            }
+            channel_lock(p_lock);
+        }
+
+        let is_disconnected = unsafe { (*p_closed).load(Ordering.Relaxed) != 0u32 || (*p_receivers).load(Ordering.Relaxed) == 0usize };
+        if is_disconnected {
+            channel_unlock(p_lock);
+            return Result.Err(SendError { val: msg });
+        }
+
+        let slot_sz = unsafe { (*p_inner).slot_size };
+        let raw = unsafe { heap_alloc(slot_sz, 8usize) };
+        if (raw as usize) == 0usize {
+            channel_unlock(p_lock);
+            panic("channel_bounded: out of memory");
+        }
+        let p_slot = raw as *mut ChannelSlot<T>;
+        unsafe {
+            (*p_slot).data = msg;
+            let tail_idx = (*p_inner).tail;
+            let slots = (*p_inner).buffer;
+            *(slots + tail_idx) = p_slot;
+            (*p_inner).tail = (tail_idx + 1usize) % (*p_inner).capacity;
+            (*p_inner).len = (*p_inner).len + 1usize;
+        }
+
+        channel_wake_one(p_not_empty);
+        channel_unlock(p_lock);
+        Result.Ok(())
+    }
+
+    pub fn try_send(self: view<Sender<T>>, msg: T) -> Result<(), TrySendError<T>> {
+        let p_inner = self.inner;
+        let p_lock = unsafe { address_of((*p_inner).lock) };
+        let p_closed = unsafe { address_of((*p_inner).closed) };
+        let p_receivers = unsafe { address_of((*p_inner).receivers) };
+        let p_not_empty = unsafe { address_of((*p_inner).not_empty_seq) };
+
+        channel_lock(p_lock);
+
+        let is_disconnected = unsafe { (*p_closed).load(Ordering.Relaxed) != 0u32 || (*p_receivers).load(Ordering.Relaxed) == 0usize };
+        if is_disconnected {
+            channel_unlock(p_lock);
+            return Result.Err(TrySendError.Disconnected(msg));
+        }
+
+        if unsafe { (*p_inner).len == (*p_inner).capacity } {
+            channel_unlock(p_lock);
+            return Result.Err(TrySendError.Full(msg));
+        }
+
+        let slot_sz = unsafe { (*p_inner).slot_size };
+        let raw = unsafe { heap_alloc(slot_sz, 8usize) };
+        if (raw as usize) == 0usize {
+            channel_unlock(p_lock);
+            panic("channel_bounded: out of memory");
+        }
+        let p_slot = raw as *mut ChannelSlot<T>;
+        unsafe {
+            (*p_slot).data = msg;
+            let tail_idx = (*p_inner).tail;
+            let slots = (*p_inner).buffer;
+            *(slots + tail_idx) = p_slot;
+            (*p_inner).tail = (tail_idx + 1usize) % (*p_inner).capacity;
+            (*p_inner).len = (*p_inner).len + 1usize;
+        }
+
+        channel_wake_one(p_not_empty);
+        channel_unlock(p_lock);
+        Result.Ok(())
+    }
+
+    pub fn close(self: view<Sender<T>>) {
+        let p_inner = self.inner;
+        let p_lock = unsafe { address_of((*p_inner).lock) };
+        let p_closed = unsafe { address_of((*p_inner).closed) };
+        let p_not_empty = unsafe { address_of((*p_inner).not_empty_seq) };
+        let p_not_full = unsafe { address_of((*p_inner).not_full_seq) };
+
+        channel_lock(p_lock);
+        unsafe {
+            (*p_closed).store(1u32, Ordering.Release);
+        }
+        channel_wake_all(p_not_empty);
+        channel_wake_all(p_not_full);
+        channel_unlock(p_lock);
+    }
+
+
+    pub unsafe fn send_from_ptr(self: view<Sender<T>>, p_src: *const T, bytes: usize) -> Result<(), ()> {
+        let p_inner = self.inner;
+        let p_lock = address_of((*p_inner).lock);
+        let p_closed = address_of((*p_inner).closed);
+        let p_receivers = address_of((*p_inner).receivers);
+        let p_not_empty = address_of((*p_inner).not_empty_seq);
+        let p_not_full = address_of((*p_inner).not_full_seq);
+
+        channel_lock(p_lock);
+
+        while (*p_closed).load(Ordering.Relaxed) == 0u32 && (*p_receivers).load(Ordering.Relaxed) > 0usize && (*p_inner).len == (*p_inner).capacity {
+            let seq_val = (*p_not_full).load(Ordering.Relaxed);
+            channel_unlock(p_lock);
+            futex_wait(p_not_full as *const u32, seq_val, 0xFFFFFFFFFFFFFFFFu64);
+            channel_lock(p_lock);
+        }
+
+        let is_disconnected = (*p_closed).load(Ordering.Relaxed) != 0u32 || (*p_receivers).load(Ordering.Relaxed) == 0usize;
+        if is_disconnected {
+            channel_unlock(p_lock);
+            return Result.Err(());
+        }
+
+        let alloc_sz = if bytes < 128usize { 128usize } else { bytes };
+        let raw = heap_alloc(alloc_sz, 8usize);
+        if (raw as usize) == 0usize {
+            channel_unlock(p_lock);
+            panic("channel_bounded: out of memory");
+        }
+        ptr_copy_nonoverlapping(p_src as *const u8, raw, bytes);
+        let p_slot = raw as *mut ChannelSlot<T>;
+        let tail_idx = (*p_inner).tail;
+        let slots = (*p_inner).buffer;
+        *(slots + tail_idx) = p_slot;
+        (*p_inner).tail = (tail_idx + 1usize) % (*p_inner).capacity;
+        (*p_inner).len = (*p_inner).len + 1usize;
+
+        channel_wake_one(p_not_empty);
+        channel_unlock(p_lock);
+        Result.Ok(())
+    }
+
+    pub fn clone(self: view<Sender<T>>) -> Sender<T> {
+        let p_inner = self.inner;
+        let p_senders = unsafe { address_of((*p_inner).senders) };
+        unsafe {
+            (*p_senders).fetch_add(1usize, Ordering.Relaxed);
+        }
+        Sender { inner: p_inner }
+    }
+
+    pub fn capacity(self: view<Sender<T>>) -> usize {
+        unsafe { (*self.inner).capacity }
+    }
+}
+
+impl<T> Receiver<T> {
+    pub fn recv(self: view<Receiver<T>>) -> Result<T, RecvError> {
+        let p_inner = self.inner;
+        let p_lock = unsafe { address_of((*p_inner).lock) };
+        let p_senders = unsafe { address_of((*p_inner).senders) };
+        let p_closed = unsafe { address_of((*p_inner).closed) };
+        let p_not_empty = unsafe { address_of((*p_inner).not_empty_seq) };
+        let p_not_full = unsafe { address_of((*p_inner).not_full_seq) };
+
+        channel_lock(p_lock);
+
+        while unsafe { (*p_inner).len == 0usize && (*p_senders).load(Ordering.Relaxed) > 0usize && (*p_closed).load(Ordering.Relaxed) == 0u32 } {
+            let seq_val = unsafe { (*p_not_empty).load(Ordering.Relaxed) };
+            channel_unlock(p_lock);
+            unsafe {
+                futex_wait(p_not_empty as *const u32, seq_val, 0xFFFFFFFFFFFFFFFFu64);
+            }
+            channel_lock(p_lock);
+        }
+
+        if unsafe { (*p_inner).len > 0usize } {
+            let head_idx = unsafe { (*p_inner).head };
+            let slots = unsafe { (*p_inner).buffer };
+            let p_slot = unsafe { *(slots + head_idx) };
+            let val: T = unsafe { (*p_slot).data };
+            let slot_sz = unsafe { (*p_inner).slot_size };
+
+            unsafe {
+                heap_free(p_slot as *mut u8, slot_sz, 8usize);
+                (*p_inner).head = (head_idx + 1usize) % (*p_inner).capacity;
+                (*p_inner).len = (*p_inner).len - 1usize;
+            }
+
+            channel_wake_one(p_not_full);
+            channel_unlock(p_lock);
+            return Result.Ok(val);
+        }
+
+        channel_unlock(p_lock);
+        Result.Err(RecvError.Disconnected)
+    }
+
+    pub fn try_recv(self: view<Receiver<T>>) -> Result<T, TryRecvError> {
+        let p_inner = self.inner;
+        let p_lock = unsafe { address_of((*p_inner).lock) };
+        let p_senders = unsafe { address_of((*p_inner).senders) };
+        let p_closed = unsafe { address_of((*p_inner).closed) };
+        let p_not_full = unsafe { address_of((*p_inner).not_full_seq) };
+
+        channel_lock(p_lock);
+
+        if unsafe { (*p_inner).len > 0usize } {
+            let head_idx = unsafe { (*p_inner).head };
+            let slots = unsafe { (*p_inner).buffer };
+            let p_slot = unsafe { *(slots + head_idx) };
+            let val: T = unsafe { (*p_slot).data };
+            let slot_sz = unsafe { (*p_inner).slot_size };
+
+            unsafe {
+                heap_free(p_slot as *mut u8, slot_sz, 8usize);
+                (*p_inner).head = (head_idx + 1usize) % (*p_inner).capacity;
+                (*p_inner).len = (*p_inner).len - 1usize;
+            }
+
+            channel_wake_one(p_not_full);
+            channel_unlock(p_lock);
+            return Result.Ok(val);
+        }
+
+        let is_disconnected = unsafe { (*p_closed).load(Ordering.Relaxed) != 0u32 || (*p_senders).load(Ordering.Relaxed) == 0usize };
+        channel_unlock(p_lock);
+        if is_disconnected {
+            Result.Err(TryRecvError.Disconnected)
+        } else {
+            Result.Err(TryRecvError.Empty)
+        }
+    }
+
+    pub fn close(self: view<Receiver<T>>) {
+        let p_inner = self.inner;
+        let p_lock = unsafe { address_of((*p_inner).lock) };
+        let p_closed = unsafe { address_of((*p_inner).closed) };
+        let p_not_empty = unsafe { address_of((*p_inner).not_empty_seq) };
+        let p_not_full = unsafe { address_of((*p_inner).not_full_seq) };
+
+        channel_lock(p_lock);
+        unsafe {
+            (*p_closed).store(1u32, Ordering.Release);
+        }
+        channel_wake_all(p_not_empty);
+        channel_wake_all(p_not_full);
+        channel_unlock(p_lock);
+    }
+
+
+    pub unsafe fn recv_into_ptr(self: view<Receiver<T>>, p_dst: *mut T, bytes: usize) -> Result<(), RecvError> {
+        let p_inner = self.inner;
+        let p_lock = address_of((*p_inner).lock);
+        let p_senders = address_of((*p_inner).senders);
+        let p_closed = address_of((*p_inner).closed);
+        let p_not_empty = address_of((*p_inner).not_empty_seq);
+        let p_not_full = address_of((*p_inner).not_full_seq);
+
+        channel_lock(p_lock);
+
+        while (*p_inner).len == 0usize && (*p_senders).load(Ordering.Relaxed) > 0usize && (*p_closed).load(Ordering.Relaxed) == 0u32 {
+            let seq_val = (*p_not_empty).load(Ordering.Relaxed);
+            channel_unlock(p_lock);
+            futex_wait(p_not_empty as *const u32, seq_val, 0xFFFFFFFFFFFFFFFFu64);
+            channel_lock(p_lock);
+        }
+
+        if (*p_inner).len > 0usize {
+            let head_idx = (*p_inner).head;
+            let slots = (*p_inner).buffer;
+            let p_slot = *(slots + head_idx);
+            ptr_copy_nonoverlapping(p_slot as *const u8, p_dst as *mut u8, bytes);
+            let alloc_sz = if bytes < 128usize { 128usize } else { bytes };
+            heap_free(p_slot as *mut u8, alloc_sz, 8usize);
+            (*p_inner).head = (head_idx + 1usize) % (*p_inner).capacity;
+            (*p_inner).len = (*p_inner).len - 1usize;
+
+            channel_wake_one(p_not_full);
+            channel_unlock(p_lock);
+            return Result.Ok(());
+        }
+
+        channel_unlock(p_lock);
+        Result.Err(RecvError.Disconnected)
+    }
+
+    pub fn clone(self: view<Receiver<T>>) -> Receiver<T> {
+        let p_inner = self.inner;
+        let p_receivers = unsafe { address_of((*p_inner).receivers) };
+        unsafe {
+            (*p_receivers).fetch_add(1usize, Ordering.Relaxed);
+        }
+        Receiver { inner: p_inner }
+    }
+
+    pub fn capacity(self: view<Receiver<T>>) -> usize {
+        unsafe { (*self.inner).capacity }
+    }
+}
+
+impl<T> Drop for Sender<T> {
+    fn drop(self: mut_view<Sender<T>>) {
+        if (self.inner as usize) == 0usize {
+            return;
+        }
+        let p_inner = self.inner;
+        self.inner = 0 as *mut BoundedInner<T>;
+
+        let p_lock = unsafe { address_of((*p_inner).lock) };
+        let p_senders = unsafe { address_of((*p_inner).senders) };
+        let p_receivers = unsafe { address_of((*p_inner).receivers) };
+        let p_not_empty = unsafe { address_of((*p_inner).not_empty_seq) };
+
+        channel_lock(p_lock);
+        let remaining_senders = unsafe { (*p_senders).fetch_sub(1usize, Ordering.Release) } - 1usize;
+        if remaining_senders == 0usize {
+            channel_wake_all(p_not_empty);
+        }
+        let remaining_receivers = unsafe { (*p_receivers).load(Ordering.Acquire) };
+        channel_unlock(p_lock);
+
+        if remaining_senders == 0usize && remaining_receivers == 0usize {
+            let buf = unsafe { (*p_inner).buffer };
+            let cap = unsafe { (*p_inner).capacity };
+            let buf_sz = cap * size_of<usize>();
+            let alloc_buf_sz = if buf_sz < 128usize { 128usize } else { buf_sz };
+            if (buf as usize) != 0usize {
+                unsafe {
+                    heap_free(buf as *mut u8, alloc_buf_sz, 8usize);
+                }
+            }
+            let sz = size_of<BoundedInner<T>>();
+            let alloc_sz = if sz < 128usize { 128usize } else { sz };
+            unsafe {
+                heap_free(p_inner as *mut u8, alloc_sz, 8usize);
+            }
+        }
+    }
+}
+
+impl<T> Drop for Receiver<T> {
+    fn drop(self: mut_view<Receiver<T>>) {
+        if (self.inner as usize) == 0usize {
+            return;
+        }
+        let p_inner = self.inner;
+        self.inner = 0 as *mut BoundedInner<T>;
+
+        let p_lock = unsafe { address_of((*p_inner).lock) };
+        let p_senders = unsafe { address_of((*p_inner).senders) };
+        let p_receivers = unsafe { address_of((*p_inner).receivers) };
+        let p_closed = unsafe { address_of((*p_inner).closed) };
+        let p_not_full = unsafe { address_of((*p_inner).not_full_seq) };
+
+        channel_lock(p_lock);
+        let remaining_receivers = unsafe { (*p_receivers).fetch_sub(1usize, Ordering.Release) } - 1usize;
+        if remaining_receivers == 0usize {
+            unsafe {
+                (*p_closed).store(1u32, Ordering.Release);
+            }
+            channel_wake_all(p_not_full);
+
+            let count = unsafe { (*p_inner).len };
+            let mut i: usize = 0usize;
+            let slot_sz = unsafe { (*p_inner).slot_size };
+            let slots = unsafe { (*p_inner).buffer };
+            while i < count {
+                let head_idx = unsafe { (*p_inner).head };
+                let p_slot = unsafe { *(slots + head_idx) };
+                let has_d = unsafe { (*p_inner).has_drop };
+                if has_d {
+                    let df = unsafe { (*p_inner).drop_fn };
+                    unsafe {
+                        df(address_of_mut((*p_slot).data) as *mut u8);
+                    }
+                }
+                unsafe {
+                    heap_free(p_slot as *mut u8, slot_sz, 8usize);
+                    (*p_inner).head = (head_idx + 1usize) % (*p_inner).capacity;
+                }
+                i = i + 1usize;
+            }
+            unsafe {
+                (*p_inner).len = 0usize;
+            }
+        }
+        let remaining_senders = unsafe { (*p_senders).load(Ordering.Acquire) };
+        channel_unlock(p_lock);
+
+        if remaining_receivers == 0usize && remaining_senders == 0usize {
+            let buf = unsafe { (*p_inner).buffer };
+            let cap = unsafe { (*p_inner).capacity };
+            let buf_sz = cap * size_of<usize>();
+            let alloc_buf_sz = if buf_sz < 128usize { 128usize } else { buf_sz };
+            if (buf as usize) != 0usize {
+                unsafe {
+                    heap_free(buf as *mut u8, alloc_buf_sz, 8usize);
+                }
+            }
+            let sz = size_of<BoundedInner<T>>();
+            let alloc_sz = if sz < 128usize { 128usize } else { sz };
+            unsafe {
+                heap_free(p_inner as *mut u8, alloc_sz, 8usize);
+            }
+        }
+    }
+}
+
+pub fn channel_bounded_with_size<T: Send>(capacity: usize, item_size: usize) -> ChannelPair<T> {
+    if capacity == 0usize {
+        panic("channel_bounded: capacity must be greater than zero");
+    }
+    let actual_item_sz = if item_size == 0usize {
+        let sz = size_of<T>();
+        if sz < 8usize { 8usize } else { sz }
+    } else {
+        item_size
+    };
+    let slot_sz = size_of<ChannelSlot<T>>();
+    let alloc_slot_sz = if slot_sz < 128usize { 128usize } else { slot_sz };
+    let final_slot_sz = if alloc_slot_sz < actual_item_sz + 16usize { actual_item_sz + 16usize } else { alloc_slot_sz };
+
+    let buf_sz = capacity * size_of<usize>();
+    let alloc_buf_sz = if buf_sz < 128usize { 128usize } else { buf_sz };
+    let raw_buf = unsafe { heap_alloc(alloc_buf_sz, 8usize) };
+    if (raw_buf as usize) == 0usize {
+        panic("channel_bounded: out of memory");
+    }
+
+    let inner_sz = size_of<BoundedInner<T>>();
+    let alloc_inner_sz = if inner_sz < 128usize { 128usize } else { inner_sz };
+    let raw_inner = unsafe { heap_alloc(alloc_inner_sz, 8usize) };
+    if (raw_inner as usize) == 0usize {
+        unsafe { heap_free(raw_buf, alloc_buf_sz, 8usize); }
+        panic("channel_bounded: out of memory");
+    }
+
+    let p = raw_inner as *mut BoundedInner<T>;
+    unsafe {
+        (*p).lock = Atomic.new(0u32);
+        (*p).senders = Atomic.new(1usize);
+        (*p).receivers = Atomic.new(1usize);
+        (*p).closed = Atomic.new(0u32);
+        (*p).not_empty_seq = Atomic.new(0u32);
+        (*p).not_full_seq = Atomic.new(0u32);
+        (*p).head = 0usize;
+        (*p).tail = 0usize;
+        (*p).len = 0usize;
+        (*p).capacity = capacity;
+        (*p).slot_size = final_slot_sz;
+        (*p).has_drop = false;
+        (*p).drop_fn = channel_noop_drop;
+        (*p).buffer = raw_buf as *mut *mut ChannelSlot<T>;
+    }
+
+    ChannelPair {
+        tx: Sender { inner: p },
+        rx: Receiver { inner: p },
+    }
+}
+
+
+pub fn channel_bounded_with_drop<T: Send>(capacity: usize, drop_fn: fn(*mut u8) -> ()) -> ChannelPair<T> {
+    let mut pair: ChannelPair<T> = channel_bounded_with_size<T>(capacity, size_of<T>());
+    unsafe {
+        (*pair.tx.inner).has_drop = true;
+        (*pair.tx.inner).drop_fn = drop_fn;
+    }
+    pair
+}
+
+pub fn channel_bounded<T: Send>(capacity: usize) -> ChannelPair<T> {
+    channel_bounded_with_size<T>(capacity, size_of<T>())
+}
+
+// -----------------------------------------------------------------------------
+// Unbounded Channel
+// -----------------------------------------------------------------------------
+
+@repr(C)
+pub struct UnboundedNode<T> {
+    pub next: *mut UnboundedNode<T>,
+    pub data: T,
+}
+
+@repr(C)
+pub struct UnboundedInner<T> {
+    pub lock: Atomic<u32>,
+    pub senders: Atomic<usize>,
+    pub receivers: Atomic<usize>,
+    pub closed: Atomic<u32>,
+    pub not_empty_seq: Atomic<u32>,
+    pub head: *mut UnboundedNode<T>,
+    pub tail: *mut UnboundedNode<T>,
+    pub len: usize,
+    pub node_size: usize,
+    pub has_drop: bool,
+    pub drop_fn: fn(*mut u8) -> (),
+}
+
+@repr(C)
+pub struct UnboundedSender<T> {
+    pub inner: *mut UnboundedInner<T>,
+}
+
+@repr(C)
+pub struct UnboundedReceiver<T> {
+    pub inner: *mut UnboundedInner<T>,
+}
+
+pub struct UnboundedChannelPair<T> {
+    pub tx: UnboundedSender<T>,
+    pub rx: UnboundedReceiver<T>,
+}
+
+pub type UnboundedChannel<T> = UnboundedChannelPair<T>
+
+unsafe impl<T: Send> Send for UnboundedSender<T> {}
+unsafe impl<T: Send> Share for UnboundedSender<T> {}
+impl<T> !Copy for UnboundedSender<T> {}
+
+unsafe impl<T: Send> Send for UnboundedReceiver<T> {}
+unsafe impl<T: Send> Share for UnboundedReceiver<T> {}
+impl<T> !Copy for UnboundedReceiver<T> {}
+
+impl<T> UnboundedSender<T> {
+    pub fn send(self: view<UnboundedSender<T>>, msg: T) -> Result<(), SendError<T>> {
+        let p_inner = self.inner;
+        let p_lock = unsafe { address_of((*p_inner).lock) };
+        let p_closed = unsafe { address_of((*p_inner).closed) };
+        let p_receivers = unsafe { address_of((*p_inner).receivers) };
+        let p_not_empty = unsafe { address_of((*p_inner).not_empty_seq) };
+
+        channel_lock(p_lock);
+
+        let is_disconnected = unsafe { (*p_closed).load(Ordering.Relaxed) != 0u32 || (*p_receivers).load(Ordering.Relaxed) == 0usize };
+        if is_disconnected {
+            channel_unlock(p_lock);
+            return Result.Err(SendError { val: msg });
+        }
+
+        let node_sz = unsafe { (*p_inner).node_size };
+        let raw = unsafe { heap_alloc(node_sz, 8usize) };
+        if (raw as usize) == 0usize {
+            channel_unlock(p_lock);
+            panic("channel_unbounded: out of memory");
+        }
+        let p_node = raw as *mut UnboundedNode<T>;
+        unsafe {
+            (*p_node).next = 0 as *mut UnboundedNode<T>;
+            (*p_node).data = msg;
+        }
+
+        if (unsafe { (*p_inner).head as usize }) == 0usize {
+            unsafe {
+                (*p_inner).head = p_node;
+                (*p_inner).tail = p_node;
+            }
+        } else {
+            unsafe {
+                (*(*p_inner).tail).next = p_node;
+                (*p_inner).tail = p_node;
+            }
+        }
+        unsafe {
+            (*p_inner).len = (*p_inner).len + 1usize;
+        }
+
+        channel_wake_one(p_not_empty);
+        channel_unlock(p_lock);
+        Result.Ok(())
+    }
+
+    pub fn try_send(self: view<UnboundedSender<T>>, msg: T) -> Result<(), TrySendError<T>> {
+        let p_inner = self.inner;
+        let p_lock = unsafe { address_of((*p_inner).lock) };
+        let p_closed = unsafe { address_of((*p_inner).closed) };
+        let p_receivers = unsafe { address_of((*p_inner).receivers) };
+        let p_not_empty = unsafe { address_of((*p_inner).not_empty_seq) };
+
+        channel_lock(p_lock);
+
+        let is_disconnected = unsafe { (*p_closed).load(Ordering.Relaxed) != 0u32 || (*p_receivers).load(Ordering.Relaxed) == 0usize };
+        if is_disconnected {
+            channel_unlock(p_lock);
+            return Result.Err(TrySendError.Disconnected(msg));
+        }
+
+        let node_sz = unsafe { (*p_inner).node_size };
+        let raw = unsafe { heap_alloc(node_sz, 8usize) };
+        if (raw as usize) == 0usize {
+            channel_unlock(p_lock);
+            panic("channel_unbounded: out of memory");
+        }
+        let p_node = raw as *mut UnboundedNode<T>;
+        unsafe {
+            (*p_node).next = 0 as *mut UnboundedNode<T>;
+            (*p_node).data = msg;
+        }
+
+        if (unsafe { (*p_inner).head as usize }) == 0usize {
+            unsafe {
+                (*p_inner).head = p_node;
+                (*p_inner).tail = p_node;
+            }
+        } else {
+            unsafe {
+                (*(*p_inner).tail).next = p_node;
+                (*p_inner).tail = p_node;
+            }
+        }
+        unsafe {
+            (*p_inner).len = (*p_inner).len + 1usize;
+        }
+
+        channel_wake_one(p_not_empty);
+        channel_unlock(p_lock);
+        Result.Ok(())
+    }
+
+    pub fn close(self: view<UnboundedSender<T>>) {
+        let p_inner = self.inner;
+        let p_lock = unsafe { address_of((*p_inner).lock) };
+        let p_closed = unsafe { address_of((*p_inner).closed) };
+        let p_not_empty = unsafe { address_of((*p_inner).not_empty_seq) };
+
+        channel_lock(p_lock);
+        unsafe {
+            (*p_closed).store(1u32, Ordering.Release);
+        }
+        channel_wake_all(p_not_empty);
+        channel_unlock(p_lock);
+    }
+
+
+    pub unsafe fn send_from_ptr(self: view<UnboundedSender<T>>, p_src: *const T, bytes: usize) -> Result<(), ()> {
+        let p_inner = self.inner;
+        let p_lock = address_of((*p_inner).lock);
+        let p_closed = address_of((*p_inner).closed);
+        let p_receivers = address_of((*p_inner).receivers);
+        let p_not_empty = address_of((*p_inner).not_empty_seq);
+
+        channel_lock(p_lock);
+
+        let is_disconnected = (*p_closed).load(Ordering.Relaxed) != 0u32 || (*p_receivers).load(Ordering.Relaxed) == 0usize;
+        if is_disconnected {
+            channel_unlock(p_lock);
+            return Result.Err(());
+        }
+
+        let alloc_sz = if bytes + 16usize < 128usize { 128usize } else { bytes + 16usize };
+        let raw = heap_alloc(alloc_sz, 8usize);
+        if (raw as usize) == 0usize {
+            channel_unlock(p_lock);
+            panic("channel_unbounded: out of memory");
+        }
+        let p_node = raw as *mut UnboundedNode<T>;
+        (*p_node).next = 0 as *mut UnboundedNode<T>;
+        let p_dst = address_of_mut((*p_node).data) as *mut u8;
+        ptr_copy_nonoverlapping(p_src as *const u8, p_dst, bytes);
+
+        let old_tail = (*p_inner).tail;
+        if (old_tail as usize) != 0usize {
+            (*old_tail).next = p_node;
+        } else {
+            (*p_inner).head = p_node;
+        }
+        (*p_inner).tail = p_node;
+        (*p_inner).len = (*p_inner).len + 1usize;
+
+        channel_wake_one(p_not_empty);
+        channel_unlock(p_lock);
+        Result.Ok(())
+    }
+
+    pub fn clone(self: view<UnboundedSender<T>>) -> UnboundedSender<T> {
+        let p_inner = self.inner;
+        let p_senders = unsafe { address_of((*p_inner).senders) };
+        unsafe {
+            (*p_senders).fetch_add(1usize, Ordering.Relaxed);
+        }
+        UnboundedSender { inner: p_inner }
+    }
+}
+
+impl<T> UnboundedReceiver<T> {
+    pub fn recv(self: view<UnboundedReceiver<T>>) -> Result<T, RecvError> {
+        let p_inner = self.inner;
+        let p_lock = unsafe { address_of((*p_inner).lock) };
+        let p_senders = unsafe { address_of((*p_inner).senders) };
+        let p_closed = unsafe { address_of((*p_inner).closed) };
+        let p_not_empty = unsafe { address_of((*p_inner).not_empty_seq) };
+
+        channel_lock(p_lock);
+
+        while unsafe { (*p_inner).len == 0usize && (*p_senders).load(Ordering.Relaxed) > 0usize && (*p_closed).load(Ordering.Relaxed) == 0u32 } {
+            let seq_val = unsafe { (*p_not_empty).load(Ordering.Relaxed) };
+            channel_unlock(p_lock);
+            unsafe {
+                futex_wait(p_not_empty as *const u32, seq_val, 0xFFFFFFFFFFFFFFFFu64);
+            }
+            channel_lock(p_lock);
+        }
+
+        if unsafe { (*p_inner).len > 0usize } {
+            let p_head = unsafe { (*p_inner).head };
+            let val: T = unsafe { (*p_head).data };
+            let p_next = unsafe { (*p_head).next };
+            let node_sz = unsafe { (*p_inner).node_size };
+
+            unsafe {
+                (*p_inner).head = p_next;
+                if (p_next as usize) == 0usize {
+                    (*p_inner).tail = 0 as *mut UnboundedNode<T>;
+                }
+                (*p_inner).len = (*p_inner).len - 1usize;
+                heap_free(p_head as *mut u8, node_sz, 8usize);
+            }
+
+            channel_unlock(p_lock);
+            return Result.Ok(val);
+        }
+
+        channel_unlock(p_lock);
+        Result.Err(RecvError.Disconnected)
+    }
+
+    pub fn try_recv(self: view<UnboundedReceiver<T>>) -> Result<T, TryRecvError> {
+        let p_inner = self.inner;
+        let p_lock = unsafe { address_of((*p_inner).lock) };
+        let p_senders = unsafe { address_of((*p_inner).senders) };
+        let p_closed = unsafe { address_of((*p_inner).closed) };
+
+        channel_lock(p_lock);
+
+        if unsafe { (*p_inner).len > 0usize } {
+            let p_head = unsafe { (*p_inner).head };
+            let val: T = unsafe { (*p_head).data };
+            let p_next = unsafe { (*p_head).next };
+            let node_sz = unsafe { (*p_inner).node_size };
+
+            unsafe {
+                (*p_inner).head = p_next;
+                if (p_next as usize) == 0usize {
+                    (*p_inner).tail = 0 as *mut UnboundedNode<T>;
+                }
+                (*p_inner).len = (*p_inner).len - 1usize;
+                heap_free(p_head as *mut u8, node_sz, 8usize);
+            }
+
+            channel_unlock(p_lock);
+            return Result.Ok(val);
+        }
+
+        let is_disconnected = unsafe { (*p_closed).load(Ordering.Relaxed) != 0u32 || (*p_senders).load(Ordering.Relaxed) == 0usize };
+        channel_unlock(p_lock);
+        if is_disconnected {
+            Result.Err(TryRecvError.Disconnected)
+        } else {
+            Result.Err(TryRecvError.Empty)
+        }
+    }
+
+    pub fn close(self: view<UnboundedReceiver<T>>) {
+        let p_inner = self.inner;
+        let p_lock = unsafe { address_of((*p_inner).lock) };
+        let p_closed = unsafe { address_of((*p_inner).closed) };
+        let p_not_empty = unsafe { address_of((*p_inner).not_empty_seq) };
+
+        channel_lock(p_lock);
+        unsafe {
+            (*p_closed).store(1u32, Ordering.Release);
+        }
+        channel_wake_all(p_not_empty);
+        channel_unlock(p_lock);
+    }
+
+
+    pub unsafe fn recv_into_ptr(self: view<UnboundedReceiver<T>>, p_dst: *mut T, bytes: usize) -> Result<(), RecvError> {
+        let p_inner = self.inner;
+        let p_lock = address_of((*p_inner).lock);
+        let p_senders = address_of((*p_inner).senders);
+        let p_closed = address_of((*p_inner).closed);
+        let p_not_empty = address_of((*p_inner).not_empty_seq);
+
+        channel_lock(p_lock);
+
+        while (*p_inner).len == 0usize && (*p_senders).load(Ordering.Relaxed) > 0usize && (*p_closed).load(Ordering.Relaxed) == 0u32 {
+            let seq_val = (*p_not_empty).load(Ordering.Relaxed);
+            channel_unlock(p_lock);
+            futex_wait(p_not_empty as *const u32, seq_val, 0xFFFFFFFFFFFFFFFFu64);
+            channel_lock(p_lock);
+        }
+
+        let cur_head = (*p_inner).head;
+        if (cur_head as usize) != 0usize {
+            let next_node = (*cur_head).next;
+            let p_src = address_of((*cur_head).data) as *const u8;
+            ptr_copy_nonoverlapping(p_src, p_dst as *mut u8, bytes);
+            let alloc_sz = if bytes + 16usize < 128usize { 128usize } else { bytes + 16usize };
+            heap_free(cur_head as *mut u8, alloc_sz, 8usize);
+            (*p_inner).head = next_node;
+            if (next_node as usize) == 0usize {
+                (*p_inner).tail = 0 as *mut UnboundedNode<T>;
+            }
+            (*p_inner).len = (*p_inner).len - 1usize;
+
+            channel_unlock(p_lock);
+            return Result.Ok(());
+        }
+
+        channel_unlock(p_lock);
+        Result.Err(RecvError.Disconnected)
+    }
+
+    pub fn clone(self: view<UnboundedReceiver<T>>) -> UnboundedReceiver<T> {
+        let p_inner = self.inner;
+        let p_receivers = unsafe { address_of((*p_inner).receivers) };
+        unsafe {
+            (*p_receivers).fetch_add(1usize, Ordering.Relaxed);
+        }
+        UnboundedReceiver { inner: p_inner }
+    }
+}
+
+impl<T> Drop for UnboundedSender<T> {
+    fn drop(self: mut_view<UnboundedSender<T>>) {
+        if (self.inner as usize) == 0usize {
+            return;
+        }
+        let p_inner = self.inner;
+        self.inner = 0 as *mut UnboundedInner<T>;
+
+        let p_lock = unsafe { address_of((*p_inner).lock) };
+        let p_senders = unsafe { address_of((*p_inner).senders) };
+        let p_receivers = unsafe { address_of((*p_inner).receivers) };
+        let p_not_empty = unsafe { address_of((*p_inner).not_empty_seq) };
+
+        channel_lock(p_lock);
+        let remaining_senders = unsafe { (*p_senders).fetch_sub(1usize, Ordering.Release) } - 1usize;
+        if remaining_senders == 0usize {
+            channel_wake_all(p_not_empty);
+        }
+        let remaining_receivers = unsafe { (*p_receivers).load(Ordering.Acquire) };
+        channel_unlock(p_lock);
+
+        if remaining_senders == 0usize && remaining_receivers == 0usize {
+            let sz = size_of<UnboundedInner<T>>();
+            let alloc_sz = if sz < 128usize { 128usize } else { sz };
+            unsafe {
+                heap_free(p_inner as *mut u8, alloc_sz, 8usize);
+            }
+        }
+    }
+}
+
+impl<T> Drop for UnboundedReceiver<T> {
+    fn drop(self: mut_view<UnboundedReceiver<T>>) {
+        if (self.inner as usize) == 0usize {
+            return;
+        }
+        let p_inner = self.inner;
+        self.inner = 0 as *mut UnboundedInner<T>;
+
+        let p_lock = unsafe { address_of((*p_inner).lock) };
+        let p_senders = unsafe { address_of((*p_inner).senders) };
+        let p_receivers = unsafe { address_of((*p_inner).receivers) };
+        let p_closed = unsafe { address_of((*p_inner).closed) };
+
+        channel_lock(p_lock);
+        let remaining_receivers = unsafe { (*p_receivers).fetch_sub(1usize, Ordering.Release) } - 1usize;
+        if remaining_receivers == 0usize {
+            unsafe {
+                (*p_closed).store(1u32, Ordering.Release);
+            }
+
+            let mut cur = unsafe { (*p_inner).head };
+            let node_sz = unsafe { (*p_inner).node_size };
+            while (cur as usize) != 0usize {
+                let p_next = unsafe { (*cur).next };
+                let has_ud = unsafe { (*p_inner).has_drop };
+                if has_ud {
+                    let udf = unsafe { (*p_inner).drop_fn };
+                    unsafe {
+                        udf(address_of_mut((*cur).data) as *mut u8);
+                    }
+                }
+                unsafe {
+                    heap_free(cur as *mut u8, node_sz, 8usize);
+                }
+                cur = p_next;
+            }
+            unsafe {
+                (*p_inner).head = 0 as *mut UnboundedNode<T>;
+                (*p_inner).tail = 0 as *mut UnboundedNode<T>;
+                (*p_inner).len = 0usize;
+            }
+        }
+        let remaining_senders = unsafe { (*p_senders).load(Ordering.Acquire) };
+        channel_unlock(p_lock);
+
+        if remaining_receivers == 0usize && remaining_senders == 0usize {
+            let sz = size_of<UnboundedInner<T>>();
+            let alloc_sz = if sz < 128usize { 128usize } else { sz };
+            unsafe {
+                heap_free(p_inner as *mut u8, alloc_sz, 8usize);
+            }
+        }
+    }
+}
+
+pub fn channel_unbounded_with_size<T: Send>(item_size: usize) -> UnboundedChannelPair<T> {
+    let actual_item_sz = if item_size == 0usize {
+        let sz = size_of<T>();
+        if sz < 8usize { 8usize } else { sz }
+    } else {
+        item_size
+    };
+    let node_sz = size_of<UnboundedNode<T>>();
+    let alloc_node_sz = if node_sz < 128usize { 128usize } else { node_sz };
+    let final_node_sz = if alloc_node_sz < actual_item_sz + 16usize { actual_item_sz + 16usize } else { alloc_node_sz };
+
+    let inner_sz = size_of<UnboundedInner<T>>();
+    let alloc_inner_sz = if inner_sz < 128usize { 128usize } else { inner_sz };
+    let raw_inner = unsafe { heap_alloc(alloc_inner_sz, 8usize) };
+    if (raw_inner as usize) == 0usize {
+        panic("channel_unbounded: out of memory");
+    }
+
+    let p = raw_inner as *mut UnboundedInner<T>;
+    unsafe {
+        (*p).lock = Atomic.new(0u32);
+        (*p).senders = Atomic.new(1usize);
+        (*p).receivers = Atomic.new(1usize);
+        (*p).closed = Atomic.new(0u32);
+        (*p).not_empty_seq = Atomic.new(0u32);
+        (*p).head = 0 as *mut UnboundedNode<T>;
+        (*p).tail = 0 as *mut UnboundedNode<T>;
+        (*p).len = 0usize;
+        (*p).node_size = final_node_sz;
+        (*p).has_drop = false;
+        (*p).drop_fn = channel_noop_drop;
+    }
+
+    UnboundedChannelPair {
+        tx: UnboundedSender { inner: p },
+        rx: UnboundedReceiver { inner: p },
+    }
+}
+
+
+pub fn channel_unbounded_with_drop<T: Send>(drop_fn: fn(*mut u8) -> ()) -> UnboundedChannelPair<T> {
+    let mut pair: UnboundedChannelPair<T> = channel_unbounded_with_size<T>(size_of<T>());
+    unsafe {
+        (*pair.tx.inner).has_drop = true;
+        (*pair.tx.inner).drop_fn = drop_fn;
+    }
+    pair
+}
+
+pub fn channel_unbounded<T: Send>() -> UnboundedChannelPair<T> {
+    channel_unbounded_with_size<T>(size_of<T>())
+}

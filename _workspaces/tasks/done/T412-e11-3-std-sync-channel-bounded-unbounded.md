@@ -8,14 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T411]
 priority: 134
-status: doing
+status: done
 attempts: 1
 paths: [std/sync/channel, tests/std/channel]
 locks: [std/sync/mod.ax]
 spec: [spec/SPEC-32-threads-sync.md, 0136, 0206, tasks/0278, tasks/0329, tasks/0837]
 covers: [REQ-CONC-007, REQ-CONC-011, REQ-CONC-041, REQ-CONC-042, REQ-CONC-043, REQ-CONC-099, REQ-CONC-103, REQ-CONC-104, REQ-CONC-115, REQ-CONC-116, REQ-CONC-143, REQ-CONC-185, REQ-CONC-186]
 started: 2026-11-09 13:31:56
-agent: T412-impl
+finished: 2026-11-09 15:54:39
 ---
 # T412 — E11.3 — std.sync.channel: bounded & unbounded ownership-transferring channels
 
@@ -46,3 +46,4 @@ Implement `std.sync.channel` providing bounded and unbounded typed channels with
 - 2026-11-09 11:48:15 started (attempt 1) T412-impl
 - 2026-11-09 13:14:43 requeue: user stopped (not charged: attempt refunded)
 - 2026-11-09 13:31:56 started (attempt 1) T412-impl
+- 2026-11-09 15:54:39 accepted by QA -> done
