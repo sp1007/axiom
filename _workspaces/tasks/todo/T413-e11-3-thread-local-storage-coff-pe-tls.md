@@ -11,9 +11,11 @@ priority: 135
 status: todo
 attempts: 0
 paths: [std/thread/local.ax, tests/run/concurrency/tls, tests/ui/concurrency/tls]
-locks: [compiler/hir/lower.ax, compiler/types/typeck.ax, compiler/mir/builder.ax, compiler/interp/interp.ax, compiler/lir/builder.ax, compiler/target/x64/isel.ax, compiler/obj/coff.ax, compiler/link/pe.ax, std/thread/mod.ax, tests/selfhost]
+locks: [compiler/diag/code.ax, compiler/hir/hir.ax, compiler/hir/lower.ax, compiler/types/typeck.ax, compiler/own/unsafe.ax, compiler/mir/mir.ax, compiler/mir/builder.ax, compiler/verify/verifier.ax, compiler/interp/interp.ax, compiler/interp/oracle.ax, compiler/lir/lir.ax, compiler/lir/builder.ax, compiler/target/x64/encode.ax, compiler/target/x64/frame.ax, compiler/target/x64/isel.ax, compiler/target/x64/mod.ax, compiler/backend/session.ax, compiler/driver/pipeline.ax, compiler/obj/coff.ax, compiler/obj/writer.ax, compiler/link/pe.ax, compiler/link/linker.ax, compiler/link/mod.ax, std/thread/mod.ax, tests/selfhost]
 spec: [spec/SPEC-32-threads-sync.md, spec/SPEC-04-core-extensibility.md, 0136, 0203, tasks/0329, tasks/0623]
 covers: [REQ-CONC-030, REQ-CONC-110]
+started: 2026-11-09 13:32:56
+unblocks: 1
 ---
 # T413 — E11.3 — @thread_local statics, COFF/PE .tls emission & thread-local storage
 
@@ -43,3 +45,8 @@ Implement `@thread_local` statics and `std.thread.LocalKey<T>` across HIR, MIR, 
 
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
+- 2026-11-09 11:49:14 started (attempt 1) T413-impl
+- 2026-11-09 13:14:45 requeue: user stopped (not charged: attempt refunded)
+- 2026-11-09 13:32:56 started (attempt 1) T413-impl
+- 2026-11-09 14:42:17 block: Missing compiler locks for PE TLS emission: linker.ax, encode.ax, frame.ax, pipeline.ax, code.ax
+- 2026-11-09 14:55:09 unblocked (cycle 1) 
