@@ -32,7 +32,8 @@ Implement `SHA-256`, `SHA-512`, `BLAKE3`, `HMAC-SHA256`, `HKDF-SHA256`, `ChaCha2
 - [ ] Report `_workspaces/reports/T930-report.md` with exact `## Files changed`.
 
 ## Out of scope
-- Legacy broken algorithms (MD5, SHA-1, RC4, DES) which are excluded from `std.crypto` by policy.
+- Quarantined legacy algorithms (MD5, SHA-1, DES, 3DES) which are isolated in `std.crypto.legacy` (`T949`) rather than modern `std.crypto`.
+- Extended suite primitives (SHA-3, Argon2id, AES modes, constant-time Base64/Hex) implemented in `T948`.
 - Editing `docs/` or `bootstrap/axiom0/` (frozen at `axiom0-frozen`).
 
 ## Notes

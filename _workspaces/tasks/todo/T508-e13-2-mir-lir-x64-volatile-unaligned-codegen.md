@@ -22,7 +22,7 @@ Lower volatile memory operations, `Volatile<T>`/`Mmio<T>` field accesses, and un
 ## Scope
 - Lower `volatile_load`, `volatile_store`, `volatile_copy`, `compiler_fence`, and `Volatile<T>` / `Mmio<T>` / `MmioRO<T>` / `MmioWO<T>` field projections in `compiler/mir` and `compiler/lir` with side-effect barrier flags so `-O1` never CSEs, dead-stores, or reorders volatile operations.
 - Emit exact-width non-tearing x86-64 instructions (`MOV r8/m8`, `MOV r16/m16`, `MOV r32/m32`, `MOV r64/m64`, `MFENCE`/`SFENCE`/`LFENCE`) in `compiler/target/x64` for 1/2/4/8-byte volatile accesses.
-- Lower `read_unaligned`, `write_unaligned`, and `@repr(packed)` field loads/stores safely without assuming natural alignment.
+- Lower `read_unaligned`, `write_unaligned`, and `@repr(packed)` field loads/stores safely without assuming natural alignment, and emit deterministic zero-fill stores for inter-field and trailing padding bytes in struct initializers.
 
 ## Acceptance
 - [ ] LIR golden tests in `tests/lir/volatile` verify that consecutive volatile stores/loads to the same address are never eliminated or merged at `-O1` and emit single exact-width `MOV` instructions.

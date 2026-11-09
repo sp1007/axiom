@@ -100,17 +100,17 @@ P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (o
 | P9 libraries (self-host std subset) | T069–T075, T071b, T071c, T073a, T074b | — | T075 | P7, P8 |
 | P10 self-hosting | T076–T087 | — | T087 | P9 |
 | P11 concurrency & async | T088–T090, T400–T428 | T211 | T311 | P10 |
-| P12 numeric & SIMD | T450–T479 | T212 | T312 | P10 |
-| P13 low-level & security | T500–T533 | T213 | T313 | P10 |
-| P14 language completion: comptime 2.0, reflection, generators, dyn | T058, T550–T572 | T214 | T314 | P10 |
+| P12 numeric & SIMD | T450–T480 | T212 | T312 | P10 |
+| P13 low-level & security | T500–T535 | T213 | T313 | P10 |
+| P14 language completion: comptime 2.0, reflection, generators, dyn | T058, T550–T574 | T214 | T314 | P10 |
 | P15 optimizer 2.0 + regalloc | T063, T064, T600–T629 | T215 | T315 | P10 (E15.5 needs P12) |
-| P16 targets & platforms | T066, T650–T699 | T216 | T316 | P13 |
-| P17 debugging & introspection | T068, T700–T726 | T217 | T317 | P16 |
+| P16 targets & platforms | T066, T650–T699, T664a, T668a, T675a | T216 | T316 | P13 |
+| P17 debugging & introspection | T068, T700–T734 | T217 | T317 | P16 |
 | P18 compiler architecture 2.0 + Windows artifact kinds | T067, T750–T776 | T218 | T318 | P10 |
 | P19 developer tooling | T800–T819 | T219 | T319 | P18 |
-| P20 build & packages | T850–T877 | T220 | T320 | P16, P18 |
-| P21 std completion | T900–T935 | T221 | T321 | P11, P13 |
-| P22 GPU & heterogeneous | T950–T984 | T222 | T322 | P11, P12, P16 |
+| P20 build & packages | T850–T881 | T220 | T320 | P16, P18 |
+| P21 std completion | T900–T949 | T221 | T321 | P11, P13 |
+| P22 GPU & heterogeneous | T950–T988 | T222 | T322 | P11, P12, P16 |
 | P23 v1.0 release | T091, T1000–T1010 | T223 | T323 | P11–P22 |
 | P24 ecosystem (post-v1) | — | T224 (deferred) | T324 (deferred) | P23 + owner decision |
 
@@ -147,7 +147,7 @@ pulls every catalogue requirement marked `EPIC(<id>)`.
   saturating families, bit ops, conversions. Src tasks/0327 tasks/0334 tasks/0431. *(T450–T455)*
 - **E12.2 Floating-point semantics** — f32/f64 types enter the language here (axiom0 has none; T034),
   SSE2 scalar codegen and XMM argument passing in the Windows x64 ABI, IEEE-754 rules, NaN/signed zero, rounding, float formatting/
-  parsing, math library accuracy contract. Src tasks/0338 tasks/0345 tasks/0331. *(T456–T462)*
+  parsing, math library accuracy contract, plus IEEE-754 f16 scalar in promotion lattice I < f16 < f32 < f64 lowered via F16C/SSE2 and opaque bf16 storage/conversion + SIMD dot-product type (without scalar + - * /). Src tasks/0338 tasks/0345 tasks/0331, ADR-0039. *(T456–T462, T480)*
 - **E12.3 SIMD & vector types** — portable vector types, masks, lane ops, target feature detection.
   Src 0095 tasks/0337 tasks/0341 tasks/0344 tasks/0347. *(T463–T468)*
 - **E12.5 CPU feature detection & function multiversioning** — explicit `@target_feature` /
@@ -160,14 +160,14 @@ Exit (phase): numeric conformance + differential interp/native for float and vec
 ### P13 — Low-level systems, unsafe, freestanding, security
 - **E13.1 Unsafe & UB model** — builds on the minimal core version (T061a: raw pointers, unsafe blocks,
   memory intrinsics); here: full unsafe blocks/fns rules, raw pointer rules, provenance, trusted-unsafe
-  boundaries. Src 0071 0044 tasks/0339 tasks/0282. *(T500–T505)*
+  boundaries, canonical unsafe asm(...) syntax, clobber verification & x86-64 inline assembly codegen. Src 0071 0044 tasks/0339 tasks/0282, ADR-0039. *(T500–T505, T534)*
 - **E13.2 Raw memory, volatile, MMIO, layout control** — volatile, packed/aligned repr, unions (0072),
-  address spaces. Src tasks/0328 tasks/0515 0067 0072. *(T506–T510)*
+  address spaces, deterministic zero-initialization of all alignment padding bytes in @repr(C)/@repr(packed) struct constructors (ASLR infoleak defense). Src tasks/0328 tasks/0515 0067 0072, ADR-0039. *(T506–T510, T535)*
 - **E13.3 Runtime composition & freestanding profile** — hosted vs freestanding, `@entry`, optional
   runtime, startup/static init/global state, runtime capability graph. Src 0143 0097 tasks/0358
   tasks/0359 tasks/0370 tasks/0455. *(T511–T515)*
 - **E13.4 Safety profiles & capability security** — profiles, sandboxing hooks, secure memory,
-  constant-time annotations. Src tasks/0342 tasks/0449 tasks/0467 tasks/0703. *(T516–T520)*
+  constant-time annotations, --hardened binary exploit shield on x86-64 (Intel CET ENDBR64 + PE GuardFlags, 32-bit KCFI signature check --cfi=type-hash, --stack-protector=strong canaries, 4 KiB stack-clash guard probing, std.security.spectre_index). Src tasks/0342 tasks/0449 tasks/0467 tasks/0703, ADR-0039. *(T516–T520, T535)*
 - **E13.6 Fixed-address declarations (`@at`)** — owner requirements REQ-OWNER-003, REQ-OWNER-008,
   ADR-0001: overlay/placement of statics, arrays, structs, functions at absolute addresses, used
   with ordinary syntax; taking addresses of functions and variables (`address_of` / `address_of_mut`
@@ -188,13 +188,12 @@ Exit (phase): numeric conformance + differential interp/native for float and vec
 Exit: freestanding program boots without std; UB/safety conformance suite.
 
 ### P14 — Language completion: comptime 2.0, reflection, generators, dyn
-- **E14.1 Comptime completion** — full comptime execution model, partial evaluation, specialization.
-  Src 0102 0140 tasks/0340 tasks/0346 tasks/0509. *(T550–T555)*
+- **E14.1 Comptime completion** — full comptime execution model, partial evaluation, specialization,
+  sandboxed compile-time asset embedding (@embed_bytes, @embed_str) with package-root containment, QueryDb BLAKE3 invalidation, UTF-8 verification, and 64 MiB cap. Src 0102 0140 tasks/0340 tasks/0346 tasks/0509, ADR-0039. *(T550–T555, T573)*
 - **E14.2 Reflection & derive** — compile-time reflection API, derive framework, code generation
   boundary (no textual macros unless specified). Src tasks/0343 tasks/0296 tasks/0433. *(T556–T560)*
-- **E14.3 Generators & `yield`** — iterator state machines, lazy control flow. Src tasks/0512. *(T561–T565)*
-- **E14.4 dyn Trait & vtables** — dyn compatibility, coercion, vtable layout, native emission.
-  Src tasks/0476 217.49-50, 0212. *(T058, T566–T569)*
+- **E14.3 Generators & `yield`** — iterator state machines, lazy control flow, async generators (async gen fn -> AsyncIterator) with unified coroutine MIR state machine (no view/mut_view across suspension) and composite cancellation drop glue. Src tasks/0512, ADR-0039. *(T561–T565, T574)*
+- **E14.4 dyn Trait & vtables** — dyn compatibility, coercion, vtable layout, native emission in read-only .rdata [__ax_vtables_start, __ax_vtables_end) with 32-bit trait_id_hash CFI check on dispatch. Src tasks/0476 217.49-50, 0212, ADR-0039. *(T058, T566–T569)*
 - **E14.5 Surface ergonomics deferred by R7** — index auto-deref through `view`/`mut_view`
   (SPEC-03 AXS-SEM-047, ADR-0036 §4), axiomc only; plus any later R7-deferred surface conveniences.
   Src ADR-0036, T141 QA N3. *(T570–T572)*
@@ -220,10 +219,10 @@ Exit: differential green at -O2; benchmark targets met and tracked in CI.
 - **E16.1 Target description as data** — TargetDesc/ISA tables, backend conformance. Src 0163
   tasks/0524 tasks/0784. *(T653–T656)*
 - **E16.2 Linux ELF dynamic** — PIE, GOT/PLT, shared objects, libc interop. Src 0197. *(T657–T660)*
-- **E16.3 AArch64 Linux** — Src 0193 tasks/0521. *(T661–T664)*
-- **E16.4 macOS AArch64 + Mach-O** — Src 0196. *(T665–T668)*
+- **E16.3 AArch64 Linux** — Src 0193 tasks/0521, ADR-0039. *(T661–T664, T664a)*
+- **E16.4 macOS AArch64 + Mach-O** — Src 0196, ADR-0039. *(T665–T668, T668a)*
 - **E16.5 Android AArch64 (+JNI layer)** — Src 0198 0200. *(T669–T672)*
-- **E16.6 WASM32** — Src tasks/0784. *(T673–T676)*
+- **E16.6 WASM32** — Src tasks/0784, ADR-0039. *(T673–T676, T675a)*
 - **E16.7 RISC-V64** — Src 0152 §59 tasks/0784. *(T677–T680)*
 - **E16.8 Cross-compilation & target matrix, OS platform layer** — any host builds for any target
   from one frontend; target SDK/sysroot selection. Src tasks/0453 tasks/0587 0220 tasks/0336. *(T681–T684)*
@@ -264,6 +263,8 @@ Artifact matrix (E16.10–E16.13; ✔ = must be produced *and* consumed with tes
 - **E17.5 Profiler & performance introspection** — Src tasks/0572 tasks/0730. *(T715–T718)*
 - **E17.6 Sanitizers & runtime verification** — Src tasks/0599 tasks/0733. *(T719–T722)*
 - **E17.7 Trace & replay** — Src tasks/1058 (AXREPLAY) 0147. *(T723–T726)*
+- **E17.8 Coverage-guided & structure-aware fuzzing** — Coverage instrumentation (-fsanitize-coverage=trace-pc-guard) & 64 KiB shared-memory map, crash-isolated Coordinator + Worker runner, Arbitrary trait & @derive(Arbitrary) from P14 TypeInfo reflection, axiom test --fuzz CLI, and deterministic < 1.0s corpus replay regression conformance. Src tasks/0386 §95, tasks/0375 §62, tasks/0381 §100, SPEC-99, ADR-0039. *(T727–T730)*
+- **E17.9 Static C++ zero-day vulnerability scanner & SARIF 2.1** — Fast O(CFG) MIR abstract interpretation detecting 10 C++ 0-day classes across unsafe/FFI boundaries (alloc overflow, truncating casts, static UAF/double-free, stack pointer escape, union type confusion, padding infoleak, TOCTOU race, path traversal, command injection), axiom audit --zero-day, --deny-zero-day-patterns, @suppress, SARIF 2.1 emitter, and real-world CVE-modeled exploit-litmus suite. Src SPEC-151, ADR-0039. *(T731–T734)*
 Exit: step-through debugging in a standard debugger on Windows and Linux; sanitizer suite.
 
 ### P18 — Compiler architecture 2.0
@@ -305,20 +306,23 @@ Exit: VS Code extension using the LSP; formatter idempotence over the whole corp
   hot-reload with state hand-off, ownership/capability rules preserved across the boundary.
   Src tasks/0584 tasks/0583 0104 tasks/0739 tasks/0856. *(T870–T873)*
 - **E20.6 SDK / sysroot / toolchain distribution** — Src tasks/0605 tasks/1034. *(T874–T877)*
+- **E20.8 Polyglot FFI, C header importer & multi-language SDK export** — Pure-Axiom C99/C11 FFI header preprocessor & parser (axiom bindgen <header.h>, cleanly rejecting C++), ForeignInterface IR lowering to C99 .h, zero-build Python ctypes, Swift module.modulemap/.swift, Kotlin JNI .kt, and TypeScript .d.ts/WASM ESM glue, and axiom build --export-sdk CLI. Src SPEC-117, ADR-0039. *(T878–T881)*
 Exit: multi-package workspace builds reproducibly from lockfile on two machines.
 
 ### P21 — Standard library completion
 - **E21.1 Collections breadth & data-oriented storage** — deque, B-tree map, SoA helpers, handles/
   generational storage. Src 0210 tasks/0348 tasks/0349 tasks/0608. *(T900–T903)*
-- **E21.2 Text & Unicode complete** — normalization, segmentation, case mapping. Src tasks/0332 0089. *(T904–T907)*
-- **E21.3 OS: fs, process, env, signals, IPC** — Src tasks/0335 tasks/0443. *(T908–T911)*
-- **E21.4 Networking** — sockets, DNS, async integration. Src tasks/0461 tasks/0335. *(T912–T915)*
+- **E21.2 Text & Unicode complete** — normalization, segmentation, case mapping, linear-time bounded-memory Thompson PikeVM / Lazy DFA std.regex (zero backtracking, Unicode-aware, cancellable). Src tasks/0332 0089, ADR-0039. *(T904–T907, T936)*
+- **E21.3 OS: fs, process, env, signals, IPC** — Src tasks/0335 tasks/0443, plus live stateful hot-reload CLI runner axiom dev --hot. *(T908–T911, T937)*
+- **E21.4 Networking** — sockets, DNS, async integration, hardened pure-Axiom TLS 1.3 + strict RFC 5280 DER X.509 + OS system root trust store + HTTP/1.1 & HTTP/2 with Rapid Reset CVE-2023-44487 / CONTINUATION / HPACK caps + WebSocket/SSE framing. Src tasks/0461 tasks/0335, ADR-0039. *(T912–T915)*
 - **E21.5 Time & clocks** — Src tasks/0440 tasks/0464. *(T916–T919)*
 - **E21.6 Virtual memory & memory mapping** — Src tasks/0437. *(T920–T923)*
-- **E21.7 Serialization & binary data model** — Src tasks/0650 tasks/0742 tasks/0841. *(T924–T927)*
-- **E21.8 Crypto primitives & secure memory** — hashes, RNG, constant-time utilities. Src tasks/0467. *(T928–T931)*
+- **E21.7 Serialization & binary data model** — Src tasks/0650 tasks/0742 tasks/0841, SIMD-accelerated std.json with exact scalar fallback + derive(Serialize). *(T924–T927)*
+- **E21.8 Crypto primitives & secure memory** — hashes, RNG, constant-time utilities, WebPKI & TLS 1.3 crypto primitives in std.crypto (AES-128/256-GCM with @multiversion + constant-time bit-sliced fallback & constant-time GHASH, ECDSA P-256, RSA-PSS), complete modern suite (SHA-384, SHA-3/SHAKE/Keccak, Argon2id & PBKDF2 password hashing with ZeroizeOnDrop and bounded DoS limits, AES-CTR/CBC/KW, constant-time Base64/Hex), and quarantined std.crypto.legacy (SHA-1, HMAC-SHA1, MD5, bit-sliced constant-time DES/3DES) for legacy RFC 6455/6238 compatibility. Src tasks/0467, SPEC-127, ADR-0039. *(T928–T931, T938, T948, T949)*
 - **E21.9 Allocators: pool, custom and concurrent allocators** (basic arenas + typed ID tables are
-  core, T073a) — Src 0106 0036 tasks/0280. *(T932–T935)*
+  core, T073a) — Src 0106 0036 tasks/0280, production HardenedAllocator (IsoHeap: TypeId-isolated partitions, zero-on-free, 64-slot quarantine ring, XOR freelist cookies, guard pages). *(T932–T935, T939)*
+- **E21.10 Cross-OS native async reactors** — Linux io_uring + epoll dual-engine reactor with container/seccomp probe fallback & IoOpState.CancellingZombie DMA write-after-free safety, macOS/iOS kqueue/kevent64 async reactor, WSL2 and Windows mock test harness. Src SPEC-129, REQ-RT-156, REQ-ASY-158, ADR-0039. *(T940–T943)*
+- **E21.11 FastAPI-grade std.web HTTP(S) application server** — Radix tree router, FromRequest typed extractors & dependency injection validated via comptime TypeInfo reflection without runtime RTTI, @derive(Validate) with RFC 9457 422 JSON errors, comptime OpenAPI 3.1 /openapi.json extraction, air-gapped offline /docs explorer via @embed_str, hardened HTTPS/H2 server, Slowloris and max_body_bytes DoS defenses, path-traversal resistant StaticDir, streaming Multipart uploads, and SSE/WebSocket streaming. Src SPEC-152, ADR-0039. *(T944–T947)*
 Exit: std API reference complete; std conformance suite on all tier-1 targets.
 
 ### P22 — GPU & heterogeneous computing
@@ -330,6 +334,7 @@ Exit: std API reference complete; std conformance suite on all tier-1 targets.
 - **E22.6 Native raster graphics pipeline, surface/swapchain & software rasterizer fallback** — Graphics shader stages in AGIR (`@vertex`, `@fragment`) with type-checked inter-stage interface, textures (`Texture1D/2D/3D/Cube`, `StorageTexture`), samplers, `GraphicsPipeline` (vertex layouts, primitive topology, rasterizer state, blend, depth/stencil, MSAA, MRT), `RenderPass`, multi-backend native `Surface` & `Swapchain` lifecycle (Win32 `HWND`, macOS/iOS `CAMetalLayer`, Linux Wayland/X11, Android `ANativeWindow`, HTMLCanvas; VSync/Mailbox, resize/recreation, sRGB/HDR), and the deterministic CPU Software Rasterizer fallback (`std/sys/gpu/software`, 0846 §78–79) for pixel-perfect headless CI verification. Src 0846 §10–56, §78–90, §230–240, ADR-0038. *(T971–T975)*
 - **E22.7 WebGPU backend & WGSL codegen** — WebGPU Shading Language (`AGIR -> WGSL`) source emitter, address-space mapping, WGSL syntax validator, and `std/sys/gpu/webgpu` host/WASM bridge (`navigator.gpu` / native WebGPU C ABI) enabling seamless GPU compute and graphics on `wasm32` (`E16.6`) and native platforms. Src 0846 §13, §47, §217, ADR-0038. *(T976–T979)*
 - **E22.8 GPU AI acceleration (subgroups, f16/bf16, cooperative matrix) & runtime shader hot-reload** — Capability-gated SIMT Subgroup collectives (`subgroup_size`, `subgroup_shuffle`, `subgroup_broadcast`, `subgroup_ballot`, `subgroup_reduce_add/min/max`), half-precision `f16` and `bf16` device storage & compute, Cooperative Matrix / Tensor Core MMA (`TileMatrix<T, M, N, K>`, `mma_sync`) lowering across SPIR-V (`OpTypeCooperativeMatrixKHR`), HLSL/DXIL WaveMMA, and Apple MSL (`simdgroup_matrix`), plus safe runtime live shader and pipeline hot-reload (`std/gpu/hot_reload`, 0846 §252–254) with ABI compatibility verification and atomic frame-boundary swapping. Src 0096, 0139, tasks/0459, tasks/0468, tasks/0470, 0826 §601.112, 0846 §252–254, ADR-0038. *(T980–T984)*
+- **E22.9 OpenGL 4.5+ / OpenGL ES 3.1+ compatibility backend & AGIR -> GLSL** — Compatibility backend conforming to 0846 §216 (explicit architecture, zero global GL state leakage), compiler/target/glsl GLSL 450 & ESSL 310 emitter with [0, 1] clip-space Z and Y-flip normalization, std/sys/gpu/opengl thread-safe WGL/EGL/GLX driver with DSA / shadow state tracker, and headless FBO & Software-Rasterizer differential conformance suite. Src 0846 §216, SPEC-138, ADR-0039. *(T985–T988)*
 Exit: kernel and graphics conformance examples run on physical GPU (Vulkan, D3D12, Metal, WebGPU) and CPU software fallback with bit-for-bit oracle-checked results.
 
 ### P23 — v1.0 conformance, freeze, release
@@ -432,3 +437,4 @@ Exit (phase): defined by T224 per epic when the owner schedules P24.
 | 2026-11-06 | T610 unblock: clarified `SPEC-72 AXS-LOOP-011` (`OPT_INST_DISCRIMINANT` memory-read hoisting gate in `loops_can_hoist_inst`) and `AXS-BCE-004` / `AXS-LOOP-011` (whole-aggregate `OPT_INST_AGGREGATE` / `inst.mem_def != MEM_SSA_NONE` with `place.proj_count == 0` clobber checks in `bce_inst_clobbers_len_state` and `loops_region_clobbered_in_loop`); added `T610` to `T064` `depends:` to serialize `compiler/opt` path ownership | ADR-0037 |
 | 2026-11-08 | T409 unblock: new P11 prerequisite fix task T429 (`owner: axiom-backend`) fixes sub-64-bit atomic MI size=8 overwrite in `compiler/driver/pipeline.ax` and struct-embedded `Atomic<T>` Pass-1a resolution in `compiler/types/typeck.ax`; T409 depends on T429 | unblock-T409 |
 | 2026-11-09 | GPU & cross-platform expansion (ADR-0038, owner instruction "tiến hành đi"): expanded P16 with E16.13 iOS target (`T697–T699`) and P22 with E22.3 HLSL/DXIL (`T966`), E22.5 Apple Metal (`T967–T970`), E22.6 Raster Graphics & Software Rasterizer (`T971–T975`), E22.7 WebGPU (`T976–T979`), E22.8 GPU AI Acceleration & Hot-Reload (`T980–T984`); mapped all REQ-GPU-* and REQ-ECO-5958; wired P16 gate `T316` and P22 gate `T322` | owner directive / ADR-0038 |
+| 2026-11-09 | Comprehensive systems, security, web, zero-day defense, OpenGL & complete crypto expansion (ADR-0039): integrated all 13 Red-Team refined proposals into active phases P12–P22; added E17.8 (coverage fuzzing T727–T730), E17.9 (static C++ 0-day scanner T731–T734), E20.8 (polyglot SDK export T878–T881), E21.10 (cross-OS async reactors T940–T943), E21.11 (FastAPI-grade std.web T944–T947), E22.9 (OpenGL 4.5+/GLES 3.1+ T985–T988); refined P12 (f16/bf16 T480), P13 (unsafe asm T534, hardened exploit shield T535), P14 (@embed_* T573, async gen fn T574), P16 (NEON/PAC+BTI T664a, std.ffi.objc T668a, WASM SIMD/JS T675a), and P21 (regex T936, hot reload runner T937, WebPKI crypto T938, IsoHeap T939, TLS 1.3/H2 T914, SIMD JSON T924/T925/T927, complete crypto T948, quarantined legacy crypto T949) | ADR-0039 |

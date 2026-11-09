@@ -20,8 +20,8 @@ covers: [REQ-CORE-3041, REQ-CORE-3042, REQ-CORE-3043, REQ-CORE-3044]
 Implement native LIR and x86-64 lowering for `dyn Trait` fat pointers (`(data_ptr, vtable_ptr)`), deterministic read-only `.rdata` vtable emission with function relocations, and indirect method call codegen per `spec/SPEC-63-dyn-trait-vtables.md`.
 
 ## Scope
-- Lower `(ImplType, TraitId)` vtable descriptors in `compiler/lir` and `compiler/obj` into deterministic read-only `.rdata` symbols containing `[drop_in_place, size, align, method_0, method_1, ...]` with 64-bit COFF function relocations (`IMAGE_REL_AMD64_ADDR64`).
-- Lower 16-byte `dyn Trait` fat pointers (`view<dyn Trait>`, `mut_view<dyn Trait>`) across the Windows x64 ABI (register pair / by-ref argument passing and return) and emit indirect call instructions (`call [r_vtable + slot_offset]`) in `compiler/target/x64`.
+- Lower `(ImplType, TraitId)` vtable descriptors in `compiler/lir` and `compiler/obj` into deterministic read-only `.rdata` symbols bounded in `[__ax_vtables_start, __ax_vtables_end)` containing `[drop_in_place, size, align, trait_id_hash, method_0, method_1, ...]`.
+- Lower 16-byte `dyn Trait` fat pointers (`view<dyn Trait>`, `mut_view<dyn Trait>`) across the Windows x64 ABI (register pair / by-ref argument passing and return) and emit indirect call instructions (`call [r_vtable + slot_offset]`) in `compiler/target/x64`, including fine-grained 32-bit `trait_id_hash` CFI verification before dispatch under `--hardened`.
 
 ## Acceptance
 - [ ] Machine-code and differential (`--interp` and native) tests in `tests/mc/dyn` and `tests/run/dyn_native` verify `.rdata` vtable symbol emission, 16-byte fat-pointer ABI passing/returning, and indirect vtable dispatch across multiple implementing types.

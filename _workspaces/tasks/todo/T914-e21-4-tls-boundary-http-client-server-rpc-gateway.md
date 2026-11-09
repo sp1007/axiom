@@ -6,7 +6,7 @@ owner: axiom-stdlib
 reviewer: axiom-qa
 model: sonnet
 gate_model: sonnet
-depends: [T221, T311, T313, T912, T913]
+depends: [T221, T311, T313, T912, T913, T938, T948, T949]
 priority: 224
 status: todo
 attempts: 0
@@ -20,8 +20,9 @@ covers: [REQ-STD-171, REQ-STD-177, REQ-RT-173, REQ-RT-175, REQ-RT-561, REQ-RT-56
 Implement the `std.net.tls` transport boundary, `std.net.http` client/server protocol engine, and `std.net.rpc` typed framing/gateway runtime per `spec/SPEC-123-networking-sockets-dns-http.md`.
 
 ## Scope
-- Implement `std/net/tls` (`TlsConfig`, `RootCertStore`, `ServerName`, `ClientSession`, `ServerSession`, `TlsStream<S>` with explicit ALPN, certificate verification hooks, and deterministic loopback handshake in the oracle; `tasks/0838 §9-12`, `REQ-STD-171`).
-- Implement `std/net/http` (`Method`, `StatusCode`, `HeaderMap`, `Uri`, HTTP/1.1 request/response parser and serializer, `Content-Length` and chunked transfer coding, connection keep-alive pool, and loopback `HttpClient`/`HttpServer`; `tasks/0859 §3-9`, `REQ-STD-177`).
+- Implement `std/net/tls` (`TlsConfig`, `RootCertStore`, `ServerName`, `ClientSession`, `ServerSession`, `TlsStream<S>` with explicit ALPN, strict RFC 5280 DER X.509 certificate verification hooks, OS system root trust store loading, and hardened pure-Axiom TLS 1.3 protocol engine powered by `T938` AES-GCM/ECDSA/RSA-PSS; `tasks/0838 §9-12`, `REQ-STD-171`).
+- Implement `std/net/http` (`Method`, `StatusCode`, `HeaderMap`, `Uri`, HTTP/1.1 and HTTP/2 framing with Rapid Reset CVE-2023-44487 / CONTINUATION flood limits, request/response parser and serializer, `Content-Length` and chunked transfer coding, connection keep-alive pool, and loopback `HttpClient`/`HttpServer`; `tasks/0859 §3-9`, `REQ-STD-177`).
+- Implement WebSocket RFC 6455 framing and handshake key derivation using `std.encoding.base64` (`T948`) and `std.crypto.legacy.Sha1` (`T949`).
 - Implement `std/net/rpc` (`RpcFrame`, length-delimited multiplexed request/response correlation, per-call deadline propagation, backpressure limits, and `ServiceGateway` router without remote pointers or hidden GC; `tasks/0461 §19-30`, `tasks/0859 §10-15`, `REQ-RT-173`, `REQ-RT-175`).
 - Add run tests in `tests/run/std_net_http_rpc`.
 

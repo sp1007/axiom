@@ -22,7 +22,7 @@ Implement the MIR/LIR constant-time verifier for `@constant_time` functions and 
 ## Scope
 - Verify `@constant_time` functions and `Secret<T>` taint propagation in `compiler/mir`: reject secret-dependent `if`/`match`/`while` branches, secret-dependent array/slice indexing, and variable-time instructions (`DIV`/`IDIV`/`REM`) on secret operands (`AX_SEC_TIMING_LEAK`).
 - Lower constant-time conditional select (`ct_select`) to branchless x86-64 `CMOVcc` / bitwise masks without `-O1` branch re-introduction.
-- Lower `zeroize_memory` and `black_box` as volatile optimization barriers in MIR, LIR, and x86-64 so dead-store elimination never removes secret zeroization on `Drop`.
+- Lower `zeroize_memory` and `black_box` as volatile optimization barriers in MIR, LIR, and x86-64 so dead-store elimination never removes secret zeroization on `Drop`, and support `std.security.spectre_index` speculative execution barrier lowering.
 
 ## Acceptance
 - [ ] Negative UI tests in `tests/ui/constant_time` reject secret-dependent branches, secret table indexing, and secret division in `@constant_time` functions.

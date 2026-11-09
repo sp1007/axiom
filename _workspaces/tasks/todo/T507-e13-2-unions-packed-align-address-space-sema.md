@@ -22,7 +22,7 @@ Implement untagged `union` types, `@repr(packed)` / `@align(N)` layout computati
 
 ## Scope
 - Parse and lower `union` declarations in `compiler/parser`, `compiler/hir`, and `compiler/types`: compute size = max field size rounded to alignment, enforce `Copy` / `ManuallyDrop<T>` field constraints, and require `unsafe` for reading union fields.
-- Implement `@repr(packed)`, `@repr(packed(N))`, and `@align(N)` (power-of-two validation) in layout calculation, rejecting conflicting `@repr(packed)` + `@align(N)` attributes on the same type.
+- Implement `@repr(packed)`, `@repr(packed(N))`, and `@align(N)` (power-of-two validation) in layout calculation, rejecting conflicting `@repr(packed)` + `@align(N)` attributes on the same type, and enforce deterministic zero-initialization of alignment padding bytes in `@repr(C)` / `@repr(packed)` struct constructors (ASLR infoleak defense).
 - Reject taking `view<T>`, `mut_view<T>`, or aligned `*const T`/`*mut T` to an unaligned field of a `@repr(packed)` struct (`AX_TYPE_UNALIGNED_PACKED_REF`), while permitting by-value copy reads/writes and `read_unaligned`/`write_unaligned`.
 - Check explicit pointer address-space qualifiers so device/physical address-space pointers cannot implicitly coerce to default host pointers.
 
