@@ -12,7 +12,7 @@ status: todo
 attempts: 0
 paths: [std/sys/gpu/opengl, tests/run/opengl_driver]
 locks: [std/sys/gpu/mod.ax]
-spec: [spec/SPEC-138-opengl-gles-glsl-backend.md, spec/decisions/ADR-0039-p12-p22-systems-web-zeroday-opengl-expansion.md]
+spec: [spec/decisions/ADR-0040-unified-memory-architecture-uma.md, spec/SPEC-138-opengl-gles-glsl-backend.md, spec/decisions/ADR-0039-p12-p22-systems-web-zeroday-opengl-expansion.md]
 covers: [REQ-GPU-064, REQ-GPU-065]
 ---
 # T987 — E22.9 — std/sys/gpu/opengl thread-safe WGL/EGL/GLX command replay driver & state tracker
@@ -28,10 +28,12 @@ Implement the thread-safe `std/sys/gpu/opengl` compatibility driver wrapping WGL
 - Implement state tracking mechanisms:
   * Fast-path: On OpenGL 4.5+ drivers, use Direct State Access (`glCreateBuffers`, `glNamedBufferStorage`, `glBindTextureUnit`, `glCreateFramebuffers`) to manipulate GPU objects without altering global binding state.
   * Compatibility fallback: On OpenGL 4.3 / GLES 3.1, implement shadow state tracking to minimize redundant `glBind*` calls and restore prior context state before foreign calls.
+- Implement persistent buffer mapping with `glBufferStorage` per ADR-0040 §1: use `GL_MAP_PERSISTENT_BIT`; when `GL_MAP_COHERENT_BIT` is absent, emit `glMemoryBarrier(GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT)` or `glFlushMappedBufferRange` at domain handoff points.
 - Implement swapchain presentation via `SwapBuffers` / `eglSwapBuffers`.
 
 ## Acceptance
 - [ ] Run tests in `tests/run/opengl_driver` verify context creation, shader compilation, buffer upload, and offscreen rendering under Windows WGL and Linux EGL.
+- [ ] Persistent mapped buffers with client memory barriers pass buffer round-trip tests without data corruption.
 - [ ] Multi-thread test verifies recording commands across 4 worker threads and executing them safely via `Queue.submit` without thread-affinity panic.
 - [ ] Full test suite passes in the snapshot (`axiomc2.exe`).
 - [ ] Report `_workspaces/reports/T987-report.md` with exact `## Files changed`.
@@ -48,3 +50,4 @@ Implement the thread-safe `std/sys/gpu/opengl` compatibility driver wrapping WGL
 
 ## Log
 - 2026-11-09 23:40:00 created by axiom-architect (ADR-0039 P22 OpenGL compatibility expansion)
+- 2026-11-10 22:30:00 updated by architect (ADR-0040 revision: persistent mapping & client memory barriers)

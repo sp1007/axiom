@@ -12,7 +12,7 @@ status: todo
 attempts: 0
 paths: [std/sys/gpu/webgpu, tests/run/gpu_webgpu]
 locks: [std/sys/gpu/mod.ax]
-spec: [spec/SPEC-136-webgpu-wgsl-backend.md, tasks/0846]
+spec: [spec/decisions/ADR-0040-unified-memory-architecture-uma.md, spec/SPEC-136-webgpu-wgsl-backend.md, tasks/0846]
 covers: [REQ-ECO-5958, REQ-GPU-064]
 ---
 # T978 — E22.7 WebGPU host & wasm32 browser bridge (std.sys.gpu.webgpu, navigator.gpu / WebGPU C ABI)
@@ -24,16 +24,16 @@ Implement the WebGPU runtime backend in `std/sys/gpu/webgpu`, bridging Axiom GPU
 - Implement the WebAssembly WebGPU bridge in `std/sys/gpu/webgpu` for target `wasm32`:
   - Define JS import bindings for WebGPU API objects: `navigator.gpu.requestAdapter`, `adapter.requestDevice`, `device.createShaderModule`, `device.createComputePipeline`, `device.createBuffer`, `queue.writeBuffer`, `queue.submit`, `buffer.mapAsync`.
   - Handle asynchronous promises from JavaScript via event loop poll ticks without blocking the main WASM thread.
-- Implement the native WebGPU C ABI fallback in `std/sys/gpu/webgpu` for desktop targets:
-  - Dynamically load native WebGPU implementation libraries (`wgpu-native` / `Dawn` shared libraries) when configured.
-  - Implement standard `WGPUInstance`, `WGPUAdapter`, `WGPUDevice`, `WGPUQueue`, and `WGPUComputePipeline` calls.
+- Implement the native WebGPU C ABI fallback in `std/sys/gpu/webgpu` for desktop targets: dynamically load native WebGPU implementation libraries (`wgpu-native` / `Dawn`), implementing standard WebGPU objects.
 - Implement memory management and buffer operations:
-  - Allocate GPU buffers with usage flags (`WGPUBufferUsage_Storage`, `WGPUBufferUsage_Uniform`, `WGPUBufferUsage_CopySrc`, `WGPUBufferUsage_CopyDst`).
+  - Allocate GPU buffers with usage flags (`Storage`, `Uniform`, `CopySrc`, `CopyDst`).
+  - Implement fast-path initial population using `mappedAtCreation = true` per ADR-0040 §1, avoiding separate staging buffer allocation when creating pre-populated buffers.
   - Staging buffer upload and asynchronous readback mapping.
 - Add browser/NodeJS and native headless test cases in `tests/run/gpu_webgpu`.
 
 ## Acceptance
 - [ ] Tests in `tests/run/gpu_webgpu` verify adapter discovery, buffer creation, WGSL shader compilation, and compute dispatch under WASM runtime (NodeJS / headless browser) and native WebGPU.
+- [ ] Initial buffer population via `mappedAtCreation = true` verified to bypass intermediate staging copies.
 - [ ] Buffer round-trip operations preserve exact data bytes between host and device.
 - [ ] Full test suite passes in the snapshot (`axiomc2.exe`).
 - [ ] Report `_workspaces/reports/T978-report.md` with exact `## Files changed`.
@@ -50,3 +50,4 @@ Implement the WebGPU runtime backend in `std/sys/gpu/webgpu`, bridging Axiom GPU
 
 ## Log
 - 2026-11-09 21:45:00 created by architect (ADR-0038 WebGPU expansion)
+- 2026-11-10 22:30:00 updated by architect (ADR-0040 revision: mappedAtCreation initial upload fast-path)

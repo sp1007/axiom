@@ -11,7 +11,7 @@ priority: 234
 status: todo
 attempts: 0
 paths: [std/gpu/runtime, std/gpu/pipeline, std/gfx/command, tests/run/gpu_compute_runtime]
-spec: [spec/SPEC-133-host-runtime-vulkan-d3d12-compute.md, 0096, 0139, tasks/0626, tasks/0846]
+spec: [spec/decisions/ADR-0040-unified-memory-architecture-uma.md, spec/SPEC-133-host-runtime-vulkan-d3d12-compute.md, 0096, 0139, tasks/0626, tasks/0846]
 covers: [REQ-GPU-034, REQ-GPU-041, REQ-GPU-064, REQ-GPU-065]
 ---
 # T964 — E22.4 High-level std.gpu & std.gfx command runtime: ComputePipeline, CommandEncoder, RenderGraph & async dispatch
@@ -20,13 +20,15 @@ covers: [REQ-GPU-034, REQ-GPU-041, REQ-GPU-064, REQ-GPU-065]
 Implement the high-level `std.gpu.runtime`, `std.gpu.pipeline`, and `std.gfx.command` layers (`GraphicsContext`, `ComputePipeline`, `PipelineCache`, `CommandEncoder`, `RenderGraph`, and `gpu.dispatch`) per `spec/SPEC-133-host-runtime-vulkan-d3d12-compute.md` (`REQ-GPU-065`).
 
 ## Scope
-- Implement `std/gpu/runtime` and `std/gpu/pipeline`: multi-GPU device context creation (`GpuDevice.open(selector: GpuAdapterSelector)` supporting `PowerPreference.LowPower` onboard iGPU, `PowerPreference.HighPerformance` discrete dGPU, `ByVendor(GpuVendor.Nvidia)`, `ByPciId`, and `ByDeviceId`, plus `MultiGpuGroup` (`MultiGpuGroup.open(selectors)`, `MultiGpuGroup.all_discrete()`, `MultiGpuGroup.all_by_vendor(...)`, `MultiGpuGroup.all_compute_capable()`) for concurrent execution across multiple GPUs for AI training/inference, scientific compute, or hybrid rendering), typed `ComputePipeline<K>` and `PipelineCache` validated against `GpuKernelABI` reflection metadata, `gpu.dispatch(kernel, grid, block, args...)`, explicit-device `gpu.dispatch_on(device, kernel, grid, block, args...) -> Result<GpuEvent, GpuError>`, and parallel multi-GPU `gpu.dispatch_multi_gpu(group, grid_per_gpu, block, per_rank_fn) -> Result<MultiGpuEvent, GpuError>` launching per-rank command queues concurrently with `MultiGpuEvent.wait_all()`, collective synchronization (`all_reduce`, `all_gather`, `reduce_scatter`, `broadcast`), `ExecutionQueue` submission, device-affinity validation (rejecting `DeviceBuffer<T>` allocated on GPU A when submitted to GPU B without an explicit cross-GPU transfer), and generational `GraphicsDeviceState` (`Ready` -> `Lost` -> `Recovering` -> `Recreated`) rejecting stale-generation resources on device loss (`tasks/0846 §5-9`).
-- Implement `std/gfx/command` (`REQ-GPU-065`, `tasks/0846 §4-16`): `GraphicsContext.open(selector: GpuAdapterSelector)` (allowing normal GUI apps to bind to the onboard `IntegratedGpu` while graphics-intensive apps like a 3D texture painter bind to the discrete `Nvidia`/`Amd` GPU, or run UI presentation on the iGPU and brush/bake compute passes on the dGPU), offscreen/headless `RenderTarget` and `TextureView` descriptors, `CommandEncoder`, `ComputePass`, `TransferPass`, explicit resource barrier transitions, and `RenderGraph` DAG compilation (topological pass scheduling, transient buffer aliasing, per-pass device affinity, and automatic barrier insertion between producer/consumer compute and transfer passes).
+- Implement `std/gpu/runtime` and `std/gpu/pipeline`: multi-GPU device context creation, typed `ComputePipeline<K>` and `PipelineCache` validated against `GpuKernelABI` reflection metadata, `gpu.dispatch`, explicit-device `gpu.dispatch_on`, parallel multi-GPU `gpu.dispatch_multi_gpu`, collective synchronization, `ExecutionQueue` submission, device-affinity validation, and generational `GraphicsDeviceState` recovery.
+- Implement `std/gfx/command`: `GraphicsContext.open(selector: GpuAdapterSelector)`, offscreen/headless `RenderTarget` and `TextureView` descriptors, `CommandEncoder`, `ComputePass`, `TransferPass`, explicit resource barrier transitions, and `RenderGraph` DAG compilation (topological pass scheduling, transient buffer aliasing, per-pass device affinity, and automatic barrier insertion between producer/consumer compute and transfer passes).
+- Implement copy elision in `RenderGraph` transfer passes per ADR-0040 §3: on shared-pool devices (`has_unified_memory == true`), linear 1D buffer transfer nodes lower to domain transitions + barriers without staging copies; 2D/3D textures and images always emit hardware tiling/swizzling blits.
 - Verify that programs not importing `std.gpu`/`std.gfx` link zero GPU runtime symbols (`AGPU-25`).
 - Add end-to-end run tests in `tests/run/gpu_compute_runtime`.
 
 ## Acceptance
 - [ ] Run tests in `tests/run/gpu_compute_runtime` pass in `--interp` and native modes with `0 WEAK-NATIVE`, verifying typed `gpu.dispatch`, multi-pass `CommandEncoder` and `RenderGraph` execution, `PipelineCache` reuse, `GpuEvent` async/blocking completion, and generational device-loss recovery.
+- [ ] `RenderGraph` transfer passes on shared-pool devices elide copies for linear buffers while preserving identical output contents; texture passes emit layout conversion blits.
 - [ ] Full test suite passes in the snapshot (`axiomc2.exe`).
 - [ ] Report `_workspaces/reports/T964-report.md` with exact `## Files changed`.
 
@@ -35,10 +37,11 @@ Implement the high-level `std.gpu.runtime`, `std.gpu.pipeline`, and `std.gfx.com
 - Editing `docs/` or `bootstrap/axiom0/` (frozen at `axiom0-frozen`).
 
 ## Notes
-- Phase P22 (`P22-gpu-heterogeneous-computing`), depends on P11 gate `T311`, P12 gate `T312`, and P16 gate `T316` (`ROADMAP.md` §2–§3).
+- Phase P22 (`P22-gpu-heterogeneous-computing`), depends on P11 gate `T311`, P12 gate `T312`, P16 gate `T316`, and `T963`.
 - `bootstrap/axiom0` is frozen at tag `axiom0-frozen` (ROADMAP R3); all compiler and library changes live in `compiler/` and `std/`.
 - Build and test inside the task snapshot (`python tools/build_axiomc.py --out build-snap-T964/build` and `python tools/axtest.py --compiler build-snap-T964/build/axiomc2.exe --exclude-requires axiom0-internal`).
 - All Axiom source code and examples use canonical syntax (`axiom-syntax`): `=` for binding/assignment (no `:=`, no `var`), `.` for module/type paths (no `::`).
 
 ## Log
 - 2026-11-03 10:55:00 created by T222 (P22 phase planning)
+- 2026-11-10 22:30:00 updated by architect (ADR-0040 revision: RenderGraph linear buffer copy elision vs texture tiling blit)
