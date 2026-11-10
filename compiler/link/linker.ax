@@ -57,6 +57,7 @@ use compiler.obj.coff.IMPORT_OBJECT_NAME_UNDECORATE
 use compiler.obj.coff.IMAGE_FILE_MACHINE_AMD64
 use compiler.obj.coff.IMAGE_SCN_CNT_INITIALIZED_DATA
 use compiler.obj.coff.IMAGE_SCN_MEM_READ
+use compiler.obj.coff.IMAGE_SCN_MEM_WRITE
 use compiler.obj.coff.IMAGE_SCN_MEM_DISCARDABLE
 use compiler.obj.coff.IMAGE_SYM_CLASS_EXTERNAL
 use compiler.obj.coff.IMAGE_REL_AMD64_ADDR64
@@ -105,6 +106,7 @@ use compiler.link.pe.PE_DIR_EXPORT
 use compiler.link.pe.PE_DIR_IMPORT
 use compiler.link.pe.PE_DIR_BASERELOC
 use compiler.link.pe.PE_DIR_IAT
+use compiler.link.pe.PE_DIR_TLS
 use compiler.link.pe.AX_LINK_BAD_ARCHIVE
 use compiler.link.pe.AX_LINK_LIBRARY_NOT_FOUND
 use compiler.link.pe.AX_LINK_DUPLICATE_EXPORT
@@ -149,6 +151,7 @@ use compiler.link.pe.linker_append_section_data
 use compiler.link.pe.linker_append_section_data_pad
 use compiler.link.pe.linker_find_global
 use compiler.link.pe.linker_add_global
+use compiler.link.pe.linker_add_global_str
 use compiler.link.pe.linker_add_reloc
 use compiler.link.pe.linker_add_reloc_direct
 use compiler.link.pe.linker_reloc_at
@@ -315,6 +318,9 @@ pub fn linker_report_duplicate_symbol(diag: *mut DiagSink, sym_name: *const u8) 
 }
 
 pub fn linker_report_undefined_symbol(diag: *mut DiagSink, sym_name: *const u8) {
+    if (diag as usize) == 0 {
+        return;
+    }
     linker_report_diag(diag, AX_LINK_UNDEFINED_SYMBOL, sym_name, cstr_len(sym_name));
 }
 
@@ -1136,6 +1142,8 @@ pub fn linker_emit_pe_image(
             PeDataDirectory { virtual_address: import_dir_rva, size: import_dir_size }
         } else if d_idx == PE_DIR_IAT {
             PeDataDirectory { virtual_address: iat_dir_rva, size: iat_dir_size }
+        } else if d_idx == PE_DIR_TLS && ctx.tls_dir_size > 0u32 {
+            PeDataDirectory { virtual_address: ctx.tls_dir_rva, size: ctx.tls_dir_size }
         } else {
             PeDataDirectory { virtual_address: 0u32, size: 0u32 }
         };
@@ -2021,6 +2029,102 @@ fn linker_rewrite_resolved_dollar_relocs(ctx: mut_view<LinkerContext>, imports: 
     }
 }
 
+pub struct LinkerTlsInfo {
+    pub has_tls: bool,
+    pub tls_sec: *mut MergedSection,
+    pub data_sec: *mut MergedSection,
+    pub rdata_sec: *mut MergedSection,
+    pub tls_index_off: u32,
+    pub callbacks_off: u32,
+    pub tls_dir_off: u32,
+}
+
+pub fn linker_build_tls_directory_pre_rva(
+    ctx: mut_view<LinkerContext>,
+    out_info: mut_view<LinkerTlsInfo>
+) {
+    let tls_sec = linker_find_section_str(view(*ctx), { ".tls" });
+    if (tls_sec as usize) == 0 || (unsafe { (*tls_sec).size }) == 0u32 {
+        out_info.has_tls = false;
+        return;
+    }
+
+    let data_chars = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
+    let data_sec = linker_get_or_create_section_str(mut_view(*ctx), { ".data" }, data_chars);
+
+    let mut tls_index_off: [1]u32 = [0u32];
+    let ptls_idx = unsafe { address_of(tls_index_off[0]) as *mut u32 };
+    linker_append_section_data(data_sec, 0 as *const u8, 4u32, 4u32, ptls_idx);
+
+    let g_tls_idx = linker_add_global_str(mut_view(*ctx), { "_tls_index" });
+    if (g_tls_idx as usize) != 0 && !(unsafe { (*g_tls_idx).defined }) {
+        unsafe {
+            (*g_tls_idx).sec = data_sec;
+            (*g_tls_idx).offset = tls_index_off[0];
+            (*g_tls_idx).defined = true;
+        }
+    }
+
+    let rdata_chars = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+    let rdata_sec = linker_get_or_create_section_str(mut_view(*ctx), { ".rdata" }, rdata_chars);
+
+    let mut callbacks_off: [1]u32 = [0u32];
+    let pcb = unsafe { address_of(callbacks_off[0]) as *mut u32 };
+    linker_append_section_data(rdata_sec, 0 as *const u8, 8u32, 8u32, pcb);
+
+    let mut tls_dir_off: [1]u32 = [0u32];
+    let pdir = unsafe { address_of(tls_dir_off[0]) as *mut u32 };
+    linker_append_section_data(rdata_sec, 0 as *const u8, 40u32, 8u32, pdir);
+
+    let g_tls_used = linker_add_global_str(mut_view(*ctx), { "_tls_used" });
+    if (g_tls_used as usize) != 0 && !(unsafe { (*g_tls_used).defined }) {
+        unsafe {
+            (*g_tls_used).sec = rdata_sec;
+            (*g_tls_used).offset = tls_dir_off[0];
+            (*g_tls_used).defined = true;
+        }
+    }
+
+    let tls_sz = unsafe { (*tls_sec).size };
+    linker_add_reloc_direct(mut_view(*ctx), rdata_sec, tls_dir_off[0] + 0u32, IMAGE_REL_AMD64_ADDR64, tls_sec, 0u32, 0i64);
+    linker_add_reloc_direct(mut_view(*ctx), rdata_sec, tls_dir_off[0] + 8u32, IMAGE_REL_AMD64_ADDR64, tls_sec, tls_sz, 0i64);
+    linker_add_reloc_direct(mut_view(*ctx), rdata_sec, tls_dir_off[0] + 16u32, IMAGE_REL_AMD64_ADDR64, data_sec, tls_index_off[0], 0i64);
+    linker_add_reloc_direct(mut_view(*ctx), rdata_sec, tls_dir_off[0] + 24u32, IMAGE_REL_AMD64_ADDR64, rdata_sec, callbacks_off[0], 0i64);
+
+    out_info.has_tls = true;
+    out_info.tls_sec = tls_sec;
+    out_info.data_sec = data_sec;
+    out_info.rdata_sec = rdata_sec;
+    out_info.tls_index_off = tls_index_off[0];
+    out_info.callbacks_off = callbacks_off[0];
+    out_info.tls_dir_off = tls_dir_off[0];
+}
+
+pub fn linker_patch_tls_directory_post_rva(
+    ctx: mut_view<LinkerContext>,
+    info: view<LinkerTlsInfo>,
+    image_base: u64
+) {
+    if !info.has_tls {
+        return;
+    }
+    let rdata_ptr = unsafe { (*info.rdata_sec).data };
+    let start_va: u64 = image_base + ((unsafe { (*info.tls_sec).rva }) as u64);
+    let end_va: u64 = start_va + ((unsafe { (*info.tls_sec).size }) as u64);
+    let index_va: u64 = image_base + ((unsafe { (*info.data_sec).rva }) as u64) + (info.tls_index_off as u64);
+    let cb_va: u64 = image_base + ((unsafe { (*info.rdata_sec).rva }) as u64) + (info.callbacks_off as u64);
+
+    coff_write_u64_le(rdata_ptr, (info.tls_dir_off + 0u32) as usize, start_va);
+    coff_write_u64_le(rdata_ptr, (info.tls_dir_off + 8u32) as usize, end_va);
+    coff_write_u64_le(rdata_ptr, (info.tls_dir_off + 16u32) as usize, index_va);
+    coff_write_u64_le(rdata_ptr, (info.tls_dir_off + 24u32) as usize, cb_va);
+    coff_write_u32_le(rdata_ptr, (info.tls_dir_off + 32u32) as usize, 0u32);
+    coff_write_u32_le(rdata_ptr, (info.tls_dir_off + 36u32) as usize, 0x00400000u32);
+
+    ctx.tls_dir_rva = (unsafe { (*info.rdata_sec).rva }) + info.tls_dir_off;
+    ctx.tls_dir_size = 40u32;
+}
+
 fn linker_finalize_with_archives_to_buf(
     ctx: mut_view<LinkerContext>,
     candidates: mut_view<ArchiveCandidateList>,
@@ -2048,7 +2152,18 @@ fn linker_finalize_with_archives_to_buf(
     import_emit_thunks(view(imports), mut_view(*ctx), text_sec);
 
     let idata_sec = import_build_idata_section(mut_view(imports), mut_view(*ctx));
+    let mut tls_info = LinkerTlsInfo {
+        has_tls: false,
+        tls_sec: 0 as *mut MergedSection,
+        data_sec: 0 as *mut MergedSection,
+        rdata_sec: 0 as *mut MergedSection,
+        tls_index_off: 0u32,
+        callbacks_off: 0u32,
+        tls_dir_off: 0u32,
+    };
+    linker_build_tls_directory_pre_rva(mut_view(*ctx), mut_view(tls_info));
     let size_of_image = linker_assign_rvas(mut_view(*ctx), PE_DEFAULT_FILE_ALIGN, PE_DEFAULT_SECTION_ALIGN);
+    linker_patch_tls_directory_post_rva(mut_view(*ctx), view(tls_info), pe_default_image_base());
     import_patch_idata_rvas(view(imports), idata_sec);
 
     if !linker_apply_relocations(mut_view(*ctx), pe_default_image_base(), diag) {
@@ -2101,6 +2216,8 @@ pub fn pe_link_coff_buffers_to_buf(
         num_relocs: 0,
         cap_relocs: 0,
         str_arena: 0 as *mut compiler.kernel.arena.Arena,
+        tls_dir_rva: 0u32,
+        tls_dir_size: 0u32,
     };
     linker_context_init(mut_view(ctx));
     let mut candidates = archive_cand_list_new();
@@ -3034,6 +3151,8 @@ pub fn linker_emit_dll_pe_image(
             PeDataDirectory { virtual_address: reloc_dir_rva, size: reloc_dir_size }
         } else if d_idx == PE_DIR_IAT {
             PeDataDirectory { virtual_address: iat_dir_rva, size: iat_dir_size }
+        } else if d_idx == PE_DIR_TLS && ctx.tls_dir_size > 0u32 {
+            PeDataDirectory { virtual_address: ctx.tls_dir_rva, size: ctx.tls_dir_size }
         } else {
             PeDataDirectory { virtual_address: 0u32, size: 0u32 }
         };
@@ -3229,12 +3348,24 @@ fn linker_finalize_dll_with_archives_to_buf(
 
     let idata_sec = import_build_idata_section(mut_view(imports), mut_view(*ctx));
 
+    let mut tls_info = LinkerTlsInfo {
+        has_tls: false,
+        tls_sec: 0 as *mut MergedSection,
+        data_sec: 0 as *mut MergedSection,
+        rdata_sec: 0 as *mut MergedSection,
+        tls_index_off: 0u32,
+        callbacks_off: 0u32,
+        tls_dir_off: 0u32,
+    };
+    linker_build_tls_directory_pre_rva(mut_view(*ctx), mut_view(tls_info));
+
     // Create `.reloc` as the final section before assigning RVAs so `SizeOfHeaders` and all
     // preceding section RVAs/file-offsets are final prior to gathering `ADDR64` fixup RVAs.
     let reloc_chars = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE;
     let reloc_sec = linker_get_or_create_section_str(mut_view(*ctx), { ".reloc" }, reloc_chars);
 
     let _ = linker_assign_rvas(mut_view(*ctx), PE_DEFAULT_FILE_ALIGN, PE_DEFAULT_SECTION_ALIGN);
+    linker_patch_tls_directory_post_rva(mut_view(*ctx), view(tls_info), pe_default_dll_image_base());
     pe_patch_edata_rvas(mut_view(*dll_state), view(*ctx), edata_sec, dll_name_off);
     import_patch_idata_rvas(view(imports), idata_sec);
 
@@ -4840,8 +4971,19 @@ fn linker_finalize_v2_with_archives_to_buf(
     import_emit_thunks(view(imports), mut_view(*ctx), text_sec);
 
     let idata_sec = import_build_idata_section(mut_view(imports), mut_view(*ctx));
+    let mut tls_info = LinkerTlsInfo {
+        has_tls: false,
+        tls_sec: 0 as *mut MergedSection,
+        data_sec: 0 as *mut MergedSection,
+        rdata_sec: 0 as *mut MergedSection,
+        tls_index_off: 0u32,
+        callbacks_off: 0u32,
+        tls_dir_off: 0u32,
+    };
+    linker_build_tls_directory_pre_rva(mut_view(*ctx), mut_view(tls_info));
     linker_sort_sections_canonical(mut_view(*ctx));
     let size_of_image = linker_assign_rvas(mut_view(*ctx), PE_DEFAULT_FILE_ALIGN, PE_DEFAULT_SECTION_ALIGN);
+    linker_patch_tls_directory_post_rva(mut_view(*ctx), view(tls_info), pe_default_image_base());
     import_patch_idata_rvas(view(imports), idata_sec);
 
     if !linker_apply_relocations_v2(mut_view(*ctx), view(*v2), pe_default_image_base(), diag) {
@@ -4908,11 +5050,23 @@ fn linker_finalize_dll_v2_with_archives_to_buf(
 
     let idata_sec = import_build_idata_section(mut_view(imports), mut_view(*ctx));
 
+    let mut tls_info = LinkerTlsInfo {
+        has_tls: false,
+        tls_sec: 0 as *mut MergedSection,
+        data_sec: 0 as *mut MergedSection,
+        rdata_sec: 0 as *mut MergedSection,
+        tls_index_off: 0u32,
+        callbacks_off: 0u32,
+        tls_dir_off: 0u32,
+    };
+    linker_build_tls_directory_pre_rva(mut_view(*ctx), mut_view(tls_info));
+
     let reloc_chars = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE;
     let reloc_sec = linker_get_or_create_section_str(mut_view(*ctx), { ".reloc" }, reloc_chars);
 
     linker_sort_sections_canonical(mut_view(*ctx));
     let _ = linker_assign_rvas(mut_view(*ctx), PE_DEFAULT_FILE_ALIGN, PE_DEFAULT_SECTION_ALIGN);
+    linker_patch_tls_directory_post_rva(mut_view(*ctx), view(tls_info), pe_default_dll_image_base());
     pe_patch_edata_rvas(mut_view(*dll_state), view(*ctx), edata_sec, dll_name_off);
     import_patch_idata_rvas(view(imports), idata_sec);
 
@@ -4980,6 +5134,8 @@ pub fn pe_link_multi_objs_and_libs_to_buf(
         num_relocs: 0,
         cap_relocs: 0,
         str_arena: 0 as *mut compiler.kernel.arena.Arena,
+        tls_dir_rva: 0u32,
+        tls_dir_size: 0u32,
     };
     linker_context_init(mut_view(ctx));
     let mut v2 = link_v2_context_new();
@@ -5179,6 +5335,8 @@ pub fn pe_link_dll_multi_objs_and_libs_to_buf(
         num_relocs: 0,
         cap_relocs: 0,
         str_arena: 0 as *mut compiler.kernel.arena.Arena,
+        tls_dir_rva: 0u32,
+        tls_dir_size: 0u32,
     };
     linker_context_init(mut_view(ctx));
     let mut v2 = link_v2_context_new();

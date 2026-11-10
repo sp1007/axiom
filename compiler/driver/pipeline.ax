@@ -169,6 +169,7 @@ use compiler.backend.session.backend_promote_const_aggregates
 use compiler.backend.session.backend_emit_const_tables
 use compiler.backend.session.backend_lower_fn_to_mc_checked_opt
 use compiler.backend.session.backend_emit_fn_strings_rdata
+use compiler.backend.session.backend_format_const_sym_name
 use compiler.backend.session.session_emit_lir_mir_text_opt
 use compiler.backend.session.session_emit_mi_mir_text_opt
 use compiler.backend.session.session_emit_mc_mir_text_opt
@@ -188,9 +189,11 @@ use compiler.obj.coff.SectionId
 use compiler.obj.coff.SEC_CODE
 use compiler.obj.coff.SEC_RODATA
 use compiler.obj.coff.SEC_DIRECTIVE
+use compiler.obj.coff.SEC_TLS
 use compiler.obj.coff.SEC_FLAG_NONE
 use compiler.obj.coff.SEC_FLAG_EXEC
 use compiler.obj.coff.SEC_FLAG_READ
+use compiler.obj.coff.SEC_FLAG_WRITE
 use compiler.obj.coff.SYM_GLOBAL
 use compiler.obj.coff.SYM_LOCAL
 use compiler.obj.coff.SYM_EXTERNAL
@@ -526,6 +529,7 @@ pub struct PipelineCtx {
     pub ast: Ast,
     pub rmap: ResolveMap,
     pub hir: HirFile,
+    pub has_tls: bool,
     pub thir: Thir,
     pub mono: MonoEngine,
     pub time_ns: [10]u64,
@@ -574,6 +578,7 @@ pub fn pipeline_ctx_init(ctx: mut_view<PipelineCtx>) {
     ctx.rmap.next_std_symbol_v = 10000u32;
     ctx.rmap.naming_ctx = 0 as *mut NamingCtx;
     ctx.hir.items = 0 as *mut HirItem;
+    ctx.has_tls = false;
     opts_arena_init(mut_view(ctx.thir.interner.arena));
     thir_init(mut_view(ctx.thir));
     let hir_arena_ptr = unsafe { ptr_from_mut(mut_view(ctx.hir_arena)) };
@@ -879,6 +884,40 @@ pub fn pipeline_stage_hir(ctx: mut_view<PipelineCtx>) {
         view(ctx.rmap)
     );
     ctx.hir.items = hf.items;
+    let mut any_tls = false;
+    let mut it_scan = hf.items;
+    while (it_scan as usize) != 0 {
+        if (unsafe { (*it_scan).kind }) == HIR_ITEM_STATIC && (unsafe { (*it_scan).is_tls }) {
+            any_tls = true;
+            break;
+        }
+        it_scan = unsafe { (*it_scan).next };
+    }
+    ctx.has_tls = any_tls;
+}
+
+fn pipeline_mask_tls_statics(items: *mut HirItem) {
+    let mut it = items;
+    while (it as usize) != 0 {
+        unsafe {
+            if (*it).kind == HIR_ITEM_STATIC && (*it).is_tls {
+                (*it).kind = 255u8;
+            }
+            it = (*it).next;
+        }
+    }
+}
+
+fn pipeline_unmask_tls_statics(items: *mut HirItem) {
+    let mut it = items;
+    while (it as usize) != 0 {
+        unsafe {
+            if (*it).kind == 255u8 {
+                (*it).kind = HIR_ITEM_STATIC;
+            }
+            it = (*it).next;
+        }
+    }
 }
 
 pub fn pipeline_stage_typeck(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptions>) {
@@ -905,6 +944,9 @@ pub fn pipeline_stage_typeck(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptio
     if session_has_errors(view(ctx.sess)) {
         return;
     }
+    if ctx.has_tls {
+        pipeline_mask_tls_statics(ctx.hir.items);
+    }
     let _ = session_comptime_check_and_eval(
         mut_view(ctx.sess),
         view(ctx.ast),
@@ -912,6 +954,9 @@ pub fn pipeline_stage_typeck(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptio
         view(ctx.hir),
         mut_view(ctx.thir)
     );
+    if ctx.has_tls {
+        pipeline_unmask_tls_statics(ctx.hir.items);
+    }
 }
 
 pub fn pipeline_stage_own(ctx: mut_view<PipelineCtx>) {
@@ -2619,6 +2664,194 @@ fn pipe_alloc_exp_const_sym(
     StrView { ptr: dst as *const u8, len: base_len }
 }
 
+fn pipe_tls_emit_fn_reloc_at(
+    ctx: mut_view<PipelineCtx>,
+    obj: mut_view<ObjModel>,
+    tls_sec_id_v: u32,
+    fn_sym_v: u32,
+    reloc_off: u32
+) {
+    if fn_sym_v == 0u32 || (ctx.hir.items as usize) == 0 { return; }
+    let mut cur: *mut HirItem = ctx.hir.items;
+    let mut fn_name_id: u32 = 0u32;
+    while (cur as usize) != 0 {
+        if (unsafe { (*cur).symbol.v }) == fn_sym_v {
+            fn_name_id = unsafe { (*cur).name.v };
+            break;
+        }
+        cur = unsafe { (*cur).next };
+    }
+    if fn_name_id == 0u32 { return; }
+    let fname_sv = interner_get(view(ctx.sess.interner), StrId { v: fn_name_id });
+    if fname_sv.len == 0 { return; }
+
+    let mut fn_obj_sym = objmodel_find_symbol_bytes(view(*obj), fname_sv.ptr, fname_sv.len);
+    if fn_obj_sym.v == 0u32 {
+        fn_obj_sym = objmodel_add_symbol_bytes(
+            mut_view(*obj),
+            fname_sv.ptr,
+            fname_sv.len,
+            SectionId { v: 0u32 },
+            0u64,
+            0u64,
+            SYM_GLOBAL
+        );
+    }
+    let tls_sec = objmodel_get_section_mut(mut_view(*obj), SectionId { v: tls_sec_id_v });
+    section_add_reloc(
+        unsafe { mut_view(*tls_sec) },
+        reloc_off,
+        RELOC_X86_64_64,
+        fn_obj_sym,
+        0i64
+    );
+}
+
+fn pipe_tls_emit_fn_reloc(
+    ctx: mut_view<PipelineCtx>,
+    obj: mut_view<ObjModel>,
+    tls_sec_id_v: u32,
+    fn_sym_v: u32
+) {
+    let tls_sec = objmodel_get_section_mut(mut_view(*obj), SectionId { v: tls_sec_id_v });
+    let off = unsafe { (*tls_sec).bytes_len as u32 };
+    pipe_tls_emit_fn_reloc_at(mut_view(*ctx), mut_view(*obj), tls_sec_id_v, fn_sym_v, off);
+}
+
+fn pipe_emit_one_tls_item(
+    ctx: mut_view<PipelineCtx>,
+    it: *mut HirItem,
+    obj: mut_view<ObjModel>,
+    tls_sec_id_v: u32
+) {
+    let sym_v = unsafe { (*it).symbol.v };
+    let mut sz: usize = 8;
+    let mut al: usize = 8;
+    let p_ity = thir_get_item_type(view(ctx.thir), it as *const HirItem);
+    if (p_ity as usize) != 0 {
+        let ity_v = unsafe { (*p_ity).v };
+        sz = type_size(TypeId { v: ity_v }, view(ctx.thir.interner)) as usize;
+        al = type_align(TypeId { v: ity_v }, view(ctx.thir.interner)) as usize;
+    }
+    if sz == 0 { sz = 8; }
+    if al == 0 { al = 8; }
+
+    let tls_sec = objmodel_get_section_mut(mut_view(*obj), SectionId { v: tls_sec_id_v });
+    while ((unsafe { (*tls_sec).bytes_len }) % al) != 0 {
+        section_add_byte(unsafe { mut_view(*tls_sec) }, 0u8);
+    }
+    let sym_offset = unsafe { (*tls_sec).bytes_len as u64 };
+
+    let cval = sym_constmap_get(view(ctx.thir.symbol_consts), SymbolId { v: sym_v });
+    if (cval as usize) != 0 && (unsafe { (*cval).kind }) == CONST_AGGREGATE && (unsafe { (*cval).agg_data as usize }) != 0 {
+        let agg_ptr = unsafe { (*cval).agg_data };
+        let agg_sz = unsafe { (*cval).agg_size };
+        let fn_sym_v = unsafe { (*cval).alloc_id };
+        if fn_sym_v != 0u32 {
+            pipe_tls_emit_fn_reloc(mut_view(*ctx), mut_view(*obj), tls_sec_id_v, fn_sym_v);
+        }
+        if agg_sz >= 16 {
+            let drop_sym_v = unsafe { *((agg_ptr + 8) as *const u64) as u32 };
+            if drop_sym_v != 0u32 {
+                pipe_tls_emit_fn_reloc_at(mut_view(*ctx), mut_view(*obj), tls_sec_id_v, drop_sym_v, (sym_offset + 8) as u32);
+            }
+        }
+        section_add_bytes(unsafe { mut_view(*tls_sec) }, agg_ptr as *const u8, agg_sz);
+    } else if (cval as usize) != 0 && (unsafe { (*cval).kind }) == CONST_INT {
+        let ival = unsafe { (*cval).int_val };
+        let to_write = if sz > 8 { 8 } else { sz };
+        let mut b_idx: usize = 0;
+        while b_idx < to_write {
+            let byte_val = ((ival >> ((b_idx as u64) * 8u64)) & 0xFFu64) as u8;
+            section_add_byte(unsafe { mut_view(*tls_sec) }, byte_val);
+            b_idx = b_idx + 1;
+        }
+        while b_idx < sz {
+            section_add_byte(unsafe { mut_view(*tls_sec) }, 0u8);
+            b_idx = b_idx + 1;
+        }
+    } else {
+        let mut zi: usize = 0;
+        while zi < sz {
+            section_add_byte(unsafe { mut_view(*tls_sec) }, 0u8);
+            zi = zi + 1;
+        }
+    }
+
+    while ((unsafe { (*tls_sec).bytes_len }) % 8) != 0 {
+        section_add_byte(unsafe { mut_view(*tls_sec) }, 0u8);
+    }
+
+    let name_sv = backend_format_const_sym_name(
+        mut_view(ctx.backend_arena),
+        unsafe { address_of(ctx.hir) as *const HirFile },
+        unsafe { address_of(ctx.sess.interner) as *const StrInterner },
+        sym_v
+    );
+    let _ = objmodel_add_symbol_bytes(
+        mut_view(*obj),
+        name_sv.ptr,
+        name_sv.len,
+        SectionId { v: tls_sec_id_v },
+        sym_offset,
+        sz as u64,
+        SYM_GLOBAL
+    );
+
+    let raw_name_sv = interner_get(view(ctx.sess.interner), unsafe { (*it).name });
+    if raw_name_sv.len > 0 {
+        let _ = objmodel_add_symbol_bytes(
+            mut_view(*obj),
+            raw_name_sv.ptr,
+            raw_name_sv.len,
+            SectionId { v: tls_sec_id_v },
+            sym_offset,
+            sz as u64,
+            if (unsafe { (*it).vis.kind }) != 0u8 { SYM_GLOBAL } else { SYM_LOCAL }
+        );
+    }
+}
+
+fn pipe_emit_tls_statics(
+    ctx: mut_view<PipelineCtx>,
+    filter_fid_v: u32,
+    obj: mut_view<ObjModel>
+) {
+    if !ctx.has_tls {
+        return;
+    }
+
+    // ".tls$" (5 bytes)
+    let tls_name_arr: [5]u8 = [46u8, 116u8, 108u8, 115u8, 36u8];
+    let tls_name_buf = arena_alloc_raw(mut_view(ctx.backend_arena), 6, 1);
+    let mut ni: usize = 0;
+    while ni < 5 {
+        unsafe { *(tls_name_buf + ni) = tls_name_arr[ni]; }
+        ni = ni + 1;
+    }
+    unsafe { *(tls_name_buf + 5) = 0u8; }
+
+    let tls_sec_id = objmodel_add_section_bytes(
+        mut_view(*obj),
+        tls_name_buf as *const u8,
+        5,
+        SEC_TLS,
+        SEC_FLAG_READ | SEC_FLAG_WRITE,
+        8u32
+    );
+    let tls_sec_id_v = tls_sec_id.v;
+
+    let mut it2: *mut HirItem = ctx.hir.items;
+    while (it2 as usize) != 0 {
+        if (unsafe { (*it2).kind }) == HIR_ITEM_STATIC && (unsafe { (*it2).is_tls }) {
+            if filter_fid_v == 0u32 || (unsafe { (*it2).span.file.v }) == filter_fid_v {
+                pipe_emit_one_tls_item(mut_view(*ctx), it2, mut_view(*obj), tls_sec_id_v);
+            }
+        }
+        it2 = unsafe { (*it2).next };
+    }
+}
+
 fn pipe_emit_exported_consts(
     ctx: mut_view<PipelineCtx>,
     for_lib: bool,
@@ -3933,6 +4166,8 @@ fn driver_emit_objmodel_filtered_ex(
         SectionId { v: rdata_id_v },
         mut_view(cstr_counter)
     );
+
+    pipe_emit_tls_statics(mut_view(*ctx), filter_fid_v, mut_view(*obj));
 
     let mut drectve_buf = coff_buf_with_capacity(64);
     let mut fi: usize = 0;

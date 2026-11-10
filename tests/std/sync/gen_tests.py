@@ -21,6 +21,7 @@ COMMON_PREREQS = [
     "std/time/time.ax",
     "std/text/utf8.ax",
     "std/text/string.ax",
+    "std/thread/local.ax",
     "std/thread/mod.ax",
 ]
 

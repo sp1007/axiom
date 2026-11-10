@@ -1379,6 +1379,200 @@ impl String {
     pub fn slice(self: view<String>, start: usize, end: usize) -> Result<String, Utf8Error> { string_slice(self, start, end) }
 }
 
+module std.thread.local
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic fn needs_drop<T>() -> bool { false }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+@intrinsic unsafe fn drop_in_place<T>(p: *mut T) {}
+@intrinsic fn panic(msg: str) {}
+
+pub fn default_local_drop(ptr: *mut u8) -> () {
+    if (ptr as usize) != 0 {
+        unsafe {
+            heap_free(ptr, 8usize, 8usize);
+        }
+    }
+}
+
+pub struct LocalSlotNode {
+    pub slot_id: usize,
+    pub val_ptr: *mut u8,
+    pub borrow_state: i32,
+    pub drop_fn: fn(*mut u8) -> (),
+    pub next: *mut LocalSlotNode,
+}
+
+@thread_local
+static mut LOCAL_SLOTS_HEAD: *mut LocalSlotNode = 0 as *mut LocalSlotNode;
+
+pub struct LocalKey<T> {
+    pub init_fn: fn() -> T,
+    pub drop_fn: fn(*mut u8) -> (),
+    pub slot_id: u32,
+}
+
+impl<T> !Send for LocalKey<T> {}
+impl<T> !Share for LocalKey<T> {}
+
+pub fn local_key_new<T>(init_fn: fn() -> T) -> LocalKey<T> {
+    LocalKey {
+        init_fn: init_fn,
+        drop_fn: default_local_drop,
+        slot_id: 0u32,
+    }
+}
+
+pub fn local_key_new_with_drop<T>(init_fn: fn() -> T, drop_fn: fn(*mut u8) -> ()) -> LocalKey<T> {
+    LocalKey {
+        init_fn: init_fn,
+        drop_fn: drop_fn,
+        slot_id: 0u32,
+    }
+}
+
+impl<T> LocalKey<T> {
+    pub fn new(init_fn: fn() -> T) -> LocalKey<T> {
+        LocalKey {
+            init_fn: init_fn,
+            drop_fn: default_local_drop,
+            slot_id: 0u32,
+        }
+    }
+
+    pub fn new_with_drop(init_fn: fn() -> T, drop_fn: fn(*mut u8) -> ()) -> LocalKey<T> {
+        LocalKey {
+            init_fn: init_fn,
+            drop_fn: drop_fn,
+            slot_id: 0u32,
+        }
+    }
+
+    fn find_or_create_node(self: view<LocalKey<T>>) -> *mut LocalSlotNode {
+        let mut target_id: usize = self.slot_id as usize;
+        if target_id == 0usize {
+            target_id = unsafe { *(address_of(self) as *const usize) };
+        }
+        let mut cur = unsafe { LOCAL_SLOTS_HEAD };
+        while (cur as usize) != 0 {
+            if (unsafe { (*cur).slot_id }) == target_id {
+                return cur;
+            }
+            cur = unsafe { (*cur).next };
+        }
+
+        let init = self.init_fn;
+        let val: T = init();
+        let box_sz = if size_of<T>() == 0 { 8 } else { size_of<T>() };
+        let box_al = if align_of<T>() < 8 { 8 } else { align_of<T>() };
+        let v_raw = unsafe { heap_alloc(box_sz, box_al) };
+        if (v_raw as usize) == 0 {
+            panic("out of memory allocating LocalKey storage");
+        }
+        let v_box = v_raw as *mut T;
+        unsafe {
+            *v_box = val;
+        }
+
+        let node_raw = unsafe { heap_alloc(size_of<LocalSlotNode>(), align_of<LocalSlotNode>()) };
+        if (node_raw as usize) == 0 {
+            panic("out of memory allocating LocalSlotNode");
+        }
+        let node = node_raw as *mut LocalSlotNode;
+        unsafe {
+            *node = LocalSlotNode {
+                slot_id: target_id,
+                val_ptr: v_raw,
+                borrow_state: 0i32,
+                drop_fn: self.drop_fn,
+                next: LOCAL_SLOTS_HEAD,
+            };
+            LOCAL_SLOTS_HEAD = node;
+        }
+        node
+    }
+
+    pub fn with(self: view<LocalKey<T>>, f: fn(view<T>) -> ()) {
+        let node = self.find_or_create_node();
+        let st = unsafe { (*node).borrow_state };
+        if st < 0 {
+            panic("LocalKey: cannot borrow immutably while mutably borrowed");
+        }
+        let val_raw: *const T = unsafe { (*node).val_ptr as *const T };
+        let v: view<T> = unsafe { view(*val_raw) };
+        unsafe {
+            (*node).borrow_state = st + 1;
+        }
+        f(v);
+        unsafe {
+            (*node).borrow_state = (*node).borrow_state - 1;
+        }
+    }
+
+    pub fn with_mut(self: view<LocalKey<T>>, f: fn(mut_view<T>) -> ()) {
+        let node = self.find_or_create_node();
+        let st = unsafe { (*node).borrow_state };
+        if st != 0 {
+            panic("LocalKey: cannot borrow mutably while already borrowed");
+        }
+        let val_raw: *mut T = unsafe { (*node).val_ptr as *mut T };
+        let v: mut_view<T> = unsafe { mut_view(*val_raw) };
+        unsafe {
+            (*node).borrow_state = -1;
+        }
+        f(v);
+        unsafe {
+            (*node).borrow_state = 0;
+        }
+    }
+
+    pub fn get(self: view<LocalKey<T>>) -> T where T: Copy {
+        let node = self.find_or_create_node();
+        let st = unsafe { (*node).borrow_state };
+        if st < 0 {
+            panic("LocalKey: cannot borrow immutably while mutably borrowed");
+        }
+        let ptr = unsafe { (*node).val_ptr };
+        unsafe { *(ptr as *const T) }
+    }
+
+    pub fn set(self: view<LocalKey<T>>, val: T) {
+        let node = self.find_or_create_node();
+        let st = unsafe { (*node).borrow_state };
+        if st != 0 {
+            panic("LocalKey: cannot borrow mutably while already borrowed");
+        }
+        let ptr = unsafe { (*node).val_ptr };
+        unsafe { *(ptr as *mut T) = val; }
+    }
+}
+
+pub fn thread_local_cleanup() {
+    let mut cur = unsafe { LOCAL_SLOTS_HEAD };
+    unsafe {
+        LOCAL_SLOTS_HEAD = 0 as *mut LocalSlotNode;
+    }
+    while (cur as usize) != 0 {
+        let next_node = unsafe { (*cur).next };
+        let dfn = unsafe { (*cur).drop_fn };
+        let vp = unsafe { (*cur).val_ptr };
+        let dfn_addr = unsafe { *(address_of(dfn) as *const usize) };
+        if dfn_addr != 0usize && (vp as usize) != 0 {
+            dfn(vp);
+        }
+        unsafe {
+            heap_free(cur as *mut u8, size_of<LocalSlotNode>(), align_of<LocalSlotNode>());
+        }
+        cur = next_node;
+    }
+}
+
 module std.thread
 
 use std.core.host.heap_alloc
@@ -1397,6 +1591,10 @@ use std.text.string.string_new
 use std.text.string.string_with_capacity
 use std.text.string.string_clone
 use std.time.Duration
+pub use std.thread.local.LocalKey
+pub use std.thread.local.local_key_new
+pub use std.thread.local.local_key_new_with_drop
+pub use std.thread.local.thread_local_cleanup
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 @intrinsic fn align_of<T>() -> usize { 0 }
@@ -1633,6 +1831,7 @@ unsafe fn ax_spawn_trampoline<F: FnOnce<T> + Send, T: Send>(raw_typed: *mut (F, 
             heap_free(old_v, res_sz, res_al);
         }
         let r_raw = heap_alloc(res_sz, res_al);
+        thread_local_cleanup();
         let r_box = r_raw as *mut Result<T, ThreadPanic>;
         *r_box = Result.Err(make_thread_panic(ThreadId { id: (*slot).assigned_tid }));
         (*slot).val_ptr = r_raw;
@@ -1656,6 +1855,7 @@ unsafe fn ax_spawn_trampoline<F: FnOnce<T> + Send, T: Send>(raw_typed: *mut (F, 
     heap_free(c_ptr, box_size(size_of<F>()), box_align(align_of<F>()));
 
     let out_val: T = f_val();
+    thread_local_cleanup();
     let v_raw = heap_alloc(res_sz, res_al);
     let v_box = v_raw as *mut Result<T, ThreadPanic>;
     *v_box = Result.Ok(out_val);

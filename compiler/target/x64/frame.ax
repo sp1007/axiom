@@ -47,6 +47,7 @@ use compiler.lir.lir.LIR_INST_OFFSET
 use compiler.lir.lir.LIR_INST_CONST
 use compiler.lir.lir.LIR_INST_CONST_STR
 use compiler.lir.lir.LIR_INST_FN_ADDR
+use compiler.lir.lir.LIR_INST_TLS_ADDR
 use compiler.lir.lir.LIR_INST_SADD_OVERFLOW
 use compiler.lir.lir.LIR_INST_UREM_OVERFLOW
 use compiler.lir.lir.LIR_INST_CALL
@@ -173,6 +174,7 @@ use compiler.target.x64.encode.X64_MI_MFENCE
 use compiler.target.x64.encode.X64_MI_PAUSE
 use compiler.target.x64.encode.X64_MI_COMPILER_BARRIER
 use compiler.target.x64.encode.X64_MI_ATOMIC_RMW_LOOP
+use compiler.target.x64.encode.X64_MI_TLS_ADDR
 use compiler.target.x64.encode.X64Mem
 use compiler.target.x64.encode.x64_mov_rr
 use compiler.target.x64.encode.x64_mov_rm
@@ -214,6 +216,7 @@ use compiler.target.x64.encode.x64_shr_rcl
 use compiler.target.x64.encode.x64_lea
 use compiler.target.x64.encode.x64_lea_sym
 use compiler.target.x64.encode.x64_lea_extern
+use compiler.target.x64.encode.x64_emit_tls_addr_obj
 use compiler.target.x64.encode.x64_cmp_rr
 use compiler.target.x64.encode.x64_cmp_rm
 use compiler.target.x64.encode.x64_cmp_ri
@@ -650,186 +653,136 @@ fn liveness_mark_natural_loop(
     }
 }
 
-pub fn x64_compute_liveness_in_arena(
-    arena: mut_view<Arena>,
+struct LivenessBitsets {
+    words_per_bb: usize,
+    vreg_count: usize,
+    use_bits: *mut u64,
+    def_bits: *mut u64,
+    live_in: *mut u64,
+    live_out: *mut u64,
+}
+
+fn liveness_record_lir_inst(
+    bs: *mut LivenessBitsets,
+    b: usize,
+    inst: *const LirInst
+) {
+    let use_bits = unsafe { (*bs).use_bits };
+    let def_bits = unsafe { (*bs).def_bits };
+    let words_per_bb = unsafe { (*bs).words_per_bb };
+    let vreg_count = unsafe { (*bs).vreg_count };
+
+    let kind = unsafe { (*inst).kind };
+    let dest_v = unsafe { (*inst).dest.v };
+    let lhs_v = unsafe { (*inst).lhs.v };
+    let rhs_v = unsafe { (*inst).rhs.v };
+    let op_v = unsafe { (*inst).operand.v };
+    let ptr_v = unsafe { (*inst).ptr.v };
+    let val_v = unsafe { (*inst).val.v };
+    let off_v = unsafe { (*inst).offset.v };
+    let dst_addr_v = unsafe { (*inst).dst_addr.v };
+    let callee_v = unsafe { (*inst).callee_vreg.v };
+    let cas_ok_v = unsafe { (*inst).cas_ok.v };
+
+    if (kind >= LIR_INST_ADD && kind <= LIR_INST_SAR) ||
+       (kind >= LIR_INST_ICMP_EQ && kind <= LIR_INST_ICMP_UGE) ||
+       (kind >= LIR_INST_SADD_OVERFLOW && kind <= LIR_INST_UREM_OVERFLOW) ||
+       kind == LIR_INST_UDIV || kind == LIR_INST_UREM {
+        liveness_record_use(use_bits, def_bits, words_per_bb, b, lhs_v, vreg_count);
+        liveness_record_use(use_bits, def_bits, words_per_bb, b, rhs_v, vreg_count);
+        liveness_record_def(def_bits, words_per_bb, b, dest_v, vreg_count);
+    } else if kind == LIR_INST_NEG || kind == LIR_INST_NOT || kind == LIR_INST_BITNOT {
+        liveness_record_use(use_bits, def_bits, words_per_bb, b, op_v, vreg_count);
+        liveness_record_def(def_bits, words_per_bb, b, dest_v, vreg_count);
+    } else if kind == LIR_INST_LOAD || kind == LIR_INST_ATOMIC_LOAD {
+        liveness_record_use(use_bits, def_bits, words_per_bb, b, ptr_v, vreg_count);
+        liveness_record_def(def_bits, words_per_bb, b, dest_v, vreg_count);
+    } else if kind == LIR_INST_STORE || kind == LIR_INST_ATOMIC_STORE {
+        liveness_record_use(use_bits, def_bits, words_per_bb, b, ptr_v, vreg_count);
+        liveness_record_use(use_bits, def_bits, words_per_bb, b, val_v, vreg_count);
+    } else if kind == LIR_INST_ATOMIC_RMW {
+        liveness_record_use(use_bits, def_bits, words_per_bb, b, ptr_v, vreg_count);
+        liveness_record_use(use_bits, def_bits, words_per_bb, b, val_v, vreg_count);
+        liveness_record_def(def_bits, words_per_bb, b, dest_v, vreg_count);
+    } else if kind == LIR_INST_ATOMIC_CAS {
+        liveness_record_use(use_bits, def_bits, words_per_bb, b, ptr_v, vreg_count);
+        liveness_record_use(use_bits, def_bits, words_per_bb, b, lhs_v, vreg_count);
+        liveness_record_use(use_bits, def_bits, words_per_bb, b, rhs_v, vreg_count);
+        liveness_record_def(def_bits, words_per_bb, b, dest_v, vreg_count);
+        liveness_record_def(def_bits, words_per_bb, b, cas_ok_v, vreg_count);
+    } else if kind == LIR_INST_OFFSET {
+        liveness_record_use(use_bits, def_bits, words_per_bb, b, ptr_v, vreg_count);
+        liveness_record_use(use_bits, def_bits, words_per_bb, b, off_v, vreg_count);
+        liveness_record_def(def_bits, words_per_bb, b, dest_v, vreg_count);
+    } else if kind == LIR_INST_STACK_ADDR || kind == LIR_INST_CONST ||
+              kind == LIR_INST_CONST_STR || kind == LIR_INST_FN_ADDR ||
+              kind == LIR_INST_TLS_ADDR ||
+              kind == LIR_INST_ABI_RESULT {
+        liveness_record_def(def_bits, words_per_bb, b, dest_v, vreg_count);
+    } else if kind == LIR_INST_ABI_ARG {
+        if dest_v != LIR_VREG_NONE {
+            liveness_record_def(def_bits, words_per_bb, b, dest_v, vreg_count);
+        } else {
+            liveness_record_use(use_bits, def_bits, words_per_bb, b, val_v, vreg_count);
+        }
+    } else if kind == LIR_INST_CALL {
+        liveness_record_use(use_bits, def_bits, words_per_bb, b, dst_addr_v, vreg_count);
+        liveness_record_use(use_bits, def_bits, words_per_bb, b, callee_v, vreg_count);
+    }
+}
+
+fn liveness_scan_mi_bb(
+    bs: *mut LivenessBitsets,
+    b: usize,
+    mbb: *const X64MIBb,
+    slot_offset: u32
+) {
+    let use_bits = unsafe { (*bs).use_bits };
+    let def_bits = unsafe { (*bs).def_bits };
+    let words_per_bb = unsafe { (*bs).words_per_bb };
+    let vreg_count = unsafe { (*bs).vreg_count };
+
+    let mut m_inst = unsafe { (*mbb).first_inst };
+    while (m_inst as usize) != 0 {
+        let opc = unsafe { (*m_inst).opcode };
+        let sz = unsafe { (*m_inst).size };
+        let oc = unsafe { (*m_inst).op_count };
+        let mut op_i: u8 = 1u8;
+        while op_i < oc {
+            let op = unsafe { (*m_inst).ops[op_i as usize] };
+            if op.kind == X64_OP_FRAME && op.frame.slot_id >= slot_offset {
+                let v_id = op.frame.slot_id - slot_offset;
+                liveness_record_use(use_bits, def_bits, words_per_bb, b, v_id, vreg_count);
+            }
+            op_i = op_i + 1u8;
+        }
+        if oc >= 1u8 {
+            let op0 = unsafe { (*m_inst).ops[0usize] };
+            if op0.kind == X64_OP_FRAME && op0.frame.slot_id >= slot_offset {
+                let v_id0 = op0.frame.slot_id - slot_offset;
+                if opc == X64_MI_MOV && op0.frame.offset == 0 && (sz == 8u8 || sz == 0u8) {
+                    liveness_record_def(def_bits, words_per_bb, b, v_id0, vreg_count);
+                } else {
+                    liveness_record_use(use_bits, def_bits, words_per_bb, b, v_id0, vreg_count);
+                }
+            }
+        }
+        m_inst = unsafe { (*m_inst).next };
+    }
+}
+
+fn liveness_solve_dataflow(
+    bs: *mut LivenessBitsets,
+    bb_count: usize,
     lir: view<LirBody>,
     body: view<X64MIBody>
-) -> X64LivenessInfo {
-    let bb_count = lir.bb_count;
-    let vreg_count = lir.vreg_count;
-    let slot_offset = lir.slot_count as u32;
-    let words_per_bb = if vreg_count == 0 { 1 } else { (vreg_count + 63) / 64 };
-    let total_words = lir_mul_usize(bb_count, words_per_bb);
+) {
+    let use_bits = unsafe { (*bs).use_bits };
+    let def_bits = unsafe { (*bs).def_bits };
+    let live_in = unsafe { (*bs).live_in };
+    let live_out = unsafe { (*bs).live_out };
+    let words_per_bb = unsafe { (*bs).words_per_bb };
 
-    let use_bits = bitset_alloc_zeroed(mut_view(*arena), total_words);
-    let def_bits = bitset_alloc_zeroed(mut_view(*arena), total_words);
-    let live_in = bitset_alloc_zeroed(mut_view(*arena), total_words);
-    let live_out = bitset_alloc_zeroed(mut_view(*arena), total_words);
-
-    let mut loop_depth: *mut u32 = 0 as *mut u32;
-    let mut bb_bounds: *mut u32 = 0 as *mut u32;
-    if bb_count > 0 {
-        let depth_bytes = lir_mul_usize(bb_count, size_of<u32>());
-        loop_depth = arena_alloc_raw(mut_view(*arena), depth_bytes, align_of<u32>()) as *mut u32;
-        let bounds_bytes = lir_mul_usize(lir_mul_usize(bb_count, 2), size_of<u32>());
-        bb_bounds = arena_alloc_raw(mut_view(*arena), bounds_bytes, align_of<u32>()) as *mut u32;
-        let mut z: usize = 0;
-        while z < bb_count {
-            unsafe {
-                *frame_u32_at(loop_depth, z) = 0u32;
-                *frame_u32_at(bb_bounds, lir_mul_usize(z, 2)) = 0u32;
-                *frame_u32_at(bb_bounds, lir_mul_usize(z, 2) + 1) = 0u32;
-            }
-            z = z + 1;
-        }
-    }
-
-    // Number program points: each MI instruction `m` occupies `[2*m, 2*m + 2)`.
-    let mut cur_mi_idx: u32 = 0u32;
-    let mut b: usize = 0;
-    while b < bb_count {
-        let start_pos = cur_mi_idx * 2u32;
-        if b < body.bb_count && (body.bbs as usize) != 0 {
-            let mbb = unsafe { x64_mi_bb_at(body.bbs, b) };
-            let mut inst = unsafe { (*mbb).first_inst };
-            let mut cnt: u32 = 0u32;
-            while (inst as usize) != 0 {
-                cnt = cnt + 1u32;
-                inst = unsafe { (*inst).next };
-            }
-            if cnt == 0u32 {
-                cnt = 1u32;
-            }
-            cur_mi_idx = cur_mi_idx + cnt;
-        } else {
-            let lbb0 = unsafe { lir_bb_at(lir.bbs, b) };
-            let ic = unsafe { (*lbb0).inst_count as u32 };
-            cur_mi_idx = cur_mi_idx + ic + 1u32;
-        }
-        let end_pos = cur_mi_idx * 2u32;
-        unsafe {
-            *frame_u32_at(bb_bounds, lir_mul_usize(b, 2)) = start_pos;
-            *frame_u32_at(bb_bounds, lir_mul_usize(b, 2) + 1) = end_pos;
-        }
-
-        if body.is_opt && b < body.bb_count && (body.bbs as usize) != 0 {
-            let mbb = unsafe { x64_mi_bb_at(body.bbs, b) };
-            let mut m_inst = unsafe { (*mbb).first_inst };
-            while (m_inst as usize) != 0 {
-                let opc = unsafe { (*m_inst).opcode };
-                let sz = unsafe { (*m_inst).size };
-                let oc = unsafe { (*m_inst).op_count };
-                let mut op_i: u8 = 1u8;
-                while op_i < oc {
-                    let op = unsafe { (*m_inst).ops[op_i as usize] };
-                    if op.kind == X64_OP_FRAME && op.frame.slot_id >= slot_offset {
-                        let v_id = op.frame.slot_id - slot_offset;
-                        liveness_record_use(use_bits, def_bits, words_per_bb, b, v_id, vreg_count);
-                    }
-                    op_i = op_i + 1u8;
-                }
-                if oc >= 1u8 {
-                    let op0 = unsafe { (*m_inst).ops[0usize] };
-                    if op0.kind == X64_OP_FRAME && op0.frame.slot_id >= slot_offset {
-                        let v_id0 = op0.frame.slot_id - slot_offset;
-                        if opc == X64_MI_MOV && op0.frame.offset == 0 && (sz == 8u8 || sz == 0u8) {
-                            liveness_record_def(def_bits, words_per_bb, b, v_id0, vreg_count);
-                        } else {
-                            liveness_record_use(use_bits, def_bits, words_per_bb, b, v_id0, vreg_count);
-                        }
-                    }
-                }
-                m_inst = unsafe { (*m_inst).next };
-            }
-        } else {
-            // Compute upward-exposed `use_bits[b]` and `def_bits[b]` from LIR instructions + terminator.
-            let lbb = unsafe { lir_bb_at(lir.bbs, b) };
-            let inst_count = unsafe { (*lbb).inst_count };
-            let insts_base = unsafe { (*lbb).insts };
-            let mut i: usize = 0;
-            while i < inst_count {
-                let inst = unsafe { lir_inst_at(insts_base, i) };
-                let kind = unsafe { (*inst).kind };
-                let dest_v = unsafe { (*inst).dest.v };
-                let lhs_v = unsafe { (*inst).lhs.v };
-                let rhs_v = unsafe { (*inst).rhs.v };
-                let op_v = unsafe { (*inst).operand.v };
-                let ptr_v = unsafe { (*inst).ptr.v };
-                let val_v = unsafe { (*inst).val.v };
-                let off_v = unsafe { (*inst).offset.v };
-                let dst_addr_v = unsafe { (*inst).dst_addr.v };
-                let callee_v = unsafe { (*inst).callee_vreg.v };
-                let cas_ok_v = unsafe { (*inst).cas_ok.v };
-
-                if (kind >= LIR_INST_ADD && kind <= LIR_INST_SAR) ||
-                   (kind >= LIR_INST_ICMP_EQ && kind <= LIR_INST_ICMP_UGE) ||
-                   (kind >= LIR_INST_SADD_OVERFLOW && kind <= LIR_INST_UREM_OVERFLOW) ||
-                   kind == LIR_INST_UDIV || kind == LIR_INST_UREM {
-                    liveness_record_use(use_bits, def_bits, words_per_bb, b, lhs_v, vreg_count);
-                    liveness_record_use(use_bits, def_bits, words_per_bb, b, rhs_v, vreg_count);
-                    liveness_record_def(def_bits, words_per_bb, b, dest_v, vreg_count);
-                } else if kind == LIR_INST_NEG || kind == LIR_INST_NOT || kind == LIR_INST_BITNOT {
-                    liveness_record_use(use_bits, def_bits, words_per_bb, b, op_v, vreg_count);
-                    liveness_record_def(def_bits, words_per_bb, b, dest_v, vreg_count);
-                } else if kind == LIR_INST_LOAD || kind == LIR_INST_ATOMIC_LOAD {
-                    liveness_record_use(use_bits, def_bits, words_per_bb, b, ptr_v, vreg_count);
-                    liveness_record_def(def_bits, words_per_bb, b, dest_v, vreg_count);
-                } else if kind == LIR_INST_STORE || kind == LIR_INST_ATOMIC_STORE {
-                    liveness_record_use(use_bits, def_bits, words_per_bb, b, ptr_v, vreg_count);
-                    liveness_record_use(use_bits, def_bits, words_per_bb, b, val_v, vreg_count);
-                } else if kind == LIR_INST_ATOMIC_RMW {
-                    liveness_record_use(use_bits, def_bits, words_per_bb, b, ptr_v, vreg_count);
-                    liveness_record_use(use_bits, def_bits, words_per_bb, b, val_v, vreg_count);
-                    liveness_record_def(def_bits, words_per_bb, b, dest_v, vreg_count);
-                } else if kind == LIR_INST_ATOMIC_CAS {
-                    liveness_record_use(use_bits, def_bits, words_per_bb, b, ptr_v, vreg_count);
-                    liveness_record_use(use_bits, def_bits, words_per_bb, b, lhs_v, vreg_count);
-                    liveness_record_use(use_bits, def_bits, words_per_bb, b, rhs_v, vreg_count);
-                    liveness_record_def(def_bits, words_per_bb, b, dest_v, vreg_count);
-                    liveness_record_def(def_bits, words_per_bb, b, cas_ok_v, vreg_count);
-                } else if kind == LIR_INST_OFFSET {
-                    liveness_record_use(use_bits, def_bits, words_per_bb, b, ptr_v, vreg_count);
-                    liveness_record_use(use_bits, def_bits, words_per_bb, b, off_v, vreg_count);
-                    liveness_record_def(def_bits, words_per_bb, b, dest_v, vreg_count);
-                } else if kind == LIR_INST_STACK_ADDR || kind == LIR_INST_CONST ||
-                          kind == LIR_INST_CONST_STR || kind == LIR_INST_FN_ADDR ||
-                          kind == LIR_INST_ABI_RESULT {
-                    liveness_record_def(def_bits, words_per_bb, b, dest_v, vreg_count);
-                } else if kind == LIR_INST_ABI_ARG {
-                    if dest_v != LIR_VREG_NONE {
-                        liveness_record_def(def_bits, words_per_bb, b, dest_v, vreg_count);
-                    } else {
-                        liveness_record_use(use_bits, def_bits, words_per_bb, b, val_v, vreg_count);
-                    }
-                } else if kind == LIR_INST_CALL {
-                    liveness_record_use(use_bits, def_bits, words_per_bb, b, dst_addr_v, vreg_count);
-                    liveness_record_use(use_bits, def_bits, words_per_bb, b, callee_v, vreg_count);
-                }
-                i = i + 1;
-            }
-
-            let tk = unsafe { (*lbb).term.kind };
-            if tk == LIR_TERM_JCC || tk == LIR_TERM_SWITCH || tk == LIR_TERM_ASSERT {
-                let cond_v = unsafe { (*lbb).term.cond.v };
-                liveness_record_use(use_bits, def_bits, words_per_bb, b, cond_v, vreg_count);
-            }
-        }
-
-        // Detect back-edges out of `b` to identify natural loops and increment `loop_depth`.
-        let mut target_b: usize = 0;
-        while target_b <= b {
-            if liveness_bb_has_edge_opt(lir, body, b, target_b) {
-                liveness_mark_natural_loop(mut_view(*arena), lir, body, target_b, b, loop_depth);
-            }
-            target_b = target_b + 1;
-        }
-
-        b = b + 1;
-    }
-
-    // Solve backward dataflow equations until fixed point (SPEC-77 §3.1, AXS-RA-015):
-    //   live_out[b] = U_{s in succ(b)} live_in[s]
-    //   live_in[b]  = use[b] U (live_out[b] \ def[b])
     let mut changed = true;
     while changed {
         changed = false;
@@ -902,6 +855,114 @@ pub fn x64_compute_liveness_in_arena(
             }
         }
     }
+}
+
+pub fn x64_compute_liveness_in_arena(
+    arena: mut_view<Arena>,
+    lir: view<LirBody>,
+    body: view<X64MIBody>
+) -> X64LivenessInfo {
+    let bb_count = lir.bb_count;
+    let vreg_count = lir.vreg_count;
+    let slot_offset = lir.slot_count as u32;
+    let words_per_bb = if vreg_count == 0 { 1 } else { (vreg_count + 63) / 64 };
+    let total_words = lir_mul_usize(bb_count, words_per_bb);
+
+    let use_bits = bitset_alloc_zeroed(mut_view(*arena), total_words);
+    let def_bits = bitset_alloc_zeroed(mut_view(*arena), total_words);
+    let live_in = bitset_alloc_zeroed(mut_view(*arena), total_words);
+    let live_out = bitset_alloc_zeroed(mut_view(*arena), total_words);
+
+    let mut loop_depth: *mut u32 = 0 as *mut u32;
+    let mut bb_bounds: *mut u32 = 0 as *mut u32;
+    if bb_count > 0 {
+        let depth_bytes = lir_mul_usize(bb_count, size_of<u32>());
+        loop_depth = arena_alloc_raw(mut_view(*arena), depth_bytes, align_of<u32>()) as *mut u32;
+        let bounds_bytes = lir_mul_usize(lir_mul_usize(bb_count, 2), size_of<u32>());
+        bb_bounds = arena_alloc_raw(mut_view(*arena), bounds_bytes, align_of<u32>()) as *mut u32;
+        let mut z: usize = 0;
+        while z < bb_count {
+            unsafe {
+                *frame_u32_at(loop_depth, z) = 0u32;
+                *frame_u32_at(bb_bounds, lir_mul_usize(z, 2)) = 0u32;
+                *frame_u32_at(bb_bounds, lir_mul_usize(z, 2) + 1) = 0u32;
+            }
+            z = z + 1;
+        }
+    }
+
+    let p_bs = arena_alloc_raw(mut_view(*arena), size_of<LivenessBitsets>(), align_of<LivenessBitsets>()) as *mut LivenessBitsets;
+    unsafe {
+        (*p_bs).words_per_bb = words_per_bb;
+        (*p_bs).vreg_count = vreg_count;
+        (*p_bs).use_bits = use_bits;
+        (*p_bs).def_bits = def_bits;
+        (*p_bs).live_in = live_in;
+        (*p_bs).live_out = live_out;
+    }
+
+    // Number program points: each MI instruction `m` occupies `[2*m, 2*m + 2)`.
+    let mut cur_mi_idx: u32 = 0u32;
+    let mut b: usize = 0;
+    while b < bb_count {
+        let start_pos = cur_mi_idx * 2u32;
+        if b < body.bb_count && (body.bbs as usize) != 0 {
+            let mbb = unsafe { x64_mi_bb_at(body.bbs, b) };
+            let mut inst = unsafe { (*mbb).first_inst };
+            let mut cnt: u32 = 0u32;
+            while (inst as usize) != 0 {
+                cnt = cnt + 1u32;
+                inst = unsafe { (*inst).next };
+            }
+            if cnt == 0u32 {
+                cnt = 1u32;
+            }
+            cur_mi_idx = cur_mi_idx + cnt;
+        } else {
+            let lbb0 = unsafe { lir_bb_at(lir.bbs, b) };
+            let ic = unsafe { (*lbb0).inst_count as u32 };
+            cur_mi_idx = cur_mi_idx + ic + 1u32;
+        }
+        let end_pos = cur_mi_idx * 2u32;
+        unsafe {
+            *frame_u32_at(bb_bounds, lir_mul_usize(b, 2)) = start_pos;
+            *frame_u32_at(bb_bounds, lir_mul_usize(b, 2) + 1) = end_pos;
+        }
+
+        if body.is_opt && b < body.bb_count && (body.bbs as usize) != 0 {
+            let mbb = unsafe { x64_mi_bb_at(body.bbs, b) };
+            liveness_scan_mi_bb(p_bs, b, mbb as *const X64MIBb, slot_offset);
+        } else {
+            let lbb = unsafe { lir_bb_at(lir.bbs, b) };
+            let inst_count = unsafe { (*lbb).inst_count };
+            let insts_base = unsafe { (*lbb).insts };
+            let mut i: usize = 0;
+            while i < inst_count {
+                let inst = unsafe { lir_inst_at(insts_base, i) };
+                liveness_record_lir_inst(p_bs, b, inst as *const LirInst);
+                i = i + 1;
+            }
+
+            let tk = unsafe { (*lbb).term.kind };
+            if tk == LIR_TERM_JCC || tk == LIR_TERM_SWITCH || tk == LIR_TERM_ASSERT {
+                let cond_v = unsafe { (*lbb).term.cond.v };
+                liveness_record_use(use_bits, def_bits, words_per_bb, b, cond_v, vreg_count);
+            }
+        }
+
+        // Detect back-edges out of `b` to identify natural loops and increment `loop_depth`.
+        let mut target_b: usize = 0;
+        while target_b <= b {
+            if liveness_bb_has_edge_opt(lir, body, b, target_b) {
+                liveness_mark_natural_loop(mut_view(*arena), lir, body, target_b, b, loop_depth);
+            }
+            target_b = target_b + 1;
+        }
+
+        b = b + 1;
+    }
+
+    liveness_solve_dataflow(p_bs, bb_count, lir, body);
 
     X64LivenessInfo {
         bb_count: bb_count as u32,
@@ -4246,6 +4307,8 @@ pub fn x64_encode_mi_inst_obj(
         } else if inst.op_count > 0u8 && op0.kind == X64_OP_REG {
             x64_call_r(mut_view(*sec), op0.reg);
         }
+    } else if opc == X64_MI_TLS_ADDR {
+        x64_emit_tls_addr_obj(mut_view(*sec), mut_view(*obj), op0.reg, inst.msg);
     } else {
         x64_encode_mi_inst(mut_view(*sec), inst, layout);
     }

@@ -75,6 +75,7 @@ use compiler.lir.lir.LIR_INST_OFFSET
 use compiler.lir.lir.LIR_INST_CONST
 use compiler.lir.lir.LIR_INST_CONST_STR
 use compiler.lir.lir.LIR_INST_FN_ADDR
+use compiler.lir.lir.LIR_INST_TLS_ADDR
 use compiler.lir.lir.LIR_INST_SADD_OVERFLOW
 use compiler.lir.lir.LIR_INST_UADD_OVERFLOW
 use compiler.lir.lir.LIR_INST_SSUB_OVERFLOW
@@ -285,6 +286,7 @@ pub use compiler.target.x64.encode.X64_MI_MFENCE
 pub use compiler.target.x64.encode.X64_MI_PAUSE
 pub use compiler.target.x64.encode.X64_MI_COMPILER_BARRIER
 pub use compiler.target.x64.encode.X64_MI_ATOMIC_RMW_LOOP
+pub use compiler.target.x64.encode.X64_MI_TLS_ADDR
 
 pub use compiler.target.x64.encode.AX_X64_MI_MOV
 pub use compiler.target.x64.encode.AX_X64_MI_ADD
@@ -1415,6 +1417,339 @@ fn isel_atomic_sz(inst: *const LirInst, interner: view<TypeInterner>) -> u8 {
     8u8
 }
 
+struct RawIselCtx {
+    mi: *mut X64MIBody,
+    mbb: *mut X64MIBb,
+    vregs: *mut LirVReg,
+    vreg_count: usize,
+    slot_offset: u32,
+}
+
+fn isel_cx_vreg_ty(cx: *const RawIselCtx, vreg_idx: u32) -> TypeId {
+    let mut res = TypeId { v: 0u32 };
+    if (vreg_idx as usize) < (unsafe { (*cx).vreg_count }) && (unsafe { (*cx).vregs as usize }) != 0 {
+        let vp = unsafe { lir_vreg_at((*cx).vregs, vreg_idx as usize) };
+        let v = unsafe { (*vp).ty.v };
+        res = TypeId { v: v };
+    }
+    res
+}
+
+fn isel_emit_sym_addr(
+    mi: mut_view<X64MIBody>,
+    mbb: mut_view<X64MIBb>,
+    dest_slot: u32,
+    inst: *const LirInst
+) {
+    let sym_name = unsafe { (*inst).sym_name };
+    let sym_len = unsafe { (*inst).sym_len };
+    let opc = if (unsafe { (*inst).kind }) == LIR_INST_TLS_ADDR { X64_MI_TLS_ADDR } else { X64_MI_LEA };
+    let mi_inst = x64_mi_emit(mut_view(*mi), mut_view(*mbb), opc, x64_op_reg(REG_RAX), x64_op_sym(0u32));
+    unsafe {
+        (*mi_inst).msg = sym_name;
+        (*mi_inst).msg_len = sym_len;
+    }
+    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(dest_slot, 0), x64_op_reg(REG_RAX));
+}
+
+fn isel_raw_lower_arith(cx: *mut RawIselCtx, inst: *const LirInst, interner: view<TypeInterner>) -> bool {
+    let kind = unsafe { (*inst).kind };
+    let dest_v = unsafe { (*inst).dest.v };
+    let lhs_v = unsafe { (*inst).lhs.v };
+    let rhs_v = unsafe { (*inst).rhs.v };
+    let operand_v = unsafe { (*inst).operand.v };
+    let mi = unsafe { (*cx).mi };
+    let mbb = unsafe { (*cx).mbb };
+    let slot_offset = unsafe { (*cx).slot_offset };
+
+    if kind == LIR_INST_ADD || kind == LIR_INST_SUB || kind == LIR_INST_BIT_AND || kind == LIR_INST_BIT_OR || kind == LIR_INST_BIT_XOR || kind == LIR_INST_MUL {
+        let opc = if kind == LIR_INST_ADD {
+            X64_MI_ADD
+        } else if kind == LIR_INST_SUB {
+            X64_MI_SUB
+        } else if kind == LIR_INST_BIT_AND {
+            X64_MI_AND
+        } else if kind == LIR_INST_BIT_OR {
+            X64_MI_OR
+        } else if kind == LIR_INST_BIT_XOR {
+            X64_MI_XOR
+        } else {
+            X64_MI_IMUL
+        };
+        let dty = isel_cx_vreg_ty(cx as *const RawIselCtx, dest_v);
+        unsafe {
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + lhs_v, 0));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), opc, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + rhs_v, 0));
+            isel_emit_trunc(mut_view(*mi), mut_view(*mbb), dty, interner, REG_RAX);
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_RAX));
+        }
+        return true;
+    } else if kind == LIR_INST_SHL || kind == LIR_INST_SHR || kind == LIR_INST_SAR {
+        let opc = if kind == LIR_INST_SHL {
+            X64_MI_SHL
+        } else if kind == LIR_INST_SAR {
+            X64_MI_SAR
+        } else {
+            X64_MI_SHR
+        };
+        let dty = isel_cx_vreg_ty(cx as *const RawIselCtx, dest_v);
+        unsafe {
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + lhs_v, 0));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RCX), x64_op_frame(slot_offset + rhs_v, 0));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), opc, x64_op_reg(REG_RAX), x64_op_reg(REG_RCX));
+            isel_emit_trunc(mut_view(*mi), mut_view(*mbb), dty, interner, REG_RAX);
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_RAX));
+        }
+        return true;
+    } else if kind >= LIR_INST_ICMP_EQ && kind <= LIR_INST_ICMP_UGE {
+        let cond = isel_icmp_cc(kind);
+        let dty = isel_cx_vreg_ty(cx as *const RawIselCtx, dest_v);
+        unsafe {
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + lhs_v, 0));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_CMP, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + rhs_v, 0));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_SETCC, x64_op_imm(cond as i64), x64_op_reg(REG_RAX));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_AND, x64_op_reg(REG_RAX), x64_op_imm(0xFFi64));
+            isel_emit_trunc(mut_view(*mi), mut_view(*mbb), dty, interner, REG_RAX);
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_RAX));
+        }
+        return true;
+    } else if kind == LIR_INST_UADD_OVERFLOW || kind == LIR_INST_USUB_OVERFLOW || kind == LIR_INST_UMUL_OVERFLOW {
+        let bw = unsafe { (*inst).bit_width };
+        unsafe {
+            isel_emit_uoverflow(mut_view(*mi), mut_view(*mbb), kind, bw, slot_offset, dest_v, lhs_v, rhs_v);
+        }
+        return true;
+    } else if kind == LIR_INST_SADD_OVERFLOW || kind == LIR_INST_SSUB_OVERFLOW || kind == LIR_INST_SMUL_OVERFLOW {
+        let bw = unsafe { (*inst).bit_width };
+        unsafe {
+            isel_emit_soverflow(mut_view(*mi), mut_view(*mbb), kind, bw, slot_offset, dest_v, lhs_v, rhs_v);
+        }
+        return true;
+    } else if kind == LIR_INST_UDIV_OVERFLOW || kind == LIR_INST_UREM_OVERFLOW {
+        unsafe {
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_imm(0i64));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_RAX));
+        }
+        return true;
+    } else if kind == LIR_INST_SDIV_OVERFLOW || kind == LIR_INST_SREM_OVERFLOW {
+        let bw = unsafe { (*inst).bit_width };
+        let mut int_min: i64 = (0x8000000000000000u64) as i64;
+        if bw == 8u32 {
+            int_min = -128i64;
+        } else if bw == 16u32 {
+            int_min = -32768i64;
+        } else if bw == 32u32 {
+            int_min = -2147483648i64;
+        }
+        unsafe {
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + lhs_v, 0));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RDX), x64_op_frame(slot_offset + rhs_v, 0));
+
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_CMP, x64_op_reg(REG_RDX), x64_op_imm(-1i64));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_SETCC, x64_op_imm(CC_E as i64), x64_op_reg(REG_RCX));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_AND, x64_op_reg(REG_RCX), x64_op_imm(1i64));
+
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RDX), x64_op_imm(int_min));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_CMP, x64_op_reg(REG_RAX), x64_op_reg(REG_RDX));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_SETCC, x64_op_imm(CC_E as i64), x64_op_reg(REG_RAX));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_AND, x64_op_reg(REG_RAX), x64_op_imm(1i64));
+
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_AND, x64_op_reg(REG_RAX), x64_op_reg(REG_RCX));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_RAX));
+        }
+        return true;
+    } else if kind == LIR_INST_DIV || kind == LIR_INST_REM {
+        let res_reg = if kind == LIR_INST_DIV { REG_RAX } else { REG_RDX };
+        unsafe {
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + lhs_v, 0));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RDX), x64_op_reg(REG_RAX));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_SAR, x64_op_reg(REG_RDX), x64_op_imm(63i64));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_IDIV, x64_op_frame(slot_offset + rhs_v, 0), x64_op_none());
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(res_reg));
+        }
+        return true;
+    } else if kind == LIR_INST_UDIV || kind == LIR_INST_UREM {
+        unsafe {
+            isel_emit_udiv_urem(mut_view(*mi), mut_view(*mbb), kind, slot_offset, dest_v, lhs_v, rhs_v);
+        }
+        return true;
+    } else if kind == LIR_INST_NEG {
+        unsafe {
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + operand_v, 0));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RCX), x64_op_imm(0i64));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_SUB, x64_op_reg(REG_RCX), x64_op_reg(REG_RAX));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_RCX));
+        }
+        return true;
+    } else if kind == LIR_INST_NOT {
+        unsafe {
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + operand_v, 0));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_XOR, x64_op_reg(REG_RAX), x64_op_imm(1i64));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_RAX));
+        }
+        return true;
+    } else if kind == LIR_INST_BITNOT {
+        let dty = isel_cx_vreg_ty(cx as *const RawIselCtx, dest_v);
+        unsafe {
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_R10), x64_op_imm(-1i64));
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_SUB, x64_op_reg(REG_R10), x64_op_frame(slot_offset + operand_v, 0));
+            isel_emit_trunc(mut_view(*mi), mut_view(*mbb), dty, interner, REG_R10);
+            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_R10));
+        }
+        return true;
+    }
+    false
+}
+
+fn isel_raw_lower_abi(cx: *mut RawIselCtx, inst: *const LirInst, interner: view<TypeInterner>) -> bool {
+    let kind = unsafe { (*inst).kind };
+    let dest_v = unsafe { (*inst).dest.v };
+    let mi = unsafe { (*cx).mi };
+    let mbb = unsafe { (*cx).mbb };
+    let slot_offset = unsafe { (*cx).slot_offset };
+
+    if kind == LIR_INST_ABI_ARG {
+        let loc_kind = unsafe { (*inst).loc_kind };
+        let loc_ro = unsafe { (*inst).loc_reg_or_offset };
+        let val_v = unsafe { (*inst).val.v };
+        if dest_v != LIR_VREG_NONE {
+            if loc_kind == ABI_LOC_REG {
+                unsafe {
+                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(loc_ro as i32));
+                }
+            } else if loc_kind == ABI_LOC_STACK {
+                let mem = x64_op_mem(REG_RBP, REG_NONE, 1u8, (16u32 + loc_ro) as i32, false);
+                unsafe {
+                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), mem);
+                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_RAX));
+                }
+            } else if loc_kind == ABI_LOC_INDIRECT {
+                let dty = isel_cx_vreg_ty(cx as *const RawIselCtx, dest_v);
+                let size = type_size(dty, interner);
+                unsafe {
+                    if loc_ro < 16u32 {
+                        x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_reg(loc_ro as i32));
+                    } else {
+                        let mem = x64_op_mem(REG_RBP, REG_NONE, 1u8, (16u32 + loc_ro) as i32, false);
+                        x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), mem);
+                    }
+                    let mut off: u32 = 0u32;
+                    while off < size {
+                        let chunk = isel_chunk_size(size - off);
+                        let src_mem = x64_op_mem(REG_RAX, REG_NONE, 1u8, off as i32, false);
+                        x64_mi_emit_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, chunk as u8, x64_op_reg(REG_RCX), src_mem);
+                        x64_mi_emit_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, chunk as u8, x64_op_frame(slot_offset + dest_v, off as i32), x64_op_reg(REG_RCX));
+                        off = off + chunk;
+                    }
+                }
+            }
+        } else {
+            if loc_kind == ABI_LOC_REG {
+                unsafe {
+                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(loc_ro as i32), x64_op_frame(slot_offset + val_v, 0));
+                }
+            } else if loc_kind == ABI_LOC_STACK {
+                let mem = x64_op_mem(REG_RSP, REG_NONE, 1u8, loc_ro as i32, false);
+                unsafe {
+                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + val_v, 0));
+                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, mem, x64_op_reg(REG_RAX));
+                }
+            } else if loc_kind == ABI_LOC_INDIRECT {
+                unsafe {
+                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_LEA, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + val_v, 0));
+                    if loc_ro < 16u32 {
+                        x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(loc_ro as i32), x64_op_reg(REG_RAX));
+                    } else {
+                        let mem = x64_op_mem(REG_RSP, REG_NONE, 1u8, loc_ro as i32, false);
+                        x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, mem, x64_op_reg(REG_RAX));
+                    }
+                }
+            }
+        }
+        return true;
+    } else if kind == LIR_INST_CALL {
+        let callee_ty_id = unsafe { TypeId { v: (*inst).callee_ty.v } };
+        let dst_addr_v = unsafe { (*inst).dst_addr.v };
+        let callee_vreg_v = unsafe { (*inst).callee_vreg.v };
+        let sym_name = unsafe { (*inst).sym_name };
+        let sym_len = unsafe { (*inst).sym_len };
+
+        let callee_ty = type_get(interner, callee_ty_id);
+        let mut ret_ty = TypeId { v: 0u32 };
+        if (callee_ty as usize) != 0 {
+            let ck = unsafe { (*callee_ty).kind };
+            if ck == TY_FN {
+                ret_ty = unsafe { TypeId { v: (*callee_ty).ret_type.v } };
+            } else if ck == TY_CLOSURE {
+                let r_v = unsafe { (*callee_ty).ret_type.v };
+                if r_v != 0u32 {
+                    ret_ty = TypeId { v: r_v };
+                } else {
+                    let fn_v = unsafe { (*callee_ty).fn_type.v };
+                    if fn_v != 0u32 {
+                        let fn_t = type_get(interner, TypeId { v: fn_v });
+                        if (fn_t as usize) != 0 {
+                            ret_ty = unsafe { TypeId { v: (*fn_t).ret_type.v } };
+                        }
+                    }
+                }
+            }
+        }
+        if ret_ty.v != 0u32 {
+            let ret_size = type_size(ret_ty, interner);
+            if isel_type_is_ret_in_mem(ret_size) {
+                unsafe {
+                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RCX), x64_op_frame(slot_offset + dst_addr_v, 0));
+                }
+            }
+        }
+        unsafe {
+            if (sym_name as usize) != 0 {
+                let call_mi = x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_CALL, x64_op_none(), x64_op_none());
+                (*call_mi).msg = sym_name;
+                (*call_mi).msg_len = sym_len;
+            } else {
+                x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_R10), x64_op_frame(slot_offset + callee_vreg_v, 0));
+                let call_mi = x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_CALL, x64_op_reg(REG_R10), x64_op_none());
+                (*call_mi).op_count = 1u8;
+            }
+        }
+        return true;
+    } else if kind == LIR_INST_ABI_RESULT {
+        let loc_kind = unsafe { (*inst).loc_kind };
+        let loc_ro = unsafe { (*inst).loc_reg_or_offset };
+        if loc_kind == ABI_LOC_REG {
+            unsafe {
+                x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(loc_ro as i32));
+            }
+        } else if loc_kind == ABI_LOC_INDIRECT {
+            let dty = isel_cx_vreg_ty(cx as *const RawIselCtx, dest_v);
+            let mut load_sz = type_size(dty, interner);
+            unsafe {
+                if load_sz <= 8u32 {
+                    if load_sz != 1u32 && load_sz != 2u32 && load_sz != 4u32 && load_sz != 8u32 {
+                        load_sz = 8u32;
+                    }
+                    let mem = x64_op_mem(REG_RAX, REG_NONE, 1u8, 0, false);
+                    x64_mi_emit_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, load_sz as u8, x64_op_reg(REG_RCX), mem);
+                    x64_mi_emit_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, load_sz as u8, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_RCX));
+                } else {
+                    let mut off: u32 = 0u32;
+                    while off < load_sz {
+                        let chunk = isel_chunk_size(load_sz - off);
+                        let mem = x64_op_mem(REG_RAX, REG_NONE, 1u8, off as i32, false);
+                        x64_mi_emit_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, chunk as u8, x64_op_reg(REG_RCX), mem);
+                        x64_mi_emit_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, chunk as u8, x64_op_frame(slot_offset + dest_v, off as i32), x64_op_reg(REG_RCX));
+                        off = off + chunk;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+    false
+}
+
 pub fn x64_isel_raw_in_arena(
     arena: mut_view<Arena>,
     lir: view<LirBody>,
@@ -1434,12 +1769,22 @@ pub fn x64_isel_raw_in_arena(
         callee_ret_in_mem = isel_type_is_ret_in_mem(ret_size);
     }
 
+    let mut raw_cx = RawIselCtx {
+        mi: mi,
+        mbb: 0 as *mut X64MIBb,
+        vregs: lir.vregs,
+        vreg_count: lir.vreg_count,
+        slot_offset: slot_offset,
+    };
+    let pcx = unsafe { address_of_mut(raw_cx) as *mut RawIselCtx };
+
     let mut b: usize = 0;
     while b < lir.bb_count {
         let lbb = unsafe { lir_bb_at(lir.bbs, b) };
         let mbb = unsafe { x64_mi_bb_at((*mi).bbs, b) };
         unsafe {
             x64_mi_bb_reset(mut_view(*mbb), b as u32);
+            (*pcx).mbb = mbb;
         }
 
         if b == 0 && callee_ret_in_mem {
@@ -1475,273 +1820,14 @@ pub fn x64_isel_raw_in_arena(
                     x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_imm(s_len as i64));
                     x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 8), x64_op_reg(REG_RAX));
                 }
-            } else if kind == LIR_INST_FN_ADDR {
-                let sym_name = unsafe { (*inst).sym_name };
-                let sym_len = unsafe { (*inst).sym_len };
+            } else if kind == LIR_INST_FN_ADDR || kind == LIR_INST_TLS_ADDR {
                 unsafe {
-                    let lea_mi = x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_LEA, x64_op_reg(REG_RAX), x64_op_sym(0u32));
-                    (*lea_mi).msg = sym_name;
-                    (*lea_mi).msg_len = sym_len;
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_RAX));
+                    isel_emit_sym_addr(mut_view(*mi), mut_view(*mbb), slot_offset + dest_v, inst as *const LirInst);
                 }
-            } else if kind == LIR_INST_ADD || kind == LIR_INST_SUB || kind == LIR_INST_BIT_AND || kind == LIR_INST_BIT_OR || kind == LIR_INST_BIT_XOR || kind == LIR_INST_MUL {
-                let opc = if kind == LIR_INST_ADD {
-                    X64_MI_ADD
-                } else if kind == LIR_INST_SUB {
-                    X64_MI_SUB
-                } else if kind == LIR_INST_BIT_AND {
-                    X64_MI_AND
-                } else if kind == LIR_INST_BIT_OR {
-                    X64_MI_OR
-                } else if kind == LIR_INST_BIT_XOR {
-                    X64_MI_XOR
-                } else {
-                    X64_MI_IMUL
-                };
-                let dty = isel_vreg_ty(lir, dest_v);
-                unsafe {
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + lhs_v, 0));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), opc, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + rhs_v, 0));
-                    isel_emit_trunc(mut_view(*mi), mut_view(*mbb), dty, interner, REG_RAX);
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_RAX));
-                }
-            } else if kind == LIR_INST_SHL || kind == LIR_INST_SHR || kind == LIR_INST_SAR {
-                let opc = if kind == LIR_INST_SHL {
-                    X64_MI_SHL
-                } else if kind == LIR_INST_SAR {
-                    X64_MI_SAR
-                } else {
-                    X64_MI_SHR
-                };
-                let dty = isel_vreg_ty(lir, dest_v);
-                unsafe {
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + lhs_v, 0));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RCX), x64_op_frame(slot_offset + rhs_v, 0));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), opc, x64_op_reg(REG_RAX), x64_op_reg(REG_RCX));
-                    isel_emit_trunc(mut_view(*mi), mut_view(*mbb), dty, interner, REG_RAX);
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_RAX));
-                }
-            } else if kind >= LIR_INST_ICMP_EQ && kind <= LIR_INST_ICMP_UGE {
-                let cond = isel_icmp_cc(kind);
-                let dty = isel_vreg_ty(lir, dest_v);
-                unsafe {
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + lhs_v, 0));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_CMP, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + rhs_v, 0));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_SETCC, x64_op_imm(cond as i64), x64_op_reg(REG_RAX));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_AND, x64_op_reg(REG_RAX), x64_op_imm(0xFFi64));
-                    isel_emit_trunc(mut_view(*mi), mut_view(*mbb), dty, interner, REG_RAX);
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_RAX));
-                }
-            } else if kind == LIR_INST_UADD_OVERFLOW || kind == LIR_INST_USUB_OVERFLOW || kind == LIR_INST_UMUL_OVERFLOW {
-                let bw = unsafe { (*inst).bit_width };
-                unsafe {
-                    isel_emit_uoverflow(mut_view(*mi), mut_view(*mbb), kind, bw, slot_offset, dest_v, lhs_v, rhs_v);
-                }
-            } else if kind == LIR_INST_SADD_OVERFLOW || kind == LIR_INST_SSUB_OVERFLOW || kind == LIR_INST_SMUL_OVERFLOW {
-                let bw = unsafe { (*inst).bit_width };
-                unsafe {
-                    isel_emit_soverflow(mut_view(*mi), mut_view(*mbb), kind, bw, slot_offset, dest_v, lhs_v, rhs_v);
-                }
-            } else if kind == LIR_INST_UDIV_OVERFLOW || kind == LIR_INST_UREM_OVERFLOW {
-                unsafe {
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_imm(0i64));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_RAX));
-                }
-            } else if kind == LIR_INST_SDIV_OVERFLOW || kind == LIR_INST_SREM_OVERFLOW {
-                let bw = unsafe { (*inst).bit_width };
-                let mut int_min: i64 = (0x8000000000000000u64) as i64;
-                if bw == 8u32 {
-                    int_min = -128i64;
-                } else if bw == 16u32 {
-                    int_min = -32768i64;
-                } else if bw == 32u32 {
-                    int_min = -2147483648i64;
-                }
-                unsafe {
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + lhs_v, 0));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RDX), x64_op_frame(slot_offset + rhs_v, 0));
-
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_CMP, x64_op_reg(REG_RDX), x64_op_imm(-1i64));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_SETCC, x64_op_imm(CC_E as i64), x64_op_reg(REG_RCX));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_AND, x64_op_reg(REG_RCX), x64_op_imm(1i64));
-
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RDX), x64_op_imm(int_min));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_CMP, x64_op_reg(REG_RAX), x64_op_reg(REG_RDX));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_SETCC, x64_op_imm(CC_E as i64), x64_op_reg(REG_RAX));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_AND, x64_op_reg(REG_RAX), x64_op_imm(1i64));
-
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_AND, x64_op_reg(REG_RAX), x64_op_reg(REG_RCX));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_RAX));
-                }
-            } else if kind == LIR_INST_DIV || kind == LIR_INST_REM {
-                let res_reg = if kind == LIR_INST_DIV { REG_RAX } else { REG_RDX };
-                unsafe {
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + lhs_v, 0));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RDX), x64_op_reg(REG_RAX));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_SAR, x64_op_reg(REG_RDX), x64_op_imm(63i64));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_IDIV, x64_op_frame(slot_offset + rhs_v, 0), x64_op_none());
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(res_reg));
-                }
-            } else if kind == LIR_INST_UDIV || kind == LIR_INST_UREM {
-                unsafe {
-                    isel_emit_udiv_urem(mut_view(*mi), mut_view(*mbb), kind, slot_offset, dest_v, lhs_v, rhs_v);
-                }
-            } else if kind == LIR_INST_NEG {
-                unsafe {
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + operand_v, 0));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RCX), x64_op_imm(0i64));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_SUB, x64_op_reg(REG_RCX), x64_op_reg(REG_RAX));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_RCX));
-                }
-            } else if kind == LIR_INST_NOT {
-                unsafe {
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + operand_v, 0));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_XOR, x64_op_reg(REG_RAX), x64_op_imm(1i64));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_RAX));
-                }
-            } else if kind == LIR_INST_BITNOT {
-                let dty = isel_vreg_ty(lir, dest_v);
-                unsafe {
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_R10), x64_op_imm(-1i64));
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_SUB, x64_op_reg(REG_R10), x64_op_frame(slot_offset + operand_v, 0));
-                    isel_emit_trunc(mut_view(*mi), mut_view(*mbb), dty, interner, REG_R10);
-                    x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_R10));
-                }
-            } else if kind == LIR_INST_ABI_ARG {
-                let loc_kind = unsafe { (*inst).loc_kind };
-                let loc_ro = unsafe { (*inst).loc_reg_or_offset };
-                let val_v = unsafe { (*inst).val.v };
-                if dest_v != LIR_VREG_NONE {
-                    if loc_kind == ABI_LOC_REG {
-                        unsafe {
-                            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(loc_ro as i32));
-                        }
-                    } else if loc_kind == ABI_LOC_STACK {
-                        let mem = x64_op_mem(REG_RBP, REG_NONE, 1u8, (16u32 + loc_ro) as i32, false);
-                        unsafe {
-                            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), mem);
-                            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_RAX));
-                        }
-                    } else if loc_kind == ABI_LOC_INDIRECT {
-                        let dty = isel_vreg_ty(lir, dest_v);
-                        let size = type_size(dty, interner);
-                        unsafe {
-                            if loc_ro < 16u32 {
-                                x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_reg(loc_ro as i32));
-                            } else {
-                                let mem = x64_op_mem(REG_RBP, REG_NONE, 1u8, (16u32 + loc_ro) as i32, false);
-                                x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), mem);
-                            }
-                            let mut off: u32 = 0u32;
-                            while off < size {
-                                let chunk = isel_chunk_size(size - off);
-                                let src_mem = x64_op_mem(REG_RAX, REG_NONE, 1u8, off as i32, false);
-                                x64_mi_emit_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, chunk as u8, x64_op_reg(REG_RCX), src_mem);
-                                x64_mi_emit_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, chunk as u8, x64_op_frame(slot_offset + dest_v, off as i32), x64_op_reg(REG_RCX));
-                                off = off + chunk;
-                            }
-                        }
-                    }
-                } else {
-                    if loc_kind == ABI_LOC_REG {
-                        unsafe {
-                            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(loc_ro as i32), x64_op_frame(slot_offset + val_v, 0));
-                        }
-                    } else if loc_kind == ABI_LOC_STACK {
-                        let mem = x64_op_mem(REG_RSP, REG_NONE, 1u8, loc_ro as i32, false);
-                        unsafe {
-                            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + val_v, 0));
-                            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, mem, x64_op_reg(REG_RAX));
-                        }
-                    } else if loc_kind == ABI_LOC_INDIRECT {
-                        unsafe {
-                            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_LEA, x64_op_reg(REG_RAX), x64_op_frame(slot_offset + val_v, 0));
-                            if loc_ro < 16u32 {
-                                x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(loc_ro as i32), x64_op_reg(REG_RAX));
-                            } else {
-                                let mem = x64_op_mem(REG_RSP, REG_NONE, 1u8, loc_ro as i32, false);
-                                x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, mem, x64_op_reg(REG_RAX));
-                            }
-                        }
-                    }
-                }
-            } else if kind == LIR_INST_CALL {
-                let callee_ty_id = unsafe { TypeId { v: (*inst).callee_ty.v } };
-                let dst_addr_v = unsafe { (*inst).dst_addr.v };
-                let callee_vreg_v = unsafe { (*inst).callee_vreg.v };
-                let sym_name = unsafe { (*inst).sym_name };
-                let sym_len = unsafe { (*inst).sym_len };
-
-                let callee_ty = type_get(interner, callee_ty_id);
-                let mut ret_ty = TypeId { v: 0u32 };
-                if (callee_ty as usize) != 0 {
-                    let ck = unsafe { (*callee_ty).kind };
-                    if ck == TY_FN {
-                        ret_ty = unsafe { TypeId { v: (*callee_ty).ret_type.v } };
-                    } else if ck == TY_CLOSURE {
-                        let r_v = unsafe { (*callee_ty).ret_type.v };
-                        if r_v != 0u32 {
-                            ret_ty = TypeId { v: r_v };
-                        } else {
-                            let fn_v = unsafe { (*callee_ty).fn_type.v };
-                            if fn_v != 0u32 {
-                                let fn_t = type_get(interner, TypeId { v: fn_v });
-                                if (fn_t as usize) != 0 {
-                                    ret_ty = unsafe { TypeId { v: (*fn_t).ret_type.v } };
-                                }
-                            }
-                        }
-                    }
-                }
-                if ret_ty.v != 0u32 {
-                    let ret_size = type_size(ret_ty, interner);
-                    if isel_type_is_ret_in_mem(ret_size) {
-                        unsafe {
-                            x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RCX), x64_op_frame(slot_offset + dst_addr_v, 0));
-                        }
-                    }
-                }
-                unsafe {
-                    if (sym_name as usize) != 0 {
-                        let call_mi = x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_CALL, x64_op_none(), x64_op_none());
-                        (*call_mi).msg = sym_name;
-                        (*call_mi).msg_len = sym_len;
-                    } else {
-                        x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_R10), x64_op_frame(slot_offset + callee_vreg_v, 0));
-                        let call_mi = x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_CALL, x64_op_reg(REG_R10), x64_op_none());
-                        (*call_mi).op_count = 1u8;
-                    }
-                }
-            } else if kind == LIR_INST_ABI_RESULT {
-                let loc_kind = unsafe { (*inst).loc_kind };
-                let loc_ro = unsafe { (*inst).loc_reg_or_offset };
-                if loc_kind == ABI_LOC_REG {
-                    unsafe {
-                        x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(loc_ro as i32));
-                    }
-                } else if loc_kind == ABI_LOC_INDIRECT {
-                    let dty = isel_vreg_ty(lir, dest_v);
-                    let mut load_sz = type_size(dty, interner);
-                    unsafe {
-                        if load_sz <= 8u32 {
-                            if load_sz != 1u32 && load_sz != 2u32 && load_sz != 4u32 && load_sz != 8u32 {
-                                load_sz = 8u32;
-                            }
-                            let mem = x64_op_mem(REG_RAX, REG_NONE, 1u8, 0, false);
-                            x64_mi_emit_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, load_sz as u8, x64_op_reg(REG_RCX), mem);
-                            x64_mi_emit_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, load_sz as u8, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_RCX));
-                        } else {
-                            let mut off: u32 = 0u32;
-                            while off < load_sz {
-                                let chunk = isel_chunk_size(load_sz - off);
-                                let mem = x64_op_mem(REG_RAX, REG_NONE, 1u8, off as i32, false);
-                                x64_mi_emit_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, chunk as u8, x64_op_reg(REG_RCX), mem);
-                                x64_mi_emit_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, chunk as u8, x64_op_frame(slot_offset + dest_v, off as i32), x64_op_reg(REG_RCX));
-                                off = off + chunk;
-                            }
-                        }
-                    }
-                }
+            } else if isel_raw_lower_arith(pcx, inst as *const LirInst, interner) {
+                // Lowered by isel_raw_lower_arith
+            } else if isel_raw_lower_abi(pcx, inst as *const LirInst, interner) {
+                // Lowered by isel_raw_lower_abi
             } else if kind == LIR_INST_STACK_ADDR {
                 let slot_v = unsafe { (*inst).slot.v };
                 let mut ret_in_mem = false;
@@ -3222,15 +3308,8 @@ fn isel_opt_lower_inst(
         x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_RAX));
         x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_imm(s_len as i64));
         x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 8), x64_op_reg(REG_RAX));
-    } else if kind == LIR_INST_FN_ADDR {
-        let sym_name = unsafe { (*inst).sym_name };
-        let sym_len = unsafe { (*inst).sym_len };
-        let lea_mi = x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_LEA, x64_op_reg(REG_RAX), x64_op_sym(0u32));
-        unsafe {
-            (*lea_mi).msg = sym_name;
-            (*lea_mi).msg_len = sym_len;
-        }
-        x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, x64_op_frame(slot_offset + dest_v, 0), x64_op_reg(REG_RAX));
+    } else if kind == LIR_INST_FN_ADDR || kind == LIR_INST_TLS_ADDR {
+        isel_emit_sym_addr(mut_view(*mi), mut_view(*mbb), slot_offset + dest_v, inst as *const LirInst);
     } else if kind == LIR_INST_ADD || kind == LIR_INST_OFFSET || kind == LIR_INST_SUB ||
               kind == LIR_INST_BIT_AND || kind == LIR_INST_BIT_OR || kind == LIR_INST_BIT_XOR {
         tag_vreg = dest_v;
@@ -3410,14 +3489,18 @@ fn isel_opt_lower_inst(
     }
 }
 
+struct DiamondArm {
+    pub slot: u32,
+    pub val: u32,
+    pub cost: u32,
+}
+
 fn isel_check_diamond_arm(
     ctx: view<IselOptCtx>,
     lir: view<LirBody>,
     interner: view<TypeInterner>,
     arm_bb: usize,
-    out_slot: mut_view<u32>,
-    out_val: mut_view<u32>,
-    out_cost: mut_view<u32>
+    out_arm: *mut DiamondArm
 ) -> bool {
     let lbb = unsafe { lir_bb_at(lir.bbs, arm_bb) };
     let cnt = unsafe { (*lbb).inst_count };
@@ -3490,9 +3573,11 @@ fn isel_check_diamond_arm(
     if cost > 4u32 {
         return false;
     }
-    *out_slot = dst_slot;
-    *out_val = st_val_v;
-    *out_cost = cost;
+    unsafe {
+        (*out_arm).slot = dst_slot;
+        (*out_arm).val = st_val_v;
+        (*out_arm).cost = cost;
+    }
     true
 }
 
@@ -3503,9 +3588,8 @@ fn isel_emit_cond_flags_for_branch(
     mi: mut_view<X64MIBody>,
     mbb: mut_view<X64MIBb>,
     cur_bb: u32,
-    cond_v: u32,
-    out_cc: mut_view<u8>
-) {
+    cond_v: u32
+) -> u8 {
     let mut rc = isel_resolve_vreg(ctx, cond_v);
     let mut inv = false;
     let mut steps: u32 = 0u32;
@@ -3560,8 +3644,7 @@ fn isel_emit_cond_flags_for_branch(
             if inv {
                 cc = x64_cc_invert(cc);
             }
-            *out_cc = cc;
-            return;
+            return cc;
         }
         break;
     }
@@ -3573,7 +3656,7 @@ fn isel_emit_cond_flags_for_branch(
     if inv {
         cc = x64_cc_invert(cc);
     }
-    *out_cc = cc;
+    cc
 }
 
 fn isel_try_if_convert_diamond(
@@ -3652,19 +3735,23 @@ fn isel_try_if_convert_diamond(
         return false;
     }
 
-    let mut slot_then: u32 = 0u32;
-    let mut val_then: u32 = 0u32;
-    let mut cost_then: u32 = 0u32;
-    let mut slot_else: u32 = 0u32;
-    let mut val_else: u32 = 0u32;
-    let mut cost_else: u32 = 0u32;
+    let mut arm_then = DiamondArm { slot: 0u32, val: 0u32, cost: 0u32 };
+    let mut arm_else = DiamondArm { slot: 0u32, val: 0u32, cost: 0u32 };
+    let p_then: *mut DiamondArm = unsafe { address_of_mut(arm_then) };
+    let p_else: *mut DiamondArm = unsafe { address_of_mut(arm_else) };
 
-    if !isel_check_diamond_arm(ctx, lir, interner, then_bb, mut_view(slot_then), mut_view(val_then), mut_view(cost_then)) {
+    if !isel_check_diamond_arm(ctx, lir, interner, then_bb, p_then) {
         return false;
     }
-    if !isel_check_diamond_arm(ctx, lir, interner, else_bb, mut_view(slot_else), mut_view(val_else), mut_view(cost_else)) {
+    if !isel_check_diamond_arm(ctx, lir, interner, else_bb, p_else) {
         return false;
     }
+    let slot_then = arm_then.slot;
+    let val_then = arm_then.val;
+    let cost_then = arm_then.cost;
+    let slot_else = arm_else.slot;
+    let val_else = arm_else.val;
+    let cost_else = arm_else.cost;
     if slot_then != slot_else || (cost_then + cost_else + 1u32) > 6u32 {
         return false;
     }
@@ -3685,8 +3772,7 @@ fn isel_try_if_convert_diamond(
         ei = ei + 1;
     }
 
-    let mut cc: u8 = CC_NE;
-    isel_emit_cond_flags_for_branch(ctx, lir, interner, mut_view(*mi), mut_view(*mbb), b as u32, cond_v, mut_view(cc));
+    let mut cc: u8 = isel_emit_cond_flags_for_branch(ctx, lir, interner, mut_view(*mi), mut_view(*mbb), b as u32, cond_v);
     if invert_cond {
         cc = x64_cc_invert(cc);
     }
@@ -4184,8 +4270,7 @@ fn isel_opt_lower_terminator(
            (unsafe { (*lir_switch_target_at(targets_base, 0)).val }) == 0u64 &&
            isel_vreg_is_scalar_gpr(lir, interner, cond_v) {
             let t0_bb = unsafe { (*lir_switch_target_at(targets_base, 0)).target.v as i64 };
-            let mut cc: u8 = CC_NE;
-            isel_emit_cond_flags_for_branch(ctx, lir, interner, mut_view(*mi), mut_view(*mbb), b as u32, cond_v, mut_view(cc));
+            let cc: u8 = isel_emit_cond_flags_for_branch(ctx, lir, interner, mut_view(*mi), mut_view(*mbb), b as u32, cond_v);
             let inv_cc = x64_cc_invert(cc);
             x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_JCC, x64_op_imm(inv_cc as i64), x64_op_imm(t0_bb));
             x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_JMP, x64_op_imm(otherwise_v as i64), x64_op_none());
@@ -4213,8 +4298,7 @@ fn isel_opt_lower_terminator(
         let then_v = unsafe { (*lbb).term.then_target.v };
         let else_v = unsafe { (*lbb).term.else_target.v };
         if isel_vreg_is_scalar_gpr(lir, interner, cond_v) {
-            let mut cc: u8 = CC_NE;
-            isel_emit_cond_flags_for_branch(ctx, lir, interner, mut_view(*mi), mut_view(*mbb), b as u32, cond_v, mut_view(cc));
+            let cc: u8 = isel_emit_cond_flags_for_branch(ctx, lir, interner, mut_view(*mi), mut_view(*mbb), b as u32, cond_v);
             x64_mi_emit(mut_view(*mi), mut_view(*mbb), X64_MI_JCC, x64_op_imm(cc as i64), x64_op_imm(then_v as i64));
         } else {
             isel_emit_load_vreg(ctx, lir, interner, mut_view(*mi), mut_view(*mbb), REG_RAX, cond_v);
