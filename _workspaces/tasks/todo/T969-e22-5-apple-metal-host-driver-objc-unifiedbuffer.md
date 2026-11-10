@@ -12,7 +12,7 @@ status: todo
 attempts: 0
 paths: [std/sys/gpu/metal, compiler/interp/host_metal, tests/run/gpu_metal_driver]
 locks: [std/sys/gpu/mod.ax]
-spec: [spec/SPEC-134-apple-metal-msl-backend.md, 0096, 0139, tasks/0626, tasks/0846]
+spec: [spec/decisions/ADR-0040-unified-memory-architecture-uma.md, spec/SPEC-134-apple-metal-msl-backend.md, 0096, 0139, tasks/0626, tasks/0846]
 covers: [REQ-ECO-5958, REQ-GPU-007, REQ-GPU-035, REQ-GPU-036, REQ-GPU-064]
 ---
 # T969 — E22.5 Apple Metal host driver (std.sys.gpu.metal), Objective-C bridge & UnifiedBuffer zero-copy path
@@ -26,6 +26,7 @@ Implement the Apple Metal host driver in `std/sys/gpu/metal` and `compiler/inter
 - Implement buffer management:
   - Allocate `MTLBuffer` with appropriate storage modes (`MTLResourceStorageModeShared` vs `MTLResourceStorageModePrivate`).
   - Provide fast zero-copy `UnifiedBuffer` mapping on Apple Silicon (`hasUnifiedMemory == true`), allowing CPU pointers to be accessed by GPU dispatches without intermediate staging transfers while enforcing Axiom's borrow and capability invariants.
+  - Report `GpuMemoryArchitecture.CacheCoherentUma` on Apple Silicon (ADR-0040), import page-aligned `mmap` / `VirtualRegion` memory via `newBufferWithBytesNoCopy:length:options:deallocator:` (`UnifiedBuffer.from_mmap`), and expose `GpuMemoryBudget` from `recommendedMaxWorkingSetSize` / `currentAllocatedSize` so allocations beyond the budget return `GpuError.OutOfUnifiedMemoryBudget` instead of triggering iOS Jetsam / macOS memory pressure kills.
 - Implement compute dispatch and synchronization:
   - Compile pipeline state objects from MSL source via `newLibraryWithSource:options:error:` or load precompiled `.metallib`.
   - Record compute command encoders: `setComputePipelineState:`, `setBuffer:offset:atIndex:`, `setBytes:length:atIndex:`, `dispatchThreadgroups:threadsPerThreadgroup:`.
@@ -50,3 +51,4 @@ Implement the Apple Metal host driver in `std/sys/gpu/metal` and `compiler/inter
 
 ## Log
 - 2026-11-09 21:45:00 created by architect (ADR-0038 Metal expansion)
+- 2026-11-10 21:40:00 scope extended by architect (ADR-0040 Unified Memory Architecture)
