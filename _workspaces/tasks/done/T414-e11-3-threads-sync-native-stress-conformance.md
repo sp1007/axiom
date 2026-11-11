@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T410, T090, T411, T412, T413]
 priority: 136
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tests/conformance/p11/e11_3_threads_sync]
 spec: [spec/SPEC-32-threads-sync.md, 0203, 0206, 0207, 0209, tasks/0329, tasks/0623]
 covers: [REQ-CONC-036, REQ-CONC-037, REQ-CONC-038, REQ-CONC-039, REQ-CONC-081, REQ-CONC-187]
+started: 2026-11-10 22:21:13
+finished: 2026-11-11 08:15:06
 ---
 # T414 — E11.3 — Multi-threaded stress & synchronization conformance suite
 
@@ -38,3 +40,5 @@ Verify the `E11.3` exit criterion ('native stress suite') with multi-threaded st
 
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
+- 2026-11-10 22:21:13 started (attempt 1) T414-impl
+- 2026-11-11 08:15:06 accepted by QA -> done

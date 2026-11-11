@@ -8,12 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T416, T401, T411]
 priority: 139
-status: todo
-attempts: 0
+status: doing
+attempts: 1
+timeout_min: 360
 paths: [tests/ui/async/borrow_across_await, tests/ui/async/lock_guard_await, tests/ui/async/send_bounds]
-locks: [compiler/own/cap.ax, compiler/own/move.ax, compiler/mir/mir.ax, compiler/mir/builder.ax, compiler/traits/solver.ax, compiler/diag/code.ax, tests/selfhost]
+locks: [compiler/own/cap.ax, compiler/own/move.ax, compiler/own/unsafe.ax, compiler/mir/mir.ax, compiler/mir/builder.ax, compiler/traits/solver.ax, compiler/types/typeck.ax, compiler/verify/verifier.ax, compiler/driver/pipeline.ax, compiler/diag/code.ax, compiler/diag/format.ax, tests/selfhost]
 spec: [spec/SPEC-33-async.md, 0093, 0105, 0118, 0127, 0135, 0248, tasks/0275, tasks/0297, tasks/0488, tasks/0619]
 covers: [REQ-ASY-003, REQ-ASY-004, REQ-ASY-005, REQ-ASY-006, REQ-ASY-008, REQ-ASY-012, REQ-CONC-017, REQ-ASY-015, REQ-CONC-048, REQ-CONC-093, REQ-ASY-025, REQ-ASY-028, REQ-ASY-029, REQ-ASY-030, REQ-ASY-031, REQ-ASY-042, REQ-ASY-053, REQ-ASY-069, REQ-ASY-071, REQ-ASY-072, REQ-ASY-087, REQ-ASY-090, REQ-ASY-091, REQ-ASY-095, REQ-ASY-097, REQ-ASY-106, REQ-ASY-107, REQ-ASY-128, REQ-ASY-150, REQ-ASY-160]
+started: 2026-11-10 22:22:00
+agent: T417-impl
 ---
 # T417 — E11.4 — Live-across-await analysis: view, lock-guard & Future Send checking
 
@@ -45,3 +48,4 @@ Implement live-across-await dataflow analysis in `axiomc` to compute the exact l
 
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
+- 2026-11-10 22:22:00 started (attempt 1) T417-impl
