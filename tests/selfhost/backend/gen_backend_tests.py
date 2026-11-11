@@ -77,6 +77,7 @@ MODULES = [
     ("compiler.mir.drop", "compiler"),
     ("compiler.mir.builder", "compiler"),
     ("compiler.mir", "compiler"),
+    ("compiler.own.cap", "compiler"),
     ("compiler.verify.verifier", "compiler"),
     ("compiler.verify", "compiler"),
     ("compiler.opt.const_fold", "compiler"),

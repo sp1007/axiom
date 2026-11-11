@@ -23,6 +23,7 @@ use compiler.kernel.interner.StrView
 use compiler.kernel.interner.interner_get
 use compiler.source.span.Span
 use compiler.source.manager.SourceDatabase
+use compiler.source.manager.source_db_span_text
 use compiler.diag.code.AX_IO_FILE_NOT_FOUND
 use compiler.diag.code.DiagCode
 use compiler.diag.code.DiagDataKind
@@ -67,6 +68,21 @@ use compiler.resolve.symtab.resolve_map_free
 use compiler.resolve.symtab.resolve_symbol_canonical_name
 use compiler.resolve.symtab.resolve_symbol_module_path
 use compiler.hir.hir.HIR_EXPR_LITERAL
+use compiler.hir.hir.HIR_EXPR_CALL
+use compiler.hir.hir.HIR_EXPR_METHOD_CALL
+use compiler.hir.hir.HIR_EXPR_PATH
+use compiler.hir.hir.HIR_EXPR_BLOCK
+use compiler.hir.hir.HIR_EXPR_IF
+use compiler.hir.hir.HIR_EXPR_WHILE
+use compiler.hir.hir.HIR_EXPR_UNSAFE
+use compiler.hir.hir.HIR_STMT_LET
+use compiler.hir.hir.HIR_STMT_ASSIGN
+use compiler.hir.hir.HIR_STMT_EXPR
+use compiler.hir.hir.HirStmt
+use compiler.types.types.TY_COROUTINE
+use compiler.types.typeck.thir_get_expr_type
+use compiler.traits.solver.type_satisfies_auto_trait
+use compiler.traits.solver.emit_conc_bound_diag
 use compiler.hir.hir.HIR_ITEM_CONST
 use compiler.hir.hir.HIR_ITEM_EXTERN_BLOCK
 use compiler.hir.hir.HIR_ITEM_FN
@@ -986,6 +1002,173 @@ pub fn pipeline_stage_own(ctx: mut_view<PipelineCtx>) {
         0 as *mut DiagBuffer,
         0 as *mut DiagBuffer
     );
+    if !session_has_errors(view(ctx.sess)) {
+        pipe_check_spawn_send(ctx);
+    }
+}
+
+fn pipe_expr_is_spawn(ctx: view<PipelineCtx>, expr: *const HirExpr) -> bool {
+    if (expr as usize) == 0 { return false; }
+    let ek = unsafe { (*expr).kind };
+    if ek == HIR_EXPR_CALL {
+        let callee: *mut HirExpr = unsafe { (*expr).callee };
+        if (callee as usize) != 0 && (unsafe { (*callee).kind }) == HIR_EXPR_PATH {
+            let sp = Span {
+                file: FileId { v: unsafe { (*callee).path.span.file.v } },
+                start: unsafe { (*callee).path.span.start },
+                end: unsafe { (*callee).path.span.end },
+            };
+            if sp.file.v != 0u32 {
+                let sv = source_db_span_text(view(ctx.sess.source_db), sp);
+                if sv.len == 5 && unsafe { *(sv.ptr) == 115u8 && *(sv.ptr+1) == 112u8 && *(sv.ptr+2) == 97u8 && *(sv.ptr+3) == 119u8 && *(sv.ptr+4) == 110u8 } {
+                    return true;
+                }
+            }
+            let pn_v = unsafe { (*callee).path.name.v };
+            if pn_v != 0u32 {
+                let sv = interner_get(view(ctx.sess.interner), StrId { v: pn_v });
+                if sv.len == 5 && unsafe { *(sv.ptr) == 115u8 && *(sv.ptr+1) == 112u8 && *(sv.ptr+2) == 97u8 && *(sv.ptr+3) == 119u8 && *(sv.ptr+4) == 110u8 } {
+                    return true;
+                }
+            }
+        }
+    } else if ek == HIR_EXPR_METHOD_CALL {
+        let mn_v = unsafe { (*expr).method_name.v };
+        if mn_v != 0u32 {
+            let sv = interner_get(view(ctx.sess.interner), StrId { v: mn_v });
+            if sv.len == 5 && unsafe { *(sv.ptr) == 115u8 && *(sv.ptr+1) == 112u8 && *(sv.ptr+2) == 97u8 && *(sv.ptr+3) == 119u8 && *(sv.ptr+4) == 110u8 } {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+const PIPE_SEND_NAME: [4]u8 = [83u8, 101u8, 110u8, 100u8];
+
+fn pipe_scan_spawn_expr(ctx: mut_view<PipelineCtx>, expr: *const HirExpr) {
+    if (expr as usize) == 0 { return; }
+    let ek = unsafe { (*expr).kind };
+    if ek == HIR_EXPR_CALL || ek == HIR_EXPR_METHOD_CALL {
+        if ek == HIR_EXPR_CALL {
+            let callee: *mut HirExpr = unsafe { (*expr).callee };
+            if (callee as usize) != 0 { pipe_scan_spawn_expr(mut_view(*ctx), callee); }
+        } else {
+            let recv: *mut HirExpr = unsafe { (*expr).receiver };
+            if (recv as usize) != 0 { pipe_scan_spawn_expr(mut_view(*ctx), recv); }
+        }
+        let mut a: *mut HirExpr = unsafe { (*expr).args };
+        while (a as usize) != 0 {
+            pipe_scan_spawn_expr(mut_view(*ctx), a);
+            a = unsafe { (*a).next };
+        }
+        if pipe_expr_is_spawn(view(*ctx), expr) {
+            let mut arg: *mut HirExpr = unsafe { (*expr).args };
+            while (arg as usize) != 0 {
+                let at_v = unsafe { thir_get_expr_type(view(ctx.thir), arg).v };
+                if at_v != 0u32 {
+                    let at = type_get(view(ctx.thir.interner), TypeId { v: at_v });
+                    if (at as usize) != 0 && (unsafe { (*at).kind }) == TY_COROUTINE {
+                        let send_sv = StrView { ptr: unsafe { address_of(PIPE_SEND_NAME[0]) }, len: 4 };
+                        let ok_send = type_satisfies_auto_trait(
+                            view(ctx.hir),
+                            view(ctx.thir),
+                            TypeId { v: at_v },
+                            1u8,
+                            10007u32,
+                            view(send_sv),
+                            view(ctx.sess.interner),
+                            view(ctx.sess.source_db),
+                            0
+                        );
+                        if !ok_send {
+                            let arg_sp = Span {
+                                file: FileId { v: unsafe { (*arg).span.file.v } },
+                                start: unsafe { (*arg).span.start },
+                                end: unsafe { (*arg).span.end },
+                            };
+                            emit_conc_bound_diag(
+                                view(ctx.hir),
+                                view(ctx.thir),
+                                TypeId { v: at_v },
+                                1u8,
+                                10007u32,
+                                view(send_sv),
+                                view(ctx.sess.interner),
+                                view(ctx.sess.source_db),
+                                mut_view(ctx.sess.diag_sink),
+                                arg_sp
+                            );
+                        }
+                    }
+                }
+                arg = unsafe { (*arg).next };
+            }
+        }
+    } else if ek == HIR_EXPR_BLOCK || ek == HIR_EXPR_UNSAFE {
+        let blk: *mut HirBlock = unsafe { (*expr).block };
+        if (blk as usize) != 0 { pipe_scan_spawn_block(mut_view(*ctx), blk); }
+    } else if ek == HIR_EXPR_IF {
+        let cond_e: *mut HirExpr = unsafe { (*expr).cond };
+        let blk: *mut HirBlock = unsafe { (*expr).block };
+        let else_e: *mut HirExpr = unsafe { (*expr).else_branch };
+        if (cond_e as usize) != 0 { pipe_scan_spawn_expr(mut_view(*ctx), cond_e); }
+        if (blk as usize) != 0 { pipe_scan_spawn_block(mut_view(*ctx), blk); }
+        if (else_e as usize) != 0 { pipe_scan_spawn_expr(mut_view(*ctx), else_e); }
+    } else if ek == HIR_EXPR_WHILE {
+        let cond_e: *mut HirExpr = unsafe { (*expr).cond };
+        let blk: *mut HirBlock = unsafe { (*expr).block };
+        if (cond_e as usize) != 0 { pipe_scan_spawn_expr(mut_view(*ctx), cond_e); }
+        if (blk as usize) != 0 { pipe_scan_spawn_block(mut_view(*ctx), blk); }
+    }
+}
+
+fn pipe_scan_spawn_block(ctx: mut_view<PipelineCtx>, blk: *const HirBlock) {
+    if (blk as usize) == 0 { return; }
+    let mut s: *mut HirStmt = unsafe { (*blk).stmts };
+    while (s as usize) != 0 {
+        let sk = unsafe { (*s).kind };
+        if sk == HIR_STMT_LET {
+            let e: *mut HirExpr = unsafe { (*s).expr };
+            let eb: *mut HirBlock = unsafe { (*s).else_block };
+            if (e as usize) != 0 { pipe_scan_spawn_expr(mut_view(*ctx), e); }
+            if (eb as usize) != 0 { pipe_scan_spawn_block(mut_view(*ctx), eb); }
+        } else if sk == HIR_STMT_ASSIGN {
+            let l: *mut HirExpr = unsafe { (*s).left };
+            let r: *mut HirExpr = unsafe { (*s).right };
+            if (l as usize) != 0 { pipe_scan_spawn_expr(mut_view(*ctx), l); }
+            if (r as usize) != 0 { pipe_scan_spawn_expr(mut_view(*ctx), r); }
+        } else if sk == HIR_STMT_EXPR {
+            let e: *mut HirExpr = unsafe { (*s).expr };
+            if (e as usize) != 0 { pipe_scan_spawn_expr(mut_view(*ctx), e); }
+        }
+        s = unsafe { (*s).next };
+    }
+}
+
+fn pipe_check_spawn_send(ctx: mut_view<PipelineCtx>) {
+    let mut it: *mut HirItem = ctx.hir.items;
+    while (it as usize) != 0 {
+        let ik = unsafe { (*it).kind };
+        if ik == HIR_ITEM_FN {
+            let blk: *mut HirBlock = unsafe { (*it).body };
+            if (blk as usize) != 0 {
+                pipe_scan_spawn_block(mut_view(*ctx), blk);
+            }
+        } else if ik == HIR_ITEM_IMPL {
+            let mut m: *mut HirItem = unsafe { (*it).members };
+            while (m as usize) != 0 {
+                if (unsafe { (*m).kind }) == HIR_ITEM_FN {
+                    let blk: *mut HirBlock = unsafe { (*m).body };
+                    if (blk as usize) != 0 {
+                        pipe_scan_spawn_block(mut_view(*ctx), blk);
+                    }
+                }
+                m = unsafe { (*m).next };
+            }
+        }
+        it = unsafe { (*it).next };
+    }
 }
 
 pub fn pipeline_stage_interp(
@@ -1239,12 +1422,12 @@ pub fn driver_flush_diagnostics(
     err_buf: mut_view<DiagBuffer>
 ) {
     let _ = out_buf;
-    if session_diag_count(view(ctx.sess)) > 0 {
-        if dopts.json {
-            session_render_json(mut_view(ctx.sess), mut_view(*err_buf));
-        } else {
-            session_render_human(mut_view(ctx.sess), mut_view(*err_buf));
-        }
+    if dopts.json {
+        session_render_json(mut_view(ctx.sess), mut_view(*err_buf));
+        patch_unknown_intrinsic_diag_buf(view(ctx.sess.diag_sink), mut_view(*err_buf));
+        patch_wlib_diag_buf(view(ctx.sess.diag_sink), mut_view(*err_buf));
+    } else if session_diag_count(view(ctx.sess)) > 0 {
+        session_render_human(mut_view(ctx.sess), mut_view(*err_buf));
         patch_unknown_intrinsic_diag_buf(view(ctx.sess.diag_sink), mut_view(*err_buf));
         patch_wlib_diag_buf(view(ctx.sess.diag_sink), mut_view(*err_buf));
     }
@@ -4061,10 +4244,11 @@ fn driver_emit_objmodel_filtered_ex(
                 (!for_lib && pipe_is_mono_clone(ctx.mono.instances_head, it as *const HirItem)) ||
                 (!for_lib && include_std_weak && pipe_fid_is_std(ctx.proj.files as *const ProjectFile, ctx.proj.file_count, it_fid_v));
             if include_it {
+                let is_async_fn = unsafe { (*it).is_async };
                 let body = pipe_build_item_body(
                     mut_view(*ctx), run_drop_elab, run_opt, it, thir_ptr, hir_ptr, str_in_ptr, db_ptr
                 );
-                if (body as usize) != 0 {
+                if (body as usize) != 0 && !is_async_fn {
                     unsafe {
                         *pipe_hir_item_ptr_at(items_buf, fn_count) = it;
                         *pipe_mir_body_ptr_at(bodies_buf, fn_count) = body;
@@ -4090,10 +4274,11 @@ fn driver_emit_objmodel_filtered_ex(
                 (filter_fid_v == 0u32 || !for_lib || (unsafe { (*ni).span.file.v }) == filter_fid_v) &&
                 (pipe_is_trait_member(ctx.hir.items, ni) || tc_is_default_inst(ni as *const HirItem)) &&
                 !pipe_item_in_buf(items_buf, fn_count, ni) {
+                let is_async_ni = unsafe { (*ni).is_async };
                 let body = pipe_build_item_body(
                     mut_view(*ctx), run_drop_elab, run_opt, ni, thir_ptr, hir_ptr, str_in_ptr, db_ptr
                 );
-                if (body as usize) != 0 && fn_count < fn_cap {
+                if (body as usize) != 0 && !is_async_ni && fn_count < fn_cap {
                     unsafe {
                         *pipe_hir_item_ptr_at(items_buf, fn_count) = ni;
                         *pipe_mir_body_ptr_at(bodies_buf, fn_count) = body;

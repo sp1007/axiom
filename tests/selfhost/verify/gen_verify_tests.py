@@ -39,6 +39,7 @@ CORE_MODULES = [
     ("compiler.types.types", "compiler"),
     ("compiler.mir.mir", "compiler"),
     ("compiler.mir.drop", "compiler"),
+    ("compiler.own.cap", "compiler"),
     ("compiler.verify.verifier", "compiler"),
     ("compiler.verify", "compiler"),
 ]
@@ -83,6 +84,7 @@ PIPELINE_MODULES = [
     ("compiler.mir.drop", "compiler"),
     ("compiler.mir.builder", "compiler"),
     ("compiler.mir", "compiler"),
+    ("compiler.own.cap", "compiler"),
     ("compiler.verify.verifier", "compiler"),
     ("compiler.verify", "compiler"),
 ]

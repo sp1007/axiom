@@ -176,6 +176,7 @@ use compiler.types.types.TY_BUILTIN_PTR_WRITE_BYTES
 use compiler.types.types.TY_BUILTIN_SIZE_OF
 use compiler.types.types.TY_CHAR
 use compiler.types.types.TY_CLOSURE
+use compiler.types.types.TY_COROUTINE
 use compiler.types.types.TY_ENUM
 use compiler.types.types.TY_ERROR
 use compiler.types.types.TY_FN
@@ -360,6 +361,7 @@ use compiler.mir.mir.MIR_TERM_CALL
 use compiler.mir.mir.MIR_TERM_DROP
 use compiler.mir.mir.MIR_TERM_GOTO
 use compiler.mir.mir.MIR_TERM_RETURN
+use compiler.mir.mir.MIR_TERM_SUSPEND
 use compiler.mir.mir.MIR_TERM_SWITCH_INT
 use compiler.mir.mir.MIR_TERM_UNREACHABLE
 use compiler.mir.mir.MIR_UNOP_BITNOT
@@ -466,6 +468,7 @@ pub struct MirBuilder {
     pub closure_tail: *mut MirClosureBodyEntry,
     // T161: the impl whose instance of a trait default method is being built (null otherwise).
     pub self_impl: *const HirItem,
+    pub suspend_point_count: u32,
 }
 
 unsafe fn mb_sym_entry_at(base: *mut MirSymLocalMapEntry, idx: usize) -> *mut MirSymLocalMapEntry {
@@ -9612,6 +9615,66 @@ fn mb_build_match_loop_jump_try_closure_expr(
         return;
     }
 
+    if ek == HIR_EXPR_AWAIT {
+        let inner: *mut HirExpr = unsafe {
+            (*expr).inner
+        };
+        let inner_ty = mb_expr_ty(mut_view(*b), inner);
+        let fut_loc = mb_new_temp(mut_view(*b), (TypeId {
+            v: inner_ty.v
+        }), view(sp));
+        let mut fut_pl = mir_local_place(fut_loc.v);
+        mir_build_expr(mut_view(*b), inner, mut_view(fut_pl), true);
+        mb_consume_local(mut_view(*b), view(fut_pl));
+
+        let out_ty = mb_expr_ty(mut_view(*b), expr);
+        let mut out_pl = mir_local_place(0u32);
+        if has_dest {
+            mir_copy_place(mut_view(out_pl), view(*dest));
+        } else {
+            let out_loc = mb_new_temp(mut_view(*b), (TypeId {
+                v: out_ty.v
+            }), view(sp));
+            out_pl = mir_local_place(out_loc.v);
+        }
+
+        let sp_id = b.suspend_point_count;
+        b.suspend_point_count = b.suspend_point_count + 1u32;
+
+        let bb_resume = mb_new_bb(mut_view(*b), false);
+        let bb_drop = mb_new_bb(mut_view(*b), true);
+        let drop_bb_ptr = unsafe {
+            mir_bb_at((*b.body).bbs, bb_drop.v as usize)
+        };
+        unsafe {
+            mir_term_zero(mut_view((*drop_bb_ptr).terminator), MIR_TERM_UNREACHABLE);
+            (*drop_bb_ptr).terminator.span.file.v = sp.file.v;
+            (*drop_bb_ptr).terminator.span.start = sp.start;
+            (*drop_bb_ptr).terminator.span.end = sp.end;
+            (*drop_bb_ptr).has_terminator = true;
+        }
+
+        let cur_bb_ptr = unsafe {
+            mir_bb_at((*b.body).bbs, b.curr_bb.v as usize)
+        };
+        unsafe {
+            mir_term_zero(mut_view((*cur_bb_ptr).terminator), MIR_TERM_SUSPEND);
+            (*cur_bb_ptr).terminator.span.file.v = sp.file.v;
+            (*cur_bb_ptr).terminator.span.start = sp.start;
+            (*cur_bb_ptr).terminator.span.end = sp.end;
+            (*cur_bb_ptr).terminator.drop_flag = sp_id;
+            mir_copy_place(mut_view((*cur_bb_ptr).terminator.drop_place), view(fut_pl));
+            mir_copy_place(mut_view((*cur_bb_ptr).terminator.destination), view(out_pl));
+            (*cur_bb_ptr).terminator.call_target.v = bb_resume.v;
+            (*cur_bb_ptr).terminator.call_unwind.v = bb_drop.v;
+            (*cur_bb_ptr).has_terminator = true;
+        }
+
+        b.curr_bb.v = bb_resume.v;
+        b.is_diverged = false;
+        return;
+    }
+
     if ek == HIR_EXPR_CLOSURE {
         let ax = unsafe {
             type_get(view((*b.thir).interner), (TypeId {
@@ -10155,6 +10218,7 @@ pub fn mir_build_closure(
         closure_head: 0 as *mut MirClosureBodyEntry,
         closure_tail: 0 as *mut MirClosureBodyEntry,
         self_impl: 0 as *const HirItem,
+        suspend_point_count: 0u32,
     };
     let sp = Span {
         file: FileId { v: unsafe { (*closure_expr).span.file.v } },
@@ -10627,6 +10691,7 @@ pub fn mir_build_fn_subst(
         closure_head: 0 as *mut MirClosureBodyEntry,
         closure_tail: 0 as *mut MirClosureBodyEntry,
         self_impl: 0 as *const HirItem,
+        suspend_point_count: 0u32,
     };
     // T161: typeck records the impl of a default-method instance under the instance item's address tagged
     // with 2 (items are 8-aligned; the drop-impl keys use tag 1).
@@ -10661,6 +10726,16 @@ pub fn mir_build_fn_subst(
                 (*fn_ax).ret_type.v
             }
         });
+        if unsafe { (*func).is_async } {
+            let cr_ax = unsafe {
+                type_get(view((*thir).interner), TypeId { v: ret_ty.v })
+            };
+            if (cr_ax as usize) != 0 && (unsafe { (*cr_ax).kind }) == TY_COROUTINE {
+                ret_ty = mb_resolve_ty(mut_view(b), TypeId {
+                    v: unsafe { (*cr_ax).ret_type.v }
+                });
+            }
+        }
     }
 
     mb_new_local(mut_view(b), (TypeId {
@@ -11485,6 +11560,7 @@ pub fn mir_build_expr_body(
         closure_head: 0 as *mut MirClosureBodyEntry,
         closure_tail: 0 as *mut MirClosureBodyEntry,
         self_impl: 0 as *const HirItem,
+        suspend_point_count: 0u32,
     };
     let sp = Span {
         file: FileId { v: unsafe { (*expr).span.file.v } },
