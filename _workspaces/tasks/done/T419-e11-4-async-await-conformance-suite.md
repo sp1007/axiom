@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T415, T416, T417, T088, T418]
 priority: 142
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tests/conformance/p11/e11_4_async]
 spec: [spec/SPEC-33-async.md, 0093, 0127, 0135, 0201, 0202, 0248, tasks/0275, tasks/0297, tasks/0619]
 covers: [REQ-ASY-010, REQ-ASY-011, REQ-ASY-064, REQ-ASY-065, REQ-ASY-070, REQ-ASY-075, REQ-ASY-077, REQ-ASY-078, REQ-ASY-079, REQ-ASY-080, REQ-ASY-081, REQ-ASY-082, REQ-ASY-083, REQ-ASY-133, REQ-ASY-134, REQ-ASY-142]
+started: 2026-11-12 13:06:47
+finished: 2026-11-12 13:45:15
 ---
 # T419 — E11.4 — Async/await, Future layout & cancellation conformance suite
 
@@ -37,3 +39,5 @@ Verify the `E11.4` exit criterion ('async conformance') across all `AXS-ASY-*` r
 
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
+- 2026-11-12 13:06:47 started (attempt 1) T419-impl
+- 2026-11-12 13:45:15 accepted by QA -> done

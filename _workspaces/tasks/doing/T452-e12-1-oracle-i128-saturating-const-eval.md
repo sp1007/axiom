@@ -8,12 +8,15 @@ model: sonnet
 gate_model: sonnet
 depends: [T451]
 priority: 142
-status: todo
-attempts: 0
+status: doing
+attempts: 1
+timeout_min: 300
 paths: [compiler/interp, compiler/opt, tests/run/int128_interp, tests/opt/int128]
-locks: [compiler/interp_opt/session.ax, tests/selfhost]
+locks: [compiler/interp_opt/session.ax, compiler/mir/mir.ax, compiler/mir/builder.ax, compiler/types/typeck.ax, compiler/driver/pipeline.ax, std/core/prelude.ax, tests/selfhost]
 spec: [spec/SPEC-40-integers.md, spec/SPEC-03-core-semantics.md, tasks/0327, tasks/0334]
 covers: [REQ-SIMD-176, REQ-SIMD-177, REQ-SIMD-264, REQ-SIMD-265]
+started: 2026-11-12 13:07:39
+agent: T452-impl
 ---
 # T452 — E12.1 — Oracle 128-bit evaluator, saturating/bit intrinsics & const folding
 
@@ -42,3 +45,4 @@ Implement exact 128-bit (`i128`/`u128`) arithmetic, saturating operations (`SatA
 
 ## Log
 - 2026-11-03 00:30:00 created by T212 (P12 phase planning)
+- 2026-11-12 13:07:39 started (attempt 1) T452-impl
