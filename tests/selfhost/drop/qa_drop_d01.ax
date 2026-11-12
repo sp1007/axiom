@@ -46387,6 +46387,37 @@ fn drop_expand_enum_variants(
     switch_bb.v
 }
 
+fn drop_new_coro_tag_reset_bb(
+    body: mut_view<MirBody>,
+    arena: mut_view<Arena>,
+    place: view<MirPlace>,
+    t_u32_v: u32,
+    target_v: u32
+) -> MirBbId {
+    let bb = mir_add_bb(mut_view(*body), mut_view(*arena), false);
+    let stmts = arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt;
+    let tag_place = drop_place_with_proj(mut_view(*arena), place, MIR_PROJ_FIELD, 0u32);
+    unsafe {
+        mir_stmt_zero(mut_view(*stmts), MIR_STMT_ASSIGN);
+        mir_copy_place(mut_view((*stmts).place), view(tag_place));
+        (*stmts).rvalue.kind = MIR_RVALUE_USE;
+        mir_operand_zero(mut_view((*stmts).rvalue.use_op), MIR_OP_CONST);
+        (*stmts).rvalue.use_op.constant.kind = MIR_CONST_INT;
+        (*stmts).rvalue.use_op.constant.ty.v = t_u32_v;
+        (*stmts).rvalue.use_op.constant.val = 0xFFFFFFFEu64;
+
+        let bb_ptr = mir_bb_at(body.bbs, bb.v as usize);
+        (*bb_ptr).stmts = stmts;
+        (*bb_ptr).stmt_count = 1;
+        (*bb_ptr).stmt_cap = 1;
+
+        mir_term_zero(mut_view((*bb_ptr).terminator), MIR_TERM_GOTO);
+        (*bb_ptr).terminator.goto_target.v = target_v;
+        (*bb_ptr).has_terminator = true;
+    }
+    bb
+}
+
 pub fn drop_expand_coroutine(
     body: mut_view<MirBody>,
     thir: view<Thir>,
@@ -58697,6 +58728,35 @@ use compiler.types.types.TY_MUT_VIEW
 use compiler.types.types.TY_FN
 use compiler.types.types.TY_STRUCT
 use compiler.types.types.TY_ENUM
+use compiler.types.types.TY_I8
+use compiler.types.types.TY_I16
+use compiler.types.types.TY_I32
+use compiler.types.types.TY_I64
+use compiler.types.types.TY_ISIZE
+use compiler.types.types.TY_U8
+use compiler.types.types.TY_U16
+use compiler.types.types.TY_U32
+use compiler.types.types.TY_U64
+use compiler.types.types.TY_USIZE
+use compiler.types.types.TY_BOOL
+use compiler.types.types.TY_CHAR
+use compiler.types.types.TY_STR
+use compiler.types.types.TY_UNIT
+use compiler.types.types.TY_ARRAY
+use compiler.types.types.TY_VIEW
+use compiler.types.types.ClosureCapture
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_bytes
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+use compiler.source.manager.SourceDatabase
+use compiler.source.manager.source_db_line_col
+use compiler.source.manager.LineCol
+use compiler.types.layout.type_size
+use compiler.types.layout.type_align
+use compiler.types.layout.type_field_offset
+use compiler.mir.drop.mir_type_needs_drop_in
 use compiler.types.types.intern_type
 use compiler.types.types.ax_type_reset
 use compiler.types.types.mul_usize
@@ -58725,6 +58785,7 @@ use compiler.mir.mir.MIR_OP_MOVE
 use compiler.mir.mir.MIR_OP_CONST
 use compiler.mir.mir.MIR_CONST_INT
 use compiler.mir.mir.MIR_CONST_FN
+use compiler.mir.mir.MIR_CONST_BOOL
 use compiler.mir.mir.MIR_RVALUE_USE
 use compiler.mir.mir.MIR_RVALUE_REPEAT
 use compiler.mir.mir.MIR_RVALUE_REF
@@ -58772,12 +58833,12 @@ use compiler.mir.mir.mir_add_bb
 use compiler.mir.mir.mir_add_local
 use compiler.mir.mir.mir_bb_push_stmt
 use compiler.mir.drop.mir_drop_place_type
-use compiler.mir.drop.mir_type_needs_drop_in
 use compiler.mir.drop.mir_type_needs_drop
 use compiler.traits.solver.impl_matches_receiver
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 @intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
 
 // Zero-filled arena allocation: synthesized MIR records are only partially initialized below.
 fn al_alloc_z(a: mut_view<Arena>, size: usize, align: usize) -> *mut u8 {
@@ -58812,6 +58873,25 @@ pub struct SuspendPointInfo {
     pub span: Span,
     pub live_locals: *mut u32,
     pub live_count: usize,
+}
+
+pub struct AsyncLayoutData {
+    pub sp_count: usize,
+    pub sp_spans: *mut Span,
+    pub live_names: *mut *mut StrId,
+    pub live_counts: *mut usize,
+}
+
+unsafe fn span_at_mut(base: *mut Span, idx: usize) -> *mut Span {
+    (base as usize + idx * size_of<Span>()) as *mut Span
+}
+
+unsafe fn strid_at_mut(base: *mut StrId, idx: usize) -> *mut StrId {
+    (base as usize + idx * size_of<StrId>()) as *mut StrId
+}
+
+unsafe fn strid_at_const(base: *const StrId, idx: usize) -> *const StrId {
+    (base as usize + idx * size_of<StrId>()) as *const StrId
 }
 
 // Prebuilt MIR map re-exported from compiler.mir.builder
@@ -59782,6 +59862,49 @@ pub fn mir_lower_async_body(
         (*coro_mut).variant_fields = state_fields as *mut *mut TypeId;
     }
 
+    // Setup AsyncLayoutData for inspect --emit=async-layout
+    let sp_spans = al_alloc_z(unsafe { mut_view((*thir).interner.arena) }, mul_usize(if sp_count == 0 { 1 } else { sp_count }, size_of<Span>()), align_of<Span>()) as *mut Span;
+    let live_names = al_alloc_z(unsafe { mut_view((*thir).interner.arena) }, mul_usize(if sp_count == 0 { 1 } else { sp_count }, size_of<*mut StrId>()), align_of<*mut StrId>()) as *mut *mut StrId;
+    let live_counts = al_alloc_z(unsafe { mut_view((*thir).interner.arena) }, mul_usize(if sp_count == 0 { 1 } else { sp_count }, size_of<usize>()), align_of<usize>()) as *mut usize;
+    let mut lk: usize = 0;
+    while lk < sp_count {
+        let spi = unsafe { (sp_info as usize + lk * size_of<SuspendPointInfo>()) as *mut SuspendPointInfo };
+        let live_cnt = unsafe { (*spi).live_count };
+        unsafe {
+            *span_at_mut(sp_spans, lk) = (*spi).span;
+            *usize_at(live_counts, lk) = live_cnt;
+        }
+        if live_cnt > 0 {
+            let l_names = al_alloc_z(unsafe { mut_view((*thir).interner.arena) }, mul_usize(live_cnt, size_of<StrId>()), align_of<StrId>()) as *mut StrId;
+            let mut li: usize = 0;
+            while li < live_cnt {
+                let l_orig = unsafe { *u32_at((*spi).live_locals, li) };
+                let loc_decl = unsafe { mir_local_at((*body).locals, l_orig as usize) };
+                unsafe {
+                    *strid_at_mut(l_names, li) = (*loc_decl).name;
+                }
+                li = li + 1;
+            }
+            unsafe {
+                *(live_names + lk) = l_names;
+            }
+        } else {
+            unsafe {
+                *(live_names + lk) = 0 as *mut StrId;
+            }
+        }
+        lk = lk + 1;
+    }
+    let layout_data = al_alloc_z(unsafe { mut_view((*thir).interner.arena) }, size_of<AsyncLayoutData>(), align_of<AsyncLayoutData>()) as *mut AsyncLayoutData;
+    unsafe {
+        (*layout_data).sp_count = sp_count;
+        (*layout_data).sp_spans = sp_spans;
+        (*layout_data).live_names = live_names;
+        (*layout_data).live_counts = live_counts;
+        (*coro_mut).captures = layout_data as *mut ClosureCapture;
+        (*coro_mut).capture_count = sp_count;
+    }
+
     // 5. Clone original body before transforming into constructor
     let orig_clone = clone_mir_body(mut_view(*arena), body as *const MirBody);
 
@@ -60528,13 +60651,34 @@ pub fn mir_lower_async_body(
         k = k + 1;
     }
 
-    // 9. bb_invalid: Assert/Unreachable (AX_ASYNC_POLL_AFTER_COMPLETE)
+    // 9. bb_invalid: Assert (AX_ASYNC_POLL_AFTER_COMPLETE)
     let inv_bb = unsafe { mir_bb_at(poll_bbs, bb_invalid_idx) };
+    let msg_str = "polling a completed Future state machine";
+    let msg_sv: StrView = unsafe { *(address_of(msg_str) as *const StrView) };
+    let msg_len: usize = msg_sv.len;
+    let msg_buf = al_alloc_z(mut_view(*arena), msg_len + 1, 1);
+    let mut mi: usize = 0;
+    while mi < msg_len {
+        unsafe {
+            *(msg_buf + mi) = *(msg_sv.ptr + mi);
+        }
+        mi = mi + 1;
+    }
+    let t_bool_v = unsafe { (*thir).interner.t_bool.v };
     unsafe {
+        *(msg_buf + msg_len) = 0u8;
         (*inv_bb).stmts = 0 as *mut MirStmt;
         (*inv_bb).stmt_count = 0;
 
-        mir_term_zero(mut_view((*inv_bb).terminator), MIR_TERM_UNREACHABLE);
+        mir_term_zero(mut_view((*inv_bb).terminator), MIR_TERM_ASSERT);
+        mir_operand_zero(mut_view((*inv_bb).terminator.cond), MIR_OP_CONST);
+        (*inv_bb).terminator.cond.constant.kind = MIR_CONST_BOOL;
+        (*inv_bb).terminator.cond.constant.ty.v = t_bool_v;
+        (*inv_bb).terminator.cond.constant.val = 0u64;
+        (*inv_bb).terminator.expected = true;
+        (*inv_bb).terminator.msg_ptr = msg_buf as *const u8;
+        (*inv_bb).terminator.msg_len = msg_len;
+        (*inv_bb).terminator.assert_target.v = bb_invalid_idx as u32;
         (*inv_bb).has_terminator = true;
     }
 
@@ -60725,6 +60869,278 @@ pub fn async_resolve_poll_calls(body: *mut MirBody, thir: *mut Thir, hir: *const
             }
         }
         b = b + 1;
+    }
+}
+
+fn diag_push_lit(b: mut_view<DiagBuffer>, s: str) {
+    let sv: StrView = unsafe { *(address_of(s) as *const StrView) };
+    diag_buf_push_bytes(b, sv.ptr, sv.len);
+}
+
+fn format_type_name(
+    out: mut_view<DiagBuffer>,
+    ty_id: TypeId,
+    ti: view<TypeInterner>,
+    str_in: view<StrInterner>
+) {
+    if ty_id.v == 0u32 {
+        diag_push_lit(mut_view(*out), "<unknown>");
+        return;
+    }
+    let t = type_get(ti, ty_id);
+    if (t as usize) == 0 {
+        diag_push_lit(mut_view(*out), "<unknown>");
+        return;
+    }
+    let k = unsafe { (*t).kind };
+    if k == TY_I8 { diag_push_lit(mut_view(*out), "i8"); }
+    else if k == TY_I16 { diag_push_lit(mut_view(*out), "i16"); }
+    else if k == TY_I32 { diag_push_lit(mut_view(*out), "i32"); }
+    else if k == TY_I64 { diag_push_lit(mut_view(*out), "i64"); }
+    else if k == TY_ISIZE { diag_push_lit(mut_view(*out), "isize"); }
+    else if k == TY_U8 { diag_push_lit(mut_view(*out), "u8"); }
+    else if k == TY_U16 { diag_push_lit(mut_view(*out), "u16"); }
+    else if k == TY_U32 { diag_push_lit(mut_view(*out), "u32"); }
+    else if k == TY_U64 { diag_push_lit(mut_view(*out), "u64"); }
+    else if k == TY_USIZE { diag_push_lit(mut_view(*out), "usize"); }
+    else if k == TY_BOOL { diag_push_lit(mut_view(*out), "bool"); }
+    else if k == TY_CHAR { diag_push_lit(mut_view(*out), "char"); }
+    else if k == TY_STR { diag_push_lit(mut_view(*out), "str"); }
+    else if k == TY_UNIT { diag_push_lit(mut_view(*out), "()"); }
+    else if k == TY_COROUTINE {
+        let def_it = unsafe { (*t).def };
+        if (def_it as usize) != 0 {
+            diag_push_lit(mut_view(*out), "__AsyncState_");
+            let n_sv = interner_get(str_in, unsafe { (*def_it).name });
+            diag_buf_push_sv(mut_view(*out), n_sv);
+        } else {
+            diag_push_lit(mut_view(*out), "<coroutine>");
+        }
+    } else if k == TY_STRUCT || k == TY_ENUM {
+        let def_it = unsafe { (*t).def };
+        if (def_it as usize) != 0 {
+            let n_sv = interner_get(str_in, unsafe { (*def_it).name });
+            diag_buf_push_sv(mut_view(*out), n_sv);
+        } else {
+            diag_push_lit(mut_view(*out), "<type>");
+        }
+    } else if k == TY_VIEW {
+        diag_push_lit(mut_view(*out), "view<");
+        format_type_name(mut_view(*out), unsafe { (*t).pointee }, ti, str_in);
+        diag_push_lit(mut_view(*out), ">");
+    } else if k == TY_MUT_VIEW {
+        diag_push_lit(mut_view(*out), "mut_view<");
+        format_type_name(mut_view(*out), unsafe { (*t).pointee }, ti, str_in);
+        diag_push_lit(mut_view(*out), ">");
+    } else if k == TY_ARRAY {
+        diag_push_lit(mut_view(*out), "[");
+        diag_buf_push_u32(mut_view(*out), unsafe { (*t).array_len } as u32);
+        diag_push_lit(mut_view(*out), "]");
+        format_type_name(mut_view(*out), unsafe { (*t).elem }, ti, str_in);
+    } else {
+        diag_push_lit(mut_view(*out), "<type>");
+    }
+}
+
+fn emit_async_layout_for_fn(
+    out: mut_view<DiagBuffer>,
+    it: *mut HirItem,
+    thir: view<Thir>,
+    hir: view<HirFile>,
+    str_in: view<StrInterner>,
+    db: *const SourceDatabase
+) {
+    let fn_ty_ptr: *mut TypeId = unsafe { thir_get_item_type(thir, it as *const HirItem) };
+    if (fn_ty_ptr as usize) == 0 {
+        return;
+    }
+    let fn_tid: TypeId = unsafe { *fn_ty_ptr };
+    if fn_tid.v == 0u32 {
+        return;
+    }
+    let ft: *mut AxType = unsafe { type_get(view(thir.interner), TypeId { v: fn_tid.v }) };
+    if (ft as usize) == 0 || (unsafe { (*ft).kind }) != TY_FN {
+        return;
+    }
+    let coro_id: TypeId = unsafe { (*ft).ret_type };
+    if coro_id.v == 0u32 {
+        return;
+    }
+    let coro_t: *mut AxType = unsafe { type_get(view(thir.interner), TypeId { v: coro_id.v }) };
+    if (coro_t as usize) == 0 || (unsafe { (*coro_t).kind }) != TY_COROUTINE {
+        return;
+    }
+
+    diag_push_lit(mut_view(*out), "async_fn ");
+    let seg_cnt: usize = unsafe { (*it).module_path.count };
+    let segs: *mut StrId = unsafe { (*it).module_path.segments };
+    if seg_cnt > 0 && (segs as usize) != 0 {
+        let mut s: usize = 0;
+        while s < seg_cnt {
+            let sid: StrId = unsafe { *strid_at_const(segs as *const StrId, s) };
+            let s_sv: StrView = interner_get(str_in, StrId { v: sid.v });
+            diag_buf_push_sv(mut_view(*out), s_sv);
+            diag_buf_push_byte(mut_view(*out), 46u8); // '.'
+            s = s + 1;
+        }
+    }
+    let fn_name_sv: StrView = interner_get(str_in, StrId { v: unsafe { (*it).name.v } });
+    diag_buf_push_sv(mut_view(*out), fn_name_sv);
+    diag_buf_push_byte(mut_view(*out), 58u8); // ':'
+    diag_buf_push_byte(mut_view(*out), 10u8); // '\n'
+
+    diag_push_lit(mut_view(*out), "  future_type: __AsyncState_");
+    diag_buf_push_sv(mut_view(*out), fn_name_sv);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+
+    let sz: u32 = type_size(TypeId { v: coro_id.v }, view(thir.interner));
+    diag_push_lit(mut_view(*out), "  size: ");
+    diag_buf_push_u32(mut_view(*out), sz);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+
+    let al: u32 = type_align(TypeId { v: coro_id.v }, view(thir.interner));
+    diag_push_lit(mut_view(*out), "  align: ");
+    diag_buf_push_u32(mut_view(*out), al);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+
+    let var_cnt: usize = unsafe { (*coro_t).variant_count };
+    let sp_cnt: usize = if var_cnt > 0 { var_cnt - 1 } else { 0 };
+    let total_states: usize = sp_cnt + 2;
+    diag_push_lit(mut_view(*out), "  states: ");
+    diag_buf_push_u32(mut_view(*out), total_states as u32);
+    diag_push_lit(mut_view(*out), " (unpolled=0, suspend_points=");
+    diag_buf_push_u32(mut_view(*out), sp_cnt as u32);
+    diag_push_lit(mut_view(*out), ", completed=4294967295)\n");
+
+    diag_push_lit(mut_view(*out), "  state 0 (UNPOLLED):\n");
+    let mut p_ptr: *mut HirParam = unsafe { (*it).params };
+    let mut p_idx: usize = 0;
+    while (p_ptr as usize) != 0 {
+        let pname_sv: StrView = interner_get(str_in, StrId { v: unsafe { (*p_ptr).name.v } });
+        let p_fidx: usize = 1 + p_idx;
+        let p_ty: TypeId = unsafe { *typeid_at((*coro_t).fields, p_fidx) };
+        let off: u32 = type_field_offset(TypeId { v: coro_id.v }, p_fidx, view(thir.interner));
+        let psz: u32 = if p_ty.v != 0u32 { type_size(TypeId { v: p_ty.v }, view(thir.interner)) } else { 0u32 };
+        diag_push_lit(mut_view(*out), "    param ");
+        diag_buf_push_sv(mut_view(*out), pname_sv);
+        diag_push_lit(mut_view(*out), ": ");
+        format_type_name(mut_view(*out), TypeId { v: p_ty.v }, view(thir.interner), str_in);
+        diag_push_lit(mut_view(*out), " (offset=");
+        diag_buf_push_u32(mut_view(*out), off);
+        diag_push_lit(mut_view(*out), ", size=");
+        diag_buf_push_u32(mut_view(*out), psz);
+        diag_push_lit(mut_view(*out), ")\n");
+        p_idx = p_idx + 1;
+        p_ptr = unsafe { (*p_ptr).next };
+    }
+
+    let layout_data: *mut AsyncLayoutData = unsafe { (*coro_t).captures as *mut AsyncLayoutData };
+    let state_counts: *mut usize = unsafe { (*coro_t).variant_field_counts };
+    let state_fields: *mut *mut u32 = unsafe { (*coro_t).variant_fields as *mut *mut u32 };
+
+    let mut k: usize = 0;
+    while k < sp_cnt {
+        let spi_span: Span = if (layout_data as usize) != 0 && k < (unsafe { (*layout_data).sp_count }) {
+            unsafe { *span_at_mut((*layout_data).sp_spans, k) }
+        } else {
+            Span { file: FileId { v: 0u32 }, start: 0, end: 0 }
+        };
+        let lc: LineCol = if (db as usize) != 0 && spi_span.file.v != 0u32 {
+            source_db_line_col(unsafe { view(*db) }, spi_span)
+        } else {
+            LineCol { line: 1u32, col_bytes: 1u32, col_chars: 1u32 }
+        };
+
+        diag_push_lit(mut_view(*out), "  state ");
+        diag_buf_push_u32(mut_view(*out), (k + 1) as u32);
+        diag_push_lit(mut_view(*out), " (SUSPEND sp=");
+        diag_buf_push_u32(mut_view(*out), k as u32);
+        diag_push_lit(mut_view(*out), " at ");
+        diag_buf_push_u32(mut_view(*out), lc.line);
+        diag_buf_push_byte(mut_view(*out), 58u8); // ':'
+        diag_buf_push_u32(mut_view(*out), lc.col_chars);
+        diag_push_lit(mut_view(*out), "):\n");
+
+        if (state_fields as usize) != 0 && (state_counts as usize) != 0 {
+            let state_f_arr: *mut u32 = unsafe { *(state_fields + 1 + k) };
+            let total_state_k: usize = unsafe { *usize_at(state_counts, 1 + k) };
+            if total_state_k > 0 && (state_f_arr as usize) != 0 {
+                let subfut_fidx: usize = unsafe { *u32_at(state_f_arr, 0) } as usize;
+                let subfut_ty: TypeId = unsafe { *typeid_at((*coro_t).fields, subfut_fidx) };
+                let subfut_off: u32 = type_field_offset(TypeId { v: coro_id.v }, subfut_fidx, view(thir.interner));
+                let subfut_sz: u32 = if subfut_ty.v != 0u32 { type_size(TypeId { v: subfut_ty.v }, view(thir.interner)) } else { 0u32 };
+                diag_push_lit(mut_view(*out), "    sub_future: ");
+                format_type_name(mut_view(*out), TypeId { v: subfut_ty.v }, view(thir.interner), str_in);
+                diag_push_lit(mut_view(*out), " (offset=");
+                diag_buf_push_u32(mut_view(*out), subfut_off);
+                diag_push_lit(mut_view(*out), ", size=");
+                diag_buf_push_u32(mut_view(*out), subfut_sz);
+                diag_push_lit(mut_view(*out), ")\n");
+
+                let mut li: usize = 1;
+                while li < total_state_k {
+                    let live_fidx: usize = unsafe { *u32_at(state_f_arr, li) } as usize;
+                    let live_ty: TypeId = unsafe { *typeid_at((*coro_t).fields, live_fidx) };
+                    let live_off: u32 = type_field_offset(TypeId { v: coro_id.v }, live_fidx, view(thir.interner));
+                    let live_sz: u32 = if live_ty.v != 0u32 { type_size(TypeId { v: live_ty.v }, view(thir.interner)) } else { 0u32 };
+                    let needs_drop: bool = if live_ty.v != 0u32 { mir_type_needs_drop_in(TypeId { v: live_ty.v }, thir, hir, db, str_in) } else { false };
+                    let live_name_id: StrId = if (layout_data as usize) != 0 && (unsafe { (*layout_data).live_names as usize }) != 0 {
+                        let sp_lnames: *mut StrId = unsafe { *((*layout_data).live_names + k) };
+                        if (sp_lnames as usize) != 0 && (li - 1) < (unsafe { *usize_at((*layout_data).live_counts, k) }) {
+                            unsafe { *strid_at_mut(sp_lnames, li - 1) }
+                        } else {
+                            StrId { v: 0u32 }
+                        }
+                    } else {
+                        StrId { v: 0u32 }
+                    };
+                    diag_push_lit(mut_view(*out), "    live ");
+                    if live_name_id.v != 0u32 {
+                        let lname_sv: StrView = interner_get(str_in, StrId { v: live_name_id.v });
+                        diag_buf_push_sv(mut_view(*out), lname_sv);
+                    } else {
+                        diag_push_lit(mut_view(*out), "local");
+                        diag_buf_push_u32(mut_view(*out), li as u32);
+                    }
+                    diag_push_lit(mut_view(*out), ": ");
+                    format_type_name(mut_view(*out), TypeId { v: live_ty.v }, view(thir.interner), str_in);
+                    diag_push_lit(mut_view(*out), " (offset=");
+                    diag_buf_push_u32(mut_view(*out), live_off);
+                    diag_push_lit(mut_view(*out), ", size=");
+                    diag_buf_push_u32(mut_view(*out), live_sz);
+                    diag_push_lit(mut_view(*out), ", needs_drop=");
+                    diag_push_lit(mut_view(*out), if needs_drop { "true" } else { "false" });
+                    diag_push_lit(mut_view(*out), ")\n");
+                    li = li + 1;
+                }
+            }
+        }
+        k = k + 1;
+    }
+}
+
+pub fn emit_async_layout_report(
+    out: mut_view<DiagBuffer>,
+    hir: view<HirFile>,
+    thir: view<Thir>,
+    str_in: view<StrInterner>,
+    db: *const SourceDatabase
+) {
+    let mut it: *mut HirItem = hir.items;
+    while (it as usize) != 0 {
+        let ik = unsafe { (*it).kind };
+        if ik == HIR_ITEM_FN {
+            emit_async_layout_for_fn(mut_view(*out), it, thir, hir, str_in, db);
+        } else if ik == HIR_ITEM_IMPL {
+            let mut m: *mut HirItem = unsafe { (*it).members };
+            while (m as usize) != 0 {
+                if (unsafe { (*m).kind }) == HIR_ITEM_FN {
+                    emit_async_layout_for_fn(mut_view(*out), m, thir, hir, str_in, db);
+                }
+                m = unsafe { (*m).next };
+            }
+        }
+        it = unsafe { (*it).next };
     }
 }
 

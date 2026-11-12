@@ -8,12 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T088]
 priority: 141
-status: todo
-attempts: 0
+status: done
+attempts: 1
+timeout_min: 300
 paths: [tests/run/async/oracle_trace, tests/ui/async/lifecycle]
-locks: [compiler/interp/oracle.ax, compiler/interp/interp.ax, compiler/interp_opt/session.ax, compiler/driver/opts.ax, compiler/driver/pipeline.ax, tests/selfhost]
+locks: [compiler/interp/oracle.ax, compiler/interp/interp.ax, compiler/interp/frame.ax, compiler/interp/value.ax, compiler/interp/session.ax, compiler/interp_opt/session.ax, compiler/driver/opts.ax, compiler/driver/pipeline.ax, compiler/mir/async_lower.ax, compiler/mir/drop.ax, compiler/mir/mir.ax, compiler/mir/text.ax, compiler/mir/builder.ax, compiler/own_mir_verify/session.ax, compiler/lir/builder.ax, compiler/types/layout.ax, std/future/block_on.ax, std/future/mod.ax, std/core/prelude.ax, tests/inspect, tests/selfhost]
 spec: [spec/SPEC-33-async.md, 0093, 0127, 0135, 0202, tasks/0275, tasks/0297, tasks/0619]
 covers: [REQ-ASY-007, REQ-ASY-009, REQ-ASY-013, REQ-ASY-014, REQ-ASY-016, REQ-ASY-017, REQ-ASY-018, REQ-ASY-020, REQ-ASY-021, REQ-ASY-032, REQ-ASY-034, REQ-ASY-038, REQ-ASY-043, REQ-ASY-046, REQ-ASY-047, REQ-ASY-052, REQ-ASY-056, REQ-ASY-057, REQ-ASY-058, REQ-ASY-059, REQ-ASY-063, REQ-ASY-066, REQ-ASY-073, REQ-ASY-074, REQ-ASY-088, REQ-ASY-093, REQ-ASY-096, REQ-ASY-098, REQ-ASY-099, REQ-ASY-101, REQ-ASY-110, REQ-ASY-111, REQ-ASY-112, REQ-ASY-113, REQ-ASY-114, REQ-ASY-115, REQ-ASY-121, REQ-ASY-131, REQ-ASY-132, REQ-ASY-136, REQ-ASY-140, REQ-ASY-143, REQ-ASY-148]
+started: 2026-11-12 08:42:53
+finished: 2026-11-12 13:04:55
 ---
 # T418 — E11.4 — Oracle deterministic async trace & lifecycle verifier
 
@@ -42,3 +45,5 @@ Equip the MIR interpreter oracle (`compiler/interp`) and `inspect` command with 
 
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
+- 2026-11-12 08:42:53 started (attempt 1) T418-impl
+- 2026-11-12 13:04:55 accepted by QA -> done

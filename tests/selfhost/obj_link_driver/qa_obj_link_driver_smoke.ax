@@ -47443,6 +47443,37 @@ fn drop_expand_enum_variants(
     switch_bb.v
 }
 
+fn drop_new_coro_tag_reset_bb(
+    body: mut_view<MirBody>,
+    arena: mut_view<Arena>,
+    place: view<MirPlace>,
+    t_u32_v: u32,
+    target_v: u32
+) -> MirBbId {
+    let bb = mir_add_bb(mut_view(*body), mut_view(*arena), false);
+    let stmts = arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt;
+    let tag_place = drop_place_with_proj(mut_view(*arena), place, MIR_PROJ_FIELD, 0u32);
+    unsafe {
+        mir_stmt_zero(mut_view(*stmts), MIR_STMT_ASSIGN);
+        mir_copy_place(mut_view((*stmts).place), view(tag_place));
+        (*stmts).rvalue.kind = MIR_RVALUE_USE;
+        mir_operand_zero(mut_view((*stmts).rvalue.use_op), MIR_OP_CONST);
+        (*stmts).rvalue.use_op.constant.kind = MIR_CONST_INT;
+        (*stmts).rvalue.use_op.constant.ty.v = t_u32_v;
+        (*stmts).rvalue.use_op.constant.val = 0xFFFFFFFEu64;
+
+        let bb_ptr = mir_bb_at(body.bbs, bb.v as usize);
+        (*bb_ptr).stmts = stmts;
+        (*bb_ptr).stmt_count = 1;
+        (*bb_ptr).stmt_cap = 1;
+
+        mir_term_zero(mut_view((*bb_ptr).terminator), MIR_TERM_GOTO);
+        (*bb_ptr).terminator.goto_target.v = target_v;
+        (*bb_ptr).has_terminator = true;
+    }
+    bb
+}
+
 pub fn drop_expand_coroutine(
     body: mut_view<MirBody>,
     thir: view<Thir>,
@@ -59821,6 +59852,35 @@ use compiler.types.types.TY_MUT_VIEW
 use compiler.types.types.TY_FN
 use compiler.types.types.TY_STRUCT
 use compiler.types.types.TY_ENUM
+use compiler.types.types.TY_I8
+use compiler.types.types.TY_I16
+use compiler.types.types.TY_I32
+use compiler.types.types.TY_I64
+use compiler.types.types.TY_ISIZE
+use compiler.types.types.TY_U8
+use compiler.types.types.TY_U16
+use compiler.types.types.TY_U32
+use compiler.types.types.TY_U64
+use compiler.types.types.TY_USIZE
+use compiler.types.types.TY_BOOL
+use compiler.types.types.TY_CHAR
+use compiler.types.types.TY_STR
+use compiler.types.types.TY_UNIT
+use compiler.types.types.TY_ARRAY
+use compiler.types.types.TY_VIEW
+use compiler.types.types.ClosureCapture
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_bytes
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+use compiler.source.manager.SourceDatabase
+use compiler.source.manager.source_db_line_col
+use compiler.source.manager.LineCol
+use compiler.types.layout.type_size
+use compiler.types.layout.type_align
+use compiler.types.layout.type_field_offset
+use compiler.mir.drop.mir_type_needs_drop_in
 use compiler.types.types.intern_type
 use compiler.types.types.ax_type_reset
 use compiler.types.types.mul_usize
@@ -59849,6 +59909,7 @@ use compiler.mir.mir.MIR_OP_MOVE
 use compiler.mir.mir.MIR_OP_CONST
 use compiler.mir.mir.MIR_CONST_INT
 use compiler.mir.mir.MIR_CONST_FN
+use compiler.mir.mir.MIR_CONST_BOOL
 use compiler.mir.mir.MIR_RVALUE_USE
 use compiler.mir.mir.MIR_RVALUE_REPEAT
 use compiler.mir.mir.MIR_RVALUE_REF
@@ -59896,12 +59957,12 @@ use compiler.mir.mir.mir_add_bb
 use compiler.mir.mir.mir_add_local
 use compiler.mir.mir.mir_bb_push_stmt
 use compiler.mir.drop.mir_drop_place_type
-use compiler.mir.drop.mir_type_needs_drop_in
 use compiler.mir.drop.mir_type_needs_drop
 use compiler.traits.solver.impl_matches_receiver
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 @intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
 
 // Zero-filled arena allocation: synthesized MIR records are only partially initialized below.
 fn al_alloc_z(a: mut_view<Arena>, size: usize, align: usize) -> *mut u8 {
@@ -59936,6 +59997,25 @@ pub struct SuspendPointInfo {
     pub span: Span,
     pub live_locals: *mut u32,
     pub live_count: usize,
+}
+
+pub struct AsyncLayoutData {
+    pub sp_count: usize,
+    pub sp_spans: *mut Span,
+    pub live_names: *mut *mut StrId,
+    pub live_counts: *mut usize,
+}
+
+unsafe fn span_at_mut(base: *mut Span, idx: usize) -> *mut Span {
+    (base as usize + idx * size_of<Span>()) as *mut Span
+}
+
+unsafe fn strid_at_mut(base: *mut StrId, idx: usize) -> *mut StrId {
+    (base as usize + idx * size_of<StrId>()) as *mut StrId
+}
+
+unsafe fn strid_at_const(base: *const StrId, idx: usize) -> *const StrId {
+    (base as usize + idx * size_of<StrId>()) as *const StrId
 }
 
 // Prebuilt MIR map re-exported from compiler.mir.builder
@@ -60906,6 +60986,49 @@ pub fn mir_lower_async_body(
         (*coro_mut).variant_fields = state_fields as *mut *mut TypeId;
     }
 
+    // Setup AsyncLayoutData for inspect --emit=async-layout
+    let sp_spans = al_alloc_z(unsafe { mut_view((*thir).interner.arena) }, mul_usize(if sp_count == 0 { 1 } else { sp_count }, size_of<Span>()), align_of<Span>()) as *mut Span;
+    let live_names = al_alloc_z(unsafe { mut_view((*thir).interner.arena) }, mul_usize(if sp_count == 0 { 1 } else { sp_count }, size_of<*mut StrId>()), align_of<*mut StrId>()) as *mut *mut StrId;
+    let live_counts = al_alloc_z(unsafe { mut_view((*thir).interner.arena) }, mul_usize(if sp_count == 0 { 1 } else { sp_count }, size_of<usize>()), align_of<usize>()) as *mut usize;
+    let mut lk: usize = 0;
+    while lk < sp_count {
+        let spi = unsafe { (sp_info as usize + lk * size_of<SuspendPointInfo>()) as *mut SuspendPointInfo };
+        let live_cnt = unsafe { (*spi).live_count };
+        unsafe {
+            *span_at_mut(sp_spans, lk) = (*spi).span;
+            *usize_at(live_counts, lk) = live_cnt;
+        }
+        if live_cnt > 0 {
+            let l_names = al_alloc_z(unsafe { mut_view((*thir).interner.arena) }, mul_usize(live_cnt, size_of<StrId>()), align_of<StrId>()) as *mut StrId;
+            let mut li: usize = 0;
+            while li < live_cnt {
+                let l_orig = unsafe { *u32_at((*spi).live_locals, li) };
+                let loc_decl = unsafe { mir_local_at((*body).locals, l_orig as usize) };
+                unsafe {
+                    *strid_at_mut(l_names, li) = (*loc_decl).name;
+                }
+                li = li + 1;
+            }
+            unsafe {
+                *(live_names + lk) = l_names;
+            }
+        } else {
+            unsafe {
+                *(live_names + lk) = 0 as *mut StrId;
+            }
+        }
+        lk = lk + 1;
+    }
+    let layout_data = al_alloc_z(unsafe { mut_view((*thir).interner.arena) }, size_of<AsyncLayoutData>(), align_of<AsyncLayoutData>()) as *mut AsyncLayoutData;
+    unsafe {
+        (*layout_data).sp_count = sp_count;
+        (*layout_data).sp_spans = sp_spans;
+        (*layout_data).live_names = live_names;
+        (*layout_data).live_counts = live_counts;
+        (*coro_mut).captures = layout_data as *mut ClosureCapture;
+        (*coro_mut).capture_count = sp_count;
+    }
+
     // 5. Clone original body before transforming into constructor
     let orig_clone = clone_mir_body(mut_view(*arena), body as *const MirBody);
 
@@ -61652,13 +61775,34 @@ pub fn mir_lower_async_body(
         k = k + 1;
     }
 
-    // 9. bb_invalid: Assert/Unreachable (AX_ASYNC_POLL_AFTER_COMPLETE)
+    // 9. bb_invalid: Assert (AX_ASYNC_POLL_AFTER_COMPLETE)
     let inv_bb = unsafe { mir_bb_at(poll_bbs, bb_invalid_idx) };
+    let msg_str = "polling a completed Future state machine";
+    let msg_sv: StrView = unsafe { *(address_of(msg_str) as *const StrView) };
+    let msg_len: usize = msg_sv.len;
+    let msg_buf = al_alloc_z(mut_view(*arena), msg_len + 1, 1);
+    let mut mi: usize = 0;
+    while mi < msg_len {
+        unsafe {
+            *(msg_buf + mi) = *(msg_sv.ptr + mi);
+        }
+        mi = mi + 1;
+    }
+    let t_bool_v = unsafe { (*thir).interner.t_bool.v };
     unsafe {
+        *(msg_buf + msg_len) = 0u8;
         (*inv_bb).stmts = 0 as *mut MirStmt;
         (*inv_bb).stmt_count = 0;
 
-        mir_term_zero(mut_view((*inv_bb).terminator), MIR_TERM_UNREACHABLE);
+        mir_term_zero(mut_view((*inv_bb).terminator), MIR_TERM_ASSERT);
+        mir_operand_zero(mut_view((*inv_bb).terminator.cond), MIR_OP_CONST);
+        (*inv_bb).terminator.cond.constant.kind = MIR_CONST_BOOL;
+        (*inv_bb).terminator.cond.constant.ty.v = t_bool_v;
+        (*inv_bb).terminator.cond.constant.val = 0u64;
+        (*inv_bb).terminator.expected = true;
+        (*inv_bb).terminator.msg_ptr = msg_buf as *const u8;
+        (*inv_bb).terminator.msg_len = msg_len;
+        (*inv_bb).terminator.assert_target.v = bb_invalid_idx as u32;
         (*inv_bb).has_terminator = true;
     }
 
@@ -61849,6 +61993,278 @@ pub fn async_resolve_poll_calls(body: *mut MirBody, thir: *mut Thir, hir: *const
             }
         }
         b = b + 1;
+    }
+}
+
+fn diag_push_lit(b: mut_view<DiagBuffer>, s: str) {
+    let sv: StrView = unsafe { *(address_of(s) as *const StrView) };
+    diag_buf_push_bytes(b, sv.ptr, sv.len);
+}
+
+fn format_type_name(
+    out: mut_view<DiagBuffer>,
+    ty_id: TypeId,
+    ti: view<TypeInterner>,
+    str_in: view<StrInterner>
+) {
+    if ty_id.v == 0u32 {
+        diag_push_lit(mut_view(*out), "<unknown>");
+        return;
+    }
+    let t = type_get(ti, ty_id);
+    if (t as usize) == 0 {
+        diag_push_lit(mut_view(*out), "<unknown>");
+        return;
+    }
+    let k = unsafe { (*t).kind };
+    if k == TY_I8 { diag_push_lit(mut_view(*out), "i8"); }
+    else if k == TY_I16 { diag_push_lit(mut_view(*out), "i16"); }
+    else if k == TY_I32 { diag_push_lit(mut_view(*out), "i32"); }
+    else if k == TY_I64 { diag_push_lit(mut_view(*out), "i64"); }
+    else if k == TY_ISIZE { diag_push_lit(mut_view(*out), "isize"); }
+    else if k == TY_U8 { diag_push_lit(mut_view(*out), "u8"); }
+    else if k == TY_U16 { diag_push_lit(mut_view(*out), "u16"); }
+    else if k == TY_U32 { diag_push_lit(mut_view(*out), "u32"); }
+    else if k == TY_U64 { diag_push_lit(mut_view(*out), "u64"); }
+    else if k == TY_USIZE { diag_push_lit(mut_view(*out), "usize"); }
+    else if k == TY_BOOL { diag_push_lit(mut_view(*out), "bool"); }
+    else if k == TY_CHAR { diag_push_lit(mut_view(*out), "char"); }
+    else if k == TY_STR { diag_push_lit(mut_view(*out), "str"); }
+    else if k == TY_UNIT { diag_push_lit(mut_view(*out), "()"); }
+    else if k == TY_COROUTINE {
+        let def_it = unsafe { (*t).def };
+        if (def_it as usize) != 0 {
+            diag_push_lit(mut_view(*out), "__AsyncState_");
+            let n_sv = interner_get(str_in, unsafe { (*def_it).name });
+            diag_buf_push_sv(mut_view(*out), n_sv);
+        } else {
+            diag_push_lit(mut_view(*out), "<coroutine>");
+        }
+    } else if k == TY_STRUCT || k == TY_ENUM {
+        let def_it = unsafe { (*t).def };
+        if (def_it as usize) != 0 {
+            let n_sv = interner_get(str_in, unsafe { (*def_it).name });
+            diag_buf_push_sv(mut_view(*out), n_sv);
+        } else {
+            diag_push_lit(mut_view(*out), "<type>");
+        }
+    } else if k == TY_VIEW {
+        diag_push_lit(mut_view(*out), "view<");
+        format_type_name(mut_view(*out), unsafe { (*t).pointee }, ti, str_in);
+        diag_push_lit(mut_view(*out), ">");
+    } else if k == TY_MUT_VIEW {
+        diag_push_lit(mut_view(*out), "mut_view<");
+        format_type_name(mut_view(*out), unsafe { (*t).pointee }, ti, str_in);
+        diag_push_lit(mut_view(*out), ">");
+    } else if k == TY_ARRAY {
+        diag_push_lit(mut_view(*out), "[");
+        diag_buf_push_u32(mut_view(*out), unsafe { (*t).array_len } as u32);
+        diag_push_lit(mut_view(*out), "]");
+        format_type_name(mut_view(*out), unsafe { (*t).elem }, ti, str_in);
+    } else {
+        diag_push_lit(mut_view(*out), "<type>");
+    }
+}
+
+fn emit_async_layout_for_fn(
+    out: mut_view<DiagBuffer>,
+    it: *mut HirItem,
+    thir: view<Thir>,
+    hir: view<HirFile>,
+    str_in: view<StrInterner>,
+    db: *const SourceDatabase
+) {
+    let fn_ty_ptr: *mut TypeId = unsafe { thir_get_item_type(thir, it as *const HirItem) };
+    if (fn_ty_ptr as usize) == 0 {
+        return;
+    }
+    let fn_tid: TypeId = unsafe { *fn_ty_ptr };
+    if fn_tid.v == 0u32 {
+        return;
+    }
+    let ft: *mut AxType = unsafe { type_get(view(thir.interner), TypeId { v: fn_tid.v }) };
+    if (ft as usize) == 0 || (unsafe { (*ft).kind }) != TY_FN {
+        return;
+    }
+    let coro_id: TypeId = unsafe { (*ft).ret_type };
+    if coro_id.v == 0u32 {
+        return;
+    }
+    let coro_t: *mut AxType = unsafe { type_get(view(thir.interner), TypeId { v: coro_id.v }) };
+    if (coro_t as usize) == 0 || (unsafe { (*coro_t).kind }) != TY_COROUTINE {
+        return;
+    }
+
+    diag_push_lit(mut_view(*out), "async_fn ");
+    let seg_cnt: usize = unsafe { (*it).module_path.count };
+    let segs: *mut StrId = unsafe { (*it).module_path.segments };
+    if seg_cnt > 0 && (segs as usize) != 0 {
+        let mut s: usize = 0;
+        while s < seg_cnt {
+            let sid: StrId = unsafe { *strid_at_const(segs as *const StrId, s) };
+            let s_sv: StrView = interner_get(str_in, StrId { v: sid.v });
+            diag_buf_push_sv(mut_view(*out), s_sv);
+            diag_buf_push_byte(mut_view(*out), 46u8); // '.'
+            s = s + 1;
+        }
+    }
+    let fn_name_sv: StrView = interner_get(str_in, StrId { v: unsafe { (*it).name.v } });
+    diag_buf_push_sv(mut_view(*out), fn_name_sv);
+    diag_buf_push_byte(mut_view(*out), 58u8); // ':'
+    diag_buf_push_byte(mut_view(*out), 10u8); // '\n'
+
+    diag_push_lit(mut_view(*out), "  future_type: __AsyncState_");
+    diag_buf_push_sv(mut_view(*out), fn_name_sv);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+
+    let sz: u32 = type_size(TypeId { v: coro_id.v }, view(thir.interner));
+    diag_push_lit(mut_view(*out), "  size: ");
+    diag_buf_push_u32(mut_view(*out), sz);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+
+    let al: u32 = type_align(TypeId { v: coro_id.v }, view(thir.interner));
+    diag_push_lit(mut_view(*out), "  align: ");
+    diag_buf_push_u32(mut_view(*out), al);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+
+    let var_cnt: usize = unsafe { (*coro_t).variant_count };
+    let sp_cnt: usize = if var_cnt > 0 { var_cnt - 1 } else { 0 };
+    let total_states: usize = sp_cnt + 2;
+    diag_push_lit(mut_view(*out), "  states: ");
+    diag_buf_push_u32(mut_view(*out), total_states as u32);
+    diag_push_lit(mut_view(*out), " (unpolled=0, suspend_points=");
+    diag_buf_push_u32(mut_view(*out), sp_cnt as u32);
+    diag_push_lit(mut_view(*out), ", completed=4294967295)\n");
+
+    diag_push_lit(mut_view(*out), "  state 0 (UNPOLLED):\n");
+    let mut p_ptr: *mut HirParam = unsafe { (*it).params };
+    let mut p_idx: usize = 0;
+    while (p_ptr as usize) != 0 {
+        let pname_sv: StrView = interner_get(str_in, StrId { v: unsafe { (*p_ptr).name.v } });
+        let p_fidx: usize = 1 + p_idx;
+        let p_ty: TypeId = unsafe { *typeid_at((*coro_t).fields, p_fidx) };
+        let off: u32 = type_field_offset(TypeId { v: coro_id.v }, p_fidx, view(thir.interner));
+        let psz: u32 = if p_ty.v != 0u32 { type_size(TypeId { v: p_ty.v }, view(thir.interner)) } else { 0u32 };
+        diag_push_lit(mut_view(*out), "    param ");
+        diag_buf_push_sv(mut_view(*out), pname_sv);
+        diag_push_lit(mut_view(*out), ": ");
+        format_type_name(mut_view(*out), TypeId { v: p_ty.v }, view(thir.interner), str_in);
+        diag_push_lit(mut_view(*out), " (offset=");
+        diag_buf_push_u32(mut_view(*out), off);
+        diag_push_lit(mut_view(*out), ", size=");
+        diag_buf_push_u32(mut_view(*out), psz);
+        diag_push_lit(mut_view(*out), ")\n");
+        p_idx = p_idx + 1;
+        p_ptr = unsafe { (*p_ptr).next };
+    }
+
+    let layout_data: *mut AsyncLayoutData = unsafe { (*coro_t).captures as *mut AsyncLayoutData };
+    let state_counts: *mut usize = unsafe { (*coro_t).variant_field_counts };
+    let state_fields: *mut *mut u32 = unsafe { (*coro_t).variant_fields as *mut *mut u32 };
+
+    let mut k: usize = 0;
+    while k < sp_cnt {
+        let spi_span: Span = if (layout_data as usize) != 0 && k < (unsafe { (*layout_data).sp_count }) {
+            unsafe { *span_at_mut((*layout_data).sp_spans, k) }
+        } else {
+            Span { file: FileId { v: 0u32 }, start: 0, end: 0 }
+        };
+        let lc: LineCol = if (db as usize) != 0 && spi_span.file.v != 0u32 {
+            source_db_line_col(unsafe { view(*db) }, spi_span)
+        } else {
+            LineCol { line: 1u32, col_bytes: 1u32, col_chars: 1u32 }
+        };
+
+        diag_push_lit(mut_view(*out), "  state ");
+        diag_buf_push_u32(mut_view(*out), (k + 1) as u32);
+        diag_push_lit(mut_view(*out), " (SUSPEND sp=");
+        diag_buf_push_u32(mut_view(*out), k as u32);
+        diag_push_lit(mut_view(*out), " at ");
+        diag_buf_push_u32(mut_view(*out), lc.line);
+        diag_buf_push_byte(mut_view(*out), 58u8); // ':'
+        diag_buf_push_u32(mut_view(*out), lc.col_chars);
+        diag_push_lit(mut_view(*out), "):\n");
+
+        if (state_fields as usize) != 0 && (state_counts as usize) != 0 {
+            let state_f_arr: *mut u32 = unsafe { *(state_fields + 1 + k) };
+            let total_state_k: usize = unsafe { *usize_at(state_counts, 1 + k) };
+            if total_state_k > 0 && (state_f_arr as usize) != 0 {
+                let subfut_fidx: usize = unsafe { *u32_at(state_f_arr, 0) } as usize;
+                let subfut_ty: TypeId = unsafe { *typeid_at((*coro_t).fields, subfut_fidx) };
+                let subfut_off: u32 = type_field_offset(TypeId { v: coro_id.v }, subfut_fidx, view(thir.interner));
+                let subfut_sz: u32 = if subfut_ty.v != 0u32 { type_size(TypeId { v: subfut_ty.v }, view(thir.interner)) } else { 0u32 };
+                diag_push_lit(mut_view(*out), "    sub_future: ");
+                format_type_name(mut_view(*out), TypeId { v: subfut_ty.v }, view(thir.interner), str_in);
+                diag_push_lit(mut_view(*out), " (offset=");
+                diag_buf_push_u32(mut_view(*out), subfut_off);
+                diag_push_lit(mut_view(*out), ", size=");
+                diag_buf_push_u32(mut_view(*out), subfut_sz);
+                diag_push_lit(mut_view(*out), ")\n");
+
+                let mut li: usize = 1;
+                while li < total_state_k {
+                    let live_fidx: usize = unsafe { *u32_at(state_f_arr, li) } as usize;
+                    let live_ty: TypeId = unsafe { *typeid_at((*coro_t).fields, live_fidx) };
+                    let live_off: u32 = type_field_offset(TypeId { v: coro_id.v }, live_fidx, view(thir.interner));
+                    let live_sz: u32 = if live_ty.v != 0u32 { type_size(TypeId { v: live_ty.v }, view(thir.interner)) } else { 0u32 };
+                    let needs_drop: bool = if live_ty.v != 0u32 { mir_type_needs_drop_in(TypeId { v: live_ty.v }, thir, hir, db, str_in) } else { false };
+                    let live_name_id: StrId = if (layout_data as usize) != 0 && (unsafe { (*layout_data).live_names as usize }) != 0 {
+                        let sp_lnames: *mut StrId = unsafe { *((*layout_data).live_names + k) };
+                        if (sp_lnames as usize) != 0 && (li - 1) < (unsafe { *usize_at((*layout_data).live_counts, k) }) {
+                            unsafe { *strid_at_mut(sp_lnames, li - 1) }
+                        } else {
+                            StrId { v: 0u32 }
+                        }
+                    } else {
+                        StrId { v: 0u32 }
+                    };
+                    diag_push_lit(mut_view(*out), "    live ");
+                    if live_name_id.v != 0u32 {
+                        let lname_sv: StrView = interner_get(str_in, StrId { v: live_name_id.v });
+                        diag_buf_push_sv(mut_view(*out), lname_sv);
+                    } else {
+                        diag_push_lit(mut_view(*out), "local");
+                        diag_buf_push_u32(mut_view(*out), li as u32);
+                    }
+                    diag_push_lit(mut_view(*out), ": ");
+                    format_type_name(mut_view(*out), TypeId { v: live_ty.v }, view(thir.interner), str_in);
+                    diag_push_lit(mut_view(*out), " (offset=");
+                    diag_buf_push_u32(mut_view(*out), live_off);
+                    diag_push_lit(mut_view(*out), ", size=");
+                    diag_buf_push_u32(mut_view(*out), live_sz);
+                    diag_push_lit(mut_view(*out), ", needs_drop=");
+                    diag_push_lit(mut_view(*out), if needs_drop { "true" } else { "false" });
+                    diag_push_lit(mut_view(*out), ")\n");
+                    li = li + 1;
+                }
+            }
+        }
+        k = k + 1;
+    }
+}
+
+pub fn emit_async_layout_report(
+    out: mut_view<DiagBuffer>,
+    hir: view<HirFile>,
+    thir: view<Thir>,
+    str_in: view<StrInterner>,
+    db: *const SourceDatabase
+) {
+    let mut it: *mut HirItem = hir.items;
+    while (it as usize) != 0 {
+        let ik = unsafe { (*it).kind };
+        if ik == HIR_ITEM_FN {
+            emit_async_layout_for_fn(mut_view(*out), it, thir, hir, str_in, db);
+        } else if ik == HIR_ITEM_IMPL {
+            let mut m: *mut HirItem = unsafe { (*it).members };
+            while (m as usize) != 0 {
+                if (unsafe { (*m).kind }) == HIR_ITEM_FN {
+                    emit_async_layout_for_fn(mut_view(*out), m, thir, hir, str_in, db);
+                }
+                m = unsafe { (*m).next };
+            }
+        }
+        it = unsafe { (*it).next };
     }
 }
 
@@ -81375,6 +81791,18 @@ pub struct InterpOrdAccess {
     pub read_epochs: [16]u64,
 }
 
+pub struct InterpAsyncFut {
+    pub fut_id: u64,
+    pub self_addr: usize,
+    pub name_ptr: *const u8,
+    pub name_len: usize,
+    pub state_tag: u32,
+    pub is_completed: bool,
+    pub is_cancelled: bool,
+    pub last_suspended_sp: u32,
+    pub has_last_suspended_sp: bool,
+}
+
 pub struct InterpOracleState {
     pub current_tid: u32,
     pub has_concurrent_threads: bool,
@@ -81397,6 +81825,10 @@ pub struct InterpOracleState {
     pub current_frame_storage: *mut u8,
     pub current_frame_storage_size: usize,
     pub last_thread_callee: [16]usize,
+    pub next_fut_id: u64,
+    pub async_futs: *mut InterpAsyncFut,
+    pub async_fut_len: usize,
+    pub async_fut_cap: usize,
 }
 
 pub struct InterpValue {
@@ -81504,6 +81936,11 @@ pub unsafe fn interp_atomic_write_at(base: *mut InterpAtomicWrite, idx: usize) -
 pub unsafe fn interp_atomic_loc_at(base: *mut InterpAtomicLoc, idx: usize) -> *mut InterpAtomicLoc {
     let off = interp_mul_usize(idx, size_of<InterpAtomicLoc>());
     ((base as usize) + off) as *mut InterpAtomicLoc
+}
+
+pub unsafe fn interp_async_fut_at(base: *mut InterpAsyncFut, idx: usize) -> *mut InterpAsyncFut {
+    let off = interp_mul_usize(idx, size_of<InterpAsyncFut>());
+    ((base as usize) + off) as *mut InterpAsyncFut
 }
 
 pub unsafe fn interp_ord_access_at(base: *mut InterpOrdAccess, idx: usize) -> *mut InterpOrdAccess {
@@ -82339,6 +82776,10 @@ pub fn interp_ctx_init(
     ctx.oracle.ord_access_cap = 0;
     ctx.oracle.current_frame_storage = 0 as *mut u8;
     ctx.oracle.current_frame_storage_size = 0;
+    ctx.oracle.next_fut_id = 1u64;
+    ctx.oracle.async_futs = 0 as *mut InterpAsyncFut;
+    ctx.oracle.async_fut_len = 0;
+    ctx.oracle.async_fut_cap = 0;
 }
 
 pub fn interp_ctx_alloc_zeroed() -> *mut InterpCtx {
@@ -82396,6 +82837,17 @@ pub fn interp_ctx_free_allocs(ctx: mut_view<InterpCtx>) {
         ctx.oracle.ord_accesses = 0 as *mut InterpOrdAccess;
         ctx.oracle.ord_access_len = 0;
         ctx.oracle.ord_access_cap = 0;
+    }
+    if (ctx.oracle.async_futs as usize) != 0 {
+        if ctx.oracle.async_fut_cap > 0 {
+            let abytes = interp_mul_usize(ctx.oracle.async_fut_cap, size_of<InterpAsyncFut>());
+            unsafe {
+                heap_free(ctx.oracle.async_futs as *mut u8, abytes, align_of<InterpAsyncFut>());
+            }
+        }
+        ctx.oracle.async_futs = 0 as *mut InterpAsyncFut;
+        ctx.oracle.async_fut_len = 0;
+        ctx.oracle.async_fut_cap = 0;
     }
     if (ctx.allocs as usize) != 0 {
         let mut i: usize = 0;
@@ -82500,9 +82952,13 @@ use compiler.interp.value.interp_register_alloc
 use compiler.interp.value.interp_report_ub
 use compiler.interp.value.interp_validate_raw_ptr
 use compiler.interp.value.interp_zero_bytes
+use compiler.interp.value.InterpAsyncFut
+use compiler.interp.value.interp_async_fut_at
+use compiler.interp.value.interp_panic_sv
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 @intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
 
 // Concatenated host intrinsic names:
 //   0..10:   "heap_alloc"
@@ -84513,6 +84969,142 @@ pub fn oracle_atomic_compiler_fence(ctx: mut_view<InterpCtx>, ord: u8) {
     }
 }
 
+// =================================================================================================
+// Async Lifecycle Tracing & Verification (SPEC-33 AXS-ASY-050, REQ-ASY-059, REQ-ASY-060)
+// =================================================================================================
+
+pub fn oracle_find_or_create_fut(
+    ctx: mut_view<InterpCtx>,
+    self_addr: usize,
+    name: StrView
+) -> *mut InterpAsyncFut {
+    let mut i: usize = 0;
+    while i < ctx.oracle.async_fut_len {
+        let fut = unsafe { interp_async_fut_at(ctx.oracle.async_futs, i) };
+        if (unsafe { (*fut).self_addr }) == self_addr {
+            return fut;
+        }
+        i = i + 1;
+    }
+
+    if ctx.oracle.async_fut_len >= ctx.oracle.async_fut_cap {
+        let new_cap: usize = if ctx.oracle.async_fut_cap == 0 { 16 } else { ctx.oracle.async_fut_cap * 2 };
+        let new_bytes = interp_mul_usize(new_cap, size_of<InterpAsyncFut>());
+        let new_ptr = unsafe { heap_alloc(new_bytes, align_of<InterpAsyncFut>()) as *mut InterpAsyncFut };
+        unsafe {
+            interp_zero_bytes(new_ptr as *mut u8, new_bytes);
+        }
+        if ctx.oracle.async_fut_len > 0 && (ctx.oracle.async_futs as usize) != 0 {
+            let old_bytes = interp_mul_usize(ctx.oracle.async_fut_len, size_of<InterpAsyncFut>());
+            unsafe {
+                interp_copy_bytes(new_ptr as *mut u8, ctx.oracle.async_futs as *const u8, old_bytes);
+                heap_free(ctx.oracle.async_futs as *mut u8, interp_mul_usize(ctx.oracle.async_fut_cap, size_of<InterpAsyncFut>()), align_of<InterpAsyncFut>());
+            }
+        }
+        ctx.oracle.async_futs = new_ptr;
+        ctx.oracle.async_fut_cap = new_cap;
+    }
+
+    let idx = ctx.oracle.async_fut_len;
+    ctx.oracle.async_fut_len = idx + 1;
+    let slot = unsafe { interp_async_fut_at(ctx.oracle.async_futs, idx) };
+    let fid = ctx.oracle.next_fut_id;
+    ctx.oracle.next_fut_id = fid + 1u64;
+
+    unsafe {
+        (*slot).fut_id = fid;
+        (*slot).self_addr = self_addr;
+        (*slot).name_ptr = name.ptr;
+        (*slot).name_len = name.len;
+        (*slot).state_tag = 0u32;
+        (*slot).is_completed = false;
+        (*slot).is_cancelled = false;
+        (*slot).last_suspended_sp = 0u32;
+        (*slot).has_last_suspended_sp = false;
+    }
+    slot
+}
+
+fn oracle_panic_str(ctx: mut_view<InterpCtx>, s: str) {
+    let sv: StrView = unsafe { *(address_of(s) as *const StrView) };
+    interp_panic_sv(mut_view(*ctx), sv);
+}
+
+pub fn oracle_record_async_poll(
+    ctx: mut_view<InterpCtx>,
+    self_addr: usize,
+    name: StrView,
+    state_tag: u32
+) -> u64 {
+    let fut = oracle_find_or_create_fut(mut_view(*ctx), self_addr, name);
+    let fid = unsafe { (*fut).fut_id };
+    let is_comp = unsafe { (*fut).is_completed };
+    let is_canc = unsafe { (*fut).is_cancelled };
+
+    if state_tag == 0u32 {
+        unsafe {
+            (*fut).name_ptr = name.ptr;
+            (*fut).name_len = name.len;
+            (*fut).state_tag = 0u32;
+            (*fut).is_completed = false;
+            (*fut).is_cancelled = false;
+            (*fut).last_suspended_sp = 0u32;
+            (*fut).has_last_suspended_sp = false;
+        }
+        return fid;
+    }
+
+    if is_comp || is_canc || state_tag == 0xFFFFFFFFu32 || state_tag == 0xFFFFFFFEu32 {
+        oracle_panic_str(mut_view(*ctx), "polling a completed Future state machine");
+        return fid;
+    }
+
+    unsafe {
+        (*fut).state_tag = state_tag;
+    }
+    fid
+}
+
+pub fn oracle_record_async_suspend(
+    ctx: mut_view<InterpCtx>,
+    self_addr: usize,
+    name: StrView,
+    sp: u32,
+    state: u32
+) {
+    let fut = oracle_find_or_create_fut(mut_view(*ctx), self_addr, name);
+    unsafe {
+        (*fut).state_tag = state;
+        (*fut).last_suspended_sp = sp;
+        (*fut).has_last_suspended_sp = true;
+    }
+}
+
+pub fn oracle_record_async_complete(
+    ctx: mut_view<InterpCtx>,
+    self_addr: usize,
+    name: StrView
+) {
+    let fut = oracle_find_or_create_fut(mut_view(*ctx), self_addr, name);
+    unsafe {
+        (*fut).state_tag = 0xFFFFFFFFu32;
+        (*fut).is_completed = true;
+    }
+}
+
+pub fn oracle_record_async_cancel_drop(
+    ctx: mut_view<InterpCtx>,
+    self_addr: usize,
+    name: StrView,
+    state: u32
+) {
+    let fut = oracle_find_or_create_fut(mut_view(*ctx), self_addr, name);
+    unsafe {
+        (*fut).state_tag = 0xFFFFFFFEu32;
+        (*fut).is_cancelled = true;
+    }
+}
+
 // Axiom Compiler — MIR Interpreter Call Frames, Places & Body Map (compiler/interp/frame.ax)
 // Port of CallFrame, get_local_ptr, get_place_ptr, eval_operand, and AxMirMap from
 // bootstrap/axiom0/src/interp/interp.c.
@@ -85445,6 +86037,10 @@ use compiler.interp.oracle.oracle_reset_atomic_loc
 use compiler.interp.oracle.oracle_sched_ptr
 use compiler.interp.oracle.oracle_seed_prng
 use compiler.interp.oracle.oracle_set_sched_ptr
+use compiler.interp.oracle.oracle_record_async_poll
+use compiler.interp.oracle.oracle_record_async_suspend
+use compiler.interp.oracle.oracle_record_async_complete
+use compiler.interp.oracle.oracle_record_async_cancel_drop
 use compiler.interp.frame.CallFrame
 use compiler.interp.frame.eval_operand
 use compiler.interp.frame.frame_cleanup
@@ -86637,6 +87233,10 @@ fn exec_assign_use(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, stmt: *mut 
         } else {
             let val = resolve_const_op_val(view(*ctx), frame, unsafe { view((*stmt).rvalue.use_op) });
             write_scalar_to_ptr(dest, size, val);
+            if size == 4 && (val as u32) == 0xFFFFFFFEu32 {
+                let empty_sv = StrView { ptr: 0 as *const u8, len: 0 };
+                oracle_record_async_cancel_drop(mut_view(*ctx), dest as usize, empty_sv, 0xFFFFFFFEu32);
+            }
         }
     } else {
         let mut src_ty = TypeId { v: 0u32 };
@@ -88363,6 +88963,32 @@ fn exec_concurrent_pair(
 // MIR Body Execution Loop
 // =================================================================================================
 
+fn interp_is_async_poll(ctx: view<InterpCtx>, body: *mut MirBody, out_name: mut_view<StrView>) -> bool {
+    if (body as usize) == 0 || (ctx.interner as usize) == 0 {
+        return false;
+    }
+    let p_sv = unsafe { interner_get(view(*ctx.interner), (*body).fn_name) };
+    if p_sv.len > 10 && (p_sv.ptr as usize) != 0 {
+        let b0 = unsafe { *p_sv.ptr };
+        let b1 = unsafe { *(p_sv.ptr + 1) };
+        let b2 = unsafe { *(p_sv.ptr + 2) };
+        let b3 = unsafe { *(p_sv.ptr + 3) };
+        let b4 = unsafe { *(p_sv.ptr + 4) };
+        let b5 = unsafe { *(p_sv.ptr + 5) };
+        let b6 = unsafe { *(p_sv.ptr + 6) };
+        let b7 = unsafe { *(p_sv.ptr + 7) };
+        let b8 = unsafe { *(p_sv.ptr + 8) };
+        let b9 = unsafe { *(p_sv.ptr + 9) };
+        if b0 == 95u8 && b1 == 95u8 && b2 == 97u8 && b3 == 120u8 && b4 == 95u8 &&
+           b5 == 112u8 && b6 == 111u8 && b7 == 108u8 && b8 == 108u8 && b9 == 95u8 {
+            out_name.ptr = unsafe { p_sv.ptr + 10 };
+            out_name.len = p_sv.len - 10;
+            return true;
+        }
+    }
+    false
+}
+
 pub fn exec_mir_body(
     ctx: mut_view<InterpCtx>,
     body: *mut MirBody,
@@ -88387,6 +89013,22 @@ pub fn exec_mir_body(
     let prev_frame_storage_size = ctx.oracle.current_frame_storage_size;
     ctx.oracle.current_frame_storage = frame.storage;
     ctx.oracle.current_frame_storage_size = frame.storage_size;
+
+    let mut async_poll_fn = StrView { ptr: 0 as *const u8, len: 0 };
+    let is_async_poll = interp_is_async_poll(view(*ctx), body, mut_view(async_poll_fn));
+    let mut async_self_host_ptr: *mut u8 = 0 as *mut u8;
+    if is_async_poll && (frame.local_ptrs as usize) != 0 && frame.local_cap > 1 {
+        let p1 = unsafe { *interp_u8_ptr_at(frame.local_ptrs, 1) };
+        if (p1 as usize) != 0 {
+            let self_addr = unsafe { *(p1 as *const u64) };
+            async_self_host_ptr = interp_resolve_synth_ptr(mut_view(*ctx), self_addr);
+            if (async_self_host_ptr as usize) != 0 {
+                let init_state = unsafe { *(async_self_host_ptr as *const u32) };
+                let _ = oracle_record_async_poll(mut_view(*ctx), async_self_host_ptr as usize, async_poll_fn, init_state);
+            }
+        }
+    }
+
     let bb_count = unsafe { (*body).bb_count };
     let mut current_bb = MirBbId { v: 0u32 };
 
@@ -88664,6 +89306,15 @@ pub fn exec_mir_body(
         } else {
             interp_panic(mut_view(*ctx), INTERP_MSG_PANIC_UNSUPPORTED_TERM);
             break;
+        }
+    }
+
+    if is_async_poll && !ctx.failed && (async_self_host_ptr as usize) != 0 {
+        let end_state = unsafe { *(async_self_host_ptr as *const u32) };
+        if end_state == 0xFFFFFFFFu32 {
+            oracle_record_async_complete(mut_view(*ctx), async_self_host_ptr as usize, async_poll_fn);
+        } else if end_state >= 1u32 && end_state < 0xFFFFFFFEu32 {
+            oracle_record_async_suspend(mut_view(*ctx), async_self_host_ptr as usize, async_poll_fn, end_state - 1u32, end_state);
         }
     }
 
@@ -123339,6 +123990,7 @@ pub const EMIT_THIR: u32 = 10u32;
 pub const EMIT_TOKENS: u32 = 11u32;
 pub const EMIT_OPTIR: u32 = 12u32;
 pub const EMIT_MEMSSA: u32 = 13u32;
+pub const EMIT_ASYNC_LAYOUT: u32 = 14u32;
 
 pub const STAGE_SOURCE: u32 = 0u32;
 pub const STAGE_LEX: u32 = 1u32;
@@ -123521,7 +124173,7 @@ const VERSION_FEATURES_BYTES: [78]u8 = [
 //  312..319 (7):  "main.ax"
 //  319..330 (11): "src/main.ax"
 //  330..346 (16): "<std>/core/host.ax" (wait: 18 bytes)
-const DRIVER_STR_TABLE: [1023]u8 = [
+const DRIVER_STR_TABLE: [1035]u8 = [
     // 0..4: "help"
     104u8, 101u8, 108u8, 112u8,
     // 4..10: "--help"
@@ -123709,6 +124361,8 @@ const DRIVER_STR_TABLE: [1023]u8 = [
     111u8, 112u8, 116u8, 105u8, 114u8,
     // 1017..1023: "memssa" (6)
     109u8, 101u8, 109u8, 115u8, 115u8, 97u8,
+    // 1023..1035: "async-layout" (12)
+    97u8, 115u8, 121u8, 110u8, 99u8, 45u8, 108u8, 97u8, 121u8, 111u8, 117u8, 116u8,
 ];
 
 // Diagnostic messages & target error suffix:
@@ -124270,6 +124924,7 @@ pub fn driver_find_emitter(name: view<StrView>) -> u32 {
     if sv_eq_table(name, 87, 6) { return EMIT_TOKENS; }
     if sv_eq_table(name, 1012, 5) { return EMIT_OPTIR; }
     if sv_eq_table(name, 1017, 6) { return EMIT_MEMSSA; }
+    if sv_eq_table(name, 1023, 12) { return EMIT_ASYNC_LAYOUT; }
     EMIT_NONE
 }
 
@@ -126263,6 +126918,7 @@ use _mir_build_shim._shim_mir_build_fn as mir_build_fn
 use compiler.types.typeck.tc_is_default_inst
 use compiler.mir.drop.mir_drop_elaborate
 use compiler.mir.async_lower.mir_prebuilt_get
+use compiler.mir.async_lower.emit_async_layout_report
 use compiler.opt.opt_run_in_arena
 use compiler.opt.optir.optir_build_from_mir
 use compiler.opt.optir.optir_verify_contract
@@ -126414,6 +127070,7 @@ use compiler.driver.opts.EMIT_THIR
 use compiler.driver.opts.EMIT_TOKENS
 use compiler.driver.opts.EMIT_OPTIR
 use compiler.driver.opts.EMIT_MEMSSA
+use compiler.driver.opts.EMIT_ASYNC_LAYOUT
 use compiler.driver.opts.STAGE_SOURCE
 use compiler.driver.opts.STAGE_LEX
 use compiler.driver.opts.STAGE_PARSE
@@ -127785,6 +128442,29 @@ fn driver_execute_inspect_ctx(
                 if session_has_errors(view(ctx.sess)) {
                     rc = AX_EXIT_DIAG;
                 }
+            }
+        }
+        driver_flush_diagnostics(mut_view(*ctx), dopts, mut_view(*out_buf), mut_view(*err_buf));
+        return rc;
+    }
+
+    if ek == EMIT_ASYNC_LAYOUT {
+        let ok = pipeline_run_stages(mut_view(*ctx), dopts, STAGE_TYPECK, mut_view(*out_buf));
+        if !ok || session_has_errors(view(ctx.sess)) {
+            rc = AX_EXIT_DIAG;
+        } else {
+            pipe_lower_all_async_functions(mut_view(*ctx));
+            if session_has_errors(view(ctx.sess)) {
+                rc = AX_EXIT_DIAG;
+            } else {
+                let db_p = unsafe { address_of(ctx.sess.source_db) };
+                emit_async_layout_report(
+                    mut_view(*out_buf),
+                    view(ctx.hir),
+                    view(ctx.thir),
+                    view(ctx.sess.interner),
+                    db_p
+                );
             }
         }
         driver_flush_diagnostics(mut_view(*ctx), dopts, mut_view(*out_buf), mut_view(*err_buf));

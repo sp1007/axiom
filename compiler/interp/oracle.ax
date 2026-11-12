@@ -74,9 +74,13 @@ use compiler.interp.value.interp_register_alloc
 use compiler.interp.value.interp_report_ub
 use compiler.interp.value.interp_validate_raw_ptr
 use compiler.interp.value.interp_zero_bytes
+use compiler.interp.value.InterpAsyncFut
+use compiler.interp.value.interp_async_fut_at
+use compiler.interp.value.interp_panic_sv
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 @intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
 
 // Concatenated host intrinsic names:
 //   0..10:   "heap_alloc"
@@ -2084,5 +2088,141 @@ pub fn oracle_atomic_compiler_fence(ctx: mut_view<InterpCtx>, ord: u8) {
     if ord == MIR_ORDER_RELAXED || ord > MIR_ORDER_SEQ_CST {
         interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_ATOMIC_ORDER);
         return;
+    }
+}
+
+// =================================================================================================
+// Async Lifecycle Tracing & Verification (SPEC-33 AXS-ASY-050, REQ-ASY-059, REQ-ASY-060)
+// =================================================================================================
+
+pub fn oracle_find_or_create_fut(
+    ctx: mut_view<InterpCtx>,
+    self_addr: usize,
+    name: StrView
+) -> *mut InterpAsyncFut {
+    let mut i: usize = 0;
+    while i < ctx.oracle.async_fut_len {
+        let fut = unsafe { interp_async_fut_at(ctx.oracle.async_futs, i) };
+        if (unsafe { (*fut).self_addr }) == self_addr {
+            return fut;
+        }
+        i = i + 1;
+    }
+
+    if ctx.oracle.async_fut_len >= ctx.oracle.async_fut_cap {
+        let new_cap: usize = if ctx.oracle.async_fut_cap == 0 { 16 } else { ctx.oracle.async_fut_cap * 2 };
+        let new_bytes = interp_mul_usize(new_cap, size_of<InterpAsyncFut>());
+        let new_ptr = unsafe { heap_alloc(new_bytes, align_of<InterpAsyncFut>()) as *mut InterpAsyncFut };
+        unsafe {
+            interp_zero_bytes(new_ptr as *mut u8, new_bytes);
+        }
+        if ctx.oracle.async_fut_len > 0 && (ctx.oracle.async_futs as usize) != 0 {
+            let old_bytes = interp_mul_usize(ctx.oracle.async_fut_len, size_of<InterpAsyncFut>());
+            unsafe {
+                interp_copy_bytes(new_ptr as *mut u8, ctx.oracle.async_futs as *const u8, old_bytes);
+                heap_free(ctx.oracle.async_futs as *mut u8, interp_mul_usize(ctx.oracle.async_fut_cap, size_of<InterpAsyncFut>()), align_of<InterpAsyncFut>());
+            }
+        }
+        ctx.oracle.async_futs = new_ptr;
+        ctx.oracle.async_fut_cap = new_cap;
+    }
+
+    let idx = ctx.oracle.async_fut_len;
+    ctx.oracle.async_fut_len = idx + 1;
+    let slot = unsafe { interp_async_fut_at(ctx.oracle.async_futs, idx) };
+    let fid = ctx.oracle.next_fut_id;
+    ctx.oracle.next_fut_id = fid + 1u64;
+
+    unsafe {
+        (*slot).fut_id = fid;
+        (*slot).self_addr = self_addr;
+        (*slot).name_ptr = name.ptr;
+        (*slot).name_len = name.len;
+        (*slot).state_tag = 0u32;
+        (*slot).is_completed = false;
+        (*slot).is_cancelled = false;
+        (*slot).last_suspended_sp = 0u32;
+        (*slot).has_last_suspended_sp = false;
+    }
+    slot
+}
+
+fn oracle_panic_str(ctx: mut_view<InterpCtx>, s: str) {
+    let sv: StrView = unsafe { *(address_of(s) as *const StrView) };
+    interp_panic_sv(mut_view(*ctx), sv);
+}
+
+pub fn oracle_record_async_poll(
+    ctx: mut_view<InterpCtx>,
+    self_addr: usize,
+    name: StrView,
+    state_tag: u32
+) -> u64 {
+    let fut = oracle_find_or_create_fut(mut_view(*ctx), self_addr, name);
+    let fid = unsafe { (*fut).fut_id };
+    let is_comp = unsafe { (*fut).is_completed };
+    let is_canc = unsafe { (*fut).is_cancelled };
+
+    if state_tag == 0u32 {
+        unsafe {
+            (*fut).name_ptr = name.ptr;
+            (*fut).name_len = name.len;
+            (*fut).state_tag = 0u32;
+            (*fut).is_completed = false;
+            (*fut).is_cancelled = false;
+            (*fut).last_suspended_sp = 0u32;
+            (*fut).has_last_suspended_sp = false;
+        }
+        return fid;
+    }
+
+    if is_comp || is_canc || state_tag == 0xFFFFFFFFu32 || state_tag == 0xFFFFFFFEu32 {
+        oracle_panic_str(mut_view(*ctx), "polling a completed Future state machine");
+        return fid;
+    }
+
+    unsafe {
+        (*fut).state_tag = state_tag;
+    }
+    fid
+}
+
+pub fn oracle_record_async_suspend(
+    ctx: mut_view<InterpCtx>,
+    self_addr: usize,
+    name: StrView,
+    sp: u32,
+    state: u32
+) {
+    let fut = oracle_find_or_create_fut(mut_view(*ctx), self_addr, name);
+    unsafe {
+        (*fut).state_tag = state;
+        (*fut).last_suspended_sp = sp;
+        (*fut).has_last_suspended_sp = true;
+    }
+}
+
+pub fn oracle_record_async_complete(
+    ctx: mut_view<InterpCtx>,
+    self_addr: usize,
+    name: StrView
+) {
+    let fut = oracle_find_or_create_fut(mut_view(*ctx), self_addr, name);
+    unsafe {
+        (*fut).state_tag = 0xFFFFFFFFu32;
+        (*fut).is_completed = true;
+    }
+}
+
+pub fn oracle_record_async_cancel_drop(
+    ctx: mut_view<InterpCtx>,
+    self_addr: usize,
+    name: StrView,
+    state: u32
+) {
+    let fut = oracle_find_or_create_fut(mut_view(*ctx), self_addr, name);
+    unsafe {
+        (*fut).state_tag = 0xFFFFFFFEu32;
+        (*fut).is_cancelled = true;
     }
 }
