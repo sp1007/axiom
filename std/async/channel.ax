@@ -1,0 +1,748 @@
+// std.asyn.channel - Async-Aware Channels (SPEC-34 §4 AXS-EXEC-034)
+module std.asyn.channel
+
+use std.core.prelude.RawWaker
+use std.core.prelude.RawWakerVTable
+use std.core.prelude.Waker
+use std.core.prelude.Context
+use std.core.prelude.Future
+use std.core.prelude.Poll
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.core.option.Option
+use std.core.result.Result
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.core.host.thread_yield
+use std.asyn.waker.waker_leak
+use std.asyn.waker.raw_waker_wake_by_ref
+use std.asyn.waker.raw_waker_drop
+
+pub struct SendError<T> {
+    pub val: T,
+}
+
+pub enum TrySendError<T> {
+    Full(T),
+    Disconnected(T),
+}
+
+@derive(Copy)
+pub enum RecvError {
+    Disconnected,
+}
+
+@derive(Copy)
+pub enum TryRecvError {
+    Empty,
+    Disconnected,
+}
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic fn needs_drop<T>() -> bool { false }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn drop_in_place<T>(p: *mut T) {}
+
+fn spin_lock(p_lock: *const Atomic<u32>) {
+    while unsafe { (*p_lock).compare_exchange(0u32, 1u32, Ordering.Acquire, Ordering.Relaxed).val != 0u32 } {
+        unsafe {
+            thread_yield();
+        }
+    }
+}
+
+fn spin_unlock(p_lock: *const Atomic<u32>) {
+    unsafe {
+        (*p_lock).store(0u32, Ordering.Release);
+    }
+}
+
+@repr(C)
+pub struct MessageNode<T> {
+    pub data: T,
+    pub next: *mut MessageNode<T>,
+}
+
+@repr(C)
+pub struct ChanWaiterNode {
+    pub waiter_id: u64,
+    pub waker_data: *const u8,
+    pub waker_vt: *const RawWakerVTable,
+    pub next: *mut ChanWaiterNode,
+}
+
+@repr(C)
+pub struct AsyncChannelInner<T> {
+    pub lock: Atomic<u32>,
+    pub capacity: usize,
+    pub is_bounded: bool,
+    pub msg_head: *mut MessageNode<T>,
+    pub msg_tail: *mut MessageNode<T>,
+    pub msg_count: usize,
+    pub send_waiters_head: *mut ChanWaiterNode,
+    pub send_waiters_tail: *mut ChanWaiterNode,
+    pub recv_waiters_head: *mut ChanWaiterNode,
+    pub recv_waiters_tail: *mut ChanWaiterNode,
+    pub sender_count: Atomic<usize>,
+    pub receiver_count: Atomic<usize>,
+    pub next_waiter_id: Atomic<u64>,
+}
+
+pub struct AsyncSender<T> {
+    pub inner: *mut AsyncChannelInner<T>,
+}
+
+unsafe impl<T: Send> Send for AsyncSender<T> {}
+unsafe impl<T: Send> Share for AsyncSender<T> {}
+impl<T> !Copy for AsyncSender<T> {}
+
+pub struct AsyncReceiver<T> {
+    pub inner: *mut AsyncChannelInner<T>,
+}
+
+unsafe impl<T: Send> Send for AsyncReceiver<T> {}
+unsafe impl<T: Send> Share for AsyncReceiver<T> {}
+impl<T> !Copy for AsyncReceiver<T> {}
+
+pub struct SendFuture<T> {
+    pub inner: *mut AsyncChannelInner<T>,
+    pub msg_node: *mut MessageNode<T>,
+    pub waiter_id: u64,
+    pub node: *mut ChanWaiterNode,
+}
+
+unsafe impl<T: Send> Send for SendFuture<T> {}
+impl<T> !Copy for SendFuture<T> {}
+
+pub struct RecvFuture<T> {
+    pub inner: *mut AsyncChannelInner<T>,
+    pub waiter_id: u64,
+    pub node: *mut ChanWaiterNode,
+}
+
+unsafe impl<T: Send> Send for RecvFuture<T> {}
+impl<T> !Copy for RecvFuture<T> {}
+
+// -----------------------------------------------------------------------------
+// Channel Construction
+// -----------------------------------------------------------------------------
+
+fn create_channel_inner<T>(capacity: usize, is_bounded: bool) -> *mut AsyncChannelInner<T> {
+    let sz = size_of<AsyncChannelInner<T>>();
+    let al = align_of<AsyncChannelInner<T>>();
+    let raw = unsafe { heap_alloc(sz, al) };
+    let inner = raw as *mut AsyncChannelInner<T>;
+    unsafe {
+        (*inner).lock = Atomic.new(0u32);
+        (*inner).capacity = capacity;
+        (*inner).is_bounded = is_bounded;
+        (*inner).msg_head = 0 as *mut MessageNode<T>;
+        (*inner).msg_tail = 0 as *mut MessageNode<T>;
+        (*inner).msg_count = 0;
+        (*inner).send_waiters_head = 0 as *mut ChanWaiterNode;
+        (*inner).send_waiters_tail = 0 as *mut ChanWaiterNode;
+        (*inner).recv_waiters_head = 0 as *mut ChanWaiterNode;
+        (*inner).recv_waiters_tail = 0 as *mut ChanWaiterNode;
+        (*inner).sender_count = Atomic.new(1usize);
+        (*inner).receiver_count = Atomic.new(1usize);
+        (*inner).next_waiter_id = Atomic.new(1u64);
+    }
+    inner
+}
+
+pub struct AsyncChannelPair<T> {
+    pub tx: AsyncSender<T>,
+    pub rx: AsyncReceiver<T>,
+}
+
+pub fn async_channel_bounded<T: Send>(capacity: usize) -> AsyncChannelPair<T> {
+    let cap = if capacity == 0 { 1 } else { capacity };
+    let ch_inner = create_channel_inner<T>(cap, true);
+    AsyncChannelPair {
+        tx: AsyncSender { inner: ch_inner },
+        rx: AsyncReceiver { inner: ch_inner },
+    }
+}
+
+pub fn async_channel_unbounded<T: Send>() -> AsyncChannelPair<T> {
+    let ch_inner = create_channel_inner<T>(0xFFFFFFFFFFFFFFFFusize, false);
+    AsyncChannelPair {
+        tx: AsyncSender { inner: ch_inner },
+        rx: AsyncReceiver { inner: ch_inner },
+    }
+}
+
+pub fn channel<T: Send>(capacity: usize) -> AsyncChannelPair<T> {
+    if capacity == 0 {
+        async_channel_unbounded<T>()
+    } else {
+        async_channel_bounded<T>(capacity)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Waiter Queue Helpers
+// -----------------------------------------------------------------------------
+
+// Waiter nodes are owned by the future that registered them. Wakers only unlink a node from its
+// queue and wake it by reference; the owning future releases the stored waker and frees the node.
+fn free_waiter_node(n: *mut ChanWaiterNode) {
+    unsafe {
+        raw_waker_drop((*n).waker_data, (*n).waker_vt);
+        heap_free(n as *mut u8, size_of<ChanWaiterNode>(), align_of<ChanWaiterNode>());
+    }
+}
+
+fn enqueue_waiter(p_head: *mut *mut ChanWaiterNode, p_tail: *mut *mut ChanWaiterNode, n: *mut ChanWaiterNode) {
+    unsafe {
+        (*n).next = 0 as *mut ChanWaiterNode;
+        if (*p_tail as usize) == 0 {
+            *p_head = n;
+            *p_tail = n;
+        } else {
+            (**p_tail).next = n;
+            *p_tail = n;
+        }
+    }
+}
+
+fn dequeue_waiter(p_head: *mut *mut ChanWaiterNode, p_tail: *mut *mut ChanWaiterNode) -> *mut ChanWaiterNode {
+    let h = unsafe { *p_head };
+    if (h as usize) != 0 {
+        unsafe {
+            *p_head = (*h).next;
+            if (*p_head as usize) == 0 {
+                *p_tail = 0 as *mut ChanWaiterNode;
+            }
+            (*h).next = 0 as *mut ChanWaiterNode;
+        }
+    }
+    h
+}
+
+fn remove_waiter(p_head: *mut *mut ChanWaiterNode, p_tail: *mut *mut ChanWaiterNode, target: *mut ChanWaiterNode) {
+    let mut cur = unsafe { *p_head };
+    let mut prev: *mut ChanWaiterNode = 0 as *mut ChanWaiterNode;
+    while (cur as usize) != 0 {
+        if cur == target {
+            if (prev as usize) != 0 {
+                unsafe {
+                    (*prev).next = (*cur).next;
+                }
+            } else {
+                unsafe {
+                    *p_head = (*cur).next;
+                }
+            }
+            if unsafe { *p_tail } == target {
+                unsafe {
+                    *p_tail = prev;
+                }
+            }
+            break;
+        }
+        prev = cur;
+        cur = unsafe { (*cur).next };
+    }
+}
+
+// -----------------------------------------------------------------------------
+// AsyncSender Implementation
+// -----------------------------------------------------------------------------
+
+impl<T> AsyncSender<T> {
+    pub fn clone(self: view<AsyncSender<T>>) -> AsyncSender<T> {
+        let inner = self.inner;
+        unsafe {
+            (*inner).sender_count.fetch_add(1usize, Ordering.Relaxed);
+        }
+        AsyncSender { inner: inner }
+    }
+
+    pub fn send(self: view<AsyncSender<T>>, val: T) -> SendFuture<T> {
+        let inner = self.inner;
+        let w_id = unsafe { (*inner).next_waiter_id.fetch_add(1u64, Ordering.Relaxed) };
+        let sz = size_of<MessageNode<T>>();
+        let al = align_of<MessageNode<T>>();
+        let raw = unsafe { heap_alloc(sz, al) };
+        let msg = raw as *mut MessageNode<T>;
+        unsafe {
+            (*msg).data = val;
+            (*msg).next = 0 as *mut MessageNode<T>;
+        }
+        SendFuture {
+            inner: inner,
+            msg_node: msg,
+            waiter_id: w_id,
+            node: 0 as *mut ChanWaiterNode,
+        }
+    }
+
+    pub fn try_send(self: view<AsyncSender<T>>, val: T) -> Result<(), TrySendError<T>> {
+        let inner = self.inner;
+        let p_lock: *const Atomic<u32> = unsafe { address_of<Atomic<u32>>((*inner).lock) };
+        spin_lock(p_lock);
+
+        let rx_count = unsafe { (*inner).receiver_count.load(Ordering.Acquire) };
+        if rx_count == 0 {
+            spin_unlock(p_lock);
+            return Result.Err(TrySendError.Disconnected(val));
+        }
+
+        let cap = unsafe { (*inner).capacity };
+        let bounded = unsafe { (*inner).is_bounded };
+        let count = unsafe { (*inner).msg_count };
+        if bounded && count >= cap {
+            spin_unlock(p_lock);
+            return Result.Err(TrySendError.Full(val));
+        }
+
+        let sz = size_of<MessageNode<T>>();
+        let al = align_of<MessageNode<T>>();
+        let raw = unsafe { heap_alloc(sz, al) };
+        let msg = raw as *mut MessageNode<T>;
+        unsafe {
+            (*msg).data = val;
+            (*msg).next = 0 as *mut MessageNode<T>;
+            if ((*inner).msg_tail as usize) == 0 {
+                (*inner).msg_head = msg;
+                (*inner).msg_tail = msg;
+            } else {
+                (*(*inner).msg_tail).next = msg;
+                (*inner).msg_tail = msg;
+            }
+            (*inner).msg_count = count + 1;
+        }
+
+        // Wake one waiting receiver if any
+        let rw = dequeue_waiter(unsafe { address_of_mut((*inner).recv_waiters_head) }, unsafe { address_of_mut((*inner).recv_waiters_tail) });
+        if (rw as usize) != 0 {
+            unsafe {
+                raw_waker_wake_by_ref((*rw).waker_data, (*rw).waker_vt);
+            }
+        }
+        spin_unlock(p_lock);
+
+        Result.Ok(())
+    }
+
+    pub fn close(self: mut_view<AsyncSender<T>>) {
+        let inner = self.inner;
+        if (inner as usize) == 0 {
+            return;
+        }
+        self.inner = 0 as *mut AsyncChannelInner<T>;
+        let prev = unsafe { (*inner).sender_count.fetch_sub(1usize, Ordering.AcqRel) };
+        if prev == 1usize {
+            // Wake all waiting receivers so they see disconnection
+            let p_lock: *const Atomic<u32> = unsafe { address_of<Atomic<u32>>((*inner).lock) };
+            spin_lock(p_lock);
+            let mut rw = unsafe { (*inner).recv_waiters_head };
+            unsafe {
+                (*inner).recv_waiters_head = 0 as *mut ChanWaiterNode;
+                (*inner).recv_waiters_tail = 0 as *mut ChanWaiterNode;
+            }
+            while (rw as usize) != 0 {
+                let next = unsafe { (*rw).next };
+                unsafe {
+                    raw_waker_wake_by_ref((*rw).waker_data, (*rw).waker_vt);
+                }
+                rw = next;
+            }
+            spin_unlock(p_lock);
+        }
+        let senders = unsafe { (*inner).sender_count.load(Ordering.Acquire) };
+        let receivers = unsafe { (*inner).receiver_count.load(Ordering.Acquire) };
+        if senders == 0 && receivers == 0 {
+            let mut msg = unsafe { (*inner).msg_head };
+            while (msg as usize) != 0 {
+                let next = unsafe { (*msg).next };
+                unsafe {
+                    if needs_drop<T>() {
+                        drop_in_place<T>(address_of_mut((*msg).data));
+                    }
+                    heap_free(msg as *mut u8, size_of<MessageNode<T>>(), align_of<MessageNode<T>>());
+                }
+                msg = next;
+            }
+            unsafe {
+                heap_free(inner as *mut u8, size_of<AsyncChannelInner<T>>(), align_of<AsyncChannelInner<T>>());
+            }
+        }
+    }
+}
+
+impl<T> Drop for AsyncSender<T> {
+    fn drop(self: mut_view<AsyncSender<T>>) {
+        mut_view(*self).close();
+    }
+}
+
+// -----------------------------------------------------------------------------
+// SendFuture Implementation
+// -----------------------------------------------------------------------------
+
+impl<T> SendFuture<T> {
+    pub fn poll_send(self: mut_view<SendFuture<T>>, cx: mut_view<Context>) -> Poll<Result<(), SendError<T>>> {
+        let msg = self.msg_node;
+        if (msg as usize) == 0 {
+            return Poll.Ready(Result.Ok(()));
+        }
+
+        let inner = self.inner;
+        let p_lock: *const Atomic<u32> = unsafe { address_of<Atomic<u32>>((*inner).lock) };
+        spin_lock(p_lock);
+
+        let rx_count = unsafe { (*inner).receiver_count.load(Ordering.Acquire) };
+        if rx_count == 0 {
+            spin_unlock(p_lock);
+            let val = unsafe { (*msg).data };
+            unsafe {
+                heap_free(msg as *mut u8, size_of<MessageNode<T>>(), align_of<MessageNode<T>>());
+            }
+            self.msg_node = 0 as *mut MessageNode<T>;
+            return Poll.Ready(Result.Err(SendError { val: val }));
+        }
+
+        let cap = unsafe { (*inner).capacity };
+        let bounded = unsafe { (*inner).is_bounded };
+        let count = unsafe { (*inner).msg_count };
+
+        if !bounded || count < cap {
+            // Buffer has space: push message
+            unsafe {
+                (*msg).next = 0 as *mut MessageNode<T>;
+                if ((*inner).msg_tail as usize) == 0 {
+                    (*inner).msg_head = msg;
+                    (*inner).msg_tail = msg;
+                } else {
+                    (*(*inner).msg_tail).next = msg;
+                    (*inner).msg_tail = msg;
+                }
+                (*inner).msg_count = count + 1;
+            }
+            self.msg_node = 0 as *mut MessageNode<T>;
+
+            // If we had a registered waiter node, remove it
+            if (self.node as usize) != 0 {
+                remove_waiter(unsafe { address_of_mut((*inner).send_waiters_head) }, unsafe { address_of_mut((*inner).send_waiters_tail) }, self.node);
+                free_waiter_node(self.node);
+                self.node = 0 as *mut ChanWaiterNode;
+            }
+
+            // Wake one waiting receiver
+            let rw = dequeue_waiter(unsafe { address_of_mut((*inner).recv_waiters_head) }, unsafe { address_of_mut((*inner).recv_waiters_tail) });
+            if (rw as usize) != 0 {
+                unsafe {
+                    raw_waker_wake_by_ref((*rw).waker_data, (*rw).waker_vt);
+                }
+            }
+            spin_unlock(p_lock);
+
+            return Poll.Ready(Result.Ok(()));
+        }
+
+        // Bounded and full: register or update waiter
+        if (self.node as usize) == 0 {
+            let sz = size_of<ChanWaiterNode>();
+            let al = align_of<ChanWaiterNode>();
+            let raw_n = unsafe { heap_alloc(sz, al) };
+            let n = raw_n as *mut ChanWaiterNode;
+            unsafe {
+                (*n).waiter_id = self.waiter_id;
+                let lw = waker_leak(cx.waker());
+                (*n).waker_data = lw.data;
+                (*n).waker_vt = lw.vtable;
+                (*n).next = 0 as *mut ChanWaiterNode;
+            }
+            enqueue_waiter(unsafe { address_of_mut((*inner).send_waiters_head) }, unsafe { address_of_mut((*inner).send_waiters_tail) }, n);
+            self.node = n;
+        } else {
+            // Woken (or spurious) poll with the condition still unmet: refresh the waker and make
+            // sure the node is queued again (a waking peer unlinks it).
+            unsafe {
+                raw_waker_drop((*self.node).waker_data, (*self.node).waker_vt);
+                let lw = waker_leak(cx.waker());
+                (*self.node).waker_data = lw.data;
+                (*self.node).waker_vt = lw.vtable;
+            }
+            remove_waiter(unsafe { address_of_mut((*inner).send_waiters_head) }, unsafe { address_of_mut((*inner).send_waiters_tail) }, self.node);
+            enqueue_waiter(unsafe { address_of_mut((*inner).send_waiters_head) }, unsafe { address_of_mut((*inner).send_waiters_tail) }, self.node);
+        }
+
+        spin_unlock(p_lock);
+        Poll.Pending
+    }
+}
+
+impl Future for SendFuture<i64> {
+    type Output = Result<(), SendError<i64>>;
+
+    fn poll(self: mut_view<SendFuture<i64>>, cx: mut_view<Context>) -> Poll<Result<(), SendError<i64>>> {
+        self.poll_send(cx)
+    }
+}
+
+impl<T> Drop for SendFuture<T> {
+    fn drop(self: mut_view<SendFuture<T>>) {
+        let msg = self.msg_node;
+        let inner = self.inner;
+        let n = self.node;
+
+        if (n as usize) != 0 {
+            self.node = 0 as *mut ChanWaiterNode;
+            let p_lock: *const Atomic<u32> = unsafe { address_of<Atomic<u32>>((*inner).lock) };
+            spin_lock(p_lock);
+            remove_waiter(unsafe { address_of_mut((*inner).send_waiters_head) }, unsafe { address_of_mut((*inner).send_waiters_tail) }, n);
+            spin_unlock(p_lock);
+            free_waiter_node(n);
+        }
+
+        if (msg as usize) != 0 {
+            self.msg_node = 0 as *mut MessageNode<T>;
+            unsafe {
+                if needs_drop<T>() {
+                    drop_in_place<T>(address_of_mut((*msg).data));
+                }
+                heap_free(msg as *mut u8, size_of<MessageNode<T>>(), align_of<MessageNode<T>>());
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// AsyncReceiver Implementation
+// -----------------------------------------------------------------------------
+
+impl<T> AsyncReceiver<T> {
+    pub fn clone(self: view<AsyncReceiver<T>>) -> AsyncReceiver<T> {
+        let inner = self.inner;
+        unsafe {
+            (*inner).receiver_count.fetch_add(1usize, Ordering.Relaxed);
+        }
+        AsyncReceiver { inner: inner }
+    }
+
+    pub fn recv(self: view<AsyncReceiver<T>>) -> RecvFuture<T> {
+        let inner = self.inner;
+        let w_id = unsafe { (*inner).next_waiter_id.fetch_add(1u64, Ordering.Relaxed) };
+        RecvFuture {
+            inner: inner,
+            waiter_id: w_id,
+            node: 0 as *mut ChanWaiterNode,
+        }
+    }
+
+    pub fn try_recv(self: view<AsyncReceiver<T>>) -> Result<T, TryRecvError> {
+        let inner = self.inner;
+        let p_lock: *const Atomic<u32> = unsafe { address_of<Atomic<u32>>((*inner).lock) };
+        spin_lock(p_lock);
+
+        let h = unsafe { (*inner).msg_head };
+        if (h as usize) != 0 {
+            unsafe {
+                (*inner).msg_head = (*h).next;
+                if ((*inner).msg_head as usize) == 0 {
+                    (*inner).msg_tail = 0 as *mut MessageNode<T>;
+                }
+                (*inner).msg_count = (*inner).msg_count - 1;
+            }
+            let val = unsafe { (*h).data };
+            unsafe {
+                heap_free(h as *mut u8, size_of<MessageNode<T>>(), align_of<MessageNode<T>>());
+            }
+
+            // Wake one waiting sender if any
+            let sw = dequeue_waiter(unsafe { address_of_mut((*inner).send_waiters_head) }, unsafe { address_of_mut((*inner).send_waiters_tail) });
+            if (sw as usize) != 0 {
+                unsafe {
+                    raw_waker_wake_by_ref((*sw).waker_data, (*sw).waker_vt);
+                }
+            }
+            spin_unlock(p_lock);
+
+            return Result.Ok(val);
+        }
+
+        let senders = unsafe { (*inner).sender_count.load(Ordering.Acquire) };
+        spin_unlock(p_lock);
+
+        if senders == 0 {
+            Result.Err(TryRecvError.Disconnected)
+        } else {
+            Result.Err(TryRecvError.Empty)
+        }
+    }
+}
+
+impl<T> Drop for AsyncReceiver<T> {
+    fn drop(self: mut_view<AsyncReceiver<T>>) {
+        let inner = self.inner;
+        if (inner as usize) == 0 {
+            return;
+        }
+        self.inner = 0 as *mut AsyncChannelInner<T>;
+        let prev = unsafe { (*inner).receiver_count.fetch_sub(1usize, Ordering.AcqRel) };
+        if prev == 1usize {
+            // Wake all waiting senders so they see disconnection
+            let p_lock: *const Atomic<u32> = unsafe { address_of<Atomic<u32>>((*inner).lock) };
+            spin_lock(p_lock);
+            let mut sw = unsafe { (*inner).send_waiters_head };
+            unsafe {
+                (*inner).send_waiters_head = 0 as *mut ChanWaiterNode;
+                (*inner).send_waiters_tail = 0 as *mut ChanWaiterNode;
+            }
+            while (sw as usize) != 0 {
+                let next = unsafe { (*sw).next };
+                unsafe {
+                    raw_waker_wake_by_ref((*sw).waker_data, (*sw).waker_vt);
+                }
+                sw = next;
+            }
+            spin_unlock(p_lock);
+        }
+        let senders = unsafe { (*inner).sender_count.load(Ordering.Acquire) };
+        let receivers = unsafe { (*inner).receiver_count.load(Ordering.Acquire) };
+        if senders == 0 && receivers == 0 {
+            let mut msg = unsafe { (*inner).msg_head };
+            while (msg as usize) != 0 {
+                let next = unsafe { (*msg).next };
+                unsafe {
+                    if needs_drop<T>() {
+                        drop_in_place<T>(address_of_mut((*msg).data));
+                    }
+                    heap_free(msg as *mut u8, size_of<MessageNode<T>>(), align_of<MessageNode<T>>());
+                }
+                msg = next;
+            }
+            unsafe {
+                heap_free(inner as *mut u8, size_of<AsyncChannelInner<T>>(), align_of<AsyncChannelInner<T>>());
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// RecvFuture Implementation
+// -----------------------------------------------------------------------------
+
+impl<T> RecvFuture<T> {
+    pub fn poll_recv(self: mut_view<RecvFuture<T>>, cx: mut_view<Context>) -> Poll<Result<T, RecvError>> {
+        let inner = self.inner;
+        let p_lock: *const Atomic<u32> = unsafe { address_of<Atomic<u32>>((*inner).lock) };
+        spin_lock(p_lock);
+
+        let h = unsafe { (*inner).msg_head };
+        if (h as usize) != 0 {
+            unsafe {
+                (*inner).msg_head = (*h).next;
+                if ((*inner).msg_head as usize) == 0 {
+                    (*inner).msg_tail = 0 as *mut MessageNode<T>;
+                }
+                (*inner).msg_count = (*inner).msg_count - 1;
+            }
+            let val = unsafe { (*h).data };
+            unsafe {
+                heap_free(h as *mut u8, size_of<MessageNode<T>>(), align_of<MessageNode<T>>());
+            }
+
+            // Remove waiter node if registered
+            if (self.node as usize) != 0 {
+                remove_waiter(unsafe { address_of_mut((*inner).recv_waiters_head) }, unsafe { address_of_mut((*inner).recv_waiters_tail) }, self.node);
+                free_waiter_node(self.node);
+                self.node = 0 as *mut ChanWaiterNode;
+            }
+
+            // Wake one waiting sender if any
+            let sw = dequeue_waiter(unsafe { address_of_mut((*inner).send_waiters_head) }, unsafe { address_of_mut((*inner).send_waiters_tail) });
+            if (sw as usize) != 0 {
+                unsafe {
+                    raw_waker_wake_by_ref((*sw).waker_data, (*sw).waker_vt);
+                }
+            }
+            spin_unlock(p_lock);
+
+            return Poll.Ready(Result.Ok(val));
+        }
+
+        let senders = unsafe { (*inner).sender_count.load(Ordering.Acquire) };
+        if senders == 0 {
+            if (self.node as usize) != 0 {
+                remove_waiter(unsafe { address_of_mut((*inner).recv_waiters_head) }, unsafe { address_of_mut((*inner).recv_waiters_tail) }, self.node);
+                free_waiter_node(self.node);
+                self.node = 0 as *mut ChanWaiterNode;
+            }
+            spin_unlock(p_lock);
+            return Poll.Ready(Result.Err(RecvError.Disconnected));
+        }
+
+        // Buffer empty & senders alive: register or update waiter
+        if (self.node as usize) == 0 {
+            let sz = size_of<ChanWaiterNode>();
+            let al = align_of<ChanWaiterNode>();
+            let raw_n = unsafe { heap_alloc(sz, al) };
+            let n = raw_n as *mut ChanWaiterNode;
+            unsafe {
+                (*n).waiter_id = self.waiter_id;
+                let lw = waker_leak(cx.waker());
+                (*n).waker_data = lw.data;
+                (*n).waker_vt = lw.vtable;
+                (*n).next = 0 as *mut ChanWaiterNode;
+            }
+            enqueue_waiter(unsafe { address_of_mut((*inner).recv_waiters_head) }, unsafe { address_of_mut((*inner).recv_waiters_tail) }, n);
+            self.node = n;
+        } else {
+            // Woken (or spurious) poll with the condition still unmet: refresh the waker and make
+            // sure the node is queued again (a waking peer unlinks it).
+            unsafe {
+                raw_waker_drop((*self.node).waker_data, (*self.node).waker_vt);
+                let lw = waker_leak(cx.waker());
+                (*self.node).waker_data = lw.data;
+                (*self.node).waker_vt = lw.vtable;
+            }
+            remove_waiter(unsafe { address_of_mut((*inner).recv_waiters_head) }, unsafe { address_of_mut((*inner).recv_waiters_tail) }, self.node);
+            enqueue_waiter(unsafe { address_of_mut((*inner).recv_waiters_head) }, unsafe { address_of_mut((*inner).recv_waiters_tail) }, self.node);
+        }
+
+        spin_unlock(p_lock);
+        Poll.Pending
+    }
+}
+
+impl Future for RecvFuture<i64> {
+    type Output = Result<i64, RecvError>;
+
+    fn poll(self: mut_view<RecvFuture<i64>>, cx: mut_view<Context>) -> Poll<Result<i64, RecvError>> {
+        self.poll_recv(cx)
+    }
+}
+
+impl<T> Drop for RecvFuture<T> {
+    fn drop(self: mut_view<RecvFuture<T>>) {
+        let n = self.node;
+        if (n as usize) == 0 {
+            return;
+        }
+        self.node = 0 as *mut ChanWaiterNode;
+        let inner = self.inner;
+        let p_lock: *const Atomic<u32> = unsafe { address_of<Atomic<u32>>((*inner).lock) };
+        spin_lock(p_lock);
+
+        remove_waiter(unsafe { address_of_mut((*inner).recv_waiters_head) }, unsafe { address_of_mut((*inner).recv_waiters_tail) }, n);
+
+        // If there are messages in the queue and another receiver is waiting, forward wakeup!
+        if unsafe { (*inner).msg_count } > 0 {
+            let rw = unsafe { (*inner).recv_waiters_head };
+            if (rw as usize) != 0 {
+                unsafe {
+                    raw_waker_wake_by_ref((*rw).waker_data, (*rw).waker_vt);
+                }
+            }
+        }
+
+        spin_unlock(p_lock);
+        free_waiter_node(n);
+    }
+}

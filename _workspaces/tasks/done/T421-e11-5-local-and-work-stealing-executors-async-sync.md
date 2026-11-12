@@ -8,15 +8,15 @@ model: sonnet
 gate_model: sonnet
 depends: [T420, T412, T088, T418]
 priority: 144
-status: doing
+status: done
 attempts: 1
 timeout_min: 300
 paths: [std/async/executor.ax, std/async/task.ax, std/async/waker.ax, std/async/sync.ax, std/async/channel.ax, std/async/mod.ax, tests/std/async/executor]
 locks: [std/mod.ax, std/future/mod.ax]
 spec: [spec/SPEC-34-executors-fibers.md, 0202, 0205, tasks/0277, tasks/0278, tasks/0620, tasks/0621, tasks/0835, tasks/0836]
 covers: [REQ-CONC-034, REQ-CONC-035, REQ-CONC-049, REQ-ASY-037, REQ-ASY-041, REQ-ASY-054, REQ-ASY-076, REQ-ASY-086, REQ-ASY-102, REQ-ASY-108, REQ-ASY-129, REQ-ASY-130, REQ-CONC-130, REQ-CONC-147, REQ-CONC-148, REQ-CONC-184, REQ-CONC-190]
-started: 2026-11-12 13:07:58
-agent: T421-impl
+started: 2026-11-12 21:33:51
+finished: 2026-11-13 05:21:48
 ---
 # T421 — E11.5 — Single-thread LocalExecutor, multi-thread work-stealing Executor & async sync
 
@@ -45,3 +45,6 @@ Implement `std.async` single-thread `LocalExecutor`, multi-thread work-stealing 
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
 - 2026-11-12 13:07:58 started (attempt 1) T421-impl
+- 2026-11-12 21:33:40 requeue: previous session died; resume from files (not charged: attempt refunded)
+- 2026-11-12 21:33:51 started (attempt 1) T421-impl
+- 2026-11-13 05:21:48 accepted by QA -> done

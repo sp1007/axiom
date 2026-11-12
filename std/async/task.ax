@@ -1,0 +1,406 @@
+// std.asyn.task - TaskControlBlock, TaskHandle, and Lifecycle Management (SPEC-34 AXS-EXEC-003..007)
+module std.asyn.task
+
+use std.core.prelude.RawWaker
+use std.core.prelude.RawWakerVTable
+use std.core.prelude.Waker
+use std.core.prelude.Context
+use std.core.prelude.Future
+use std.core.prelude.Poll
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.core.result.Result
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.core.host.thread_yield
+
+pub use std.asyn.waker.TaskHeader
+pub use std.asyn.waker.TASK_IDLE
+pub use std.asyn.waker.TASK_POLLING
+pub use std.asyn.waker.TASK_NOTIFIED
+pub use std.asyn.waker.TASK_COMPLETED
+pub use std.asyn.waker.TASK_CANCELLED
+pub use std.asyn.waker.TASK_PANICKED
+pub use std.asyn.waker.FLAG_CANCEL_REQUESTED
+pub use std.asyn.waker.FLAG_DETACHED
+pub use std.asyn.waker.make_task_waker
+pub use std.asyn.waker.task_wake
+pub use std.asyn.waker.task_dec_ref
+pub use std.asyn.waker.init_task_header_vtable
+pub use std.asyn.waker.new_task_waker_vtable
+pub use std.asyn.waker.waker_leak
+pub use std.asyn.waker.raw_waker_wake
+pub use std.asyn.waker.raw_waker_drop
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic fn needs_drop<T>() -> bool { false }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn drop_in_place<T>(p: *mut T) {}
+
+@derive(Copy)
+pub struct TaskId {
+    pub id: u64,
+}
+
+pub struct TaskPanic {
+    pub task_id: TaskId,
+}
+
+pub enum TaskError {
+    Cancelled,
+    Panicked,
+}
+
+pub enum TaskResult<T> {
+    Completed(T),
+    Cancelled,
+    Panicked,
+}
+
+@repr(C)
+pub struct TaskSlot<T> {
+    pub header: TaskHeader,
+    pub has_output: bool,
+    pub has_join_waker: bool,
+    pub join_waker_data: *const u8,
+    pub join_waker_vt: *const RawWakerVTable,
+    // Last on purpose: the join fields above are reached through `TaskSlot<u8>` casts and must sit at
+    // the same offsets for every output type T.
+    pub output: T,
+}
+
+@repr(C)
+pub struct TaskControlBlock<F, T> {
+    pub slot: TaskSlot<T>,
+    pub future: F,
+    pub has_future: bool,
+}
+
+pub struct TaskHandle<T> {
+    pub raw_task: *mut TaskHeader,
+    pub task_id: TaskId,
+}
+
+unsafe impl<T: Send> Send for TaskHandle<T> {}
+impl<T> !Copy for TaskHandle<T> {}
+
+pub struct LocalTaskHandle<T> {
+    pub raw_task: *mut TaskHeader,
+    pub task_id: TaskId,
+}
+
+impl<T> !Copy for LocalTaskHandle<T> {}
+impl<T> !Send for LocalTaskHandle<T> {}
+
+pub unsafe fn task_take_output<T>(raw: *mut TaskHeader) -> T {
+    let slot = raw as *mut TaskSlot<T>;
+    (*slot).has_output = false;
+    (*slot).output
+}
+
+pub unsafe fn task_set_join_waker(raw: *mut TaskHeader, w: Waker) {
+    let slot = raw as *mut TaskSlot<u8>;
+    if (*slot).has_join_waker {
+        raw_waker_drop((*slot).join_waker_data, (*slot).join_waker_vt);
+    }
+    let lw = waker_leak(w);
+    (*slot).join_waker_data = lw.data;
+    (*slot).join_waker_vt = lw.vtable;
+    (*slot).has_join_waker = true;
+}
+
+pub unsafe fn task_wake_join_waker(raw: *mut TaskHeader) {
+    let slot = raw as *mut TaskSlot<u8>;
+    if (*slot).has_join_waker {
+        (*slot).has_join_waker = false;
+        raw_waker_wake((*slot).join_waker_data, (*slot).join_waker_vt);
+    }
+}
+
+pub fn tcb_poll_fn<F: Future<Output = T>, T>(tcb: *mut TaskControlBlock<F, T>, cx_raw: *mut u8) -> u32 {
+    let raw = tcb as *mut TaskHeader;
+    let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) };
+    if (st & FLAG_CANCEL_REQUESTED) != 0u32 {
+        unsafe {
+            if (*tcb).has_future {
+                let mut tmp: [1]F = [*address_of_mut((*tcb).future)];
+            }
+            (*tcb).has_future = false;
+            (*raw).state.store(TASK_CANCELLED, Ordering.Release);
+            task_wake_join_waker(raw);
+        }
+        return TASK_CANCELLED;
+    }
+
+    unsafe {
+        (*raw).state.store(TASK_POLLING, Ordering.Release);
+    }
+
+    let p_cx = cx_raw as *mut Context;
+    let poll_res = unsafe { (*tcb).future.poll(mut_view(*p_cx)) };
+
+    match poll_res {
+        Poll.Ready(val) => {
+            unsafe {
+                if (*tcb).has_future {
+                    let mut tmp: [1]F = [*address_of_mut((*tcb).future)];
+                }
+                (*tcb).has_future = false;
+                (*tcb).slot.output = val;
+                (*tcb).slot.has_output = true;
+                (*raw).state.store(TASK_COMPLETED, Ordering.Release);
+                task_wake_join_waker(raw);
+            }
+            TASK_COMPLETED
+        },
+        Poll.Pending => {
+            let cas = unsafe { (*raw).state.compare_exchange(TASK_POLLING, TASK_IDLE, Ordering.AcqRel, Ordering.Acquire) };
+            if !cas.ok {
+                let s_fn = unsafe { (*raw).schedule_fn };
+                let s_addr = unsafe { *(address_of<fn(*mut TaskHeader)>(s_fn) as *const usize) };
+                if s_addr != 0usize {
+                    s_fn(raw);
+                }
+                TASK_NOTIFIED
+            } else {
+                TASK_IDLE
+            }
+        },
+    }
+}
+
+pub fn default_task_drop(raw: *mut TaskHeader) {
+    if (raw as usize) != 0 {
+        let sz = unsafe { (*raw).alloc_size };
+        let al = unsafe { (*raw).alloc_align };
+        unsafe {
+            heap_free(raw as *mut u8, sz, al);
+        }
+    }
+}
+
+impl<T> TaskHandle<T> {
+    pub fn id(self: view<TaskHandle<T>>) -> TaskId {
+        self.task_id
+    }
+
+    pub fn is_finished(self: view<TaskHandle<T>>) -> bool {
+        if (self.raw_task as usize) == 0 {
+            return true;
+        }
+        let st: u32 = unsafe { (*self.raw_task).state.load(Ordering.Acquire) } & 0x7u32;
+        st >= TASK_COMPLETED
+    }
+
+    pub fn cancel(self: view<TaskHandle<T>>) {
+        if (self.raw_task as usize) == 0 {
+            return;
+        }
+        unsafe {
+            (*self.raw_task).state.fetch_or(FLAG_CANCEL_REQUESTED, Ordering.Release);
+        }
+        task_wake(self.raw_task);
+    }
+
+    pub fn detach(mut self: TaskHandle<T>) {
+        let raw = self.raw_task;
+        self.raw_task = 0 as *mut TaskHeader;
+        if (raw as usize) != 0 {
+            unsafe {
+                (*raw).state.fetch_or(FLAG_DETACHED, Ordering.Release);
+            }
+            task_dec_ref(raw);
+        }
+    }
+
+    pub fn join(mut self: TaskHandle<T>) -> TaskResult<T> {
+        let raw = self.raw_task;
+        self.raw_task = 0 as *mut TaskHeader;
+        if (raw as usize) == 0 {
+            return TaskResult.Cancelled;
+        }
+        while (unsafe { (*raw).state.load(Ordering.Acquire) } & 0x7u32) < TASK_COMPLETED {
+            unsafe {
+                thread_yield();
+            }
+        }
+        let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) } & 0x7u32;
+        let res = if st == TASK_COMPLETED {
+            let slot = raw as *mut TaskSlot<T>;
+            let out = unsafe { (*slot).output };
+            unsafe { (*slot).has_output = false; }
+            TaskResult.Completed(out)
+        } else if st == TASK_CANCELLED {
+            TaskResult.Cancelled
+        } else {
+            TaskResult.Panicked
+        };
+        task_dec_ref(raw);
+        res
+    }
+}
+
+impl Future for TaskHandle<i64> {
+    type Output = Result<i64, TaskError>;
+
+    fn poll(self: mut_view<TaskHandle<i64>>, cx: mut_view<Context>) -> Poll<Result<i64, TaskError>> {
+        let raw = self.raw_task;
+        if (raw as usize) == 0 {
+            return Poll.Ready(Result.Err(TaskError.Cancelled));
+        }
+        let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) } & 0x7u32;
+        if st == TASK_COMPLETED {
+            let slot = raw as *mut TaskSlot<i64>;
+            let out = unsafe { (*slot).output };
+            unsafe { (*slot).has_output = false; }
+            task_dec_ref(raw);
+            self.raw_task = 0 as *mut TaskHeader;
+            return Poll.Ready(Result.Ok(out));
+        }
+        if st == TASK_CANCELLED {
+            task_dec_ref(raw);
+            self.raw_task = 0 as *mut TaskHeader;
+            return Poll.Ready(Result.Err(TaskError.Cancelled));
+        }
+        if st == TASK_PANICKED {
+            task_dec_ref(raw);
+            self.raw_task = 0 as *mut TaskHeader;
+            return Poll.Ready(Result.Err(TaskError.Panicked));
+        }
+        unsafe {
+            task_set_join_waker(raw, cx.waker());
+        }
+        Poll.Pending
+    }
+}
+
+impl<T> Drop for TaskHandle<T> {
+    fn drop(self: mut_view<TaskHandle<T>>) {
+        let raw = self.raw_task;
+        if (raw as usize) != 0 {
+            self.raw_task = 0 as *mut TaskHeader;
+            let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) };
+            if (st & 0x7u32) < TASK_COMPLETED && (st & FLAG_DETACHED) == 0u32 {
+                unsafe {
+                    (*raw).state.fetch_or(FLAG_CANCEL_REQUESTED, Ordering.Release);
+                }
+                task_wake(raw);
+            }
+            task_dec_ref(raw);
+        }
+    }
+}
+
+impl<T> LocalTaskHandle<T> {
+    pub fn id(self: view<LocalTaskHandle<T>>) -> TaskId {
+        self.task_id
+    }
+
+    pub fn is_finished(self: view<LocalTaskHandle<T>>) -> bool {
+        if (self.raw_task as usize) == 0 {
+            return true;
+        }
+        let st: u32 = unsafe { (*self.raw_task).state.load(Ordering.Acquire) } & 0x7u32;
+        st >= TASK_COMPLETED
+    }
+
+    pub fn cancel(self: view<LocalTaskHandle<T>>) {
+        if (self.raw_task as usize) == 0 {
+            return;
+        }
+        unsafe {
+            (*self.raw_task).state.fetch_or(FLAG_CANCEL_REQUESTED, Ordering.Release);
+        }
+        task_wake(self.raw_task);
+    }
+
+    pub fn detach(mut self: LocalTaskHandle<T>) {
+        let raw = self.raw_task;
+        self.raw_task = 0 as *mut TaskHeader;
+        if (raw as usize) != 0 {
+            unsafe {
+                (*raw).state.fetch_or(FLAG_DETACHED, Ordering.Release);
+            }
+            task_dec_ref(raw);
+        }
+    }
+
+    pub fn join(mut self: LocalTaskHandle<T>) -> TaskResult<T> {
+        let raw = self.raw_task;
+        self.raw_task = 0 as *mut TaskHeader;
+        if (raw as usize) == 0 {
+            return TaskResult.Cancelled;
+        }
+        while (unsafe { (*raw).state.load(Ordering.Acquire) } & 0x7u32) < TASK_COMPLETED {
+            unsafe {
+                thread_yield();
+            }
+        }
+        let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) } & 0x7u32;
+        let res = if st == TASK_COMPLETED {
+            let slot = raw as *mut TaskSlot<T>;
+            let out = unsafe { (*slot).output };
+            unsafe { (*slot).has_output = false; }
+            TaskResult.Completed(out)
+        } else if st == TASK_CANCELLED {
+            TaskResult.Cancelled
+        } else {
+            TaskResult.Panicked
+        };
+        task_dec_ref(raw);
+        res
+    }
+}
+
+impl Future for LocalTaskHandle<i64> {
+    type Output = Result<i64, TaskError>;
+
+    fn poll(self: mut_view<LocalTaskHandle<i64>>, cx: mut_view<Context>) -> Poll<Result<i64, TaskError>> {
+        let raw = self.raw_task;
+        if (raw as usize) == 0 {
+            return Poll.Ready(Result.Err(TaskError.Cancelled));
+        }
+        let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) } & 0x7u32;
+        if st == TASK_COMPLETED {
+            let slot = raw as *mut TaskSlot<i64>;
+            let out = unsafe { (*slot).output };
+            unsafe { (*slot).has_output = false; }
+            task_dec_ref(raw);
+            self.raw_task = 0 as *mut TaskHeader;
+            return Poll.Ready(Result.Ok(out));
+        }
+        if st == TASK_CANCELLED {
+            task_dec_ref(raw);
+            self.raw_task = 0 as *mut TaskHeader;
+            return Poll.Ready(Result.Err(TaskError.Cancelled));
+        }
+        if st == TASK_PANICKED {
+            task_dec_ref(raw);
+            self.raw_task = 0 as *mut TaskHeader;
+            return Poll.Ready(Result.Err(TaskError.Panicked));
+        }
+        unsafe {
+            task_set_join_waker(raw, cx.waker());
+        }
+        Poll.Pending
+    }
+}
+
+impl<T> Drop for LocalTaskHandle<T> {
+    fn drop(self: mut_view<LocalTaskHandle<T>>) {
+        let raw = self.raw_task;
+        if (raw as usize) != 0 {
+            self.raw_task = 0 as *mut TaskHeader;
+            let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) };
+            if (st & 0x7u32) < TASK_COMPLETED && (st & FLAG_DETACHED) == 0u32 {
+                unsafe {
+                    (*raw).state.fetch_or(FLAG_CANCEL_REQUESTED, Ordering.Release);
+                }
+                task_wake(raw);
+            }
+            task_dec_ref(raw);
+        }
+    }
+}

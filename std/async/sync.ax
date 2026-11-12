@@ -1,0 +1,580 @@
+// std.asyn.sync - Async-Aware Synchronization Primitives (SPEC-34 §4 AXS-EXEC-030..033)
+module std.asyn.sync
+
+use std.core.prelude.RawWaker
+use std.core.prelude.RawWakerVTable
+use std.core.prelude.Waker
+use std.core.prelude.Context
+use std.core.prelude.Future
+use std.core.prelude.Poll
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.core.option.Option
+use std.core.result.Result
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.core.host.thread_yield
+use std.asyn.waker.waker_leak
+use std.asyn.waker.raw_waker_wake
+use std.asyn.waker.raw_waker_drop
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+fn spin_lock(p_lock: *const Atomic<u32>) {
+    while unsafe { (*p_lock).compare_exchange(0u32, 1u32, Ordering.Acquire, Ordering.Relaxed).val != 0u32 } {
+        unsafe {
+            thread_yield();
+        }
+    }
+}
+
+fn spin_unlock(p_lock: *const Atomic<u32>) {
+    unsafe {
+        (*p_lock).store(0u32, Ordering.Release);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// AsyncMutex<T> (AXS-EXEC-031)
+// -----------------------------------------------------------------------------
+
+@repr(C)
+pub struct WaiterNode {
+    pub waiter_id: u64,
+    pub waker_data: *const u8,
+    pub waker_vt: *const RawWakerVTable,
+    pub granted: Atomic<bool>,
+    pub next: *mut WaiterNode,
+}
+
+@repr(C)
+pub struct AsyncMutexInner<T> {
+    pub locked: Atomic<u32>,
+    pub waiters_head: *mut WaiterNode,
+    pub waiters_tail: *mut WaiterNode,
+    pub queue_lock: Atomic<u32>,
+    pub next_waiter_id: Atomic<u64>,
+    pub data: T,
+}
+
+pub struct AsyncMutex<T> {
+    pub inner: *mut AsyncMutexInner<T>,
+}
+
+unsafe impl<T: Send> Send for AsyncMutex<T> {}
+unsafe impl<T: Send> Share for AsyncMutex<T> {}
+impl<T> !Copy for AsyncMutex<T> {}
+
+pub struct AsyncMutexGuard<T> {
+    pub mutex: *mut AsyncMutexInner<T>,
+}
+
+unsafe impl<T: Send> Send for AsyncMutexGuard<T> {}
+unsafe impl<T: Share> Share for AsyncMutexGuard<T> {}
+impl<T> !Copy for AsyncMutexGuard<T> {}
+
+pub struct AsyncMutexLockFuture<T> {
+    pub mutex: *mut AsyncMutexInner<T>,
+    pub waiter_id: u64,
+    pub node: *mut WaiterNode,
+}
+
+impl<T> AsyncMutex<T> {
+    pub fn new(val: T) -> AsyncMutex<T> {
+        let sz = size_of<AsyncMutexInner<T>>();
+        let al = align_of<AsyncMutexInner<T>>();
+        let raw = unsafe { heap_alloc(sz, al) };
+        let inner = raw as *mut AsyncMutexInner<T>;
+        unsafe {
+            (*inner).locked = Atomic.new(0u32);
+            (*inner).waiters_head = 0 as *mut WaiterNode;
+            (*inner).waiters_tail = 0 as *mut WaiterNode;
+            (*inner).queue_lock = Atomic.new(0u32);
+            (*inner).next_waiter_id = Atomic.new(1u64);
+            (*inner).data = val;
+        }
+        AsyncMutex { inner: inner }
+    }
+
+    pub fn lock(self: view<AsyncMutex<T>>) -> AsyncMutexLockFuture<T> {
+        self.lock_async()
+    }
+
+    pub fn lock_async(self: view<AsyncMutex<T>>) -> AsyncMutexLockFuture<T> {
+        let inner = self.inner;
+        let w_id = unsafe { (*inner).next_waiter_id.fetch_add(1u64, Ordering.Relaxed) };
+        AsyncMutexLockFuture {
+            mutex: inner,
+            waiter_id: w_id,
+            node: 0 as *mut WaiterNode,
+        }
+    }
+
+    pub fn try_lock(self: view<AsyncMutex<T>>) -> Option<AsyncMutexGuard<T>> {
+        let inner = self.inner;
+        let cas = unsafe { (*inner).locked.compare_exchange(0u32, 1u32, Ordering.Acquire, Ordering.Relaxed) };
+        if cas.ok {
+            Option.Some(AsyncMutexGuard { mutex: inner })
+        } else {
+            Option.None
+        }
+    }
+}
+
+impl<T> AsyncMutexGuard<T> {
+    pub fn get_ptr(self: view<AsyncMutexGuard<T>>) -> *const T {
+        unsafe { address_of<T>((*self.mutex).data) }
+    }
+
+    pub fn get_mut_ptr(self: mut_view<AsyncMutexGuard<T>>) -> *mut T {
+        unsafe { address_of_mut<T>((*self.mutex).data) }
+    }
+
+    pub fn val(self: view<AsyncMutexGuard<T>>) -> T where T: Copy {
+        unsafe { (*self.mutex).data }
+    }
+
+    pub fn set(self: mut_view<AsyncMutexGuard<T>>, v: T) {
+        unsafe { (*self.mutex).data = v; }
+    }
+}
+
+impl<T> Drop for AsyncMutexGuard<T> {
+    fn drop(self: mut_view<AsyncMutexGuard<T>>) {
+        let m = self.mutex;
+        if (m as usize) == 0 {
+            return;
+        }
+        self.mutex = 0 as *mut AsyncMutexInner<T>;
+        let ql: *const Atomic<u32> = unsafe { address_of<Atomic<u32>>((*m).queue_lock) };
+        spin_lock(ql);
+        let head = unsafe { (*m).waiters_head };
+        if (head as usize) != 0 {
+            unsafe {
+                (*m).waiters_head = (*head).next;
+                if ((*m).waiters_head as usize) == 0 {
+                    (*m).waiters_tail = 0 as *mut WaiterNode;
+                }
+                (*head).next = 0 as *mut WaiterNode;
+                (*head).granted.store(true, Ordering.Release);
+                raw_waker_wake((*head).waker_data, (*head).waker_vt);
+            }
+        } else {
+            unsafe {
+                (*m).locked.store(0u32, Ordering.Release);
+            }
+        }
+        spin_unlock(ql);
+    }
+}
+
+impl<T> AsyncMutexLockFuture<T> {
+    pub fn poll_lock(self: mut_view<AsyncMutexLockFuture<T>>, cx: mut_view<Context>) -> Poll<AsyncMutexGuard<T>> {
+        let m = self.mutex;
+        if (self.node as usize) != 0 {
+            // Re-check `granted` under the queue lock: a releasing guard sets it (and consumes the
+            // stored waker) under the same lock, so the waker is never replaced after being consumed.
+            let ql0: *const Atomic<u32> = unsafe { address_of<Atomic<u32>>((*m).queue_lock) };
+            spin_lock(ql0);
+            if unsafe { (*self.node).granted.load(Ordering.Acquire) } {
+                spin_unlock(ql0);
+                unsafe {
+                    heap_free(self.node as *mut u8, size_of<WaiterNode>(), align_of<WaiterNode>());
+                }
+                self.node = 0 as *mut WaiterNode;
+                return Poll.Ready(AsyncMutexGuard { mutex: m });
+            }
+            unsafe {
+                raw_waker_drop((*self.node).waker_data, (*self.node).waker_vt);
+                let lw = waker_leak(cx.waker());
+                (*self.node).waker_data = lw.data;
+                (*self.node).waker_vt = lw.vtable;
+            }
+            spin_unlock(ql0);
+            return Poll.Pending;
+        }
+
+        let cas = unsafe { (*m).locked.compare_exchange(0u32, 1u32, Ordering.Acquire, Ordering.Relaxed) };
+        if cas.ok {
+            return Poll.Ready(AsyncMutexGuard { mutex: m });
+        }
+
+        let raw_n = unsafe { heap_alloc(size_of<WaiterNode>(), align_of<WaiterNode>()) };
+        let n = raw_n as *mut WaiterNode;
+        unsafe {
+            (*n).waiter_id = self.waiter_id;
+            let lw = waker_leak(cx.waker());
+            (*n).waker_data = lw.data;
+            (*n).waker_vt = lw.vtable;
+            (*n).granted = Atomic.new(false);
+            (*n).next = 0 as *mut WaiterNode;
+        }
+        self.node = n;
+
+        let ql: *const Atomic<u32> = unsafe { address_of<Atomic<u32>>((*m).queue_lock) };
+        spin_lock(ql);
+        let cas_retry = unsafe { (*m).locked.compare_exchange(0u32, 1u32, Ordering.Acquire, Ordering.Relaxed) };
+        if cas_retry.ok {
+            spin_unlock(ql);
+            unsafe {
+                raw_waker_drop((*n).waker_data, (*n).waker_vt);
+                heap_free(raw_n, size_of<WaiterNode>(), align_of<WaiterNode>());
+            }
+            self.node = 0 as *mut WaiterNode;
+            return Poll.Ready(AsyncMutexGuard { mutex: m });
+        }
+
+        unsafe {
+            if ((*m).waiters_tail as usize) == 0 {
+                (*m).waiters_head = n;
+                (*m).waiters_tail = n;
+            } else {
+                (*(*m).waiters_tail).next = n;
+                (*m).waiters_tail = n;
+            }
+        }
+        spin_unlock(ql);
+        Poll.Pending
+    }
+}
+
+impl Future for AsyncMutexLockFuture<i64> {
+    type Output = AsyncMutexGuard<i64>;
+
+    fn poll(self: mut_view<AsyncMutexLockFuture<i64>>, cx: mut_view<Context>) -> Poll<AsyncMutexGuard<i64>> {
+        self.poll_lock(cx)
+    }
+}
+
+impl<T> Drop for AsyncMutexLockFuture<T> {
+    fn drop(self: mut_view<AsyncMutexLockFuture<T>>) {
+        let n = self.node;
+        if (n as usize) == 0 {
+            return;
+        }
+        self.node = 0 as *mut WaiterNode;
+        let m = self.mutex;
+        let ql: *const Atomic<u32> = unsafe { address_of<Atomic<u32>>((*m).queue_lock) };
+        spin_lock(ql);
+        let was_granted: bool = unsafe { (*n).granted.load(Ordering.Acquire) };
+        if was_granted {
+            let head = unsafe { (*m).waiters_head };
+            if (head as usize) != 0 {
+                unsafe {
+                    (*m).waiters_head = (*head).next;
+                    if ((*m).waiters_head as usize) == 0 {
+                        (*m).waiters_tail = 0 as *mut WaiterNode;
+                    }
+                    (*head).next = 0 as *mut WaiterNode;
+                    (*head).granted.store(true, Ordering.Release);
+                    raw_waker_wake((*head).waker_data, (*head).waker_vt);
+                }
+            } else {
+                unsafe {
+                    (*m).locked.store(0u32, Ordering.Release);
+                }
+            }
+        } else {
+            let mut cur = unsafe { (*m).waiters_head };
+            let mut prev: *mut WaiterNode = 0 as *mut WaiterNode;
+            while (cur as usize) != 0 {
+                if cur == n {
+                    if (prev as usize) != 0 {
+                        unsafe {
+                            (*prev).next = (*cur).next;
+                        }
+                    } else {
+                        unsafe {
+                            (*m).waiters_head = (*cur).next;
+                        }
+                    }
+                    if unsafe { (*m).waiters_tail } == cur {
+                        unsafe {
+                            (*m).waiters_tail = prev;
+                        }
+                    }
+                    break;
+                }
+                prev = cur;
+                cur = unsafe { (*cur).next };
+            }
+            unsafe {
+                raw_waker_drop((*n).waker_data, (*n).waker_vt);
+            }
+        }
+        spin_unlock(ql);
+        unsafe {
+            heap_free(n as *mut u8, size_of<WaiterNode>(), align_of<WaiterNode>());
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// AsyncSemaphore (AXS-EXEC-033)
+// -----------------------------------------------------------------------------
+
+@repr(C)
+pub struct SemWaiterNode {
+    pub waiter_id: u64,
+    pub waker_data: *const u8,
+    pub waker_vt: *const RawWakerVTable,
+    pub granted: Atomic<bool>,
+    pub next: *mut SemWaiterNode,
+}
+
+@repr(C)
+pub struct AsyncSemaphoreInner {
+    pub permits: Atomic<usize>,
+    pub waiters_head: *mut SemWaiterNode,
+    pub waiters_tail: *mut SemWaiterNode,
+    pub queue_lock: Atomic<u32>,
+    pub next_waiter_id: Atomic<u64>,
+}
+
+pub struct AsyncSemaphore {
+    pub inner: *mut AsyncSemaphoreInner,
+}
+
+unsafe impl Send for AsyncSemaphore {}
+unsafe impl Share for AsyncSemaphore {}
+impl !Copy for AsyncSemaphore {}
+
+pub struct AsyncSemaphorePermit {
+    pub sem: *mut AsyncSemaphoreInner,
+}
+
+unsafe impl Send for AsyncSemaphorePermit {}
+impl !Copy for AsyncSemaphorePermit {}
+
+pub struct AsyncSemaphoreAcquireFuture {
+    pub sem: *mut AsyncSemaphoreInner,
+    pub waiter_id: u64,
+    pub node: *mut SemWaiterNode,
+}
+
+impl AsyncSemaphore {
+    pub fn new(permits: usize) -> AsyncSemaphore {
+        let sz = size_of<AsyncSemaphoreInner>();
+        let al = align_of<AsyncSemaphoreInner>();
+        let raw = unsafe { heap_alloc(sz, al) };
+        let inner = raw as *mut AsyncSemaphoreInner;
+        unsafe {
+            (*inner).permits = Atomic.new(permits);
+            (*inner).waiters_head = 0 as *mut SemWaiterNode;
+            (*inner).waiters_tail = 0 as *mut SemWaiterNode;
+            (*inner).queue_lock = Atomic.new(0u32);
+            (*inner).next_waiter_id = Atomic.new(1u64);
+        }
+        AsyncSemaphore { inner: inner }
+    }
+
+    pub fn acquire(self: view<AsyncSemaphore>) -> AsyncSemaphoreAcquireFuture {
+        let inner = self.inner;
+        let w_id = unsafe { (*inner).next_waiter_id.fetch_add(1u64, Ordering.Relaxed) };
+        AsyncSemaphoreAcquireFuture {
+            sem: inner,
+            waiter_id: w_id,
+            node: 0 as *mut SemWaiterNode,
+        }
+    }
+
+    pub fn try_acquire(self: view<AsyncSemaphore>) -> Option<AsyncSemaphorePermit> {
+        let inner = self.inner;
+        loop {
+            let cur: usize = unsafe { (*inner).permits.load(Ordering.Acquire) };
+            if cur == 0usize {
+                return Option.None;
+            }
+            let cas = unsafe { (*inner).permits.compare_exchange_weak(cur, cur - 1usize, Ordering.AcqRel, Ordering.Acquire) };
+            if cas.ok {
+                return Option.Some(AsyncSemaphorePermit { sem: inner });
+            }
+        }
+    }
+
+    pub fn available_permits(self: view<AsyncSemaphore>) -> usize {
+        unsafe { (*self.inner).permits.load(Ordering.Acquire) }
+    }
+}
+
+impl Drop for AsyncSemaphorePermit {
+    fn drop(self: mut_view<AsyncSemaphorePermit>) {
+        let s = self.sem;
+        if (s as usize) == 0 {
+            return;
+        }
+        self.sem = 0 as *mut AsyncSemaphoreInner;
+        let ql: *const Atomic<u32> = unsafe { address_of<Atomic<u32>>((*s).queue_lock) };
+        spin_lock(ql);
+        let head = unsafe { (*s).waiters_head };
+        if (head as usize) != 0 {
+            unsafe {
+                (*s).waiters_head = (*head).next;
+                if ((*s).waiters_head as usize) == 0 {
+                    (*s).waiters_tail = 0 as *mut SemWaiterNode;
+                }
+                (*head).next = 0 as *mut SemWaiterNode;
+                (*head).granted.store(true, Ordering.Release);
+                raw_waker_wake((*head).waker_data, (*head).waker_vt);
+            }
+        } else {
+            unsafe {
+                (*s).permits.fetch_add(1usize, Ordering.Release);
+            }
+        }
+        spin_unlock(ql);
+    }
+}
+
+impl Future for AsyncSemaphoreAcquireFuture {
+    type Output = AsyncSemaphorePermit;
+
+    fn poll(self: mut_view<AsyncSemaphoreAcquireFuture>, cx: mut_view<Context>) -> Poll<AsyncSemaphorePermit> {
+        let s = self.sem;
+        if (self.node as usize) != 0 {
+            let ql0: *const Atomic<u32> = unsafe { address_of<Atomic<u32>>((*s).queue_lock) };
+            spin_lock(ql0);
+            if unsafe { (*self.node).granted.load(Ordering.Acquire) } {
+                spin_unlock(ql0);
+                unsafe {
+                    heap_free(self.node as *mut u8, size_of<SemWaiterNode>(), align_of<SemWaiterNode>());
+                }
+                self.node = 0 as *mut SemWaiterNode;
+                return Poll.Ready(AsyncSemaphorePermit { sem: s });
+            }
+            unsafe {
+                raw_waker_drop((*self.node).waker_data, (*self.node).waker_vt);
+                let lw = waker_leak(cx.waker());
+                (*self.node).waker_data = lw.data;
+                (*self.node).waker_vt = lw.vtable;
+            }
+            spin_unlock(ql0);
+            return Poll.Pending;
+        }
+
+        // Fast path: try to acquire permit
+        loop {
+            let cur: usize = unsafe { (*s).permits.load(Ordering.Acquire) };
+            if cur > 0usize {
+                let cas = unsafe { (*s).permits.compare_exchange_weak(cur, cur - 1usize, Ordering.AcqRel, Ordering.Acquire) };
+                if cas.ok {
+                    return Poll.Ready(AsyncSemaphorePermit { sem: s });
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Enqueue waiter
+        let raw_n = unsafe { heap_alloc(size_of<SemWaiterNode>(), align_of<SemWaiterNode>()) };
+        let n = raw_n as *mut SemWaiterNode;
+        unsafe {
+            (*n).waiter_id = self.waiter_id;
+            let lw = waker_leak(cx.waker());
+            (*n).waker_data = lw.data;
+            (*n).waker_vt = lw.vtable;
+            (*n).granted = Atomic.new(false);
+            (*n).next = 0 as *mut SemWaiterNode;
+        }
+        self.node = n;
+
+        let ql: *const Atomic<u32> = unsafe { address_of<Atomic<u32>>((*s).queue_lock) };
+        spin_lock(ql);
+        // Double check permits under lock
+        loop {
+            let cur: usize = unsafe { (*s).permits.load(Ordering.Acquire) };
+            if cur > 0usize {
+                let cas = unsafe { (*s).permits.compare_exchange_weak(cur, cur - 1usize, Ordering.AcqRel, Ordering.Acquire) };
+                if cas.ok {
+                    spin_unlock(ql);
+                    unsafe {
+                        raw_waker_drop((*n).waker_data, (*n).waker_vt);
+                        heap_free(raw_n, size_of<SemWaiterNode>(), align_of<SemWaiterNode>());
+                    }
+                    self.node = 0 as *mut SemWaiterNode;
+                    return Poll.Ready(AsyncSemaphorePermit { sem: s });
+                }
+            } else {
+                break;
+            }
+        }
+
+        unsafe {
+            if ((*s).waiters_tail as usize) == 0 {
+                (*s).waiters_head = n;
+                (*s).waiters_tail = n;
+            } else {
+                (*(*s).waiters_tail).next = n;
+                (*s).waiters_tail = n;
+            }
+        }
+        spin_unlock(ql);
+        Poll.Pending
+    }
+}
+
+impl Drop for AsyncSemaphoreAcquireFuture {
+    fn drop(self: mut_view<AsyncSemaphoreAcquireFuture>) {
+        let n = self.node;
+        if (n as usize) == 0 {
+            return;
+        }
+        self.node = 0 as *mut SemWaiterNode;
+        let s = self.sem;
+        let ql: *const Atomic<u32> = unsafe { address_of<Atomic<u32>>((*s).queue_lock) };
+        spin_lock(ql);
+        let was_granted: bool = unsafe { (*n).granted.load(Ordering.Acquire) };
+        if was_granted {
+            let head = unsafe { (*s).waiters_head };
+            if (head as usize) != 0 {
+                unsafe {
+                    (*s).waiters_head = (*head).next;
+                    if ((*s).waiters_head as usize) == 0 {
+                        (*s).waiters_tail = 0 as *mut SemWaiterNode;
+                    }
+                    (*head).next = 0 as *mut SemWaiterNode;
+                    (*head).granted.store(true, Ordering.Release);
+                    raw_waker_wake((*head).waker_data, (*head).waker_vt);
+                }
+            } else {
+                unsafe {
+                    (*s).permits.fetch_add(1usize, Ordering.Release);
+                }
+            }
+        } else {
+            let mut cur = unsafe { (*s).waiters_head };
+            let mut prev: *mut SemWaiterNode = 0 as *mut SemWaiterNode;
+            while (cur as usize) != 0 {
+                if cur == n {
+                    if (prev as usize) != 0 {
+                        unsafe {
+                            (*prev).next = (*cur).next;
+                        }
+                    } else {
+                        unsafe {
+                            (*s).waiters_head = (*cur).next;
+                        }
+                    }
+                    if unsafe { (*s).waiters_tail } == cur {
+                        unsafe {
+                            (*s).waiters_tail = prev;
+                        }
+                    }
+                    break;
+                }
+                prev = cur;
+                cur = unsafe { (*cur).next };
+            }
+            unsafe {
+                raw_waker_drop((*n).waker_data, (*n).waker_vt);
+            }
+        }
+        spin_unlock(ql);
+        unsafe {
+            heap_free(n as *mut u8, size_of<SemWaiterNode>(), align_of<SemWaiterNode>());
+        }
+    }
+}

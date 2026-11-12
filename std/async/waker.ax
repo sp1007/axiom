@@ -1,0 +1,273 @@
+// std.asyn.waker - Task Waker Implementation & VTable (SPEC-34 AXS-EXEC-004)
+module std.asyn.waker
+
+use std.core.prelude.RawWaker
+use std.core.prelude.RawWakerVTable
+use std.core.prelude.Waker
+use std.core.prelude.Context
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+
+use std.core.host.heap_alloc
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+pub const TASK_IDLE: u32 = 0u32
+pub const TASK_POLLING: u32 = 1u32
+pub const TASK_NOTIFIED: u32 = 2u32
+pub const TASK_COMPLETED: u32 = 3u32
+pub const TASK_CANCELLED: u32 = 4u32
+pub const TASK_PANICKED: u32 = 5u32
+
+pub const FLAG_CANCEL_REQUESTED: u32 = 0x100u32
+pub const FLAG_DETACHED: u32 = 0x200u32
+
+@repr(C)
+pub struct TaskHeader {
+    pub vtable: *const RawWakerVTable,
+    pub state: Atomic<u32>,
+    pub ref_count: Atomic<u32>,
+    pub task_id: u64,
+    pub owner_thread_id: u64,
+    pub queue_next: *mut TaskHeader,
+    pub schedule_fn: fn(*mut TaskHeader),
+    pub poll_fn: fn(*mut u8, *mut u8) -> u32,
+    pub drop_fn: fn(*mut TaskHeader),
+    pub schedule_data: *mut u8,
+    pub alloc_size: usize,
+    pub alloc_align: usize,
+}
+
+fn task_waker_clone(data: *const u8) -> RawWaker {
+    let raw = data as *mut TaskHeader;
+    if (raw as usize) != 0 {
+        unsafe {
+            (*raw).ref_count.fetch_add(1u32, Ordering.Relaxed);
+            return RawWaker {
+                data: data,
+                vtable: (*raw).vtable,
+            };
+        }
+    }
+    RawWaker {
+        data: 0 as *const u8,
+        vtable: 0 as *const RawWakerVTable,
+    }
+}
+
+fn task_waker_wake(data: *const u8) {
+    let raw = data as *mut TaskHeader;
+    if (raw as usize) != 0 {
+        task_wake(raw);
+        task_dec_ref(raw);
+    }
+}
+
+fn task_waker_wake_by_ref(data: *const u8) {
+    let raw = data as *mut TaskHeader;
+    if (raw as usize) != 0 {
+        task_wake(raw);
+    }
+}
+
+fn task_waker_drop(data: *const u8) {
+    let raw = data as *mut TaskHeader;
+    if (raw as usize) != 0 {
+        task_dec_ref(raw);
+    }
+}
+
+pub fn new_task_waker_vtable() -> *const RawWakerVTable {
+    let p = unsafe { heap_alloc(32usize, 8usize) as *mut RawWakerVTable };
+    unsafe {
+        (*p).clone = task_waker_clone;
+        (*p).wake = task_waker_wake;
+        (*p).wake_by_ref = task_waker_wake_by_ref;
+        (*p).drop_waker = task_waker_drop;
+    }
+    p as *const RawWakerVTable
+}
+
+pub fn init_task_header_vtable(header: *mut TaskHeader, vt: *const RawWakerVTable) {
+    if (header as usize) != 0 {
+        unsafe {
+            (*header).vtable = vt;
+        }
+    }
+}
+
+pub fn make_task_waker(header: *mut TaskHeader) -> Waker {
+    if (header as usize) != 0 {
+        unsafe {
+            (*header).ref_count.fetch_add(1u32, Ordering.Relaxed);
+            return Waker {
+                raw: RawWaker {
+                    data: header as *const u8,
+                    vtable: (*header).vtable,
+                },
+            };
+        }
+    }
+    Waker {
+        raw: RawWaker {
+            data: 0 as *const u8,
+            vtable: 0 as *const RawWakerVTable,
+        },
+    }
+}
+
+pub fn task_wake(raw: *mut TaskHeader) {
+    if (raw as usize) == 0 {
+        return;
+    }
+    loop {
+        if (unsafe { (*raw).state.load(Ordering.Acquire) } & 0x7u32) == TASK_IDLE {
+            let f1 = unsafe { (*raw).state.load(Ordering.Acquire) } & 0xFFFFFFF8u32;
+            let f2 = unsafe { (*raw).state.load(Ordering.Acquire) } & 0xFFFFFFF8u32;
+            let s_expected = f1 | TASK_IDLE;
+            let desired = f2 | TASK_NOTIFIED;
+            let cas = unsafe { (*raw).state.compare_exchange_weak(s_expected, desired, Ordering.AcqRel, Ordering.Acquire) };
+            if cas.ok {
+                let s_fn = unsafe { (*raw).schedule_fn };
+                let s_addr = unsafe { *(address_of<fn(*mut TaskHeader)>(s_fn) as *const usize) };
+                if s_addr != 0usize {
+                    s_fn(raw);
+                }
+                return;
+            }
+        } else if (unsafe { (*raw).state.load(Ordering.Acquire) } & 0x7u32) == TASK_POLLING {
+            let f1 = unsafe { (*raw).state.load(Ordering.Acquire) } & 0xFFFFFFF8u32;
+            let f2 = unsafe { (*raw).state.load(Ordering.Acquire) } & 0xFFFFFFF8u32;
+            let s_expected = f1 | TASK_POLLING;
+            let desired = f2 | TASK_NOTIFIED;
+            let cas = unsafe { (*raw).state.compare_exchange_weak(s_expected, desired, Ordering.AcqRel, Ordering.Acquire) };
+            if cas.ok {
+                return;
+            }
+        } else {
+            return;
+        }
+    }
+}
+
+pub fn task_dec_ref(raw: *mut TaskHeader) {
+    if (raw as usize) == 0 {
+        return;
+    }
+    let prev = unsafe { (*raw).ref_count.fetch_sub(1u32, Ordering.AcqRel) };
+    if prev == 1u32 {
+        let df = unsafe { (*raw).drop_fn };
+        let df_addr = unsafe { *(address_of<fn(*mut TaskHeader)>(df) as *const usize) };
+        if df_addr != 0usize {
+            df(raw);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Detached wakers (reference-owning data/vtable pair with no drop glue)
+// -----------------------------------------------------------------------------
+//
+// Wait queues (AsyncMutex, AsyncSemaphore, channels, TaskHandle join) keep wakers inside raw heap
+// nodes. A `Waker` stored there would run its Drop glue when the node memory is overwritten, so the
+// queues store the waker as two plain pointer fields (`waker_data`, `waker_vt`) that own exactly one
+// reference, and manage that reference explicitly:
+//   waker_leak             Waker -> RawWaker, transferring the reference (the Waker is neutralised)
+//   raw_waker_wake         wake the task and release the reference (consumes it)
+//   raw_waker_wake_by_ref  wake the task, keep the reference
+//   raw_waker_drop         release the reference without waking
+// The pair is deliberately not stored as a `RawWaker`/`Waker` struct field: such fields read back
+// wrong values inside `std.*` modules today (report follow-up FU-3).
+
+pub fn waker_leak(mut w: Waker) -> RawWaker {
+    let rw = RawWaker {
+        data: w.raw.data,
+        vtable: w.raw.vtable,
+    };
+    w.raw.data = 0 as *const u8;
+    rw
+}
+
+pub fn raw_waker_wake(data: *const u8, vt: *const RawWakerVTable) {
+    if (data as usize) != 0 {
+        // Bind the function pointer to a local first: calling a field expression directly is not
+        // lowered correctly by the native backend (report follow-up FU-2).
+        let f = unsafe { (*vt).wake };
+        f(data);
+    }
+}
+
+pub fn raw_waker_wake_by_ref(data: *const u8, vt: *const RawWakerVTable) {
+    if (data as usize) != 0 {
+        let f = unsafe { (*vt).wake_by_ref };
+        f(data);
+    }
+}
+
+pub fn raw_waker_drop(data: *const u8, vt: *const RawWakerVTable) {
+    if (data as usize) != 0 {
+        let f = unsafe { (*vt).drop_waker };
+        f(data);
+    }
+}
+
+impl Waker {
+    pub fn wake(self: Waker) {
+        let data = self.raw.data;
+        if (data as usize) != 0 {
+            let raw = data as *mut TaskHeader;
+            task_wake(raw);
+            task_dec_ref(raw);
+        }
+    }
+
+    pub fn wake_by_ref(self: view<Waker>) {
+        let data = self.raw.data;
+        if (data as usize) != 0 {
+            let raw = data as *mut TaskHeader;
+            task_wake(raw);
+        }
+    }
+
+    pub fn clone(self: view<Waker>) -> Waker {
+        let data = self.raw.data;
+        let vt = self.raw.vtable;
+        if (data as usize) != 0 {
+            let raw = data as *mut TaskHeader;
+            unsafe {
+                (*raw).ref_count.fetch_add(1u32, Ordering.Relaxed);
+            }
+            return Waker {
+                raw: RawWaker {
+                    data: data,
+                    vtable: vt,
+                },
+            };
+        }
+        Waker {
+            raw: RawWaker {
+                data: 0 as *const u8,
+                vtable: 0 as *const RawWakerVTable,
+            },
+        }
+    }
+}
+
+impl Drop for Waker {
+    fn drop(self: mut_view<Waker>) {
+        let data = self.raw.data;
+        if (data as usize) != 0 {
+            self.raw.data = 0 as *const u8;
+            let raw = data as *mut TaskHeader;
+            task_dec_ref(raw);
+        }
+    }
+}
+
+impl Context {
+    pub fn waker(self: mut_view<Context>) -> Waker {
+        view(self.waker_val).clone()
+    }
+}

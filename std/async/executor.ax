@@ -1,0 +1,689 @@
+// std.asyn.executor - LocalExecutor & Work-Stealing Multi-Thread Executor (SPEC-34 §2)
+module std.asyn.executor
+
+use std.core.prelude.RawWaker
+use std.core.prelude.RawWakerVTable
+use std.core.prelude.Waker
+use std.core.prelude.Context
+use std.core.prelude.Future
+use std.core.prelude.Poll
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.core.result.Result
+use std.core.option.Option
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.core.host.thread_spawn
+use std.core.host.thread_join
+use std.core.host.thread_current_id
+use std.core.host.thread_yield
+use std.core.host.futex_wait
+use std.core.host.futex_wake
+
+use std.asyn.waker.TaskHeader
+use std.asyn.waker.TASK_IDLE
+use std.asyn.waker.TASK_POLLING
+use std.asyn.waker.TASK_NOTIFIED
+use std.asyn.waker.TASK_COMPLETED
+use std.asyn.waker.TASK_CANCELLED
+use std.asyn.waker.TASK_PANICKED
+use std.asyn.waker.FLAG_CANCEL_REQUESTED
+use std.asyn.waker.FLAG_DETACHED
+use std.asyn.waker.make_task_waker
+use std.asyn.waker.task_wake
+use std.asyn.waker.task_dec_ref
+use std.asyn.waker.init_task_header_vtable
+use std.asyn.waker.new_task_waker_vtable
+
+use std.asyn.task.TaskId
+use std.asyn.task.TaskHandle
+use std.asyn.task.LocalTaskHandle
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.default_task_drop
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+// -----------------------------------------------------------------------------
+// Cooperative Task Yield (AXS-EXEC-014)
+// -----------------------------------------------------------------------------
+
+pub struct YieldNowFuture {
+    pub yielded: bool,
+}
+
+impl Future for YieldNowFuture {
+    type Output = ();
+
+    fn poll(self: mut_view<YieldNowFuture>, cx: mut_view<Context>) -> Poll<()> {
+        if self.yielded {
+            return Poll.Ready(());
+        }
+        self.yielded = true;
+        let mut w = cx.waker();
+        view(w).wake_by_ref();
+        Poll.Pending
+    }
+}
+
+pub fn yield_now() -> YieldNowFuture {
+    YieldNowFuture { yielded: false }
+}
+
+// -----------------------------------------------------------------------------
+// Single-Threaded LocalExecutor (AXS-EXEC-010)
+// -----------------------------------------------------------------------------
+
+pub struct LocalExecutor {
+    pub owner_thread: u64,
+    pub ready_head: *mut TaskHeader,
+    pub ready_tail: *mut TaskHeader,
+    pub active_tasks: usize,
+    pub next_task_id: u64,
+    pub waker_vtable: *const RawWakerVTable,
+}
+
+fn local_schedule(task: *mut TaskHeader) {
+    if (task as usize) == 0 {
+        return;
+    }
+    let p_exec = unsafe { (*task).schedule_data as *mut LocalExecutor };
+    if (p_exec as usize) != 0 {
+        local_enqueue(p_exec, task);
+    }
+}
+
+fn local_enqueue(exec: *mut LocalExecutor, task: *mut TaskHeader) {
+    if (exec as usize) == 0 {
+        return;
+    }
+    unsafe {
+        (*task).queue_next = 0 as *mut TaskHeader;
+        if ((*exec).ready_tail as usize) == 0 {
+            (*exec).ready_head = task;
+            (*exec).ready_tail = task;
+        } else {
+            (*(*exec).ready_tail).queue_next = task;
+            (*exec).ready_tail = task;
+        }
+    }
+}
+
+fn local_dequeue(exec: *mut LocalExecutor) -> *mut TaskHeader {
+    if (exec as usize) == 0 {
+        return 0 as *mut TaskHeader;
+    }
+    let h = unsafe { (*exec).ready_head };
+    if (h as usize) == 0 {
+        return 0 as *mut TaskHeader;
+    }
+    unsafe {
+        (*exec).ready_head = (*h).queue_next;
+        if ((*exec).ready_head as usize) == 0 {
+            (*exec).ready_tail = 0 as *mut TaskHeader;
+        }
+        (*h).queue_next = 0 as *mut TaskHeader;
+    }
+    h
+}
+
+impl LocalExecutor {
+    pub fn new() -> LocalExecutor {
+        LocalExecutor {
+            owner_thread: unsafe { thread_current_id() },
+            ready_head: 0 as *mut TaskHeader,
+            ready_tail: 0 as *mut TaskHeader,
+            active_tasks: 0,
+            next_task_id: 1,
+            waker_vtable: new_task_waker_vtable(),
+        }
+    }
+
+    pub fn spawn_local<F: Future<Output = T>, T>(self: mut_view<LocalExecutor>, fut: F, poll_fn: fn(*mut u8, *mut u8) -> u32) -> LocalTaskHandle<T> {
+        let p_self = unsafe { address_of_mut(*self) as *mut LocalExecutor };
+        let sz = size_of<TaskControlBlock<F, T>>();
+        let al = align_of<TaskControlBlock<F, T>>();
+        let raw = unsafe { heap_alloc(sz, al) };
+        let tcb = raw as *mut TaskControlBlock<F, T>;
+        let tid = TaskId { id: self.next_task_id };
+        self.next_task_id = self.next_task_id + 1u64;
+
+        unsafe {
+            init_task_header_vtable(raw as *mut TaskHeader, self.waker_vtable);
+            (*tcb).slot.header.state = Atomic.new(TASK_NOTIFIED);
+            (*tcb).slot.header.ref_count = Atomic.new(2u32);
+            (*tcb).slot.header.task_id = tid.id;
+            (*tcb).slot.header.owner_thread_id = self.owner_thread;
+            (*tcb).slot.header.queue_next = 0 as *mut TaskHeader;
+            (*tcb).slot.header.schedule_fn = local_schedule;
+            (*tcb).slot.header.poll_fn = poll_fn;
+            (*tcb).slot.header.drop_fn = default_task_drop;
+            (*tcb).slot.header.schedule_data = p_self as *mut u8;
+            (*tcb).slot.header.alloc_size = sz;
+            (*tcb).slot.header.alloc_align = al;
+            (*tcb).slot.has_output = false;
+            (*tcb).slot.has_join_waker = false;
+            (*tcb).future = fut;
+            (*tcb).has_future = true;
+        }
+
+        local_enqueue(p_self, raw as *mut TaskHeader);
+        self.active_tasks = self.active_tasks + 1;
+
+        LocalTaskHandle {
+            raw_task: raw as *mut TaskHeader,
+            task_id: tid,
+        }
+    }
+
+    pub fn try_tick(self: mut_view<LocalExecutor>) -> bool {
+        let p_self = unsafe { address_of_mut(*self) as *mut LocalExecutor };
+        let task = local_dequeue(p_self);
+        if (task as usize) == 0 {
+            return false;
+        }
+        let w = make_task_waker(task);
+        let mut cx = Context { waker_val: w };
+        let poll_fn = unsafe { (*task).poll_fn };
+        let st: u32 = poll_fn(task as *mut u8, unsafe { address_of_mut<Context>(cx) as *mut u8 });
+        if st >= TASK_COMPLETED {
+            if self.active_tasks > 0 {
+                self.active_tasks = self.active_tasks - 1;
+            }
+            task_dec_ref(task);
+        }
+        true
+    }
+
+    pub fn run(self: mut_view<LocalExecutor>) {
+        while self.active_tasks > 0 {
+            if !mut_view(*self).try_tick() {
+                unsafe {
+                    thread_yield();
+                }
+            }
+        }
+    }
+
+    pub fn run_until<F: Future<Output = T>, T>(self: mut_view<LocalExecutor>, mut main_fut: F) -> T {
+        let mut cx = Context {
+            waker_val: Waker {
+                raw: RawWaker {
+                    data: 0 as *const u8,
+                    vtable: 0 as *const RawWakerVTable,
+                },
+            },
+        };
+        loop {
+            match main_fut.poll(mut_view(cx)) {
+                Poll.Ready(val) => {
+                    return val;
+                },
+                Poll.Pending => {
+                    if !mut_view(*self).try_tick() {
+                        unsafe {
+                            thread_yield();
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    pub fn active_task_count(self: view<LocalExecutor>) -> usize {
+        self.active_tasks
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Multi-Threaded Work-Stealing Executor (AXS-EXEC-011..012)
+// -----------------------------------------------------------------------------
+
+pub struct ExecutorConfig {
+    pub worker_count: usize,
+    pub local_queue_capacity: usize,
+    pub global_queue_capacity: usize,
+}
+
+const LOCAL_QUEUE_CAP: usize = 256;
+
+@repr(C)
+pub struct WorkerData {
+    pub worker_id: usize,
+    pub thread_handle: i64,
+    pub head: Atomic<usize>,
+    pub tail: Atomic<usize>,
+    pub queue: [256]*mut TaskHeader,
+    // Opaque pointer to the owning ExecutorInner. A field typed `*mut ExecutorInner` here would be a
+    // forward reference to a later-declared struct, which currently yields wrong field offsets
+    // through the pointer (see T421 report, follow-up FU-1); cast at use instead.
+    pub executor: *mut u8,
+    // OS thread id of the worker (0 until the worker thread has started).
+    pub tid: Atomic<u64>,
+}
+
+@repr(C)
+pub struct ExecutorInner {
+    pub worker_count: usize,
+    pub workers: *mut WorkerData,
+    pub global_head: *mut TaskHeader,
+    pub global_tail: *mut TaskHeader,
+    pub global_lock: Atomic<u32>,
+    pub global_count: Atomic<usize>,
+    pub shutdown: Atomic<bool>,
+    pub park_word: Atomic<u32>,
+    pub active_tasks: Atomic<usize>,
+    pub next_task_id: Atomic<u64>,
+    pub waker_vtable: *const RawWakerVTable,
+    pub steal_count: Atomic<usize>,
+}
+
+// A copyable handle to the shared executor state (like an Arc handle): tasks may hold a copy to spawn
+// child tasks. `shutdown` must be called on exactly one handle once all work has completed.
+@derive(Copy)
+pub struct Executor {
+    pub inner: *mut ExecutorInner,
+}
+
+fn spin_lock(inner: *mut ExecutorInner) {
+    while unsafe { (*inner).global_lock.compare_exchange(0u32, 1u32, Ordering.Acquire, Ordering.Relaxed).val != 0u32 } {
+        unsafe {
+            thread_yield();
+        }
+    }
+}
+
+fn spin_unlock(inner: *mut ExecutorInner) {
+    unsafe {
+        (*inner).global_lock.store(0u32, Ordering.Release);
+    }
+}
+
+fn executor_global_enqueue(inner: *mut ExecutorInner, task: *mut TaskHeader) {
+    spin_lock(inner);
+    unsafe {
+        (*task).queue_next = 0 as *mut TaskHeader;
+        if ((*inner).global_tail as usize) == 0 {
+            (*inner).global_head = task;
+            (*inner).global_tail = task;
+        } else {
+            (*(*inner).global_tail).queue_next = task;
+            (*inner).global_tail = task;
+        }
+        (*inner).global_count.fetch_add(1usize, Ordering.Release);
+        (*inner).park_word.fetch_add(1u32, Ordering.Release);
+        futex_wake(address_of((*inner).park_word) as *const u32, 1u32);
+    }
+    spin_unlock(inner);
+}
+
+fn executor_global_dequeue(inner: *mut ExecutorInner) -> *mut TaskHeader {
+    spin_lock(inner);
+    let h = unsafe { (*inner).global_head };
+    if (h as usize) != 0 {
+        unsafe {
+            (*inner).global_head = (*h).queue_next;
+            if ((*inner).global_head as usize) == 0 {
+                (*inner).global_tail = 0 as *mut TaskHeader;
+            }
+            (*h).queue_next = 0 as *mut TaskHeader;
+            (*inner).global_count.fetch_sub(1usize, Ordering.Release);
+        }
+    }
+    spin_unlock(inner);
+    h
+}
+
+fn worker_push_local(w: *mut WorkerData, task: *mut TaskHeader) -> bool {
+    let t: usize = unsafe { (*w).tail.load(Ordering.Relaxed) };
+    let h: usize = unsafe { (*w).head.load(Ordering.Acquire) };
+    if t >= h {
+        if (t - h) >= LOCAL_QUEUE_CAP {
+            return false;
+        }
+    }
+    let idx = t % LOCAL_QUEUE_CAP;
+    unsafe {
+        (*w).queue[idx] = task;
+        (*w).tail.store(t + 1usize, Ordering.Release);
+    }
+    true
+}
+
+fn worker_pop_local(w: *mut WorkerData) -> *mut TaskHeader {
+    let t: usize = unsafe { (*w).tail.load(Ordering.Relaxed) };
+    let h: usize = unsafe { (*w).head.load(Ordering.Acquire) };
+    if t <= h {
+        return 0 as *mut TaskHeader;
+    }
+    let new_t: usize = t - 1usize;
+    unsafe {
+        (*w).tail.store(new_t, Ordering.SeqCst);
+    }
+    let h_now: usize = unsafe { (*w).head.load(Ordering.SeqCst) };
+    if h_now <= new_t {
+        let idx = new_t % LOCAL_QUEUE_CAP;
+        let task = unsafe { (*w).queue[idx] };
+        if h_now == new_t {
+            let cas = unsafe { (*w).head.compare_exchange(h_now, h_now + 1usize, Ordering.AcqRel, Ordering.Relaxed) };
+            unsafe {
+                (*w).tail.store(h_now + 1usize, Ordering.Relaxed);
+            }
+            if !cas.ok {
+                return 0 as *mut TaskHeader;
+            }
+        }
+        return task;
+    } else {
+        unsafe {
+            (*w).tail.store(h_now, Ordering.Relaxed);
+        }
+        return 0 as *mut TaskHeader;
+    }
+}
+
+fn worker_steal_from(victim: *mut WorkerData) -> *mut TaskHeader {
+    let h: usize = unsafe { (*victim).head.load(Ordering.Acquire) };
+    let t: usize = unsafe { (*victim).tail.load(Ordering.Acquire) };
+    if h >= t {
+        return 0 as *mut TaskHeader;
+    }
+    let idx = h % LOCAL_QUEUE_CAP;
+    let task = unsafe { (*victim).queue[idx] };
+    let cas = unsafe { (*victim).head.compare_exchange(h, h + 1usize, Ordering.AcqRel, Ordering.Relaxed) };
+    if cas.ok {
+        task
+    } else {
+        0 as *mut TaskHeader
+    }
+}
+
+// Returns the WorkerData of the calling OS thread, or null when the caller is not a worker thread.
+fn current_worker(inner: *mut ExecutorInner) -> *mut WorkerData {
+    let me: u64 = unsafe { thread_current_id() };
+    let n: usize = unsafe { (*inner).worker_count };
+    let base: *mut WorkerData = unsafe { (*inner).workers };
+    let mut i: usize = 0usize;
+    while i < n {
+        let w: *mut WorkerData = unsafe { base + i };
+        let tid: u64 = unsafe { (*w).tid.load(Ordering.Acquire) };
+        if tid == me {
+            return w;
+        }
+        i = i + 1usize;
+    }
+    0 as *mut WorkerData
+}
+
+// A wake issued from a worker thread goes to that worker's local deque (single producer: the owner);
+// wakes from other threads, or a full local deque, go to the bounded-order global injection queue.
+fn executor_schedule(task: *mut TaskHeader) {
+    if (task as usize) == 0 {
+        return;
+    }
+    let inner = unsafe { (*task).schedule_data as *mut ExecutorInner };
+    if (inner as usize) != 0 {
+        let w = current_worker(inner);
+        if (w as usize) != 0 {
+            if worker_push_local(w, task) {
+                return;
+            }
+        }
+        executor_global_enqueue(inner, task);
+    }
+}
+
+fn executor_try_help_one(inner: *mut ExecutorInner) -> bool {
+    let task = executor_global_dequeue(inner);
+    if (task as usize) == 0 {
+        return false;
+    }
+    let w = make_task_waker(task);
+    let mut cx = Context { waker_val: w };
+    let poll_fn = unsafe { (*task).poll_fn };
+    let st: u32 = poll_fn(task as *mut u8, unsafe { address_of_mut<Context>(cx) as *mut u8 });
+    if st >= TASK_COMPLETED {
+        unsafe {
+            (*inner).active_tasks.fetch_sub(1usize, Ordering.Release);
+        }
+        task_dec_ref(task);
+    }
+    true
+}
+
+fn worker_thread_main(ctx: *mut u8) -> i64 {
+    let w = ctx as *mut WorkerData;
+    let inner = unsafe { (*w).executor as *mut ExecutorInner };
+    unsafe {
+        (*w).tid.store(thread_current_id(), Ordering.Release);
+    }
+    let mut poll_count: usize = 0usize;
+
+
+    loop {
+        let is_shutdown: bool = unsafe { (*inner).shutdown.load(Ordering.Acquire) };
+        if is_shutdown {
+            let active: usize = unsafe { (*inner).active_tasks.load(Ordering.Acquire) };
+            if active == 0usize {
+                break;
+            }
+        }
+        poll_count = poll_count + 1usize;
+        let mut task: *mut TaskHeader = 0 as *mut TaskHeader;
+
+        // 1. Every 61 polls, check global queue first (fairness tick)
+        if (poll_count % 61usize) == 0usize {
+            task = executor_global_dequeue(inner);
+        }
+
+        // 2. Otherwise pop from local queue
+        if (task as usize) == 0 {
+            task = worker_pop_local(w);
+        }
+
+        // 3. If local empty, check global queue
+        if (task as usize) == 0 {
+            task = executor_global_dequeue(inner);
+        }
+
+        // 4. If global also empty, attempt work stealing
+        if (task as usize) == 0 {
+            let num_workers: usize = unsafe { (*inner).worker_count };
+            let workers_base: *mut WorkerData = unsafe { (*inner).workers };
+            let my_id: usize = unsafe { (*w).worker_id };
+            let mut i: usize = 0usize;
+            while i < num_workers {
+                let victim_id: usize = (my_id + 1usize + i) % num_workers;
+                if victim_id != my_id {
+                    let victim: *mut WorkerData = unsafe { workers_base + victim_id };
+                    let stolen = worker_steal_from(victim);
+                    if (stolen as usize) != 0 {
+                        unsafe {
+                            (*inner).steal_count.fetch_add(1usize, Ordering.Relaxed);
+                        }
+                        task = stolen;
+                        break;
+                    }
+                }
+                i = i + 1usize;
+            }
+        }
+
+        // 5. If task found, execute poll
+        if (task as usize) != 0 {
+            let task_w = make_task_waker(task);
+            let mut cx = Context { waker_val: task_w };
+            let poll_fn = unsafe { (*task).poll_fn };
+            let st: u32 = poll_fn(task as *mut u8, unsafe { address_of_mut<Context>(cx) as *mut u8 });
+            if st >= TASK_COMPLETED {
+                unsafe {
+                    (*inner).active_tasks.fetch_sub(1usize, Ordering.Release);
+                }
+                task_dec_ref(task);
+            }
+        } else {
+            // No work found across all sources: yield or wait
+            unsafe {
+                thread_yield();
+            }
+        }
+    }
+    0i64
+}
+
+impl Executor {
+    pub fn new(worker_count: usize) -> Executor {
+        let count = if worker_count == 0 { 1usize } else { worker_count };
+        let sz_inner = size_of<ExecutorInner>();
+        let al_inner = align_of<ExecutorInner>();
+        let raw_inner = unsafe { heap_alloc(sz_inner, al_inner) };
+        let inner = raw_inner as *mut ExecutorInner;
+
+        let sz_workers = count * size_of<WorkerData>();
+        let al_workers = align_of<WorkerData>();
+        let raw_workers = unsafe { heap_alloc(sz_workers, al_workers) };
+        let workers = raw_workers as *mut WorkerData;
+
+        unsafe {
+            (*inner).worker_count = count;
+            (*inner).workers = workers;
+            (*inner).global_head = 0 as *mut TaskHeader;
+            (*inner).global_tail = 0 as *mut TaskHeader;
+            (*inner).global_lock = Atomic.new(0u32);
+            (*inner).global_count = Atomic.new(0usize);
+            (*inner).shutdown = Atomic.new(false);
+            (*inner).park_word = Atomic.new(0u32);
+            (*inner).active_tasks = Atomic.new(0usize);
+            (*inner).next_task_id = Atomic.new(1u64);
+            (*inner).waker_vtable = new_task_waker_vtable();
+            (*inner).steal_count = Atomic.new(0usize);
+
+            let mut i: usize = 0usize;
+            while i < count {
+                let w: *mut WorkerData = workers + i;
+                (*w).worker_id = i;
+                (*w).thread_handle = 0i64;
+                (*w).head = Atomic.new(0usize);
+                (*w).tail = Atomic.new(0usize);
+                (*w).executor = inner as *mut u8;
+                (*w).tid = Atomic.new(0u64);
+                let mut k: usize = 0usize;
+                while k < LOCAL_QUEUE_CAP {
+                    (*w).queue[k] = 0 as *mut TaskHeader;
+                    k = k + 1usize;
+                }
+                i = i + 1usize;
+            }
+
+            // Spawn worker OS threads
+            let mut j: usize = 0usize;
+            while j < count {
+                let w: *mut WorkerData = workers + j;
+                let th = thread_spawn(worker_thread_main, w as *mut u8, 0usize);
+                (*w).thread_handle = th;
+                j = j + 1usize;
+            }
+        }
+
+        Executor { inner: inner }
+    }
+
+    pub fn spawn<F: Future<Output = T> + Send, T: Send>(self: view<Executor>, fut: F, poll_fn: fn(*mut u8, *mut u8) -> u32) -> TaskHandle<T> {
+        let inner = self.inner;
+        let sz = size_of<TaskControlBlock<F, T>>();
+        let al = align_of<TaskControlBlock<F, T>>();
+        let raw = unsafe { heap_alloc(sz, al) };
+        let tcb = raw as *mut TaskControlBlock<F, T>;
+        let tid_val = unsafe { (*inner).next_task_id.fetch_add(1u64, Ordering.Relaxed) };
+        let tid = TaskId { id: tid_val };
+
+        unsafe {
+            init_task_header_vtable(raw as *mut TaskHeader, (*inner).waker_vtable);
+            (*tcb).slot.header.state = Atomic.new(TASK_NOTIFIED);
+            (*tcb).slot.header.ref_count = Atomic.new(2u32);
+            (*tcb).slot.header.task_id = tid.id;
+            (*tcb).slot.header.owner_thread_id = 0u64;
+            (*tcb).slot.header.queue_next = 0 as *mut TaskHeader;
+            (*tcb).slot.header.schedule_fn = executor_schedule;
+            (*tcb).slot.header.poll_fn = poll_fn;
+            (*tcb).slot.header.drop_fn = default_task_drop;
+            (*tcb).slot.header.schedule_data = inner as *mut u8;
+            (*tcb).slot.header.alloc_size = sz;
+            (*tcb).slot.header.alloc_align = al;
+            (*tcb).slot.has_output = false;
+            (*tcb).slot.has_join_waker = false;
+            (*tcb).future = fut;
+            (*tcb).has_future = true;
+
+            (*inner).active_tasks.fetch_add(1usize, Ordering.Release);
+        }
+
+        executor_schedule(raw as *mut TaskHeader);
+
+        TaskHandle {
+            raw_task: raw as *mut TaskHeader,
+            task_id: tid,
+        }
+    }
+
+    pub fn block_on<F: Future<Output = T>, T>(self: view<Executor>, mut fut: F) -> T {
+        let mut cx = Context {
+            waker_val: Waker {
+                raw: RawWaker {
+                    data: 0 as *const u8,
+                    vtable: 0 as *const RawWakerVTable,
+                },
+            },
+        };
+        loop {
+            match fut.poll(mut_view(cx)) {
+                Poll.Ready(val) => {
+                    return val;
+                },
+                Poll.Pending => {
+                    if !executor_try_help_one(self.inner) {
+                        unsafe {
+                            thread_yield();
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    pub fn worker_count(self: view<Executor>) -> usize {
+        unsafe { (*self.inner).worker_count }
+    }
+
+    // Number of tasks that were taken from another worker's local deque (diagnostics / tests).
+    pub fn steal_count(self: view<Executor>) -> usize {
+        unsafe { (*self.inner).steal_count.load(Ordering.Relaxed) }
+    }
+
+    pub fn shutdown(self: view<Executor>) {
+        let inner = self.inner;
+        if (inner as usize) == 0 {
+            return;
+        }
+        unsafe {
+            (*inner).shutdown.store(true, Ordering.Release);
+            (*inner).park_word.fetch_add(1u32, Ordering.Release);
+            futex_wake(address_of((*inner).park_word) as *const u32, (*inner).worker_count as u32);
+
+            let count = (*inner).worker_count;
+            let mut i: usize = 0usize;
+            while i < count {
+                let w: *mut WorkerData = (*inner).workers + i;
+                let th = (*w).thread_handle;
+                if th > 0i64 {
+                    let mut ret: i64 = 0i64;
+                    let _ = thread_join(th, address_of_mut(ret));
+                    (*w).thread_handle = 0i64;
+                }
+                i = i + 1usize;
+            }
+        }
+    }
+}
