@@ -59,6 +59,9 @@ use compiler.mir.mir.mir_stmt_at
 use compiler.mir.mir.mir_print
 use compiler.mir.builder.mir_build_fn
 use compiler.mir.drop.mir_drop_elaborate
+use compiler.mir.async_lower.mir_lower_async_body
+use compiler.mir.async_lower.mir_prebuilt_get
+use compiler.mir.async_lower.async_resolve_poll_calls
 use compiler.own.move.own_type_is_copy
 use compiler.own.cap.own_cap_check
 use compiler.own.init.own_check
@@ -377,6 +380,9 @@ pub fn session_own_check_body(
     body: mut_view<MirBody>,
     thir: view<Thir>
 ) -> bool {
+    if body.async_lowered {
+        return !session_has_errors(view(*sess));
+    }
     session_mark_body_copy_locals(view(*sess), mut_view(*body), thir);
     own_check(it, mut_view(*body), thir, mut_view(sess.diag_sink), view(sess.interner));
     if !session_has_errors(view(*sess)) {
@@ -435,17 +441,49 @@ pub fn session_own_mir_verify_fn(
     let str_in_ptr = interner_mut_ptr(mut_view(sess.interner));
     let db_ptr = source_db_const_ptr(view(sess.source_db));
 
-    let body = mir_build_fn(
-        mut_view(*mir_arena),
-        it,
-        thir_ptr,
-        hir_ptr,
-        str_in_ptr,
-        db_ptr,
-        mono
-    );
+    let pre = mir_prebuilt_get(it as *const HirItem);
+    let mut body = pre;
+    if (body as usize) == 0 {
+        body = mir_build_fn(
+            mut_view(*mir_arena),
+            it,
+            thir_ptr,
+            hir_ptr,
+            str_in_ptr,
+            db_ptr,
+            mono
+        );
+    }
     if (body as usize) == 0 {
         return 0 as *mut MirBody;
+    }
+
+    let is_async = unsafe { (*it).is_async };
+    if is_async {
+        verify_mir(
+            unsafe { view(*body) },
+            thir_ptr as *const Thir,
+            mut_view(sess.diag_sink),
+            it as *const HirItem
+        );
+        let _ = session_own_check_body(
+            mut_view(*sess),
+            it as *const HirItem,
+            unsafe { mut_view(*body) },
+            view(*thir)
+        );
+        if !session_has_errors(view(*sess)) {
+            mir_lower_async_body(
+                mut_view(*mir_arena),
+                it,
+                body,
+                thir_ptr,
+                hir_ptr,
+                str_in_ptr,
+                0 as *mut *mut HirItem,
+                0 as *mut *mut MirBody
+            );
+        }
     }
 
     if (pre_mir_out as usize) != 0 {
@@ -454,36 +492,48 @@ pub fn session_own_mir_verify_fn(
         }
     }
 
-    verify_mir(
-        unsafe { view(*body) },
-        thir_ptr as *const Thir,
-        mut_view(sess.diag_sink),
-        it as *const HirItem
-    );
-
-    let _ = session_own_check_body(
-        mut_view(*sess),
-        it as *const HirItem,
-        unsafe { mut_view(*body) },
-        view(*thir)
-    );
-
-    if run_drop_elab && !session_has_errors(view(*sess)) {
-        session_drop_elaborate_body(
-            mut_view(*sess),
-            mut_view(*mir_arena),
-            unsafe { mut_view(*body) },
-            mut_view(*thir),
-            hir
+    if !is_async {
+        verify_mir(
+            unsafe { view(*body) },
+            thir_ptr as *const Thir,
+            mut_view(sess.diag_sink),
+            it as *const HirItem
         );
-        if !session_has_errors(view(*sess)) {
-            verify_mir_drop_flags(
-                unsafe { view(*body) },
-                thir_ptr as *const Thir,
-                mut_view(sess.diag_sink),
-                it as *const HirItem
+
+        if (pre as usize) == 0 {
+            let _ = session_own_check_body(
+                mut_view(*sess),
+                it as *const HirItem,
+                unsafe { mut_view(*body) },
+                view(*thir)
             );
         }
+    }
+
+    if (pre as usize) == 0 {
+        if run_drop_elab && !session_has_errors(view(*sess)) {
+            session_drop_elaborate_body(
+                mut_view(*sess),
+                mut_view(*mir_arena),
+                unsafe { mut_view(*body) },
+                mut_view(*thir),
+                hir
+            );
+            if !session_has_errors(view(*sess)) {
+                verify_mir_drop_flags(
+                    unsafe { view(*body) },
+                    thir_ptr as *const Thir,
+                    mut_view(sess.diag_sink),
+                    it as *const HirItem
+                );
+            }
+            if (elab_mir_out as usize) != 0 {
+                unsafe {
+                    mir_print(mut_view(*elab_mir_out), view(*body));
+                }
+            }
+        }
+    } else {
         if (elab_mir_out as usize) != 0 {
             unsafe {
                 mir_print(mut_view(*elab_mir_out), view(*body));
@@ -531,6 +581,83 @@ fn synthesize_guard_drop_impl(arena: mut_view<Arena>, str_in: *mut StrInterner, 
     hir.items = imp;
 }
 
+// Builds, verifies (await-related checks + initialization) and lowers one `async fn` into its
+// state-machine constructor + synthesized `poll` (T088). No-op once lowered (`is_async` cleared).
+fn session_lower_async_item(
+    sess: mut_view<CompilerSession>,
+    mir_arena: mut_view<Arena>,
+    it: *mut HirItem,
+    hir_ptr: *const HirFile,
+    thir: mut_view<Thir>,
+    mono: *mut MonoEngine
+) {
+    if !(unsafe { (*it).is_async }) || (unsafe { (*it).kind }) != HIR_ITEM_FN || session_has_errors(view(*sess)) {
+        return;
+    }
+    let thir_ptr = thir_mut_ptr(mut_view(*thir));
+    let str_in_ptr = interner_mut_ptr(mut_view(sess.interner));
+    let db_ptr = source_db_const_ptr(view(sess.source_db));
+    let mut body = mir_prebuilt_get(it as *const HirItem);
+    if (body as usize) == 0 {
+        body = mir_build_fn(mut_view(*mir_arena), it, thir_ptr, hir_ptr, str_in_ptr, db_ptr, mono);
+    }
+    if (body as usize) == 0 {
+        return;
+    }
+    verify_mir(unsafe { view(*body) }, thir_ptr as *const Thir, mut_view(sess.diag_sink), it as *const HirItem);
+    let _ = session_own_check_body(mut_view(*sess), it as *const HirItem, unsafe { mut_view(*body) }, view(*thir));
+    if !session_has_errors(view(*sess)) {
+        mir_lower_async_body(
+            mut_view(*mir_arena),
+            it,
+            body,
+            thir_ptr,
+            hir_ptr,
+            str_in_ptr,
+            0 as *mut *mut HirItem,
+            0 as *mut *mut MirBody
+        );
+    }
+}
+
+// Lowers every `async fn` (free functions and impl members) before any other body is built, so
+// that callers see the final state-machine layout (field types decide drop glue) (T088).
+pub fn session_lower_all_async(
+    sess: mut_view<CompilerSession>,
+    mir_arena: mut_view<Arena>,
+    hir: view<HirFile>,
+    thir: mut_view<Thir>,
+    mono: *mut MonoEngine
+) {
+    let hir_ptr = hir_const_ptr(hir);
+    let mut it: *mut HirItem = hir.items;
+    while (it as usize) != 0 {
+        let next = unsafe { (*it).next };
+        session_lower_async_item(mut_view(*sess), mut_view(*mir_arena), it, hir_ptr, mut_view(*thir), mono);
+        if (unsafe { (*it).kind }) == HIR_ITEM_IMPL {
+            let mut m: *mut HirItem = unsafe { (*it).members };
+            while (m as usize) != 0 {
+                session_lower_async_item(mut_view(*sess), mut_view(*mir_arena), m, hir_ptr, mut_view(*thir), mono);
+                m = unsafe { (*m).next };
+            }
+        }
+        it = next;
+    }
+    // Every `impl Future` now exists: bind the sub-future `poll` calls of the synthesized bodies.
+    let thir_ptr = thir_mut_ptr(mut_view(*thir));
+    let str_in_ptr = interner_mut_ptr(mut_view(sess.interner));
+    let mut pit: *mut HirItem = hir.items;
+    while (pit as usize) != 0 {
+        if (unsafe { (*pit).kind }) == HIR_ITEM_FN {
+            let pb = mir_prebuilt_get(pit as *const HirItem);
+            if (pb as usize) != 0 {
+                async_resolve_poll_calls(pb, thir_ptr, hir_ptr, str_in_ptr);
+            }
+        }
+        pit = unsafe { (*pit).next };
+    }
+}
+
 pub fn session_own_mir_verify_file_with_synth(
     sess: mut_view<CompilerSession>,
     mir_arena: mut_view<Arena>,
@@ -546,6 +673,7 @@ pub fn session_own_mir_verify_file_with_synth(
     if !session_unsafe_check(mut_view(*sess), hir, view(*thir)) {
         return 0;
     }
+    session_lower_all_async(mut_view(*sess), mut_view(*mir_arena), hir, mut_view(*thir), mono);
 
     let thir_ptr = thir_mut_ptr(mut_view(*thir));
     let str_in_ptr = interner_mut_ptr(mut_view(sess.interner));

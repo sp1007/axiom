@@ -75,6 +75,7 @@ MODULES = [
     ("compiler.mir.mir", "compiler"),
     ("compiler.mir.drop", "compiler"),
     ("compiler.mir.builder", "compiler"),
+    ("compiler.mir.async_lower", "compiler"),
     ("compiler.mir", "compiler"),
 ]
 

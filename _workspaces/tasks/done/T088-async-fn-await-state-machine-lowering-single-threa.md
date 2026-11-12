@@ -8,12 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T211, T417]
 priority: 140
-status: todo
-attempts: 0
+status: done
+attempts: 1
+timeout_min: 360
 paths: [compiler/mir/async_lower.ax, std/future/block_on.ax, tests/run/async, tests/mir/async]
-locks: [compiler/mir/mir.ax, compiler/mir/drop.ax, compiler/mir/builder.ax, compiler/verify/verifier.ax, compiler/types/layout.ax, compiler/driver/pipeline.ax, compiler/interp/interp.ax, std/future/mod.ax, tests/selfhost]
+locks: [compiler/mir/mir.ax, compiler/mir/mod.ax, compiler/mir/drop.ax, compiler/mir/builder.ax, compiler/own_mir_verify/session.ax, compiler/verify/verifier.ax, compiler/types/types.ax, compiler/types/typeck.ax, compiler/types/layout.ax, compiler/traits/solver.ax, compiler/traits/mono.ax, compiler/driver/pipeline.ax, compiler/interp/interp.ax, compiler/interp/session.ax, compiler/interp/frame.ax, compiler/interp_opt/session.ax, compiler/own/init.ax, compiler/lir/builder.ax, compiler/backend/session.ax, std/future/mod.ax, std/core/prelude.ax, std/prelude.ax, std/mod.ax, tests/selfhost]
 spec: [spec/SPEC-33-async.md, 0093, 0127, 0135, 0201, 0202, 0248, tasks/0275, tasks/0297, tasks/0619]
 covers: [REQ-ASY-167, REQ-ASY-168]
+started: 2026-11-11 11:23:22
+finished: 2026-11-12 08:37:56
 ---
 # T088 — E11.4 — MIR state-machine lowering, cancellation drop glue & block_on poll driver
 
@@ -44,3 +47,5 @@ Transform `async fn` MIR bodies (`Suspend` terminators) into verified, zero-heap
 ## Log
 - 2026-10-06 02:23:54 covers += REQ-ASY-167, REQ-ASY-168 (metadata only)
 - 2026-11-03 00:10:00 refined scope, paths, locks, and dependencies in T211 (P11 phase planning)
+- 2026-11-11 11:23:22 started (attempt 1) T088-impl
+- 2026-11-12 08:37:56 accepted by QA -> done

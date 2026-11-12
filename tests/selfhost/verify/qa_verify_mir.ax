@@ -10068,6 +10068,13 @@ pub struct MirBody {
     pub bb_count: usize,
     pub bb_cap: usize,
     pub drop_flag_count: usize,
+    // Set once `mir_drop_elaborate` ran on this body (shared prebuilt async bodies, T088).
+    pub drop_elaborated: bool,
+    // Set once the object writer prepared this body (opt + call-type resolution, T088).
+    pub backend_prepared: bool,
+    // Set on the constructor / synthesized `poll` of a lowered `async fn` (T088): ownership was
+    // verified on the source coroutine body, so the source-level checkers skip these bodies.
+    pub async_lowered: bool,
 }
 
 // --- Pointer Indexing Helpers ---
@@ -10617,6 +10624,9 @@ pub fn mir_body_reset(body: mut_view<MirBody>) {
     body.bb_count = 0;
     body.bb_cap = 0;
     body.drop_flag_count = 0;
+    body.drop_elaborated = false;
+    body.backend_prepared = false;
+    body.async_lowered = false;
 }
 
 pub fn mir_body_init(body: mut_view<MirBody>) {
@@ -13847,6 +13857,7 @@ use compiler.types.types.Thir
 use compiler.types.types.CAP_MOVE
 use compiler.types.types.TY_ARRAY
 use compiler.types.types.TY_CLOSURE
+use compiler.types.types.TY_COROUTINE
 use compiler.types.types.TY_ENUM
 use compiler.types.types.TY_MUT_VIEW
 use compiler.types.types.TY_SLICE
@@ -14278,6 +14289,21 @@ pub fn mir_type_needs_drop_in(
         return false;
     }
 
+    if kind == TY_COROUTINE {
+        // A lowered state machine needs drop glue only if some saved field (parameter, live
+        // local or in-flight sub-future) needs drop; field 0 is the `u32` state tag.
+        let field_count = unsafe { (*t).field_count };
+        let fields = unsafe { (*t).fields };
+        let mut i: usize = 1;
+        while i < field_count {
+            if mir_type_needs_drop_in(drop_field_type(fields, i), thir, hir, db, str_in) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
     if kind == TY_STRUCT {
         let def = unsafe { (*t).def };
         if (def as usize) != 0 {
@@ -14377,7 +14403,7 @@ pub fn mir_drop_place_type(body: view<MirBody>, thir: view<Thir>, place: view<Mi
             current = TypeId { v: unsafe { (*t).pointee.v } };
         } else if proj_kind == MIR_PROJ_FIELD {
             let field_idx = (unsafe { (*proj).field_idx }) as usize;
-            if kind == TY_STRUCT || kind == TY_TUPLE {
+            if kind == TY_STRUCT || kind == TY_TUPLE || kind == TY_COROUTINE {
                 let field_count = unsafe { (*t).field_count };
                 if field_idx < field_count {
                     current = drop_field_type(unsafe { (*t).fields }, field_idx);
@@ -14899,6 +14925,113 @@ fn drop_expand_enum_variants(
     switch_bb.v
 }
 
+pub fn drop_expand_coroutine(
+    body: mut_view<MirBody>,
+    thir: view<Thir>,
+    hir: view<HirFile>,
+    db: *const SourceDatabase,
+    str_in: view<StrInterner>,
+    arena: mut_view<Arena>,
+    t: *mut AxType,
+    place: view<MirPlace>,
+    target_v: u32
+) -> u32 {
+    let state_count = unsafe { (*t).variant_count };
+    if state_count == 0 {
+        return target_v;
+    }
+
+    let tag_local = drop_new_local(mut_view(*body), mut_view(*arena), thir.interner.t_u32.v, false);
+    let switch_bb = mir_add_bb(mut_view(*body), mut_view(*arena), false);
+
+    // tag_local = place.0;
+    let tag_place = drop_place_with_proj(mut_view(*arena), place, MIR_PROJ_FIELD, 0u32);
+    let tag_stmt = drop_set_single_assign(mut_view(*body), mut_view(*arena), switch_bb.v, tag_local.v);
+    unsafe {
+        (*tag_stmt).rvalue.kind = MIR_RVALUE_USE;
+        mir_operand_zero(mut_view((*tag_stmt).rvalue.use_op), MIR_OP_COPY);
+        mir_copy_place(mut_view((*tag_stmt).rvalue.use_op.place), view(tag_place));
+    }
+
+    let values_bytes = mir_mul_usize(state_count, size_of<u64>());
+    let targets_bytes = mir_mul_usize(state_count, size_of<MirBbId>());
+    let values = arena_alloc_raw(mut_view(*arena), values_bytes, align_of<u64>()) as *mut u64;
+    let targets = arena_alloc_raw(mut_view(*arena), targets_bytes, align_of<MirBbId>()) as *mut MirBbId;
+    let mut arm_count: usize = 0;
+
+    let state_counts = unsafe { (*t).variant_field_counts };
+    let state_fields = unsafe { (*t).variant_fields as *mut *mut u32 };
+
+    let mut state: usize = 0;
+    while state < state_count {
+        let fcnt = if (state_counts as usize) != 0 { unsafe { *usize_at(state_counts, state) } } else { 0 };
+        let fidx_arr = if (state_fields as usize) != 0 { unsafe { *(state_fields + state) } } else { 0 as *mut u32 };
+
+        let mut state_target_v = target_v;
+
+        if state == 0 {
+            let mut p_idx: usize = 0;
+            while p_idx < fcnt {
+                let f_idx = unsafe { *u32_at(fidx_arr, p_idx) };
+                if (f_idx as usize) < (unsafe { (*t).field_count }) {
+                    let field_ty = unsafe { *typeid_at((*t).fields, f_idx as usize) };
+                    if mir_type_needs_drop_in(field_ty, thir, hir, db, str_in) {
+                        let field_place = drop_place_with_proj(mut_view(*arena), place, MIR_PROJ_FIELD, f_idx);
+                        let field_bb = drop_new_field_drop_bb(mut_view(*body), mut_view(*arena), view(field_place), state_target_v);
+                        state_target_v = field_bb.v;
+                    }
+                }
+                p_idx = p_idx + 1;
+            }
+        } else {
+            let mut li: usize = 1;
+            while li < fcnt {
+                let f_idx = unsafe { *u32_at(fidx_arr, li) };
+                if (f_idx as usize) < (unsafe { (*t).field_count }) {
+                    let field_ty = unsafe { *typeid_at((*t).fields, f_idx as usize) };
+                    if mir_type_needs_drop_in(field_ty, thir, hir, db, str_in) {
+                        let field_place = drop_place_with_proj(mut_view(*arena), place, MIR_PROJ_FIELD, f_idx);
+                        let field_bb = drop_new_field_drop_bb(mut_view(*body), mut_view(*arena), view(field_place), state_target_v);
+                        state_target_v = field_bb.v;
+                    }
+                }
+                li = li + 1;
+            }
+            if fcnt > 0 {
+                let subfut_idx = unsafe { *u32_at(fidx_arr, 0) };
+                if (subfut_idx as usize) < (unsafe { (*t).field_count }) {
+                    let field_ty = unsafe { *typeid_at((*t).fields, subfut_idx as usize) };
+                    if mir_type_needs_drop_in(field_ty, thir, hir, db, str_in) {
+                        let field_place = drop_place_with_proj(mut_view(*arena), place, MIR_PROJ_FIELD, subfut_idx);
+                        let field_bb = drop_new_field_drop_bb(mut_view(*body), mut_view(*arena), view(field_place), state_target_v);
+                        state_target_v = field_bb.v;
+                    }
+                }
+            }
+        }
+
+        unsafe {
+            *mir_u64_at(values, arm_count) = state as u64;
+            (*mir_bb_id_at(targets, arm_count)).v = state_target_v;
+        }
+        arm_count = arm_count + 1;
+        state = state + 1;
+    }
+
+    let switch_ptr_now = unsafe { mir_bb_at(body.bbs, switch_bb.v as usize) };
+    unsafe {
+        mir_term_zero(mut_view((*switch_ptr_now).terminator), MIR_TERM_SWITCH_INT);
+        mir_operand_zero(mut_view((*switch_ptr_now).terminator.discr), MIR_OP_MOVE);
+        mir_place_reset_u32(mut_view((*switch_ptr_now).terminator.discr.place), tag_local.v);
+        (*switch_ptr_now).terminator.values = values;
+        (*switch_ptr_now).terminator.targets = targets;
+        (*switch_ptr_now).terminator.switch_count = arm_count;
+        (*switch_ptr_now).terminator.otherwise.v = target_v;
+        (*switch_ptr_now).has_terminator = true;
+    }
+    switch_bb.v
+}
+
 // The destructor call block: `_a = &place; _t = const <drop fn>(move _a) -> [return: target,
 // unwind: bb0]`. Returns the call block.
 fn drop_expand_user_destructor(
@@ -15014,6 +15147,10 @@ fn drop_expand_block(
         inner_target_v = drop_expand_enum_variants(
             mut_view(*body), view(*thir), hir, db, str_in, mut_view(*arena), t, view(place), inner_target_v
         );
+    } else if kind == TY_COROUTINE {
+        inner_target_v = drop_expand_coroutine(
+            mut_view(*body), view(*thir), hir, db, str_in, mut_view(*arena), t, view(place), inner_target_v
+        );
     } else if kind == TY_ARRAY {
         let alen = (unsafe { (*t).array_len }) as usize;
         let elem_ty = TypeId { v: unsafe { (*t).elem.v } };
@@ -15096,6 +15233,11 @@ pub fn mir_drop_elaborate(
     str_in: view<StrInterner>,
     arena: mut_view<Arena>
 ) {
+    // Prebuilt bodies (lowered `async fn` constructors / `poll`) can be reached from several items.
+    if body.drop_elaborated {
+        return;
+    }
+    body.drop_elaborated = true;
     let orig_local_count = body.local_count;
     let bool_ty_v = thir.interner.t_bool.v;
     let flags_bytes = mir_mul_usize(orig_local_count + 1, size_of<u32>());
@@ -17455,6 +17597,16 @@ pub fn verify_types_compatible(thir: *const Thir, a: TypeId, b: TypeId) -> bool 
         }
         return true;
     }
+    if ka == TY_COROUTINE && kb == TY_COROUTINE {
+        let defa = unsafe { (*ta).def as usize };
+        let defb = unsafe { (*tb).def as usize };
+        if defa != defb {
+            return false;
+        }
+        let reta = TypeId { v: unsafe { (*ta).ret_type.v } };
+        let retb = TypeId { v: unsafe { (*tb).ret_type.v } };
+        return verify_types_compatible(thir, reta, retb);
+    }
     if ka == TY_CLOSURE && kb == TY_CLOSURE {
         return (unsafe { (*ta).closure_id }) == (unsafe { (*tb).closure_id });
     }
@@ -17584,7 +17736,7 @@ fn verify_check_proj_field(
         out_ty.v = unsafe { (*typeid_at((*t).fields, f_idx)).v };
         return true;
     }
-    if tk == TY_STRUCT {
+    if tk == TY_STRUCT || tk == TY_COROUTINE {
         let fc = unsafe { (*t).field_count };
         if fc == 0 {
             out_ty.v = 0u32;
@@ -17892,7 +18044,7 @@ fn verify_check_aggregate_rvalue(
             }
             i = i + 1;
         }
-    } else if tk == TY_STRUCT {
+    } else if tk == TY_STRUCT || tk == TY_COROUTINE {
         let fc = unsafe { (*t).field_count };
         if fc > 0 {
             if rv.operand_count != fc {
@@ -18683,7 +18835,7 @@ fn verify_own_type_needs_drop(thir: *const Thir, thir_has_items: bool, ty: TypeI
         return false;
     }
     let tk = unsafe { (*t).kind };
-    if tk != TY_STRUCT && tk != TY_ENUM && tk != TY_TUPLE && tk != TY_ARRAY && tk != TY_CLOSURE {
+    if tk != TY_STRUCT && tk != TY_COROUTINE && tk != TY_ENUM && tk != TY_TUPLE && tk != TY_ARRAY && tk != TY_CLOSURE {
         return false;
     }
     if !thir_has_items {
@@ -18742,7 +18894,7 @@ fn verify_own_projected_place_type(
             }
         } else if pk == MIR_PROJ_FIELD {
             let f = (unsafe { (*proj).field_idx }) as usize;
-            if (tk == TY_TUPLE || tk == TY_STRUCT) && f < (unsafe { (*t).field_count }) && (unsafe { (*t).fields as usize }) != 0 {
+            if (tk == TY_TUPLE || tk == TY_STRUCT || tk == TY_COROUTINE) && f < (unsafe { (*t).field_count }) && (unsafe { (*t).fields as usize }) != 0 {
                 cur_ty_v = unsafe { (*typeid_at((*t).fields, f)).v };
             } else if tk == TY_CLOSURE {
                 if f == 0 {
@@ -19400,7 +19552,7 @@ fn verify_type_contains_view(thir: *const Thir, ty: TypeId, depth: usize) -> boo
     if k == TY_ARRAY || k == TY_SLICE {
         return verify_type_contains_view(thir, unsafe { (*t).elem }, depth + 1);
     }
-    if k == TY_TUPLE || k == TY_STRUCT {
+    if k == TY_TUPLE || k == TY_STRUCT || k == TY_COROUTINE {
         let fc = unsafe { (*t).field_count };
         let flds = unsafe { (*t).fields };
         let mut i: usize = 0;
@@ -19447,7 +19599,7 @@ fn verify_type_is_guard(thir: *const Thir, ty: TypeId, depth: usize) -> bool {
         return false;
     }
     let k = unsafe { (*t).kind };
-    if k == TY_STRUCT {
+    if k == TY_STRUCT || k == TY_COROUTINE {
         if unsafe { (*t).is_unsafe } {
             return true;
         }
@@ -19655,7 +19807,9 @@ pub fn verify_mir_own(
     sink: mut_view<DiagSink>,
     func: *const HirItem
 ) {
-    if body.bb_count == 0 || body.local_count == 0 {
+    // Lowered `async fn` state machines move saved state out of / into `*self` (T088); their
+    // ownership was verified on the source coroutine body before lowering.
+    if body.bb_count == 0 || body.local_count == 0 || body.async_lowered {
         return;
     }
 
@@ -20290,7 +20444,7 @@ pub fn verify_mir_cap(
     sink: mut_view<DiagSink>
 ) {
     let _ = thir;
-    if body.bb_count == 0 || body.local_count == 0 {
+    if body.bb_count == 0 || body.local_count == 0 || body.async_lowered {
         return;
     }
     let lc = body.local_count;

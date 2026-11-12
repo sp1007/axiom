@@ -392,6 +392,7 @@ use compiler.mir.mir.mir_stmt_reset
 use compiler.mir.mir.mir_term_zero
 use compiler.mir.mir.mir_u64_at
 use compiler.mir.drop.mir_type_needs_drop_in
+use compiler.mir.drop.mir_drop_place_type
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 @intrinsic fn align_of<T>() -> usize { 0 }
@@ -8526,6 +8527,9 @@ fn mb_build_control_or_call_expr(
                     callee_op.constant.kind = MIR_CONST_FN;
                     callee_op.constant.sym.v = sym.v;
                     callee_op.constant.val = sym.v as u64;
+                    if callee_op.constant.ty.v == 0u32 {
+                        callee_op.constant.ty.v = cty.v;
+                    }
                     let mono_ptr = b.mono;
                     let thir_ptr = b.thir;
                     let str_in_ptr = b.str_in;
@@ -10637,6 +10641,26 @@ fn mb_instantiate_default(b: view<MirBuilder>, func: *mut HirItem) {
     }
 }
 
+pub fn mir_prebuilt_set(item: *const HirItem, body: *mut MirBody) {
+    if (item as usize) == 0 || (body as usize) == 0 {
+        return;
+    }
+    unsafe {
+        (*(item as *mut HirItem)).expr = body as *mut HirExpr;
+    }
+}
+
+pub fn mir_prebuilt_get(item: *const HirItem) -> *mut MirBody {
+    if (item as usize) == 0 {
+        return 0 as *mut MirBody;
+    }
+    let k = unsafe { (*item).kind };
+    if k == HIR_ITEM_FN {
+        return unsafe { (*item).expr as *mut MirBody };
+    }
+    0 as *mut MirBody
+}
+
 pub fn mir_build_fn_subst(
     arena: mut_view<Arena>,
     func: *mut HirItem,
@@ -10647,6 +10671,10 @@ pub fn mir_build_fn_subst(
     mono: *mut MonoEngine,
     subst_args: view<GenericArgsSlice>
 ) -> *mut MirBody {
+    let pre = mir_prebuilt_get(func as *const HirItem);
+    if (pre as usize) != 0 && subst_args.count == 0 {
+        return pre;
+    }
     if (func as usize) == 0 || (unsafe { (*func).kind }) != HIR_ITEM_FN || (unsafe { (*func).body as usize }) == 0 {
         return 0 as *mut MirBody;
     }
@@ -11029,6 +11057,164 @@ fn mb_mono_find_or_create(
     inst
 }
 
+// The lowered `async fn` coroutine type the call in `bb` receives as its first argument (through
+// views/pointers, or through the borrowed place when the temp is typed `mut_view<Self>`), or 0.
+fn mb_coroutine_receiver_ty(body: *mut MirBody, bb: *mut MirBb, thir: *mut Thir) -> u32 {
+    if (unsafe { (*bb).terminator.arg_count }) == 0 {
+        return 0u32;
+    }
+    let a0 = unsafe { mir_op_at((*bb).terminator.args, 0) };
+    if (unsafe { (*a0).kind }) == MIR_OP_CONST || (unsafe { (*a0).place.proj_count }) != 0 {
+        return 0u32;
+    }
+    let l0 = unsafe { (*a0).place.local.v };
+    if (l0 as usize) >= (unsafe { (*body).local_count }) {
+        return 0u32;
+    }
+    let mut v = unsafe { (*mir_local_at((*body).locals, l0 as usize)).ty.v };
+    let probe = TypeId { v: v };
+    if mb_receiver_is_generic(thir, probe) {
+        v = mb_ref_source_ty(body, thir, l0);
+    }
+    let mut depth: usize = 0;
+    while depth < 8 && v != 0u32 {
+        let t = unsafe { type_get(view((*thir).interner), TypeId { v: v }) };
+        if (t as usize) == 0 {
+            return 0u32;
+        }
+        let k = unsafe { (*t).kind };
+        if k == TY_VIEW || k == TY_MUT_VIEW || k == TY_PTR {
+            v = unsafe { (*t).pointee.v };
+        } else if k == TY_COROUTINE && (unsafe { (*t).field_count }) > 0 {
+            return v;
+        } else {
+            return 0u32;
+        }
+        depth = depth + 1;
+    }
+    0u32
+}
+
+// Binds the call in `bb` (currently to the fn symbol `sym_v`) to the same-named member of the impl
+// for the coroutine type `coro_v`; returns that member, or null when there is none.
+fn mb_coroutine_method(
+    body: *mut MirBody,
+    bb: *mut MirBb,
+    thir: *mut Thir,
+    hir: *const HirFile,
+    str_in: *mut StrInterner,
+    sym_v: u32,
+    coro_v: u32
+) -> *mut HirItem {
+    let _ = body;
+    // The original name of the currently bound fn (a trait method or some impl's member).
+    let mut name_v: u32 = 0u32;
+    let mut it: *mut HirItem = unsafe { (*hir).items };
+    while (it as usize) != 0 && name_v == 0u32 {
+        let ik = unsafe { (*it).kind };
+        if ik == HIR_ITEM_TRAIT || ik == HIR_ITEM_IMPL {
+            let mut m: *mut HirItem = unsafe { (*it).members };
+            while (m as usize) != 0 {
+                if (unsafe { (*m).kind }) == HIR_ITEM_FN && (unsafe { (*m).symbol.v }) == sym_v {
+                    name_v = mb_orig_fn_name_v(thir as *const Thir, m as *const HirItem);
+                    break;
+                }
+                m = unsafe { (*m).next };
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+    if name_v == 0u32 {
+        return 0 as *mut HirItem;
+    }
+    let mut iit: *mut HirItem = unsafe { (*hir).items };
+    while (iit as usize) != 0 {
+        if (unsafe { (*iit).kind }) == HIR_ITEM_IMPL && (unsafe { (*iit).trait_path as usize }) != 0 {
+            let recv = TypeId { v: coro_v };
+            if unsafe { impl_matches_receiver(view((*thir).interner), view(*str_in), iit, recv) } {
+                let mut im: *mut HirItem = unsafe { (*iit).members };
+                while (im as usize) != 0 {
+                    if (unsafe { (*im).kind }) == HIR_ITEM_FN && mb_orig_fn_name_v(thir as *const Thir, im as *const HirItem) == name_v {
+                        let m_sv = unsafe { (*im).symbol.v };
+                        unsafe {
+                            (*bb).terminator.func.constant.sym.v = m_sv;
+                            (*bb).terminator.func.constant.val = m_sv as u64;
+                        }
+                        let im_ty = unsafe { thir_get_item_type(view(*thir), im as *const HirItem) };
+                        if (im_ty as usize) != 0 && (unsafe { (*im_ty).v }) != 0u32 {
+                            unsafe { (*bb).terminator.func.constant.ty.v = (*im_ty).v; }
+                        }
+                        return im;
+                    }
+                    im = unsafe { (*im).next };
+                }
+            }
+        }
+        iit = unsafe { (*iit).next };
+    }
+    0 as *mut HirItem
+}
+
+// True when `ty`, after peeling views/pointers, is a generic parameter (no impl can be chosen from it).
+fn mb_receiver_is_generic(thir: *mut Thir, ty: TypeId) -> bool {
+    let mut v = ty.v;
+    let mut depth: usize = 0;
+    while depth < 8 {
+        let t = unsafe { type_get(view((*thir).interner), TypeId { v: v }) };
+        if (t as usize) == 0 {
+            return false;
+        }
+        let k = unsafe { (*t).kind };
+        if k == TY_VIEW || k == TY_MUT_VIEW || k == TY_PTR {
+            v = unsafe { (*t).pointee.v };
+        } else {
+            return k == TY_PARAM;
+        }
+        depth = depth + 1;
+    }
+    false
+}
+
+// The type of the place borrowed into `local` by `local = &[mut] place` in `body`, or 0.
+fn mb_ref_source_ty(body: *mut MirBody, thir: *mut Thir, local: u32) -> u32 {
+    let bc = unsafe { (*body).bb_count };
+    let mut bi: usize = 0;
+    while bi < bc {
+        let bb = unsafe { mir_bb_at((*body).bbs, bi) };
+        let sc = unsafe { (*bb).stmt_count };
+        let mut si: usize = 0;
+        while si < sc {
+            let st = unsafe { mir_stmt_at((*bb).stmts, si) };
+            if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN && (unsafe { (*st).place.local.v }) == local &&
+                (unsafe { (*st).place.proj_count }) == 0 && (unsafe { (*st).rvalue.kind }) == MIR_RVALUE_REF {
+                let src = unsafe { mir_drop_place_type(view(*body), view(*thir), view((*st).rvalue.place)) };
+                return src.v;
+            }
+            si = si + 1;
+        }
+        bi = bi + 1;
+    }
+    0u32
+}
+
+// True when `m` is a member of a TRAIT item (a trait method, resolved per receiver type below).
+fn mb_item_is_trait_member(hir: *const HirFile, m: *mut HirItem) -> bool {
+    let mut t: *mut HirItem = unsafe { (*hir).items };
+    while (t as usize) != 0 {
+        if (unsafe { (*t).kind }) == HIR_ITEM_TRAIT {
+            let mut tm: *mut HirItem = unsafe { (*t).members };
+            while (tm as usize) != 0 {
+                if (tm as usize) == (m as usize) {
+                    return true;
+                }
+                tm = unsafe { (*tm).next };
+            }
+        }
+        t = unsafe { (*t).next };
+    }
+    false
+}
+
 fn mb_scan_or_rewrite_calls(
     body: *mut MirBody,
     thir: *mut Thir,
@@ -11054,44 +11240,30 @@ fn mb_scan_or_rewrite_calls(
                 sym_v = (unsafe { (*bb).terminator.func.constant.val }) as u32;
             }
             let mut callee: *mut HirItem = 0 as *mut HirItem;
-            if (thir as usize) != 0 && (unsafe { (*thir).expr_methods.cap }) > 0 {
+            // T088: a method call on a lowered `async fn` state machine binds to that coroutine's
+            // synthesized impl (typeck saw no impl for the opaque coroutine type).
+            let coro_v = mb_coroutine_receiver_ty(body, bb, thir);
+            if coro_v != 0u32 {
+                callee = mb_coroutine_method(body, bb, thir, hir, str_in, sym_v, coro_v);
+                if (callee as usize) != 0 {
+                    sym_v = unsafe { (*bb).terminator.func.constant.sym.v };
+                }
+            }
+            if (callee as usize) == 0 && (thir as usize) != 0 && (unsafe { (*thir).expr_methods.cap }) > 0 {
                 let indexed: *mut *const HirItem = unsafe { ptr_itemmap_get(view((*thir).expr_methods), 4usize) };
-                if (indexed as usize) != 0 && (unsafe { *indexed as usize }) != 0 {
+                if (indexed as usize) != 0 {
                     let k: usize = ((sym_v as usize) << 3) | 4usize;
                     let p: *mut *const HirItem = unsafe { ptr_itemmap_get(view((*thir).expr_methods), k) };
                     if (p as usize) != 0 {
                         let cand: *mut HirItem = (unsafe { *p }) as *mut HirItem;
-                        if (cand as usize) != 0 && (unsafe { (*cand).kind }) == HIR_ITEM_FN && (unsafe { (*cand).span.file.v }) != 0xFFFFFFFEu32 {
+                        if (cand as usize) != 0 && (unsafe { (*cand).kind }) == HIR_ITEM_FN && (unsafe { (*cand).span.file.v }) != 0xFFFFFFFEu32 &&
+                            !mb_item_is_trait_member(hir, cand) {
                             callee = cand;
                         }
                     }
-                } else {
-                    let mut it: *mut HirItem = unsafe { (*hir).items };
-                    while ((it as usize) != 0) {
-                        if (unsafe { (*it).span.file.v }) != 0xFFFFFFFEu32 {
-                            let ik = unsafe { (*it).kind };
-                            if ik == HIR_ITEM_FN && (unsafe { (*it).symbol.v }) == sym_v {
-                                callee = it;
-                                break;
-                            }
-                            if ik == HIR_ITEM_IMPL {
-                                let mut m: *mut HirItem = unsafe { (*it).members };
-                                while ((m as usize) != 0) {
-                                    if (unsafe { (*m).kind }) == HIR_ITEM_FN && (unsafe { (*m).symbol.v }) == sym_v {
-                                        callee = m;
-                                        break;
-                                    }
-                                    m = unsafe { (*m).next };
-                                }
-                                if (callee as usize) != 0 {
-                                    break;
-                                }
-                            }
-                        }
-                        it = unsafe { (*it).next };
-                    }
                 }
-            } else {
+            }
+            if (callee as usize) == 0 {
                 let mut it: *mut HirItem = unsafe { (*hir).items };
                 while ((it as usize) != 0) {
                     if (unsafe { (*it).span.file.v }) != 0xFFFFFFFEu32 {
@@ -11145,6 +11317,15 @@ fn mb_scan_or_rewrite_calls(
                         } else if (unsafe { (*a0).place.local.v as usize }) < (unsafe { (*body).local_count }) {
                             let l0 = unsafe { mir_local_at((*body).locals, (*a0).place.local.v as usize) };
                             receiver_ty.v = unsafe { (*l0).ty.v };
+                            // The receiver temp may carry the trait signature's `mut_view<Self>`; use the
+                            // type of the borrowed place instead (T088: lowered `async fn` futures).
+                            let recv_probe = TypeId { v: receiver_ty.v };
+                            if mb_receiver_is_generic(thir, recv_probe) {
+                                let src_v = mb_ref_source_ty(body, thir, unsafe { (*a0).place.local.v });
+                                if src_v != 0u32 {
+                                    receiver_ty.v = src_v;
+                                }
+                            }
                         }
                     }
                     let tm_orig_name = mb_orig_fn_name_v(thir as *const Thir, trait_method as *const HirItem);
@@ -11163,6 +11344,10 @@ fn mb_scan_or_rewrite_calls(
                                         unsafe {
                                             (*bb).terminator.func.constant.sym.v = m_sv;
                                             (*bb).terminator.func.constant.val = m_sv as u64;
+                                        }
+                                        let im_ty = unsafe { thir_get_item_type(view(*thir), im as *const HirItem) };
+                                        if (im_ty as usize) != 0 && (unsafe { (*im_ty).v }) != 0u32 {
+                                            unsafe { (*bb).terminator.func.constant.ty.v = (*im_ty).v; }
                                         }
                                         break;
                                     }
@@ -11438,6 +11623,10 @@ pub fn mir_build_fn(
     db: *const SourceDatabase,
     mono: *mut MonoEngine
 ) -> *mut MirBody {
+    let pre = mir_prebuilt_get(func as *const HirItem);
+    if (pre as usize) != 0 {
+        return pre;
+    }
     let empty_subst = GenericArgsSlice {
         args: 0 as *mut TypeId,
         count: 0,
@@ -11467,7 +11656,35 @@ pub fn mir_build_fn(
             return body;
         }
     }
-    mir_build_fn_subst(arena, func, thir, hir, str_in, db, mono, view(empty_subst))
+    let built = mir_build_fn_subst(arena, func, thir, hir, str_in, db, mono, view(empty_subst));
+    mb_rewrite_coroutine_calls(built, thir, hir, str_in);
+    built
+}
+
+// Binds method calls on lowered `async fn` state machines to their synthesized impl (T088); the
+// mono call scan does the same when the engine is prepared.
+pub fn mb_rewrite_coroutine_calls(body: *mut MirBody, thir: *mut Thir, hir: *const HirFile, str_in: *mut StrInterner) {
+    if (body as usize) == 0 || (thir as usize) == 0 || (hir as usize) == 0 || (str_in as usize) == 0 {
+        return;
+    }
+    let bc = unsafe { (*body).bb_count };
+    let mut bi: usize = 0;
+    while bi < bc {
+        let bb = unsafe { mir_bb_at((*body).bbs, bi) };
+        if (unsafe { (*bb).has_terminator }) && (unsafe { (*bb).terminator.kind }) == MIR_TERM_CALL &&
+            (unsafe { (*bb).terminator.func.kind }) == MIR_OP_CONST &&
+            (unsafe { (*bb).terminator.func.constant.kind }) == MIR_CONST_FN {
+            let coro_v = mb_coroutine_receiver_ty(body, bb, thir);
+            if coro_v != 0u32 {
+                let mut sym_v = unsafe { (*bb).terminator.func.constant.sym.v };
+                if sym_v == 0u32 {
+                    sym_v = (unsafe { (*bb).terminator.func.constant.val }) as u32;
+                }
+                let _ = mb_coroutine_method(body, bb, thir, hir, str_in, sym_v, coro_v);
+            }
+        }
+        bi = bi + 1;
+    }
 }
 
 fn mb_expr_uses_int128(b: mut_view<MirBuilder>, e: *mut HirExpr) -> bool {
