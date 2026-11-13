@@ -6,6 +6,9 @@ _workspaces/tasks, tests/, a stub tools/axtest.py that prints a canned JSON resu
 stub check programs. Python 3 standard library only.
 """
 
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import shutil
@@ -361,12 +364,41 @@ class GatecheckTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("MS-P1 BLOCKED: check harness_check exited 1: harness: 2 problems", out)
 
-    def test_check_without_command_blocks(self):
+    def test_differential_check_runs_axtest_diff(self):
+        # T029 gave `differential` a command (`python tools/axtest.py diff`); the check must run it
+        # and block the milestone when it fails.
         blocks = [milestone("MS-P1", "T022", None, ["tests/unit/kernel"], checks=["differential"])]
         r = base_repo(self.tmp, blocks=blocks)
+        diff_stub = """\
+import sys
+if sys.argv[1:] == ['diff']:
+    print('diff ran')
+    sys.exit(%d)
+"""
+        r.write("tools/axtest.py", (diff_stub % 0) + AXTEST_STUB)
+        rc, out, err = r.run("--gate", "T022")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.lines(out), ["MS-P1 PASS"])
+        r.write("tools/axtest.py", (diff_stub % 3).replace("'diff ran'", "'diff mismatch'") + AXTEST_STUB)
         rc, out, _ = r.run("--gate", "T022")
         self.assertEqual(rc, 1)
-        self.assertIn("check differential has no command yet", out)
+        self.assertIn("MS-P1 BLOCKED: check differential exited 3: diff mismatch", out)
+
+    def test_check_without_command_blocks(self):
+        # R9: a due milestone listing a check that has no command is BLOCKED, never PASS. Every check
+        # in the real table has a command now (T029), so the table entry is patched in-process.
+        blocks = [milestone("MS-P1", "T022", None, ["tests/unit/kernel"], checks=["differential"])]
+        r = base_repo(self.tmp, blocks=blocks)
+        spec = importlib.util.spec_from_file_location("gatecheck_under_test", str(GATECHECK))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.CHECK_COMMANDS["differential"] = None
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = mod.main(["--root", str(r.root), "--gate", "T022"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.lines(buf.getvalue()),
+                         ["MS-P1 BLOCKED: check differential has no command yet (AXS-BOOT-050)"])
 
     def test_internal_gatecheck_check_reports_rule_problem(self):
         r = base_repo(self.tmp, tsv="feature\toracle\tnative\tconsumer\nF-INT\tT069\t\tT017\n")

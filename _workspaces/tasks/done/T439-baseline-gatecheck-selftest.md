@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 18
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tools/gatecheck.py, tools/tests/gatecheck]
 locks: [_workspaces/baseline-failures.txt]
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/decisions/ADR-0005-plan-structure-corrections.md]
 covers: [REQ-TST-068]
+started: 2026-11-13 18:45:10
+finished: 2026-11-13 19:11:01
 ---
 # T439 — Baseline fix: gatecheck self-test
 
@@ -42,3 +44,5 @@ reports gatecheck as KNOWN (ADR-0042 §1, T437a-qa R2).
 
 ## Log
 - 2026-11-13 created by axiom-architect (ADR-0042 §1, architect inbox 1)
+- 2026-11-13 18:45:10 started (attempt 1) T439-impl
+- 2026-11-13 19:11:01 accepted by QA -> done
