@@ -6,15 +6,17 @@ owner: axiom-qa
 reviewer: axiom-architect
 model: opus
 gate_model: opus
-depends: [T452]
+depends: []
 priority: 11
-status: todo
+status: done
 attempts: 0
 timeout_min: 900
 paths: [tools/axtest.py, tools/axtest_cache.py, tools/tests/axtest, tests/driver/dep_file]
 locks: [compiler/driver, compiler/source, tests/selfhost]
 spec: [spec/decisions/ADR-0041-complete-suite-baseline-and-test-cache.md, spec/SPEC-20-selfhost.md]
 covers: [REQ-TST-056, REQ-TST-057]
+superseded_by: T437a
+finished: 2026-11-13 11:31:02
 ---
 # T437 — Sound per-test result cache and complete-suite cost reduction
 
@@ -76,3 +78,6 @@ wall time is not dominated by a late heavy bundle.
 
 ## Log
 - 2026-11-13 07:40:00 created by axiom-architect (ADR-0041 §4, owner decision 2026-11-13)
+- 2026-11-13 11:31:02 superseded by T437a -> done (no code of its own)
+- 2026-11-13 architect: split into T437a (runner/gate tooling, no deps, priority 10) and T437b (compiler `--dep-file`,
+  depends T452 + T437a); dependency on T452 moved to T437b (ADR-0041 §6)

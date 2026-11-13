@@ -22,6 +22,10 @@ test suite"; owner-delegated decision for everything below)
   `--no-cache`. Kèm đo `--time-passes` một bundle selfhost 30k dòng và xếp lịch "dài nhất trước".
 - Quyết định 4: id lỗi có sẵn nhưng chưa từng chạy (155 id `tests/selfhost` T421 chưa chạy) → gate báo BLOCKED kèm bằng
   chứng lỗi y hệt ở HEAD; architect thêm vào baseline cùng task sửa. Gate không bao giờ tự thêm.
+- Bổ sung §6 (2026-11-13, sau quyết định gate theo task 60-90 phút): tách T437 thành **T437a** (chỉ `tools/`:
+  cache với danh sách phụ thuộc dự phòng, `--affected`, `--smoke` + `tests/smoke.list`, `--baseline`, chạy dài nhất
+  trước, `tools/taskgate.py` chạy cả gate bằng một lệnh; không phụ thuộc, ưu tiên 10, chạy đầu tiên) và **T437b**
+  (cờ `--dep-file` trong compiler, sinh lại bundle selfhost; sau T452 và T437a).
 - Revisit: có — (a) quyết định 2/T432 về tên `Ordering` trong prelude; (b) các điều kiện đúng đắn của cache (§4) nếu
   mẫu kiểm chứng phát hiện sai lệch.
 
@@ -166,6 +170,30 @@ does not optimise compiler passes itself.
 be accepted while its gate's failing ids are not a subset of the baseline (the gate verdict is FAIL or BLOCKED per §3).
 `taskctl accept` already refuses a non-PASS verdict, so no script change is needed. T437 adds `axtest.py --baseline
 <file>` to print the subset check mechanically (`BASELINE OK` / `NEW FAILURES: …`).
+
+### §6 Addendum (2026-11-13): split of T437 for the per-task gate scope
+Context: the owner then limited the per-task gate to about 60-90 minutes (task tests + affected set + smoke set +
+archcheck; periodic full runs cover the rest; `.claude/agents/axiom-qa.md` "Per-task gate scope", "Periodic full run")
+and asked for T437 first in line. T437 depended on T452 and locked `tests/selfhost`, `compiler/driver`,
+`compiler/source` only because of the compiler `--dep-file` flag and bundle regeneration; its runner part touches only
+`tools/`.
+Options: (1) keep T437 whole, wait for T452 — rejected, delays the tool that makes every gate cheaper; (2) start T437
+now with `--force` — rejected, collides with T452's `tests/selfhost` lock; (3) **split by file ownership (chosen)**:
+- **T437a** (axiom-qa, opus, no dependency, priority 10, paths only `tools/` + `tools/tests/` + `tests/smoke.list`):
+  §4 S1-S8 with the superset fallback and a stub-tested exact path; `--affected` (exact dep lists when cached, else the
+  grep rule + a checked-in `tools/affected_map.txt` compiler-module → test-group table, derivation printed);
+  `--smoke` (checked-in `tests/smoke.list`: `always:` cases + per-group pools of light ids, one per group drawn with a
+  printed seed, `--smoke --check` bounds it to ~20 min at `-j 2`); durations + longest-first; selfhost bundle
+  `--time-passes` profile; `--baseline`; `tools/taskgate.py` = whole per-task gate in one command with a Markdown +
+  JSON summary for the QA file. Named `taskgate.py` to stay distinct from the phase-gate checker `tools/gatecheck.py`.
+- **T437b** (axiom-stdlib, opus, depends T452 + T437a, priority 11, locks `compiler/driver`, `compiler/source`,
+  `tests/selfhost`): the `--dep-file` flag, bundle regeneration, warm/cold measurements with exact deps.
+Priority 10 is the lowest non-critical value (critical is < 10, which would drain the other slots), so T437a is the
+first pick when a slot frees and is not forced to run alone. T437 is closed as superseded; no other task depended on it.
+Rationale: the cache alone cannot shorten a per-task gate whose compiler changed (binary hash in the key); the
+selection tooling (`--affected`, `--smoke`, `taskgate.py`) is what makes the 60-90 minute target mechanical and
+auditable, and it needs no compiler change.
+Revisit: no.
 
 ## Consequences
 - The T452 and T422 gates apply the subset rule by hand against this file; from T437 on, by `--baseline`.
