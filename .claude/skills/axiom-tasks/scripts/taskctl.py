@@ -596,7 +596,10 @@ def _extract_path(text):
         text = m.group(1)
     m = re.search(r"`([^`]+)`", text)
     tok = m.group(1).strip() if m else (text.split()[0] if text.split() else "")
-    tok = tok.replace("\\", "/").strip().rstrip(":,;").strip("*_")
+    tok = tok.replace("\\", "/").strip().rstrip(":,;").strip("*")
+    # `_x_` is markdown emphasis; a leading underscore alone is part of a real path (_workspaces/...)
+    if len(tok) > 2 and tok.startswith("_") and tok.endswith("_"):
+        tok = tok.strip("_")
     while tok.startswith("./"):
         tok = tok[2:]
     if tok.lower() in ("", "none", "(none)", "n/a", "-", "—"):
