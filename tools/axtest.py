@@ -1392,7 +1392,7 @@ class CacheGlue:
             "dep_source": dep_source,
         }
 
-    def superset_deps(self, test):
+    def superset_deps(self, test, with_std=True):
         c = self.cache
         tdir = self.test_dir(test)
         deps = [["tree", c.rel(tdir)]]
@@ -1401,7 +1401,7 @@ class CacheGlue:
             inp.resolve().relative_to(tdir.resolve())
         except ValueError:
             deps.append(["tree", c.rel(inp if inp.is_dir() else inp.parent)])
-        if self.std_dir is not None:
+        if with_std and self.std_dir is not None:
             deps.append(["tree", c.rel(self.std_dir)])
         for ci in test.cache_inputs:
             q = c.abs(ci)
@@ -1410,10 +1410,15 @@ class CacheGlue:
         return deps
 
     def guard_deps(self, test):
+        """Inputs of an exact-mode entry besides the compiler-reported list: what the program may read at run
+        time. T437b round 1 (QA F1): the same conservative rule as the superset mode minus the std root -- the
+        contents of the test's directory tree (ADR-0041 S4 addendum: a test may read files of its own directory
+        without declaring them), the input's directory when it lies elsewhere, every `cache-inputs:` path and the
+        ancestor `axiom.toml` probes -- plus the test directory listing."""
         c = self.cache
         tdir = self.test_dir(test)
         deps = [["dirlist", c.rel(tdir)]]
-        deps.extend(c.ancestor_toml_deps(tdir if not Path(test.path).is_dir() else tdir.parent))
+        deps.extend(self.superset_deps(test, with_std=False))
         return deps
 
     def prepare(self, plan):
@@ -1432,7 +1437,7 @@ class CacheGlue:
         if not exact:
             plan.deps_before = self.cache.with_digests(self.superset_deps(test), memo=True)
         else:
-            plan.guard_before = self.cache.with_digests(self.guard_deps(test))
+            plan.guard_before = self.cache.with_digests(self.guard_deps(test), memo=True)
         plan.rec = self.cache.lookup(plan.prekey, plan.pre)
 
     def run_fresh(self, plan, store=True):

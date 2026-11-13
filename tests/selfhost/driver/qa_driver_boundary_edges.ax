@@ -4592,6 +4592,7 @@ use host_intrinsics.heap_free
 use host_intrinsics.metadata
 use host_intrinsics.open
 use host_intrinsics.read
+use host_intrinsics.write
 
 use compiler.kernel.arena.Arena
 use compiler.kernel.arena.ArenaChunk
@@ -4613,6 +4614,8 @@ use compiler.diag.emitter.DiagDataEntry
 use compiler.diag.emitter.DiagSink
 use compiler.diag.emitter.diag_sink_report
 use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_new
+use compiler.diag.format.diag_buf_free
 use compiler.diag.format.diag_buf_push_byte
 use compiler.diag.format.diag_buf_push_bytes
 
@@ -5635,6 +5638,7 @@ pub struct DriverOptions {
     pub lib_names: *mut StrView,
     pub lib_name_count: usize,
     pub lib_name_cap: usize,
+    pub dep_file: StrView,
 }
 
 pub fn driver_parse_i32_decimal(sv: view<StrView>, default_val: i32) -> i32 {
@@ -5727,6 +5731,7 @@ pub fn driver_options_new() -> DriverOptions {
         lib_names: 0 as *mut StrView,
         lib_name_count: 0,
         lib_name_cap: 0,
+        dep_file: sv_empty(),
     }
 }
 
@@ -5772,6 +5777,7 @@ pub fn driver_options_init(dopts: mut_view<DriverOptions>) {
     dopts.lib_names = 0 as *mut StrView;
     dopts.lib_name_count = 0;
     dopts.lib_name_cap = 0;
+    sv_clear(mut_view(dopts.dep_file));
 }
 
 pub fn driver_options_free(dopts: mut_view<DriverOptions>) {
@@ -6016,6 +6022,20 @@ fn sv_is_opt_implib(sv: view<StrView>) -> bool {
     }
 }
 
+// `--dep-file` (T437b, ADR-0041 §4 S2)
+fn sv_is_opt_dep_file(sv: view<StrView>) -> bool {
+    if sv.len != 10 || (sv.ptr as usize) == 0 {
+        return false;
+    }
+    unsafe {
+        *(sv.ptr + 0) == 45u8 && *(sv.ptr + 1) == 45u8 &&
+        *(sv.ptr + 2) == 100u8 && *(sv.ptr + 3) == 101u8 &&
+        *(sv.ptr + 4) == 112u8 && *(sv.ptr + 5) == 45u8 &&
+        *(sv.ptr + 6) == 102u8 && *(sv.ptr + 7) == 105u8 &&
+        *(sv.ptr + 8) == 108u8 && *(sv.ptr + 9) == 101u8
+    }
+}
+
 fn sv_is_opt_rt_obj(sv: view<StrView>) -> bool {
     if sv.len != 8 || (sv.ptr as usize) == 0 {
         return false;
@@ -6236,6 +6256,9 @@ pub fn driver_parse_options(
             } else if sv_is_opt_rt_obj(view(name_sv)) {
                 is_str_opt = true;
                 opt_kind = 10u32;
+            } else if sv_is_opt_dep_file(view(name_sv)) {
+                is_str_opt = true;
+                opt_kind = 11u32;
             }
 
             if is_str_opt {
@@ -6290,6 +6313,8 @@ pub fn driver_parse_options(
                     sv_set(mut_view(dopts.implib), val_ptr, val_len);
                 } else if opt_kind == 10u32 {
                     sv_set(mut_view(dopts.rt_obj), val_ptr, val_len);
+                } else if opt_kind == 11u32 {
+                    sv_set(mut_view(dopts.dep_file), val_ptr, val_len);
                 }
                 i = i + 1;
                 continue;
@@ -6892,6 +6917,9 @@ pub struct Project {
     pub files: *mut ProjectFile,
     pub file_count: usize,
     pub file_cap: usize,
+    pub probes: *mut ProjectProbe,
+    pub probe_count: usize,
+    pub probe_cap: usize,
 }
 
 pub unsafe fn project_file_at(base: *mut ProjectFile, idx: usize) -> *mut ProjectFile {
@@ -6964,6 +6992,9 @@ pub fn project_new() -> Project {
         files: 0 as *mut ProjectFile,
         file_count: 0,
         file_cap: 0,
+        probes: 0 as *mut ProjectProbe,
+        probe_count: 0,
+        probe_cap: 0,
     }
 }
 
@@ -6977,6 +7008,9 @@ pub fn project_init(proj: mut_view<Project>) {
     proj.files = 0 as *mut ProjectFile;
     proj.file_count = 0;
     proj.file_cap = 0;
+    proj.probes = 0 as *mut ProjectProbe;
+    proj.probe_count = 0;
+    proj.probe_cap = 0;
 }
 
 pub fn project_free(proj: mut_view<Project>) {
@@ -6992,6 +7026,18 @@ pub fn project_free(proj: mut_view<Project>) {
     proj.files = 0 as *mut ProjectFile;
     proj.file_count = 0;
     proj.file_cap = 0;
+    if proj.probe_cap > 0 && (proj.probes as usize) != 0 {
+        unsafe {
+            heap_free(
+                proj.probes as *mut u8,
+                opts_mul_usize(proj.probe_cap, size_of<ProjectProbe>()),
+                align_of<ProjectProbe>()
+            );
+        }
+    }
+    proj.probes = 0 as *mut ProjectProbe;
+    proj.probe_count = 0;
+    proj.probe_cap = 0;
     manifest_free(mut_view(proj.manifest));
     arena_destroy(mut_view(proj.arena));
 }
@@ -7126,6 +7172,8 @@ fn scan_package_dir_recursive(
         StrView { ptr: base_dir.ptr, len: base_dir.len }
     };
 
+    // The listing decides which module files exist (T437b `--dep-file`: `<dir>/ dir`).
+    project_record_probe(mut_view(*proj), view(cur_dir), PROBE_DIR);
     let dhid = unsafe { dir_open(cur_dir.ptr, cur_dir.len) };
     if dhid <= 0i64 {
         return;
@@ -7170,8 +7218,9 @@ fn scan_package_dir_recursive(
     let _ = dir_close(dhid);
 }
 
-fn find_src_package_root(norm_input: view<StrView>, arena: mut_view<Arena>) -> StrView {
+fn find_src_package_root(norm_input: view<StrView>, proj: mut_view<Project>) -> StrView {
     // Look for `/src/` in `norm_input` and check if `<root>/axiom.toml` exists on disk.
+    // Every candidate is recorded: an absent `axiom.toml` is an input too (creating it makes a package).
     let norm_len = norm_input.len;
     if norm_len < 6 || (norm_input.ptr as usize) == 0 {
         return sv_empty();
@@ -7185,10 +7234,11 @@ fn find_src_package_root(norm_input: view<StrView>, arena: mut_view<Arena>) -> S
         let b4 = unsafe { *(norm_input.ptr + i + 4) };
         if b0 == 47u8 && b1 == 115u8 && b2 == 114u8 && b3 == 99u8 && b4 == 47u8 {
             let cand_root = StrView { ptr: norm_input.ptr, len: i };
-            let toml_rel = arena_table_sv(mut_view(*arena), 302, 10);
-            let toml_path = arena_join_path(mut_view(*arena), view(cand_root), view(toml_rel));
+            let toml_rel = arena_table_sv(mut_view(proj.arena), 302, 10);
+            let toml_path = arena_join_path(mut_view(proj.arena), view(cand_root), view(toml_rel));
+            project_record_probe(mut_view(*proj), view(toml_path), PROBE_FILE);
             if host_file_exists(view(toml_path)) {
-                return arena_clone_sv(mut_view(*arena), view(cand_root));
+                return arena_clone_sv(mut_view(proj.arena), view(cand_root));
             }
         }
         i = i + 1;
@@ -7203,6 +7253,7 @@ pub fn project_append_std_core_files(proj: mut_view<Project>) {
     // 1. <std>/core/option.ax -> std.core.option
     let opt_rel = arena_table_sv(mut_view(proj.arena), 468, 15);
     let opt_disk = arena_join_path(mut_view(proj.arena), view(proj.std_root), view(opt_rel));
+    project_record_probe(mut_view(*proj), view(opt_disk), PROBE_FILE);
     if host_file_exists(view(opt_disk)) {
         let opt_disp = arena_table_sv(mut_view(proj.arena), 330, 20);
         let opt_mod = arena_table_sv(mut_view(proj.arena), 350, 15);
@@ -7212,6 +7263,7 @@ pub fn project_append_std_core_files(proj: mut_view<Project>) {
     // 2. <std>/core/result.ax -> std.core.result
     let res_rel = arena_table_sv(mut_view(proj.arena), 483, 15);
     let res_disk = arena_join_path(mut_view(proj.arena), view(proj.std_root), view(res_rel));
+    project_record_probe(mut_view(*proj), view(res_disk), PROBE_FILE);
     if host_file_exists(view(res_disk)) {
         let res_disp = arena_table_sv(mut_view(proj.arena), 365, 20);
         let res_mod = arena_table_sv(mut_view(proj.arena), 385, 15);
@@ -7221,6 +7273,7 @@ pub fn project_append_std_core_files(proj: mut_view<Project>) {
     // 3. <std>/core/prelude.ax -> std.core.prelude
     let prel_rel = arena_table_sv(mut_view(proj.arena), 498, 16);
     let prel_disk = arena_join_path(mut_view(proj.arena), view(proj.std_root), view(prel_rel));
+    project_record_probe(mut_view(*proj), view(prel_disk), PROBE_FILE);
     if host_file_exists(view(prel_disk)) {
         let prel_disp = arena_table_sv(mut_view(proj.arena), 400, 21);
         let prel_mod = arena_table_sv(mut_view(proj.arena), 421, 16);
@@ -7234,6 +7287,7 @@ pub fn project_append_std_host_if_needed(proj: mut_view<Project>, uses_host: boo
     }
     let host_rel = arena_table_sv(mut_view(proj.arena), 514, 13);
     let host_disk = arena_join_path(mut_view(proj.arena), view(proj.std_root), view(host_rel));
+    project_record_probe(mut_view(*proj), view(host_disk), PROBE_FILE);
     if !host_file_exists(view(host_disk)) {
         return;
     }
@@ -7264,11 +7318,12 @@ pub fn project_discover(
         proj.is_package = true;
         sv_copy_to(mut_view(proj.root_dir), view(norm_input));
     } else {
+        project_record_probe(mut_view(*proj), view(norm_input), PROBE_FILE);
         if !host_file_exists(view(norm_input)) {
             emit_driver_diag(mut_view(*sink), AX_IO_FILE_NOT_FOUND, 0, 25);
             return false;
         }
-        let pkg_root = find_src_package_root(view(norm_input), mut_view(proj.arena));
+        let pkg_root = find_src_package_root(view(norm_input), mut_view(*proj));
         if pkg_root.len > 0 {
             proj.is_package = true;
             sv_copy_to(mut_view(proj.root_dir), view(pkg_root));
@@ -7280,6 +7335,7 @@ pub fn project_discover(
     if proj.is_package {
         let toml_rel = arena_table_sv(mut_view(proj.arena), 302, 10);
         let toml_path = arena_join_path(mut_view(proj.arena), view(proj.root_dir), view(toml_rel));
+        project_record_probe(mut_view(*proj), view(toml_path), PROBE_FILE);
         if host_file_exists(view(toml_path)) {
             if !manifest_read_file(view(toml_path), mut_view(proj.manifest)) {
                 emit_driver_diag(mut_view(*sink), AX_DRIVER_BAD_MANIFEST, 42, 48);
@@ -7292,6 +7348,8 @@ pub fn project_discover(
         let src_dir = arena_join_path(mut_view(proj.arena), view(proj.root_dir), view(src_rel));
         let user_start = proj.file_count;
         let root_copy = StrView { ptr: proj.root_dir.ptr, len: proj.root_dir.len };
+        // Whether `src/` exists is read from the package root's listing.
+        project_record_probe(mut_view(*proj), view(root_copy), PROBE_DIR);
         if host_is_dir(view(src_dir)) {
             scan_package_dir_recursive(mut_view(*proj), view(root_copy), view(src_rel));
         } else {
@@ -7328,6 +7386,7 @@ pub fn project_add_extra_ax_file(
     sink: mut_view<DiagSink>
 ) -> bool {
     let norm = arena_normalize_path(mut_view(proj.arena), input_path);
+    project_record_probe(mut_view(*proj), view(norm), PROBE_FILE);
     if !host_file_exists(view(norm)) {
         emit_driver_diag(mut_view(*sink), AX_IO_FILE_NOT_FOUND, 0, 25);
         return false;
@@ -7423,6 +7482,424 @@ pub fn project_add_extra_ax_file(
         pos = pos - 1;
     }
     true
+}
+
+// =============================================================================
+// 10. Dependency File (`--dep-file=<path>`, ADR-0041 §4 S2, T437b)
+// =============================================================================
+//
+// `axiomc build|run|check|inspect --dep-file=<path>` writes every input the source stage consulted, so a
+// test-result cache can key on exactly those bytes:
+//   `<path> <sha256>`  a file the compiler loaded: the root file, package/module files, std files (core
+//                      option/result/prelude, `core/host.ax`, the `future` lang-item modules), `axiom.toml`,
+//                      extra `.ax` and object inputs. The hash is over the bytes the compiler read.
+//   `<path> -`         a path the compiler probed and found absent (an absence fact: creating the file
+//                      changes the compilation, e.g. `<pkg>/axiom.toml`, `std/core/host.ax`).
+//   `<dir>/ dir`       a directory whose listing the compiler used (package scan, `src/` lookup).
+// One entry per line, LF, sorted by the path bytes, one line per path (a loaded file wins over a probe of the
+// same path). Every path is written as the compiler opened it (relative to its working directory unless
+// absolute; std files therefore as `<std-root>/core/prelude.ax`, e.g. `std/core/prelude.ax` under
+// `--std-root std`), with `/` separators. The std root itself is chosen by `--std-root` / `AXIOM_STD` / the
+// executable location (inputs of the invocation, not listed).
+// The driver writes the file right after the source stage (so it exists even when the program run by
+// `run --interp` exits the process) and again when the command ends, also when the compilation fails.
+
+pub const PROBE_FILE: u32 = 0u32;
+pub const PROBE_DIR: u32 = 1u32;
+
+pub struct ProjectProbe {
+    pub path: StrView,
+    pub kind: u32,
+}
+
+unsafe fn project_probe_at(base: *mut ProjectProbe, idx: usize) -> *mut ProjectProbe {
+    ((base as *mut u8) + opts_mul_usize(idx, size_of<ProjectProbe>())) as *mut ProjectProbe
+}
+
+// Records a path the discovery consulted (`PROBE_FILE`: existence/content; `PROBE_DIR`: listing).
+pub fn project_record_probe(proj: mut_view<Project>, path: view<StrView>, kind: u32) {
+    if path.len == 0 || (path.ptr as usize) == 0 {
+        return;
+    }
+    if proj.probe_count >= proj.probe_cap {
+        let new_cap: usize = if proj.probe_cap == 0 { 16 } else { opts_mul_usize(proj.probe_cap, 2) };
+        let new_bytes = opts_mul_usize(new_cap, size_of<ProjectProbe>());
+        let new_arr = unsafe { heap_alloc(new_bytes, align_of<ProjectProbe>()) as *mut ProjectProbe };
+        if proj.probe_count > 0 && (proj.probes as usize) != 0 {
+            let old_bytes = opts_mul_usize(proj.probe_count, size_of<ProjectProbe>());
+            let old_cap_bytes = opts_mul_usize(proj.probe_cap, size_of<ProjectProbe>());
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(proj.probes as *const u8, new_arr as *mut u8, old_bytes);
+                heap_free(proj.probes as *mut u8, old_cap_bytes, align_of<ProjectProbe>());
+            }
+        }
+        proj.probes = new_arr;
+        proj.probe_cap = new_cap;
+    }
+    let copy = arena_clone_sv(mut_view(proj.arena), path);
+    let slot = unsafe { project_probe_at(proj.probes, proj.probe_count) };
+    unsafe {
+        (*slot).path.ptr = copy.ptr;
+        (*slot).path.len = copy.len;
+        (*slot).kind = kind;
+    }
+    proj.probe_count = proj.probe_count + 1;
+}
+
+// --- SHA-256 (FIPS 180-4) over a byte range; 32-bit words held in u64 and masked ------------------
+
+const DEP_SHA256_K: [64]u64 = [
+    0x428a2f98u64, 0x71374491u64, 0xb5c0fbcfu64, 0xe9b5dba5u64,
+    0x3956c25bu64, 0x59f111f1u64, 0x923f82a4u64, 0xab1c5ed5u64,
+    0xd807aa98u64, 0x12835b01u64, 0x243185beu64, 0x550c7dc3u64,
+    0x72be5d74u64, 0x80deb1feu64, 0x9bdc06a7u64, 0xc19bf174u64,
+    0xe49b69c1u64, 0xefbe4786u64, 0x0fc19dc6u64, 0x240ca1ccu64,
+    0x2de92c6fu64, 0x4a7484aau64, 0x5cb0a9dcu64, 0x76f988dau64,
+    0x983e5152u64, 0xa831c66du64, 0xb00327c8u64, 0xbf597fc7u64,
+    0xc6e00bf3u64, 0xd5a79147u64, 0x06ca6351u64, 0x14292967u64,
+    0x27b70a85u64, 0x2e1b2138u64, 0x4d2c6dfcu64, 0x53380d13u64,
+    0x650a7354u64, 0x766a0abbu64, 0x81c2c92eu64, 0x92722c85u64,
+    0xa2bfe8a1u64, 0xa81a664bu64, 0xc24b8b70u64, 0xc76c51a3u64,
+    0xd192e819u64, 0xd6990624u64, 0xf40e3585u64, 0x106aa070u64,
+    0x19a4c116u64, 0x1e376c08u64, 0x2748774cu64, 0x34b0bcb5u64,
+    0x391c0cb3u64, 0x4ed8aa4au64, 0x5b9cca4fu64, 0x682e6ff3u64,
+    0x748f82eeu64, 0x78a5636fu64, 0x84c87814u64, 0x8cc70208u64,
+    0x90befffau64, 0xa4506cebu64, 0xbef9a3f7u64, 0xc67178f2u64
+];
+
+const DEP_MASK32: u64 = 4294967295u64;
+
+fn dep_rotr32(x: u64, n: u32) -> u64 {
+    ((x >> n) | (x << (32u32 - n))) & DEP_MASK32
+}
+
+unsafe fn dep_word_at(base: *mut u64, idx: usize) -> *mut u64 {
+    ((base as usize) + opts_mul_usize(idx, 8)) as *mut u64
+}
+
+// Compresses one 64-byte block into the 8-word state.
+fn dep_sha256_compress(state: *mut u64, block: *const u8) {
+    let mut w: [64]u64 = [0u64; 64];
+    let mut t: usize = 0;
+    while t < 16 {
+        let b0 = (unsafe { *(block + t * 4) }) as u64;
+        let b1 = (unsafe { *(block + t * 4 + 1) }) as u64;
+        let b2 = (unsafe { *(block + t * 4 + 2) }) as u64;
+        let b3 = (unsafe { *(block + t * 4 + 3) }) as u64;
+        w[t] = (b0 << 24u32) | (b1 << 16u32) | (b2 << 8u32) | b3;
+        t = t + 1;
+    }
+    while t < 64 {
+        let x15 = w[t - 15];
+        let x2 = w[t - 2];
+        let s0 = dep_rotr32(x15, 7u32) ^ dep_rotr32(x15, 18u32) ^ (x15 >> 3u32);
+        let s1 = dep_rotr32(x2, 17u32) ^ dep_rotr32(x2, 19u32) ^ (x2 >> 10u32);
+        w[t] = (w[t - 16] + s0 + w[t - 7] + s1) & DEP_MASK32;
+        t = t + 1;
+    }
+
+    let mut a = unsafe { *dep_word_at(state, 0) };
+    let mut b = unsafe { *dep_word_at(state, 1) };
+    let mut c = unsafe { *dep_word_at(state, 2) };
+    let mut d = unsafe { *dep_word_at(state, 3) };
+    let mut e = unsafe { *dep_word_at(state, 4) };
+    let mut f = unsafe { *dep_word_at(state, 5) };
+    let mut g = unsafe { *dep_word_at(state, 6) };
+    let mut h = unsafe { *dep_word_at(state, 7) };
+
+    t = 0;
+    while t < 64 {
+        let big_s1 = dep_rotr32(e, 6u32) ^ dep_rotr32(e, 11u32) ^ dep_rotr32(e, 25u32);
+        let choose = (e & f) ^ ((e ^ DEP_MASK32) & g);
+        let t1 = (h + big_s1 + choose + DEP_SHA256_K[t] + w[t]) & DEP_MASK32;
+        let big_s0 = dep_rotr32(a, 2u32) ^ dep_rotr32(a, 13u32) ^ dep_rotr32(a, 22u32);
+        let majority = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = (big_s0 + majority) & DEP_MASK32;
+        h = g;
+        g = f;
+        f = e;
+        e = (d + t1) & DEP_MASK32;
+        d = c;
+        c = b;
+        b = a;
+        a = (t1 + t2) & DEP_MASK32;
+        t = t + 1;
+    }
+
+    unsafe {
+        *dep_word_at(state, 0) = (*dep_word_at(state, 0) + a) & DEP_MASK32;
+        *dep_word_at(state, 1) = (*dep_word_at(state, 1) + b) & DEP_MASK32;
+        *dep_word_at(state, 2) = (*dep_word_at(state, 2) + c) & DEP_MASK32;
+        *dep_word_at(state, 3) = (*dep_word_at(state, 3) + d) & DEP_MASK32;
+        *dep_word_at(state, 4) = (*dep_word_at(state, 4) + e) & DEP_MASK32;
+        *dep_word_at(state, 5) = (*dep_word_at(state, 5) + f) & DEP_MASK32;
+        *dep_word_at(state, 6) = (*dep_word_at(state, 6) + g) & DEP_MASK32;
+        *dep_word_at(state, 7) = (*dep_word_at(state, 7) + h) & DEP_MASK32;
+    }
+}
+
+fn dep_hex_digit(v: u64) -> u8 {
+    if v < 10u64 { (48u64 + v) as u8 } else { (87u64 + v) as u8 }
+}
+
+// Writes the 64 lowercase hex digits of sha256(data[0..len]) to `out_hex`.
+pub fn dep_sha256_hex(data: *const u8, byte_len: usize, out_hex: *mut u8) {
+    let mut state: [8]u64 = [
+        0x6a09e667u64, 0xbb67ae85u64, 0x3c6ef372u64, 0xa54ff53au64,
+        0x510e527fu64, 0x9b05688cu64, 0x1f83d9abu64, 0x5be0cd19u64
+    ];
+    let sp = unsafe { address_of_mut(state[0]) };
+    let mut off: usize = 0;
+    while off + 64 <= byte_len {
+        dep_sha256_compress(sp, unsafe { data + off });
+        off = off + 64;
+    }
+
+    // Padding: the remaining bytes, 0x80, zeros, the 64-bit big-endian bit length (one or two blocks).
+    let mut tail: [128]u8 = [0u8; 128];
+    let rem = byte_len - off;
+    let mut i: usize = 0;
+    while i < rem {
+        tail[i] = unsafe { *(data + off + i) };
+        i = i + 1;
+    }
+    tail[rem] = 128u8;
+    let tail_len: usize = if rem < 56 { 64 } else { 128 };
+    let bit_len: u64 = (byte_len as u64) * 8u64;
+    let mut k: usize = 0;
+    while k < 8 {
+        let shift = (56 - k * 8) as u32;
+        tail[tail_len - 8 + k] = ((bit_len >> shift) & 255u64) as u8;
+        k = k + 1;
+    }
+    let tp = unsafe { address_of(tail[0]) };
+    dep_sha256_compress(sp, tp);
+    if tail_len == 128 {
+        dep_sha256_compress(sp, unsafe { tp + 64 });
+    }
+
+    let mut wi: usize = 0;
+    while wi < 8 {
+        let word = unsafe { *dep_word_at(sp, wi) };
+        let mut nib: usize = 0;
+        while nib < 8 {
+            let shift = (28 - nib * 4) as u32;
+            let v = (word >> shift) & 15u64;
+            unsafe { *(out_hex + wi * 8 + nib) = dep_hex_digit(v); }
+            nib = nib + 1;
+        }
+        wi = wi + 1;
+    }
+}
+
+// --- the dependency list ---------------------------------------------------------------------------
+
+pub struct DepEntry {
+    pub path: StrView,
+    pub tag: StrView,
+}
+
+unsafe fn dep_entry_at(base: *mut DepEntry, idx: usize) -> *mut DepEntry {
+    ((base as *mut u8) + opts_mul_usize(idx, size_of<DepEntry>())) as *mut DepEntry
+}
+
+// The written form of `disk`: the path as the compiler opened it (relative to its working directory unless
+// absolute) with `/` separators, and a trailing `/` for a directory.
+fn dep_display_path(arena: mut_view<Arena>, disk: view<StrView>, is_dir: bool) -> StrView {
+    let total = disk.len + (if is_dir { 1 } else { 0 });
+    let dst = arena_alloc_raw(mut_view(*arena), total + 1, 1);
+    let mut pos: usize = 0;
+    while pos < disk.len {
+        let mut ch = unsafe { *(disk.ptr + pos) };
+        if ch == 92u8 {
+            ch = 47u8;
+        }
+        unsafe { *(dst + pos) = ch; }
+        pos = pos + 1;
+    }
+    if is_dir {
+        unsafe { *(dst + pos) = 47u8; }
+        pos = pos + 1;
+    }
+    unsafe { *(dst + pos) = 0u8; }
+    StrView { ptr: dst as *const u8, len: pos }
+}
+
+fn dep_hash_tag(arena: mut_view<Arena>, data: *const u8, byte_len: usize) -> StrView {
+    let dst = arena_alloc_raw(mut_view(*arena), 65, 1);
+    dep_sha256_hex(data, byte_len, dst);
+    unsafe { *(dst + 64) = 0u8; }
+    StrView { ptr: dst as *const u8, len: 64 }
+}
+
+fn dep_absent_tag(arena: mut_view<Arena>) -> StrView {
+    let dst = arena_alloc_raw(mut_view(*arena), 2, 1);
+    unsafe {
+        *(dst + 0) = 45u8;
+        *(dst + 1) = 0u8;
+    }
+    StrView { ptr: dst as *const u8, len: 1 }
+}
+
+fn dep_dir_tag(arena: mut_view<Arena>) -> StrView {
+    let dst = arena_alloc_raw(mut_view(*arena), 4, 1);
+    unsafe {
+        *(dst + 0) = 100u8;
+        *(dst + 1) = 105u8;
+        *(dst + 2) = 114u8;
+        *(dst + 3) = 0u8;
+    }
+    StrView { ptr: dst as *const u8, len: 3 }
+}
+
+// The hash of the file's current bytes, or `-` when it cannot be read (absent, a directory).
+fn dep_file_tag(arena: mut_view<Arena>, path: view<StrView>) -> StrView {
+    if !host_file_exists(path) {
+        return dep_absent_tag(mut_view(*arena));
+    }
+    let mut ok: bool = false;
+    let ok_ptr = unsafe { address_of_mut(ok) };
+    let text = host_read_file_in_arena(path, mut_view(*arena), ok_ptr);
+    if !ok {
+        return dep_absent_tag(mut_view(*arena));
+    }
+    dep_hash_tag(mut_view(*arena), text.ptr, text.len)
+}
+
+fn dep_push_entry(entries: *mut DepEntry, n: mut_view<usize>, path: StrView, tag: StrView) {
+    let slot = unsafe { dep_entry_at(entries, *n) };
+    unsafe {
+        (*slot).path.ptr = path.ptr;
+        (*slot).path.len = path.len;
+        (*slot).tag.ptr = tag.ptr;
+        (*slot).tag.len = tag.len;
+    }
+    *n = *n + 1;
+}
+
+// Stable insertion sort by path bytes (entries recorded earlier win among equal paths).
+fn dep_sort_entries(entries: *mut DepEntry, n: usize) {
+    let mut i: usize = 1;
+    while i < n {
+        let cur = unsafe { *dep_entry_at(entries, i) };
+        let mut j: usize = i;
+        while j > 0 {
+            let prev = unsafe { *dep_entry_at(entries, j - 1) };
+            if sv_cmp(view(prev.path), view(cur.path)) <= 0 {
+                break;
+            }
+            unsafe { *dep_entry_at(entries, j) = prev; }
+            j = j - 1;
+        }
+        unsafe { *dep_entry_at(entries, j) = cur; }
+        i = i + 1;
+    }
+}
+
+// Writes the dependency list of `proj` (plus `extras`: further files the command reads, e.g. object
+// inputs or a `.mir` input) to `dep_path`. Returns false when the file cannot be written.
+pub fn project_write_dep_file(
+    proj: view<Project>,
+    dep_path: view<StrView>,
+    extras: *const StrView,
+    extra_count: usize
+) -> bool {
+    if dep_path.len == 0 || (dep_path.ptr as usize) == 0 {
+        return true;
+    }
+    let mut arena = arena_new();
+    let cap = proj.file_count + extra_count + proj.probe_count + 1;
+    let entries = arena_alloc_raw(
+        mut_view(arena),
+        opts_mul_usize(cap, size_of<DepEntry>()),
+        align_of<DepEntry>()
+    ) as *mut DepEntry;
+    let mut n: usize = 0;
+
+    // 1. Files of the project, hashed over the bytes the source stage read.
+    let mut i: usize = 0;
+    while i < proj.file_count {
+        let pf = unsafe { project_file_const_at(proj.files as *const ProjectFile, i) };
+        let disk = pf_get_disk_path(pf);
+        let txt = pf_get_text(pf);
+        let disp = dep_display_path(mut_view(arena), view(disk), false);
+        let tag = if (txt.ptr as usize) != 0 {
+            dep_hash_tag(mut_view(arena), txt.ptr, txt.len)
+        } else {
+            dep_file_tag(mut_view(arena), view(disk))
+        };
+        dep_push_entry(entries, mut_view(n), disp, tag);
+        i = i + 1;
+    }
+
+    // 2. Further files the command reads.
+    let mut x: usize = 0;
+    while x < extra_count {
+        let raw = sv_slot_get(extras, x);
+        if raw.len > 0 {
+            let norm = arena_normalize_path(mut_view(arena), view(raw));
+            let disp = dep_display_path(mut_view(arena), view(norm), false);
+            let tag = dep_file_tag(mut_view(arena), view(norm));
+            dep_push_entry(entries, mut_view(n), disp, tag);
+        }
+        x = x + 1;
+    }
+
+    // 3. Probes: present files are hashed, absent ones are `-`, listed directories `dir`.
+    let mut p: usize = 0;
+    while p < proj.probe_count {
+        let pr = unsafe { *project_probe_at(proj.probes, p) };
+        if pr.kind == PROBE_DIR {
+            let disp = dep_display_path(mut_view(arena), view(pr.path), true);
+            let tag = dep_dir_tag(mut_view(arena));
+            dep_push_entry(entries, mut_view(n), disp, tag);
+        } else {
+            let disp = dep_display_path(mut_view(arena), view(pr.path), false);
+            let tag = dep_file_tag(mut_view(arena), view(pr.path));
+            dep_push_entry(entries, mut_view(n), disp, tag);
+        }
+        p = p + 1;
+    }
+
+    dep_sort_entries(entries, n);
+
+    let mut out = diag_buf_new();
+    let mut e: usize = 0;
+    while e < n {
+        let ent = unsafe { *dep_entry_at(entries, e) };
+        let mut dup = false;
+        if e > 0 {
+            let prev = unsafe { *dep_entry_at(entries, e - 1) };
+            dup = sv_eq(view(prev.path), view(ent.path));
+        }
+        if !dup {
+            diag_buf_push_bytes(mut_view(out), ent.path.ptr, ent.path.len);
+            diag_buf_push_byte(mut_view(out), 32u8);
+            diag_buf_push_bytes(mut_view(out), ent.tag.ptr, ent.tag.len);
+            diag_buf_push_byte(mut_view(out), 10u8);
+        }
+        e = e + 1;
+    }
+
+    let mut ok = false;
+    let h = unsafe { open(dep_path.ptr, dep_path.len, 1u32) };
+    if h >= 0i64 {
+        ok = true;
+        let mut written: usize = 0;
+        while written < out.len {
+            let src = unsafe { (out.ptr as *const u8) + written };
+            let wr = unsafe { write(h, src, out.len - written) };
+            if wr <= 0i64 {
+                ok = false;
+                break;
+            }
+            written = written + (wr as usize);
+        }
+        let _ = close(h);
+    }
+    diag_buf_free(mut_view(out));
+    arena_destroy(mut_view(arena));
+    ok
 }
 
 module selfhost_driver_boundary_edges_test

@@ -26,6 +26,7 @@ runner directive, kind and state can be proven without the real compiler:
     //@ emit EXT TEXT     stdout of `inspect --emit=EXT`
 
     //@ append FILE TEXT  (T437a) append the line TEXT to FILE (relative to the current directory)
+    //@ cat FILE          (T437b) program: copy FILE (relative to the current directory) to stdout at run time
     //@ dep PATH          (T437a) a file the compiler "loads" (path relative to the current directory);
                           listed in the --dep-file output
 
@@ -132,6 +133,13 @@ def run_program(src, flags, mode, args=None, input_path=None):
                 return 99
         elif op == "sleep":
             time.sleep(float(rest))
+        elif op == "cat":
+            # T437b round 1: a run-time read of a data file (never in the compiler's dependency list)
+            try:
+                with open(rest.strip(), "rb") as fh:
+                    w(sys.stdout, fh.read())
+            except OSError:
+                w(sys.stdout, b"<missing>\n")
         elif op == "append":
             fname, _, text = rest.partition(" ")
             with open(fname, "a", encoding="utf-8", newline="\n") as fh:

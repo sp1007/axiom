@@ -56,6 +56,13 @@ SCHEMA = 1
 MAX_CANDIDATES = 8
 DEFAULT_MAX_BYTES = 1 << 30           # LRU bound of the entries/ tree (1 GiB)
 NONDET_STD_DIRS = ("thread", "sync", "async", "time")   # S4: scheduling and timing are not inputs
+# Std files the compiler loads without any `std.` text in the program (T437b, ADR-0042 §5 G2): the core
+# files of `project_append_std_core_files` and `project_append_std_host_if_needed` in compiler/driver/opts.ax
+# and the `future` lang-item modules of `pipe_append_std_future_files_if_needed` in compiler/driver/pipeline.ax.
+# `core/host.ax` is loaded only when the program text contains `host`; it is listed unconditionally (superset).
+# tests/driver/dep_file/check_dep_file.py checks this list against the real `--dep-file` output.
+IMPLICIT_STD_FILES = ("core/option.ax", "core/result.ax", "core/prelude.ax", "core/host.ax",
+                      "future/mod.ax", "future/block_on.ax")
 NONDET_SOURCE_RE = re.compile(r"\bstd\.(?:thread|sync|async|time)\b|\basync\b|\bawait\b|\bspawn\b")
 STD_REF_RE = re.compile(r"\bstd(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
 TREE_SKIP = {".git"}
@@ -303,12 +310,16 @@ class Hasher:
         return sha256_bytes("".join(lines).encode("utf-8"))
 
     def dirlist(self, path):
-        """Digest of the names in one directory (not recursive)."""
+        """Digest of the names in one directory (not recursive); a subdirectory's name carries a trailing `/`
+        (T437b: a file replaced by a directory of the same name changes what a package scan loads)."""
         p = Path(path)
         if not p.is_dir():
             return "absent"
         try:
-            names = sorted(os.listdir(str(p)))
+            names = []
+            for n in os.listdir(str(p)):
+                names.append(n + "/" if os.path.isdir(os.path.join(str(p), n)) else n)
+            names.sort()
         except OSError:
             return "unreadable"
         return sha256_bytes("\n".join(names).encode("utf-8"))
@@ -360,8 +371,24 @@ def read_json(path):
         return None
 
 
+DEP_ABSENT = "-"
+DEP_DIR = "dir"
+# A listed directory `D/ dir` is handed to the runner as the absent sentinel `D/<DIRLIST_SENTINEL>`: the runner keys
+# every dependency's parent directory listing (`dirlist`), so the sentinel puts D's listing into the key, and the
+# sentinel itself must stay absent. `--affected` (rule 1) treats it as "any file directly in D".
+DIRLIST_SENTINEL = ".axtest-dirlist"
+
+
 def parse_dep_file(path):
-    """`path sha256` per line (S2). Returns a list of (path, sha) or None when unreadable/malformed."""
+    """The compiler's `--dep-file` list (S2; written by `compiler/driver/opts.ax` section 10, T437b):
+        `<path> <sha256>`  a file the compiler loaded (hash of the bytes it read)
+        `<path> -`         a path it probed and found absent (absence fact)
+        `<dir>/ dir`       a directory whose listing it used (package scan)
+    Paths are relative to the compiler's working directory (the repository root for the runner) or absolute.
+    Returns a list of (path, digest) in the runner's `file` digest vocabulary -- a lower-case sha256, or
+    `absent` for an absence fact (the runner re-hashes a missing file to `absent`, so creating it is a miss), with
+    a listed directory as its absent sentinel child (DIRLIST_SENTINEL) -- or None when the file is unreadable or
+    a line is malformed."""
     try:
         with open(path, "rb") as f:
             text = f.read().decode("utf-8")
@@ -372,11 +399,33 @@ def parse_dep_file(path):
         line = line.strip()
         if not line:
             continue
-        m = re.match(r"^(.*\S)\s+([0-9a-fA-F]{64})$", line)
+        m = re.match(r"^(.*\S)\s+([0-9a-fA-F]{64}|-|dir)$", line)
         if not m:
             return None
-        out.append((m.group(1), m.group(2).lower()))
+        pth, tag = m.group(1), m.group(2)
+        if tag == DEP_DIR:
+            if not pth.endswith("/") or len(pth) < 2:
+                return None
+            out.append((pth + DIRLIST_SENTINEL, "absent"))
+        elif pth.endswith("/"):
+            return None
+        elif tag == DEP_ABSENT:
+            out.append((pth, "absent"))
+        else:
+            out.append((pth, tag.lower()))
     return out
+
+
+def dep_matches_change(dep, changed_rel):
+    """`--affected` rule 1: a changed path hits a dependency entry when it is the entry, or when the entry is a
+    listed directory's sentinel and the changed path lies in that directory (at any depth: a new subdirectory
+    changes the listing too)."""
+    if dep == changed_rel:
+        return True
+    if dep.endswith("/" + DIRLIST_SENTINEL):
+        d = dep[:-len(DIRLIST_SENTINEL)]
+        return changed_rel.startswith(d)
+    return False
 
 
 # ----------------------------------------------------------------------------------------------
@@ -919,7 +968,6 @@ class StdIndex:
     def nondet_reason(self, source_texts):
         """A reason string when the sources (or the std modules they reach) involve threads, sync, async,
         time, or an OS timer/clock/environment/randomness/process-id binding; None otherwise."""
-        seen_files = set()
         todo = []
         for text in source_texts:
             m = NONDET_SOURCE_RE.search(text)
@@ -929,6 +977,18 @@ class StdIndex:
             if b:
                 return b
             todo.extend(STD_REF_RE.findall(text))
+        seen_files = set()
+        # G2: the implicitly loaded std files are reached by every program, with or without `std.` text
+        if self.std_root is not None:
+            for rel in IMPLICIT_STD_FILES:
+                f = self.std_root.joinpath(*rel.split("/"))
+                if not f.is_file():
+                    continue
+                seen_files.add(str(f))
+                b = self.file_calls_binding(f)
+                if b:
+                    return "implicitly loaded std/%s uses host binding `%s`" % (rel, b)
+                todo.extend(self.refs_of(f))
         seen_mods = set()
         while todo:
             mod = todo.pop()
@@ -959,7 +1019,8 @@ class StdIndex:
 
 def exact_deps_nondet(dep_rels, std_rel, std_index=None, root=None):
     """S4 for an exact dependency list: a dependency under std/{thread,sync,async,time}, or (with std_index and
-    root) a loaded std file that uses a nondeterministic leaf binding (OS thread/timer/env/... bindings)."""
+    root) a loaded std file that uses a nondeterministic leaf binding (OS thread/timer/env/... bindings). The
+    list holds every loaded file, the implicitly loaded prelude/core/future files included (G2)."""
     prefix = (std_rel.rstrip("/") + "/") if std_rel else "std/"
     for r in dep_rels:
         if r.startswith(prefix):

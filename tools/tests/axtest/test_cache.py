@@ -521,6 +521,91 @@ class BaselineTests(CacheCase):
         self.assertEqual(self.rc, 0)
 
 
+class ExactRuntimeInputTests(CacheCase):
+    """T437b round 1 (QA F1): in exact mode the compiler's dependency list says nothing about files the program
+    reads at run time. The key must still hold the test directory tree (ADR-0041 S4 addendum), the
+    `cache-inputs:` paths and the input's directory; `--affected` rule 2a must select exact entries too."""
+
+    ENV = {"STUB_DEP_FILE": "1"}
+
+    def list_affected(self, *changed):
+        cmd = [sys.executable, str(self.axtest), "--root", str(self.root), "--compiler", str(self.compiler),
+               "--exe-suffix", ".py", "--cache-dir", str(self.cache), "--list", "--affected"] + list(changed)
+        full = {k: v for k, v in os.environ.items()
+                if not (k.startswith("STUB_") or k.startswith("AXIOM") or k.startswith("AX_"))}
+        full.update(self.ENV)
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=full)
+        return p.stdout.decode("utf-8", "replace")
+
+    def three_runs(self, data, key):
+        res = self.ax(env=self.ENV)
+        self.assertEqual(res[key], ("PASS", False), self.err)
+        self.assertEqual(self.doc["cache"]["dep_source"], "exact")
+        self.assertEqual(len(self.entries()), 1, self.err)
+        self.assertEqual(self.ax(env=self.ENV)[key], ("PASS", True), self.err)
+        data.write_bytes(b"v2\n")
+        self.assertEqual(self.ax(env=self.ENV)[key], ("FAIL", False), self.err)
+        self.assertEqual(self.ax("--no-cache", env=self.ENV)[key], ("FAIL", False))
+
+    def test_runtime_read_of_a_file_in_the_test_directory(self):
+        data = self.put("run/rt/data.txt", "v1\n")
+        self.put("run/rt/r.ax", hdr("test: run", "modes: interp", "stdout: v1\\n") + "//@ cat tests/run/rt/data.txt\n")
+        self.three_runs(data, "run/rt/r.ax [interp]")
+        # the stored exact entry keys the directory tree, not only its listing
+        rec = json.loads(self.entries()[0].read_text(encoding="utf-8"))
+        self.assertIn(["tree", "tests/run/rt"], [d[:2] for d in rec["deps"]])
+
+    def test_runtime_read_in_a_subdirectory_of_the_test_directory(self):
+        data = self.put("run/rt/in/deep.txt", "v1\n")
+        self.put("run/rt/r.ax", hdr("test: run", "modes: interp", "stdout: v1\\n")
+                 + "//@ cat tests/run/rt/in/deep.txt\n")
+        self.three_runs(data, "run/rt/r.ax [interp]")
+
+    def test_runtime_read_of_a_declared_cache_input_outside_the_test_directory(self):
+        data = self.put("data/in.txt", "v1\n", under=self.root)
+        self.put("run/rt/r.ax", hdr("test: run", "modes: interp", "stdout: v1\\n", "cache-inputs: data/in.txt")
+                 + "//@ cat data/in.txt\n")
+        self.three_runs(data, "run/rt/r.ax [interp]")
+        out = self.list_affected("data/in.txt")
+        self.assertIn("run/rt/r.ax", out)
+
+    def test_declared_cache_input_directory_selects_on_a_new_file(self):
+        self.put("data/in.txt", "v1\n", under=self.root)
+        self.put("run/rt/r.ax", hdr("test: run", "modes: interp", "stdout: v1\\n", "cache-inputs: data")
+                 + "//@ cat data/in.txt\n")
+        self.ax(env=self.ENV)
+        self.assertEqual(self.ax(env=self.ENV)["run/rt/r.ax [interp]"], ("PASS", True))
+        self.put("data/new.txt", "x", under=self.root)
+        self.assertEqual(self.ax(env=self.ENV)["run/rt/r.ax [interp]"], ("PASS", False))
+        self.assertIn("run/rt/r.ax", self.list_affected("data/new.txt"))
+
+    def test_affected_rule_2a_selects_an_exact_entry(self):
+        self.put("run/rt/data.txt", "v1\n")
+        self.put("run/rt/r.ax", hdr("test: run", "modes: interp", "stdout: v1\\n") + "//@ cat tests/run/rt/data.txt\n")
+        self.put("run/other/o.ax", PASS_RUN)
+        self.ax(env=self.ENV)
+        idx = axtest_cache.load_exact_deps_index(self.cache)
+        self.assertIn("run/rt/r.ax", idx)                    # an exact entry exists
+        self.assertNotIn("tests/run/rt/data.txt", idx["run/rt/r.ax"])
+        out = self.list_affected("tests/run/rt/data.txt")
+        self.assertIn("run/rt/r.ax", out)
+        self.assertNotIn("run/other/o.ax", out)
+
+    def test_nocache_is_never_stored_in_exact_mode(self):
+        self.put("run/rt/r.ax", hdr("test: run", "modes: interp", "stdout: ok\\n", "nocache: reads the clock")
+                 + "//@ out ok\\n\n")
+        self.ax(env=self.ENV)
+        self.assertEqual(self.ax(env=self.ENV)["run/rt/r.ax [interp]"], ("PASS", False))
+        self.assertEqual(self.entries(), [])
+
+    def test_unrelated_file_outside_the_test_directory_still_hits(self):
+        # the gain of the exact mode is kept: a change elsewhere (here: another test directory) is no miss
+        self.put("run/rt/r.ax", PASS_RUN)
+        self.ax(env=self.ENV)
+        self.put("run/other/note.txt", "x")
+        self.assertEqual(self.ax(env=self.ENV)["run/rt/r.ax [interp]"], ("PASS", True))
+
+
 class IdFileTests(CacheCase):
     def test_id_file_selects_exact_ids(self):
         self.put("run/a.ax", PASS_RUN)

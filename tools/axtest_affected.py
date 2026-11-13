@@ -6,8 +6,10 @@ and prints, for every selected id, the rule that selected it (the derivation the
 order (`.claude/agents/axiom-qa.md` "Per-task gate scope", T437a scope (b)):
 
  1. exact      a cached entry with `dep_source: exact` (tools/axtest_cache.py deps-index) whose compiler-reported
-               dependency list contains a changed file selects that test. Tests with such an entry are not
-               subject to the grep rules 2a/2b below (their dependency list is exact).
+               dependency list contains a changed file selects that test (also a file created where the compiler
+               probed an absent path, and any change inside a directory whose listing it used: T437b). Tests
+               with such an entry are not subject to the grep rules 2a/2b below (their dependency list is
+               exact).
  2a. test      a changed test file selects itself; any other changed file under tests/ (helper, expectation,
                fixture, generator) selects the tests of its directory (a `fixtures/`/`__pycache__/` directory
                counts as its parent) and every test whose `input:`/`stdout-file:` names it. Files directly in
@@ -972,8 +974,13 @@ def derive(root, args, tests, cache_dir=None):
     changed_set = set(changed)
 
     # rule 1: exact dependency lists
+    sentinel_tail = "/" + axtest_cache.DIRLIST_SENTINEL
     for tid, deps in sorted(exact.items()):
         hit = sorted(changed_set & deps)
+        if not hit:
+            # a listed directory (T437b `--dep-file` `<dir>/ dir`): any change inside it
+            hit = sorted(f for f in changed_set for d in deps
+                         if d.endswith(sentinel_tail) and axtest_cache.dep_matches_change(d, f))
         if hit:
             aff.add(tid, "exact: dependency %s" % hit[0])
 
@@ -994,12 +1001,32 @@ def derive(root, args, tests, cache_dir=None):
                 continue
             test_by_input.setdefault(rel, []).append(t.id)
 
+    # rule 2c (T437b round 1): a changed file at or under a `cache-inputs:` path selects the test, whatever
+    # its location (a declared run-time input is a key input in both cache modes, ADR-0041 S4)
+    declared = []
+    for t in tests:
+        for ci in getattr(t, "cache_inputs", None) or []:
+            q = Path(ci)
+            if not q.is_absolute():
+                q = root / q
+            try:
+                rel = Path(os.path.normpath(str(q))).resolve().relative_to(root.resolve()).as_posix()
+            except (ValueError, OSError):
+                continue
+            declared.append((rel.rstrip("/"), t.id))
+    declared_hit = set()
+    for f in changed:
+        for rel, tid in declared:
+            if rel == "." or f == rel or f.startswith(rel + "/"):
+                aff.add(tid, "test: cache-inputs: %s names %s" % (rel, f))
+                declared_hit.add(f)
+
     for f in changed:
         if f.startswith(NOOP_PREFIXES):
             aff.noop.append(f)
             continue
         if f.startswith("tests/"):
-            matched = False
+            matched = f in declared_hit
             if f in corpus.by_rel:
                 aff.add(corpus.by_rel[f], "test: changed test file")
                 matched = True
@@ -1007,9 +1034,10 @@ def derive(root, args, tests, cache_dir=None):
                 if f.count("/") == 1:
                     aff.noop.append(f)       # tests/README.md, tests/smoke.list: read by no compiled test
                     continue
+                # rule 2a applies to exact entries too (T437b round 1, QA F1): a program may read files of its
+                # own directory at run time, which no compiler dependency list records
                 for tid in corpus.owner_ids(f):
-                    if grep_ok(tid):
-                        aff.add(tid, "test: %s is in the test's directory" % f)
+                    aff.add(tid, "test: %s is in the test's directory" % f)
                     matched = True
             for tid in test_by_input.get(f, []):
                 aff.add(tid, "test: input:/stdout-file: names %s" % f)
@@ -1036,10 +1064,11 @@ def derive(root, args, tests, cache_dir=None):
             comp_changes.append(f)
             continue
         if f.startswith("tools/"):
-            if not tools_rule(root, f, aff, corpus):
+            if not tools_rule(root, f, aff, corpus) and f not in declared_hit:
                 aff.unmatched.append(f)
             continue
-        aff.unmatched.append(f)
+        if f not in declared_hit:
+            aff.unmatched.append(f)
 
     if std_mods:
         std_rule(root, std_mods, std_names, aff, corpus, grep_ok)

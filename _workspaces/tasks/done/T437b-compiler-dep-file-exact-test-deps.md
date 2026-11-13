@@ -8,15 +8,15 @@ model: opus
 gate_model: opus
 depends: [T452, T437a]
 priority: 11
-status: doing
+status: done
 attempts: 1
 timeout_min: 900
 paths: [tests/driver/dep_file]
-locks: [compiler/driver, compiler/source, tests/selfhost, tools/axtest_cache.py, tools/axtest_affected.py]
+locks: [compiler/driver, compiler/source, tests/selfhost, tools/axtest.py, tools/axtest_cache.py, tools/axtest_affected.py, tools/tests/axtest]
 spec: [spec/decisions/ADR-0041-complete-suite-baseline-and-test-cache.md, spec/SPEC-20-selfhost.md]
 covers: [REQ-TST-056]
 started: 2026-11-13 16:42:55
-agent: T437b-impl
+finished: 2026-11-14 00:18:54
 ---
 # T437b — Compiler `--dep-file` and exact test dependencies
 
@@ -37,7 +37,7 @@ selects only the tests that load the changed file (ADR-0041 §4 S2, §6).
   prelude files. Exact mode: `exact_deps_nondet` scans every file of the dep list, prelude included (assert it in a
   test). Superset mode (compiler without `--dep-file`): seed the `std.a.b` traversal with
   `std/core/{prelude,option,result,host}.ax` (or the list the compiler loads implicitly, read from one place).
-- Measure the complete `tests/selfhost` group twice with the same binary (cold `--no-cache`, then warm) and one
+- (Waived by the orchestrator in fix round 1, 2026-11-13: the complete cold/warm `tests/selfhost` measurement costs ~40 h; the 3 measured subgroups + the 151-of-154 uncacheable argument + the periodic full run replace it.) Measure subgroups of `tests/selfhost` twice with the same binary (cold `--no-cache`, then warm) and one
   std-only change scenario (touch one std file in a scratch copy: count of misses vs the superset fallback).
 
 ## Acceptance
@@ -67,3 +67,4 @@ selects only the tests that load the changed file (ADR-0041 §4 S2, §6).
 - 2026-11-13 created by axiom-architect: split of T437 (compiler part; ADR-0041 §6)
 - 2026-11-13 axiom-architect: G2 (prelude files in the never-cache scan) added to scope (ADR-0042 §5)
 - 2026-11-13 16:42:55 started (attempt 1) T437b-impl
+- 2026-11-14 00:18:54 accepted by QA -> done
