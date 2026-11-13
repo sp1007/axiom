@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 18
-status: todo
-attempts: 0
-paths: [tests/mc/isel/cdriver_abi_qa2.c]
+status: done
+attempts: 1
+paths: [tests/mc/isel/cdriver_abi_qa2.c, tests/mc/isel/cdriver_abi.c, tests/mc/isel/cdriver_abi_qa.c, tests/mc/isel/cdriver_abi_edge.c, tests/mc/frame/cdriver_probe.c, tests/mc/frame/cdriver_probe_edge.c]
 locks: [_workspaces/baseline-failures.txt]
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/decisions/ADR-0041-complete-suite-baseline-and-test-cache.md]
 covers: [REQ-TST-015, REQ-TST-004]
+started: 2026-11-13 16:42:55
+finished: 2026-11-13 18:44:44
 ---
 # T438 — Baseline fix: C test binaries build in a fresh snapshot
 
@@ -45,3 +47,5 @@ covers: [REQ-TST-015, REQ-TST-004]
 
 ## Log
 - 2026-11-13 created by axiom-architect (ADR-0042 §1, architect inbox 1)
+- 2026-11-13 16:42:55 started (attempt 1) T438-impl
+- 2026-11-13 18:44:44 accepted by QA -> done

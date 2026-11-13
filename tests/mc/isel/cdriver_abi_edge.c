@@ -1,4 +1,5 @@
 #include <stdio.h>
+#undef NDEBUG
 #include <assert.h>
 #include "abi/abi.h"
 

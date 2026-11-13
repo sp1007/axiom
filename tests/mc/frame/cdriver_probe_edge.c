@@ -1,4 +1,5 @@
 #include <stdio.h>
+#undef NDEBUG
 #include <assert.h>
 #include <string.h>
 #include "target/x64/frame/frame.h"

@@ -8,12 +8,14 @@ model: opus
 gate_model: opus
 depends: []
 priority: 25
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 600
 paths: [std/async, tests/std/async]
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/SPEC-33-async.md, spec/SPEC-34-executors-fibers.md, spec/SPEC-31-atomics.md]
 covers: [REQ-TST-036, REQ-ASY-037, REQ-ASY-109]
+started: 2026-11-13 16:42:56
+agent: T421a-impl
 ---
 # T421a — std/async: waker protocol and task-slot correctness
 
@@ -50,3 +52,4 @@ ADR-0042 §2).
 
 ## Log
 - 2026-11-13 created by axiom-architect (ADR-0042 §2; T422 FU-I, T421/T422 notes)
+- 2026-11-13 16:42:56 started (attempt 1) T421a-impl

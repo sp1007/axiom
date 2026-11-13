@@ -8,13 +8,15 @@ model: opus
 gate_model: opus
 depends: [T452, T437a]
 priority: 11
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 900
 paths: [tests/driver/dep_file]
 locks: [compiler/driver, compiler/source, tests/selfhost, tools/axtest_cache.py, tools/axtest_affected.py]
 spec: [spec/decisions/ADR-0041-complete-suite-baseline-and-test-cache.md, spec/SPEC-20-selfhost.md]
 covers: [REQ-TST-056]
+started: 2026-11-13 16:42:55
+agent: T437b-impl
 ---
 # T437b — Compiler `--dep-file` and exact test dependencies
 
@@ -64,3 +66,4 @@ selects only the tests that load the changed file (ADR-0041 §4 S2, §6).
 ## Log
 - 2026-11-13 created by axiom-architect: split of T437 (compiler part; ADR-0041 §6)
 - 2026-11-13 axiom-architect: G2 (prelude files in the never-cache scan) added to scope (ADR-0042 §5)
+- 2026-11-13 16:42:55 started (attempt 1) T437b-impl

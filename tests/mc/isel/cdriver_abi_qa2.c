@@ -1,4 +1,7 @@
 #include <stdio.h>
+// This test's only checks are assert()s: keep them live in Release (-DNDEBUG) builds,
+// where they would otherwise vanish and leave `sig` unused (-Werror).
+#undef NDEBUG
 #include <assert.h>
 #include "abi/abi.h"
 
