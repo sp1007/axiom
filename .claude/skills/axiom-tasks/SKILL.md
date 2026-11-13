@@ -157,6 +157,10 @@ Rules that keep the board healthy:
   that several tasks must touch (a diagnostic-code file, a driver command table) is either split into
   one file per module/task, or named in `locks:` by every task that edits it so they never run together.
   The build globs sources, so adding files never requires touching shared build files.
+- Every task's acceptance implicitly includes the complete-suite baseline rule (ADR-0041): the gate's failing ids must
+  be a subset of `_workspaces/baseline-failures.txt`, otherwise the verdict is FAIL (or BLOCKED for a proven
+  pre-existing failure) and `accept` refuses; only the architect adds lines, each with a fix task, and a fix task
+  removes its own lines in the same commit and names the file in `locks:`.
 - Acceptance criteria are tests, not prose. "Parser handles X" becomes "tests/parse/x/*.ax golden
   files pass".
 

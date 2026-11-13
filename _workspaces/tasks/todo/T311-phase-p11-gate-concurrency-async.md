@@ -6,7 +6,7 @@ owner: axiom-qa
 reviewer: axiom-architect
 model: opus
 gate_model: opus
-depends: [T211, T088, T089, T090, T400, T401, T402, T403, T404, T405, T406, T407, T408, T409, T410, T411, T412, T413, T414, T415, T416, T417, T418, T419, T420, T421, T422, T423, T424, T425, T426, T427, T428, T429]
+depends: [T211, T088, T089, T090, T400, T401, T402, T403, T404, T405, T406, T407, T408, T409, T410, T411, T412, T413, T414, T415, T416, T417, T418, T419, T420, T421, T422, T423, T424, T425, T426, T427, T428, T429, T434, T435, T436, T430, T431, T432, T433]
 priority: 311
 status: todo
 attempts: 0
@@ -38,3 +38,4 @@ Certify that phase P11 meets the exit criteria of every epic (`E11.1`–`E11.6`)
 ## Log
 - 2026-10-06 02:23:54 covers += REQ-ASY-167, REQ-ASY-168 (metadata only)
 - 2026-11-03 00:10:00 updated depends to include T400-T428 in T211 (P11 phase planning)
+- 2026-11-13 07:40:00 depends += T434, T435, T436, T430, T431, T432, T433 (ADR-0041 baseline fix tasks; the phase gate runs `--no-cache` and needs an empty-or-admitted baseline)

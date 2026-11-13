@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T421]
 priority: 145
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [std/async/group.ax, std/async/cancel.ax, std/async/timeout.ax, std/async/governor.ax, tests/std/async/structured]
 locks: [std/async/mod.ax]
 spec: [spec/SPEC-34-executors-fibers.md, 0126, 0127, 0135, 0202, 0205, tasks/0277, tasks/0620, tasks/0834, tasks/0836]
 covers: [REQ-CONC-040, REQ-ASY-019, REQ-ASY-109, REQ-CONC-100, REQ-CONC-150, REQ-CONC-155, REQ-CONC-188, REQ-CONC-199]
+started: 2026-11-13 05:22:12
+agent: T422-impl
 ---
 # T422 — E11.5 — Structured concurrency TaskGroup, cooperative CancellationToken & deadlines
 
@@ -41,3 +43,4 @@ Implement structured concurrency (`TaskGroup`), cooperative `CancellationToken`,
 
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
+- 2026-11-13 05:22:12 started (attempt 1) T422-impl
