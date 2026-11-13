@@ -99,7 +99,26 @@ python tools/axtest.py                    # everything
 python tools/axtest.py --filter run/struct --verbose
 python tools/axtest.py --json > _workspaces/artifacts/test-results.json   # for agents
 python tools/axtest.py --bless parse/
+python tools/axtest.py --affected <base>..<head> --list   # tests that can observe a change, with the rule per id
+python tools/axtest.py --smoke [--seed N]                 # always: ids + one id per group (tests/smoke.list)
+python tools/axtest.py --smoke --check                    # validate tests/smoke.list and its 20-minute bound
+python tools/axtest.py --baseline _workspaces/baseline-failures.txt ...   # BASELINE OK | NEW FAILURES: ...
+python tools/axtest.py --no-cache ...                     # never report cached results
+python tools/taskgate.py --task <ID> ...                  # the whole per-task gate (axiom-qa.md)
 ```
+
+Results are cached by default (ADR-0041 §4; `<main checkout>/_workspaces/artifacts/axtest-cache/`); the summary
+prints `CACHED n HITS h MISS m ...`. A test that must never be cached declares `// nocache: <reason>`; a `cmd:`
+manifest is cached only when it declares every input with `cache-inputs: <paths relative to the root>`. Keep
+`tests/smoke.list` pools light (`--smoke --check`); when a group gets its first test, add a pool line.
+- **G1 rule (ADR-0042 §5):** a test that reads, at run time, any file outside its own directory (a repository file,
+  a std source, a fixture of another group) must declare `// nocache: <reason>` or list those files/dirs in
+  `cache-inputs:`. The cache key covers the test's directory, the compiler and its loaded sources, not arbitrary
+  files the running program opens, so without the declaration a cached PASS survives a change of that file.
+- Tests whose result depends on addresses (ASLR) or wall-clock timing are not deterministic and are not admitted;
+  make them deterministic or `nocache:` (ADR-0042 §5, T437a G3).
+- The periodic full run is executed with `--no-cache` (axiom-qa.md "Periodic full run"); it is what re-validates
+  every cached entry.
 
 The runner builds nothing: build first. The build that counts for a task is the one in its snapshot
 (`taskctl.py snapshot <ID>` → `build-snap-<ID>/`, build directory `build-snap-<ID>/build`), so the

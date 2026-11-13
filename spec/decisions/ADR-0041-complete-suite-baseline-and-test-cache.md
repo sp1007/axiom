@@ -142,7 +142,9 @@ A cache entry lets a later run report a result without executing the test. It is
 - **S4 Deterministic tests only.** Never cached: `cmd:` tests (inputs not known to the runner) unless they declare
   `cache-inputs:` naming every input file/dir; tests with any `requires:` host feature; tests whose dependency list
   contains a file under `std/thread`, `std/sync`, `std/async`, `std/time` or OS thread/timer bindings (scheduling and
-  timing are not inputs); tests marked `nocache:`.
+  timing are not inputs); tests marked `nocache:`. Addendum (ADR-0042 §5): tests whose output depends on ASLR or
+  timing, and tests that read files outside their own directory without `cache-inputs:`, are outside these
+  conditions; they are made deterministic or declare `nocache:`.
 - **S5 Gate provenance.** Each entry records its producer: snapshot id, the snapshot's base commit and the sha256 of its
   change set. A gate may use an entry only if (a) the key matches exactly, (b) the entry was produced inside a
   `build-snap-*` snapshot whose base commit is an ancestor of, or equal to, the current HEAD, and (c) the compiler binary

@@ -183,8 +183,9 @@ flow (T019). [0032 §4; 0041 §32-33]
 
 **AXS-SEM-037 — Constant expressions.** Constant evaluation (const items, array lengths, T061)
 uses exactly these rules. Where a runtime operation would panic, a constant evaluation is a
-compile-time error at the offending operation: `AX_CONST_OVERFLOW` (overflow, shift out of range,
-invalid `char`), `AX_CONST_DIV_ZERO` (division or remainder by zero). In ordinary (non-constant)
+compile-time error at the offending operation: `AX_CONST_OVERFLOW` (overflow, invalid `char`),
+`AX_CONST_SHIFT_RANGE` (shift count `< 0` or `>= T.BITS`; SPEC-40 AXS-INT-005, ADR-0042 §4),
+`AX_CONST_DIV_ZERO` (division or remainder by zero). In ordinary (non-constant)
 code an operation on constant operands that must panic is *not* an error: it panics at run time,
 the optimiser must keep that panic (a lint warning is allowed). [tasks/0327 §9-10, §12, ANUM-43;
 tasks/0334 §35]
