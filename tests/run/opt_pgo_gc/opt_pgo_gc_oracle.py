@@ -151,7 +151,6 @@ def assemble_opt_pgo_gc_probe(root: str, probe_template_path: pathlib.Path) -> s
     pgo_gc_modules = list(got.CORE_MODULES) + [
         ("compiler.obj.coff", "compiler"),
         ("compiler.link.gc_icf", "compiler"),
-        ("compiler.own.cap", "compiler"),
         ("compiler.opt.alias", "compiler"),
         ("compiler.opt.memopt", "compiler"),
         ("compiler.opt.escape", "compiler"),

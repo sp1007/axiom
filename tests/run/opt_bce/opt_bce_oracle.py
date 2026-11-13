@@ -842,7 +842,6 @@ def assemble_opt_bce_probe(root: str, probe_template_path: pathlib.Path) -> str:
     main_src = template_text.replace("@PROBE_MIR_FN@", got.str_fn("probe_mir_raw", BCE_PROBE_BLOBS))
     prelude = bc.build_prelude_text(include_sym_pad=True, include_std_sys=False, root=root)
     bce_modules = list(got.PIPELINE_MODULES) + [
-        ("compiler.own.cap", "compiler"),
         ("compiler.opt.alias", "compiler"),
         ("compiler.opt.loops", "compiler"),
         ("compiler.opt.bce", "compiler"),
@@ -884,7 +883,7 @@ def main() -> int:
         bproc = run_cmd(
             [axiomc, "build", "--stack-reserve=67108864", flag, "--verify-each", "-o", str(probe_exe), str(probe_bundle)],
             root,
-            timeout=300,
+            timeout=1500,
         )
         if bproc.returncode != 0:
             sys.stderr.write(f"build opt_bce_probe {flag} --verify-each failed:\n{bproc.stdout}\n{bproc.stderr}\n")

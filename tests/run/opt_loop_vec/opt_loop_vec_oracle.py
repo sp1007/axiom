@@ -83,7 +83,6 @@ def assemble_opt_loop_vec_probe(root: str, probe_template_path: pathlib.Path) ->
     main_src = probe_template_path.read_text(encoding="utf-8")
     prelude = bc.build_prelude_text(include_sym_pad=True, include_std_sys=False, root=root)
     vec_modules = list(got.CORE_MODULES) + [
-        ("compiler.own.cap", "compiler"),
         ("compiler.opt.alias", "compiler"),
         ("compiler.opt.loops", "compiler"),
         ("compiler.opt.bce", "compiler"),

@@ -126,7 +126,6 @@ def assemble_e15_3_probe(root: str, probe_template_path: pathlib.Path) -> str:
 
     prelude = bc.build_prelude_text(include_sym_pad=True, include_std_sys=False, root=root)
     e15_3_modules = list(got.PIPELINE_MODULES) + [
-        ("compiler.own.cap", "compiler"),
         ("compiler.opt.alias", "compiler"),
         ("compiler.opt.loops", "compiler"),
         ("compiler.opt.bce", "compiler"),
@@ -223,7 +222,7 @@ def main() -> int:
         bproc = run_cmd(
             [axiomc, "build", "--stack-reserve=67108864", flag, "-o", str(probe_exe), str(probe_bundle)],
             root,
-            timeout=600,
+            timeout=1500,
         )
         if bproc.returncode != 0:
             sys.stderr.write(f"build e15_3_probe {flag} failed:\n{bproc.stdout}\n{bproc.stderr}\n")

@@ -427,7 +427,6 @@ def assemble_opt_alias_probe(root: str, probe_template_path: pathlib.Path) -> st
     main_src = template_text.replace("@PROBE_MIR_FN@", got.str_fn("probe_mir_raw", ALIAS_PROBE_BLOBS))
     prelude = bc.build_prelude_text(include_sym_pad=True, include_std_sys=False, root=root)
     alias_modules = list(got.CORE_MODULES) + [
-        ("compiler.own.cap", "compiler"),
         ("compiler.opt.alias", "compiler"),
         ("compiler.opt.memopt", "compiler"),
     ]

@@ -129,7 +129,6 @@ def assemble_e15_5_probe(root: str, probe_template_path: pathlib.Path) -> str:
 
     prelude = bc.build_prelude_text(include_sym_pad=True, include_std_sys=False, root=root)
     e15_5_modules = list(got.CORE_MODULES) + [
-        ("compiler.own.cap", "compiler"),
         ("compiler.opt.alias", "compiler"),
         ("compiler.opt.loops", "compiler"),
         ("compiler.opt.bce", "compiler"),

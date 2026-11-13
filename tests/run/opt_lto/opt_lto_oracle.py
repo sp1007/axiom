@@ -202,7 +202,6 @@ def assemble_opt_lto_probe(root: str, probe_template_path: pathlib.Path) -> str:
     main_src = template_text.replace("@PROBE_MIR_FN@", got.str_fn("probe_mir_raw", LTO_PROBE_BLOBS))
     prelude = bc.build_prelude_text(include_sym_pad=True, include_std_sys=False, root=root)
     lto_modules = list(got.CORE_MODULES) + [
-        ("compiler.own.cap", "compiler"),
         ("compiler.opt.alias", "compiler"),
         ("compiler.opt.memopt", "compiler"),
         ("compiler.opt.escape", "compiler"),

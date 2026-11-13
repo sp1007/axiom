@@ -8,13 +8,15 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 13
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 600
 paths: [tests/run/opt_alias, tests/run/opt_bce, tests/run/opt_escape, tests/run/opt_ipa_devirt, tests/run/opt_loop_vec, tests/run/opt_loops, tests/run/opt_lto, tests/run/opt_pgo_gc, tests/run/opt_slp_vec, tests/opt2, tests/conformance/p15]
 locks: [_workspaces/baseline-failures.txt]
 spec: [spec/decisions/ADR-0041-complete-suite-baseline-and-test-cache.md, spec/SPEC-70-optir-ssa-memoryssa.md, spec/SPEC-71-alias-escape-promotion.md, spec/SPEC-72-loops-scev-bce.md, spec/SPEC-73-inlining-specialization-devirt.md, spec/SPEC-74-auto-vectorization.md, spec/SPEC-75-lto-wpo-section-gc-pgo.md]
 covers: [REQ-OPT-176, REQ-OPT-037, REQ-OPT-307, REQ-OPT-108, REQ-OPT-219, REQ-OPT-246]
+started: 2026-11-13 11:41:33
+finished: 2026-11-13 16:19:56
 ---
 # T430 — Baseline fix: optimizer probe bundles build clean
 
@@ -54,3 +56,5 @@ The 15 optimizer engine/oracle tests listed for T430 in `_workspaces/baseline-fa
 
 ## Log
 - 2026-11-13 07:40:00 created by axiom-architect (ADR-0041, complete-suite baseline)
+- 2026-11-13 11:41:33 started (attempt 1) T430-impl
+- 2026-11-13 16:19:56 accepted by QA -> done

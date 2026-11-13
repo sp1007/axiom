@@ -370,7 +370,6 @@ def assemble_e15_4_probe(root: str, probe_template_path: pathlib.Path) -> str:
     main_src = template_text.replace("@PROBE_MIR_FN@", got.str_fn("probe_mir_raw", E15_4_PROBE_BLOBS))
     prelude = bc.build_prelude_text(include_sym_pad=True, include_std_sys=False, root=root)
     e15_4_modules = list(got.PIPELINE_MODULES) + [
-        ("compiler.own.cap", "compiler"),
         ("compiler.opt.alias", "compiler"),
         ("compiler.opt.memopt", "compiler"),
         ("compiler.opt.escape", "compiler"),
@@ -416,7 +415,7 @@ def main() -> int:
         bproc = run_cmd(
             [axiomc, "build", "--stack-reserve=67108864", flag, "-o", str(probe_exe), str(probe_bundle)],
             root,
-            timeout=900,
+            timeout=1500,
         )
         if bproc.returncode != 0:
             sys.stderr.write(

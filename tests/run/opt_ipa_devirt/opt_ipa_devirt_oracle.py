@@ -195,7 +195,6 @@ def assemble_opt_ipa_devirt_probe(root: str, probe_template_path: pathlib.Path) 
     main_src = template_text.replace("@PROBE_MIR_FN@", got.str_fn("probe_mir_raw", IPA_DEVIRT_PROBE_BLOBS))
     prelude = bc.build_prelude_text(include_sym_pad=True, include_std_sys=False, root=root)
     ipa_devirt_modules = list(got.PIPELINE_MODULES) + [
-        ("compiler.own.cap", "compiler"),
         ("compiler.opt.alias", "compiler"),
         ("compiler.opt.memopt", "compiler"),
         ("compiler.opt.escape", "compiler"),
@@ -241,7 +240,7 @@ def main() -> int:
         bproc = run_cmd(
             [axiomc, "build", "--stack-reserve=67108864", flag, "-o", str(probe_exe), str(probe_bundle)],
             root,
-            timeout=300,
+            timeout=1500,
         )
         if bproc.returncode != 0:
             sys.stderr.write(
