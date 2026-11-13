@@ -66,6 +66,17 @@ never "the board is empty".
    paths/locks of running tasks and of a running unblock, returns a critical task (priority < 10)
    alone once nothing runs, and returns nothing while a critical task runs or waits (drain) — idle
    slots then are expected, not a stall.
+9b. **Periodic full run** (owner decision 2026-11-13; rules in `.claude/agents/axiom-qa.md`):
+   `python $S/fullrun.py due` — exit 0 (10 tasks accepted since the last full run, or a phase gate
+   was accepted) and nothing running: `python $S/fullrun.py start`, then spawn `axiom-qa`
+   (`name: "fullrun-<n>"`, `model: sonnet`, background) on a snapshot of HEAD
+   (`taskctl.py snapshot fullrun-<n>` is not available: use `git worktree`-free copy `build-snap-fullrun-<n>`
+   made with `git archive HEAD | tar -x`) to run the ENTIRE suite incl. all `tests/selfhost/**`, resumable,
+   progress in `_workspaces/reports/fullrun-<n>.md`. Start it only when a slot is free (it counts as one
+   running job). When it reports: new failing ids (not in `_workspaces/baseline-failures.txt`) → bisect
+   the accepted commits since the last full run, create a priority-0 fix task for the culprit's owner
+   (architect, `taskctl.py new-id`), `fullrun.py finish`; no new ids → `fullrun.py finish --clean`.
+   Exit 1/3: nothing to do.
 10. **Finished or stuck?** Only when nothing is running and steps 8–9 started nothing:
     - `python $S/autopilot.py check-board` — exit 0: the board is finished → completion steps in
       tu-dong. Exit 2: board error or tasks vanished → log, run `taskctl.py validate`, do **not**
