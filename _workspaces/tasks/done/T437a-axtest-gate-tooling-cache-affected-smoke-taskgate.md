@@ -8,14 +8,14 @@ model: opus
 gate_model: opus
 depends: []
 priority: 10
-status: doing
+status: done
 attempts: 1
 timeout_min: 600
 paths: [tools/axtest.py, tools/axtest_cache.py, tools/axtest_affected.py, tools/affected_map.txt, tools/taskgate.py, tools/tests/axtest, tools/tests/taskgate, tests/smoke.list]
 spec: [spec/decisions/ADR-0041-complete-suite-baseline-and-test-cache.md, spec/SPEC-20-selfhost.md]
 covers: [REQ-TST-056, REQ-TST-057]
 started: 2026-11-13 11:33:06
-agent: T437a-impl
+finished: 2026-11-13 16:29:02
 ---
 # T437a — Per-task gate tooling: cache, affected set, smoke set, baseline check, one-command gate
 
@@ -110,3 +110,4 @@ this task edits nothing under `compiler/`, `std/`, `tests/selfhost/` or `bootstr
 - 2026-11-13 created by axiom-architect: split of T437 (owner decision 2026-11-13, first in line; ADR-0041 §6)
 - 2026-11-13 11:31:02 T437 superseded: runner part here, compiler --dep-file part in T437b
 - 2026-11-13 11:33:06 started (attempt 1) T437a-impl
+- 2026-11-13 16:29:02 accepted by QA -> done

@@ -25,8 +25,15 @@ runner directive, kind and state can be proven without the real compiler:
     //@ compile-exit N    exit code of the compiler step (default 0; with `ice` default 3)
     //@ emit EXT TEXT     stdout of `inspect --emit=EXT`
 
+    //@ append FILE TEXT  (T437a) append the line TEXT to FILE (relative to the current directory)
+    //@ dep PATH          (T437a) a file the compiler "loads" (path relative to the current directory);
+                          listed in the --dep-file output
+
 Environment: STUB_FEATURES (comma list, default `interp,native`), STUB_NO_FEATURES_CMD=1 (behave like a
 compiler that has no --features command: usage error, exit 2), STUB_FEATURES_CRASH=1.
+STUB_DEP_FILE=1 (T437a): honour `--dep-file=<path>` (ADR-0041 S2): write one `path sha256` line per loaded
+file (the input source and every `//@ dep` file), sorted; without it the flag is an ordinary unknown flag
+and no file is written (a compiler that predates the flag).
 """
 
 import json
@@ -125,6 +132,10 @@ def run_program(src, flags, mode, args=None, input_path=None):
                 return 99
         elif op == "sleep":
             time.sleep(float(rest))
+        elif op == "append":
+            fname, _, text = rest.partition(" ")
+            with open(fname, "a", encoding="utf-8", newline="\n") as fh:
+                fh.write(text + "\n")
         elif op == "echo-args":
             w(sys.stdout, ("args=" + "|".join(args) + "\n").encode("utf-8"))
         elif op == "echo-env":
@@ -189,7 +200,41 @@ def src_of(inp):
     return inp
 
 
+def write_dep_file(dep_path, inp):
+    import hashlib
+    files = set()
+    if inp is not None:
+        files.add(inp.replace("\\", "/"))
+        for op, rest in read_lines(inp):
+            if op == "dep":
+                files.add(rest.strip())
+    lines = []
+    for f in sorted(files):
+        try:
+            with open(f, "rb") as fh:
+                h = hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            continue
+        lines.append("%s %s\n" % (f, h))
+    with open(dep_path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("".join(lines))
+
+
 def main(argv):
+    dep_path = None
+    if os.environ.get("STUB_DEP_FILE"):
+        kept = []
+        for a in argv:
+            if a.startswith("--dep-file="):
+                dep_path = a[len("--dep-file="):]
+            else:
+                kept.append(a)
+        argv = kept
+    rc = main_inner(argv, dep_path)
+    return rc
+
+
+def main_inner(argv, dep_path=None):
     if not argv:
         sys.stderr.write("usage: stubcc <command>\n")
         return 2
@@ -212,6 +257,8 @@ def main(argv):
     if cmd == "check":
         flags, inp, _o, _a = split_args(rest)
         inp = src_of(inp)
+        if dep_path:
+            write_dep_file(dep_path, inp)
         rc = compile_phase(inp)
         diags = []
         for op, text in read_lines(inp):
@@ -243,6 +290,8 @@ def main(argv):
             elif not a.startswith("-"):
                 files.append(a)
         inp = src_of(files[-1])
+        if dep_path:
+            write_dep_file(dep_path, inp)
         rc = compile_phase(inp)
         if rc is not None:
             return rc
@@ -261,6 +310,8 @@ def main(argv):
             sys.stderr.write("stubcc: only run --interp is supported\n")
             return 2
         flags = [f for f in flags if f != "--interp"]
+        if dep_path:
+            write_dep_file(dep_path, inp)
         rc = compile_phase(inp)
         if rc is not None:
             return rc
@@ -268,6 +319,8 @@ def main(argv):
     if cmd == "build":
         flags, inp, out, _a = split_args(rest)
         inp = src_of(inp)
+        if dep_path:
+            write_dep_file(dep_path, inp)
         rc = compile_phase(inp)
         if rc is not None:
             return rc

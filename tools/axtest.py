@@ -8,6 +8,12 @@ the test files. Python 3 standard library only. Full documentation: tests/README
 This file is written once: every test kind and directive the later tasks need is already here
 (ADR-0005 section 2). Later tasks add test files, never edit the runner.
 
+T437a (ADR-0041 §4/§6) added, without changing any result: the sound per-test result cache
+(tools/axtest_cache.py; `--cache-dir`, `--no-cache`, `--gate`, `--verify-sample`, `CACHED n` line), recorded
+durations with longest-first scheduling, `--baseline <file>`, and selection by `--id-file`, `--affected` and
+`--smoke` (tools/axtest_affected.py, tests/smoke.list, tools/affected_map.txt). The per-task QA gate runs all
+of it in one command: tools/taskgate.py.
+
 Exit status: 0 no FAIL, 1 at least one FAIL (XPASS, CRASH and TIMEOUT count as FAIL), 2 usage error.
 The last line of the normal output is `TOTAL n PASS p FAIL f SKIP s XFAIL x`
 (with --json the JSON document goes to stdout and that line to stderr).
@@ -23,8 +29,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import axtest_cache  # noqa: E402  (T437a: result cache, ADR-0041 section 4)
 
 # ----------------------------------------------------------------------------------------------
 # Constants
@@ -77,6 +87,8 @@ DIRECTIVES = {
     "skip-unless": "multi",
     "requires": "multi",
     "emit": "multi",
+    "nocache": "single",        # T437a: never cache this test (S4)
+    "cache-inputs": "multi",    # T437a: every input of a `cmd:` test (paths relative to the root)
 }
 
 
@@ -101,6 +113,17 @@ def failed(msg, detail=""):
 
 def skipped(reason):
     return Outcome("SKIP", reason)
+
+
+def static_skip(reason):
+    """A run function that skips without calling the compiler (marked for the cache)."""
+    def fn():
+        return skipped(reason)
+    fn._static_skip = True
+    return fn
+
+
+_TLS = threading.local()   # per worker thread: the `--dep-file` sink of the test group being run
 
 
 # ----------------------------------------------------------------------------------------------
@@ -315,6 +338,8 @@ class Test:
         self.requires = []
         self.cmd = None
         self.input_override = None
+        self.nocache = False
+        self.cache_inputs = []
 
     def has_directive(self, name, value=None):
         for _ln, raw in self.dirs.get(name, []):
@@ -506,6 +531,13 @@ def parse_directives(test, found):
             test.requires.append(r)
         else:
             err(ln, "`requires:` needs a name")
+    if test.dirs.get("nocache"):
+        test.nocache = True
+    for ln, raw in test.dirs.get("cache-inputs", []):
+        try:
+            test.cache_inputs.extend(shlex.split(raw))
+        except ValueError as e:
+            err(ln, "`cache-inputs:` %s" % e)
     for ln, raw in test.dirs.get("emit", []):
         for ext in raw.split():
             if re.fullmatch(r"[a-z][a-z0-9_]*", ext) and ext not in NON_GOLDEN_EXT:
@@ -612,6 +644,9 @@ class Entry:
         self.label = label
         self.run = run
         self.preset = preset
+        # a skip decided before running (no compiler call): never part of a cache record
+        self.static_skip = bool(getattr(run, "_static_skip", False))
+        self.cached = False
 
     @property
     def name(self):
@@ -652,7 +687,14 @@ class Runner:
         return []
 
     def compiler_cmd(self, *args):
-        return exe_cmd(self.compiler) + [str(a) for a in args]
+        args = [str(a) for a in args]
+        sink = getattr(_TLS, "dep_sink", None)
+        if sink is not None and args and args[0] in ("run", "build", "check", "inspect"):
+            # T437a: ask the compiler for the files it loaded (`--dep-file`, ADR-0041 S2)
+            dep = os.path.join(sink["dir"], "deps%d.txt" % len(sink["files"]))
+            sink["files"].append(dep)
+            args = [args[0], "--dep-file=" + dep] + args[1:]
+        return exe_cmd(self.compiler) + args
 
     @property
     def features(self):
@@ -744,7 +786,7 @@ class Runner:
 
     def _with_skip(self, skip, fn):
         if skip:
-            return lambda: skipped(skip)
+            return static_skip(skip)
         return fn
 
     def run_entries(self, test, skip):
@@ -760,13 +802,13 @@ class Runner:
         entries = []
         for label, mode, extra in variants:
             if skip:
-                run = (lambda s=skip: skipped(s))
+                run = static_skip(skip)
             elif mode == "native" and test.native_after:
-                run = (lambda t=test.native_after: skipped("native after " + t))
+                run = static_skip("native after " + test.native_after)
             elif mode not in self.features:
-                run = (lambda m=mode: skipped("mode unavailable: " + m))
+                run = static_skip("mode unavailable: " + mode)
             elif label == "native-O1" and "native" not in self.features:
-                run = (lambda: skipped("mode unavailable: native"))
+                run = static_skip("mode unavailable: native")
             else:
                 run = (lambda m=mode, x=extra, lbl=label: self.run_program(test, m, x, lbl, ctx))
             entries.append(Entry(test, label, run))
@@ -1126,7 +1168,7 @@ def build_parser():
     ap.add_argument("--root", default=str(Path(__file__).resolve().parent.parent),
                     help="repository root; tests are read from <root>/tests (default: parent of tools/)")
     ap.add_argument("-j", "--jobs", type=int, default=min(8, os.cpu_count() or 1), metavar="N",
-                    help="tests run in parallel (default min(8, cpus))")
+                    help="tests run in parallel (default min(8, cpus)); the longest known tests start first")
     ap.add_argument("--timeout-scale", type=float, default=1.0, metavar="N",
                     help="multiply every step timeout by N (default 1)")
     ap.add_argument("--exclude-requires", action="append", default=[], metavar="NAME",
@@ -1134,14 +1176,47 @@ def build_parser():
     ap.add_argument("--verbose", "-v", action="store_true", help="print every result and failure details")
     ap.add_argument("--json", action="store_true",
                     help="machine-readable results as one JSON document on stdout "
-                         "(the TOTAL line goes to stderr)")
+                         "(the TOTAL line and the selection/cache/baseline lines go to stderr)")
     ap.add_argument("--bless", action="store_true",
-                    help="rewrite the golden files of the selected golden tests (review the diff!)")
+                    help="rewrite the golden files of the selected golden tests (review the diff!); "
+                         "never uses the result cache")
     ap.add_argument("--list", action="store_true", help="list the selected test ids and exit")
     ap.add_argument("--list-directive", metavar="NAME[:VALUE]",
                     help="list files that carry the directive (e.g. native-after:T033) and exit")
     ap.add_argument("--exe-suffix", default=".exe" if os.name == "nt" else "",
                     help=argparse.SUPPRESS)  # self-test hook: stub compilers write .py "executables"
+    # -- T437a: result cache (ADR-0041 section 4) -------------------------------------------------
+    g = ap.add_argument_group("result cache (ADR-0041 S1-S8)")
+    g.add_argument("--cache-dir", default=None, metavar="DIR",
+                   help="cache directory (default <main checkout>/_workspaces/artifacts/axtest-cache; a snapshot "
+                        "shares the main checkout's cache)")
+    g.add_argument("--no-cache", action="store_true",
+                   help="never report a cached result (every selected test runs); fresh PASS results are still "
+                        "recorded")
+    g.add_argument("--gate", action="store_true",
+                   help="QA gate mode (S5): use only entries produced inside a build-snap-* snapshot whose base "
+                        "commit is an ancestor of HEAD; implies --verify-sample")
+    g.add_argument("--verify-sample", nargs="?", const=-1, type=int, default=None, metavar="SEED",
+                   help="re-run max(20, 5%%) of the cache hits fresh (S6); seed printed; a mismatch disables "
+                        "the cache for the run")
+    g.add_argument("--cache-max-mb", type=int, default=1024, metavar="MB",
+                   help="LRU bound of the cache entries (default 1024)")
+    # -- T437a: selection -----------------------------------------------------------------------
+    s = ap.add_argument_group("selection (T437a)")
+    s.add_argument("--id-file", metavar="PATH",
+                   help="run exactly the test ids listed in PATH (one per line, `#` comments)")
+    s.add_argument("--affected", nargs="+", metavar="CHANGE",
+                   help="select the tests affected by a change set: a git range `A..B`, `@file` (one changed "
+                        "path per line) or paths; prints the derivation of every id")
+    s.add_argument("--smoke", action="store_true",
+                   help="select the smoke set of tests/smoke.list (always: ids + one id per group pool)")
+    s.add_argument("--seed", type=int, default=None, metavar="N",
+                   help="seed of the smoke draw (default: derived from the change set)")
+    s.add_argument("--check", action="store_true",
+                   help="with --smoke: validate tests/smoke.list and its duration bound, then exit")
+    s.add_argument("--baseline", metavar="FILE",
+                   help="after the run print BASELINE OK or NEW FAILURES: <ids> (+ BASELINE NOW PASSING: "
+                        "<ids>); the exit status is unchanged")
     return ap
 
 
@@ -1149,6 +1224,341 @@ def select(tests, filters):
     if not filters:
         return tests
     return [t for t in tests if any(f in t.id for f in filters)]
+
+
+def read_id_file(path):
+    ids = []
+    with open(path, "rb") as f:
+        for line in f.read().decode("utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                ids.append(line.split()[0])
+    return ids
+
+
+def read_baseline(path):
+    """First column of every non-comment line (ADR-0041 section 1)."""
+    return set(read_id_file(path))
+
+
+FAIL_STATES = ("FAIL", "XPASS", "CRASH", "TIMEOUT")
+
+
+def baseline_report(results, baseline):
+    """(new failing ids, baseline ids now passing) by test id (all modes of an id share its line)."""
+    failing = set()
+    ran = {}
+    for e, o, _ms in results:
+        tid = e.test.id
+        st = ran.setdefault(tid, set())
+        st.add(o.state)
+        if o.state in FAIL_STATES:
+            failing.add(tid)
+    new = sorted(failing - baseline)
+    now_passing = sorted(t for t in baseline if t in ran and t not in failing and "PASS" in ran[t])
+    return new, now_passing
+
+
+# ----------------------------------------------------------------------------------------------
+# Cache plumbing (T437a)
+# ----------------------------------------------------------------------------------------------
+
+class Plan:
+    """How one test group (all entries of one test) is executed: cached, fresh, or fresh for the sample."""
+
+    def __init__(self, grp):
+        self.grp = grp
+        self.test = grp[0].test
+        self.real = [e for e in grp if e.preset is None and not e.static_skip]
+        self.cacheable = False
+        self.reason = None
+        self.pre = None
+        self.prekey = None
+        self.deps_before = None
+        self.rec = None          # a valid cache record (hit)
+        self.verify = False      # hit chosen for the verification sample: run fresh
+        self.estimate = 0
+        self.source = None       # dep_source: exact | superset
+        self.guard_before = None
+
+
+def dkey(label):
+    """Key of a mode in durations.json (the empty label of ui/golden-less/exec entries is `-`)."""
+    return label or "-"
+
+
+def runner_module_files():
+    here = Path(__file__).resolve().parent
+    return sorted(str(p) for p in here.glob("axtest*.py"))
+
+
+class CacheGlue:
+    """Builds key material for the runner's tests and runs/stores the groups."""
+
+    def __init__(self, runner, cache, dep_mode):
+        self.runner = runner
+        self.cache = cache
+        self.dep_mode = dep_mode
+        self.std_dir = None
+        if runner.std_root_args:
+            sp = Path(runner.std_root_args[1])
+            self.std_dir = sp if sp.is_absolute() else runner.root / sp
+        self.std_index = axtest_cache.StdIndex(self.std_dir)
+        self.std_rel = cache.rel(self.std_dir) if self.std_dir else None
+
+    # -- S4 ----------------------------------------------------------------------------------
+    def uncacheable_reason(self, test, real):
+        if not real:
+            return "nothing to run"
+        if test.errors:
+            return "invalid test"
+        if test.nocache:
+            return "nocache:"
+        if test.requires or test.skip_unless:
+            return "requires/skip-unless host feature"
+        if test.xfail is not None:
+            return "xfail"
+        if test.kind == "exec" and not test.cache_inputs:
+            return "cmd: test without cache-inputs:"
+        # conservative in both dependency modes: the test's own sources and the std modules they reach
+        texts = []
+        for f in self.source_files(test):
+            try:
+                texts.append(Path(f).read_bytes().decode("utf-8", "replace"))
+            except OSError:
+                pass
+        r = self.std_index.nondet_reason(texts)
+        if r:
+            return "nondeterministic (%s)" % r
+        return None
+
+    def source_files(self, test):
+        p = Path(test.path)
+        files = []
+        if p.is_dir():
+            files.extend(sorted(p.rglob("*.ax")))
+        else:
+            files.append(p)
+        inp = Path(test.input)
+        if inp != p:
+            if inp.is_dir():
+                files.extend(sorted(inp.rglob("*.ax")))
+            elif inp.is_file():
+                files.append(inp)
+        return files
+
+    def test_dir(self, test):
+        p = Path(test.path)
+        return p if p.is_dir() else p.parent
+
+    # -- S1 ----------------------------------------------------------------------------------
+    def pre_material(self, test, labels, dep_source):
+        r = self.runner
+        c = self.cache
+        p = Path(test.path)
+        if p.is_dir():
+            test_bytes = "tree:" + c.hasher.tree(p)
+        else:
+            test_bytes = c.hasher.file(p) or "missing"
+        expect = {}
+        if test.kind == "golden":
+            for ext in test.golden_exts:
+                g = p.with_name(p.stem + "." + ext)
+                expect[c.rel(g)] = c.hasher.file(g) or "absent"
+        if test.stdout_file is not None:
+            g = p.parent / test.stdout_file
+            expect[c.rel(g)] = c.hasher.file(g) or "absent"
+        env = {}
+        penv = r.program_env(test)
+        for k in sorted(penv):
+            if k == "AXIOM_STD" or k.startswith("AXIOM") or k.startswith("AX_"):
+                env[k] = penv[k]
+        return {
+            "schema": axtest_cache.SCHEMA,
+            "compiler": c.compiler_sha,
+            "runner": c.runner_sha,
+            "test": test.id,
+            "kind": test.kind,
+            "labels": labels,
+            "features": sorted(r.features),
+            "options": {"std_root_args": list(r.std_root_args), "timeout_scale": r.timeout_scale,
+                        "exe_suffix": r.exe_suffix, "exclude_requires": sorted(r.exclude_requires)},
+            "env": env,
+            "argv": {"input": r.input_arg(test), "flags": r.common_flags(test), "args": list(test.args),
+                     "cmd": test.cmd},
+            "test_bytes": test_bytes,
+            "expect": expect,
+            "platform": c.platform,
+            "dep_source": dep_source,
+        }
+
+    def superset_deps(self, test):
+        c = self.cache
+        tdir = self.test_dir(test)
+        deps = [["tree", c.rel(tdir)]]
+        inp = Path(test.input)
+        try:
+            inp.resolve().relative_to(tdir.resolve())
+        except ValueError:
+            deps.append(["tree", c.rel(inp if inp.is_dir() else inp.parent)])
+        if self.std_dir is not None:
+            deps.append(["tree", c.rel(self.std_dir)])
+        for ci in test.cache_inputs:
+            q = c.abs(ci)
+            deps.append(["tree" if q.is_dir() else "file?", c.rel(q)])
+        deps.extend(c.ancestor_toml_deps(tdir if not Path(test.path).is_dir() else tdir.parent))
+        return deps
+
+    def guard_deps(self, test):
+        c = self.cache
+        tdir = self.test_dir(test)
+        deps = [["dirlist", c.rel(tdir)]]
+        deps.extend(c.ancestor_toml_deps(tdir if not Path(test.path).is_dir() else tdir.parent))
+        return deps
+
+    def prepare(self, plan):
+        test = plan.test
+        reason = self.uncacheable_reason(test, plan.real)
+        if reason:
+            plan.reason = reason
+            return
+        exact = self.dep_mode == "exact" and test.kind != "exec"
+        source = "exact" if exact else "superset"
+        labels = [e.label for e in plan.real]
+        plan.pre = self.pre_material(test, labels, source)
+        plan.prekey = axtest_cache.sha256_bytes(axtest_cache.canonical(plan.pre).encode("utf-8"))
+        plan.cacheable = True
+        plan.source = source
+        if not exact:
+            plan.deps_before = self.cache.with_digests(self.superset_deps(test), memo=True)
+        else:
+            plan.guard_before = self.cache.with_digests(self.guard_deps(test))
+        plan.rec = self.cache.lookup(plan.prekey, plan.pre)
+
+    def run_fresh(self, plan, store=True):
+        """Execute the group; store a PASS record when allowed (S2/S3)."""
+        c = self.cache
+        use_sink = store and plan.cacheable and c.write and plan.source == "exact"
+        sink = None
+        if use_sink:
+            sink = {"dir": tempfile.mkdtemp(prefix="axtest-deps-"), "files": []}
+            _TLS.dep_sink = sink
+        try:
+            res = [execute_entry(e) for e in plan.grp]
+        finally:
+            _TLS.dep_sink = None
+        try:
+            if store and plan.cacheable and c.write:
+                self._store(plan, res, sink)
+        except Exception as e:   # a cache problem must never change a result
+            c.skip_store("store error: %s" % type(e).__name__)
+        finally:
+            if sink is not None:
+                shutil.rmtree(sink["dir"], ignore_errors=True)
+        return res
+
+    def _store(self, plan, res, sink):
+        c = self.cache
+        results = {}
+        for e, o, ms in res:
+            if e in plan.real:
+                if o.state != "PASS":
+                    c.skip_store("not PASS")
+                    return
+                results[e.label] = {"state": "PASS", "ms": ms, "msg": o.msg}
+        test = plan.test
+        labels = [e.label for e in plan.real]
+        pre_after = self.pre_material(test, labels, plan.source)
+        if pre_after != plan.pre:
+            c.skip_store("inputs changed during the run")
+            return
+        if plan.source == "superset":
+            after = c.with_digests(self.superset_deps(test))
+            c.store(test.id, plan.prekey, plan.pre, plan.deps_before, after, results, "superset")
+            return
+        # exact: every compiler invocation must have written its dependency list
+        reported = {}
+        if not sink["files"]:
+            c.skip_store("no compiler invocation")
+            return
+        for f in sink["files"]:
+            lst = axtest_cache.parse_dep_file(f)
+            if lst is None:
+                c.skip_store("compiler wrote no dependency file")
+                return
+            for path, sha in lst:
+                rel = c.rel(c.abs(path))
+                if reported.get(rel, sha) != sha:
+                    c.skip_store("inconsistent dependency hashes")
+                    return
+                reported[rel] = sha
+        nd = axtest_cache.exact_deps_nondet(sorted(reported), self.std_rel, self.std_index, c.root)
+        if nd:
+            c.skip_store("nondeterministic (%s)" % nd)
+            return
+        guard_after = c.with_digests(self.guard_deps(test))
+        if guard_after != plan.guard_before:
+            c.skip_store("inputs changed during the run")
+            return
+        before = [["file", r, s] for r, s in sorted(reported.items())]
+        dirs = sorted({posixpath_parent(r) for r in reported})
+        kinds = [["file", r] for r in sorted(reported)] + [["dirlist", d] for d in dirs] + \
+            [[k, r] for k, r, _d in guard_after]
+        after_all = c.with_digests(kinds)
+        after_files = [x for x in after_all if x[0] == "file"]
+        if after_files != before:
+            c.skip_store("dependency changed during the run")
+            return
+        c.store(test.id, plan.prekey, plan.pre, after_all, after_all, results, "exact",
+                exact_paths=sorted(reported))
+
+
+def posixpath_parent(rel):
+    i = rel.rfind("/")
+    return rel[:i] if i > 0 else "."
+
+
+def hit_results(plan):
+    out = []
+    for e in plan.grp:
+        if e in plan.real:
+            e.cached = True
+            ms = 0
+            msg = ""
+            try:
+                r = plan.rec["results"][e.label]
+                ms = int(r.get("ms", 0))
+                msg = str(r.get("msg", ""))
+            except (KeyError, TypeError, ValueError, AttributeError):
+                ms = 0
+            out.append((e, passed(msg), ms))   # same message as the run that produced the entry
+        else:
+            out.append(execute_entry(e))
+    return out
+
+
+def estimate_ms(test, entries, durations):
+    known = durations.get(test.id) or {}
+    total = 0
+    for e in entries:
+        if dkey(e.label) in known:
+            total += int(known[dkey(e.label)])
+        elif e.preset is not None or e.static_skip:
+            continue
+        else:
+            # unknown: half of the declared step timeout, else 0.5 s
+            total += int((test.timeout or 1.0) * 500)
+    return total
+
+
+def change_seed(root, changed=None):
+    """Default smoke seed: hash of the change set (each gate draws differently within a group)."""
+    if changed is not None:
+        data = "\n".join(sorted(changed)).encode("utf-8")
+        h = axtest_cache.sha256_bytes(data)
+    else:
+        h = axtest_cache.changeset_digest(root) or ("0" * 64)
+    return int(h[:8], 16)
 
 
 def main(argv=None):
@@ -1161,8 +1571,58 @@ def main(argv=None):
     opts = ap.parse_args(argv)
     if opts.jobs < 1 or opts.timeout_scale <= 0:
         ap.error("-j must be >= 1 and --timeout-scale > 0")
+    if opts.check and not opts.smoke:
+        ap.error("--check needs --smoke")
     root = Path(native_path(opts.root)).resolve()
-    tests = select(discover(root / "tests"), opts.filters + opts.filter)
+    info_stream = sys.stderr if opts.json else sys.stdout
+
+    def info(text):
+        print(text, file=info_stream)
+
+    cache_dir = Path(native_path(opts.cache_dir)).resolve() if opts.cache_dir else \
+        axtest_cache.default_cache_dir(root)
+    durations = axtest_cache.load_durations(cache_dir)
+    all_tests = discover(root / "tests")
+
+    import axtest_affected  # noqa: E402  (selection: --affected, --smoke)
+
+    if opts.smoke and opts.check:
+        return axtest_affected.smoke_check_main(root, all_tests, durations, info)
+
+    tests = all_tests
+    selected = None          # set of ids, or None for "everything"
+    doc_extra = {}
+    if opts.id_file:
+        selected = set(read_id_file(native_path(opts.id_file)))
+        unknown = sorted(selected - {t.id for t in all_tests})
+        for u in unknown:
+            info("UNKNOWN-ID %s" % u)
+    changed_for_seed = None
+    if opts.affected:
+        try:
+            aff = axtest_affected.derive(root, opts.affected, all_tests, cache_dir)
+        except axtest_affected.AffectedError as e:
+            print("axtest: --affected: %s" % e, file=sys.stderr)
+            return 2
+        for line in aff.lines():
+            info(line)
+        changed_for_seed = aff.changed
+        selected = (selected or set()) | set(aff.ids)
+        doc_extra["affected"] = aff.as_dict()
+    if opts.smoke:
+        seed = opts.seed if opts.seed is not None else change_seed(root, changed_for_seed)
+        try:
+            sm = axtest_affected.smoke_select(root, all_tests, seed)
+        except axtest_affected.AffectedError as e:
+            print("axtest: --smoke: %s" % e, file=sys.stderr)
+            return 2
+        for line in sm.lines():
+            info(line)
+        selected = (selected or set()) | set(sm.ids)
+        doc_extra["smoke"] = sm.as_dict()
+    if selected is not None:
+        tests = [t for t in tests if t.id in selected]
+    tests = select(tests, opts.filters + opts.filter)
 
     if opts.list_directive:
         name, _, value = opts.list_directive.partition(":")
@@ -1183,11 +1643,123 @@ def main(argv=None):
                 print(e.name)
         return 0
 
+    # -- result cache ----------------------------------------------------------------------
+    plans = [Plan(g) for g in entry_groups]
+    cache = None
+    glue = None
+    if not opts.bless:
+        _ = runner.features            # probe outside the worker threads
+        cache = axtest_cache.Cache(cache_dir, root, runner.compiler, runner_module_files(),
+                                   read=not opts.no_cache, write=True, gate=opts.gate,
+                                   max_bytes=max(1, opts.cache_max_mb) << 20)
+        dep_mode = cache.dep_mode(runner.compiler_cmd, runner.std_root_args)
+        glue = CacheGlue(runner, cache, dep_mode)
+        for p in plans:
+            try:
+                glue.prepare(p)
+            except Exception as e:   # never let a cache problem hide a test: run it fresh
+                p.cacheable = False
+                p.rec = None
+                p.reason = "cache error: %s" % type(e).__name__
+    hits = [p for p in plans if p.rec is not None]
+    sample_seed = None
+    if cache is not None and hits and (opts.gate or opts.verify_sample is not None):
+        import math
+        import random
+        sample_seed = opts.verify_sample if (opts.verify_sample is not None and opts.verify_sample >= 0) \
+            else random.SystemRandom().randrange(1 << 31)
+        n = min(len(hits), max(20, int(math.ceil(len(hits) * 0.05))))
+        for p in random.Random(sample_seed).sample(sorted(hits, key=lambda q: q.test.id), n):
+            p.verify = True
+
+    for p in plans:
+        p.estimate = 0 if (p.rec is not None and not p.verify) else estimate_ms(p.test, p.grp, durations)
+    order = sorted(plans, key=lambda p: (-p.estimate, p.test.id))   # longest first
+
+    def run_plan(p):
+        if glue is None:
+            return execute_group(p.grp)
+        if p.rec is not None and not p.verify:
+            return hit_results(p)
+        return glue.run_fresh(p, store=not p.verify)
+
     results = []
+    plan_results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=opts.jobs) as pool:
-        for grp_res in pool.map(execute_group, entry_groups):
-            results.extend(grp_res)
+        for p, grp_res in zip(order, pool.map(run_plan, order)):
+            plan_results[id(p)] = grp_res
+
+    mismatch = []
+    if cache is not None:
+        for p in plans:
+            if p.verify:
+                bad = [(e.label, o.state) for e, o, _ms in plan_results[id(p)] if e in p.real and o.state != "PASS"]
+                if bad:
+                    mismatch.append(p.test.id)
+                    cache.delete_record(p.rec)
+        if mismatch:
+            # S6: the cache is suspect for this run: every other hit runs fresh, nothing is stored
+            cache.write = False
+            rerun = [p for p in plans if p.rec is not None and not p.verify]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=opts.jobs) as pool:
+                for p, grp_res in zip(rerun, pool.map(lambda q: glue.run_fresh(q, store=False), rerun)):
+                    for e in p.grp:
+                        e.cached = False
+                    plan_results[id(p)] = grp_res
+    for p in plans:
+        results.extend(plan_results[id(p)])
     results.sort(key=lambda r: (r[0].test.id, r[0].label))
+
+    # durations (hits keep the recorded duration of the run that produced them)
+    if not opts.bless:
+        upd = {}
+        for e, o, ms in results:
+            if e.preset is not None or e.static_skip or o.state == "SKIP":
+                continue
+            upd.setdefault(e.test.id, {})[dkey(e.label)] = ms
+        try:
+            axtest_cache.save_durations(cache_dir, upd)
+        except Exception:
+            pass
+    if cache is not None and cache.stored:
+        try:
+            cache.prune()
+        except Exception:
+            pass
+
+    cached_n = sum(1 for e, _o, _ms in results if e.cached)
+    cache_lines = []
+    if cache is not None:
+        # CACHED = results reported without running; HITS = test ids with a valid entry (a hit drawn for the
+        # S6 verification sample runs fresh and is not CACHED); MISS = cacheable ids without a valid entry
+        miss_n = sum(1 for p in plans if p.cacheable and p.rec is None)
+        cache_lines.append("CACHED %d HITS %d MISS %d UNCACHEABLE %d STORED %d dep_source=%s%s" % (
+            cached_n, len(hits), miss_n, sum(1 for p in plans if not p.cacheable), cache.stored,
+            glue.dep_mode, " (reads disabled: --no-cache)" if opts.no_cache else ""))
+        if sample_seed is not None:
+            cache_lines.append("VERIFY-SAMPLE seed=%d n=%d of %d hits" % (
+                sample_seed, sum(1 for p in plans if p.verify), len(hits)))
+        if mismatch:
+            cache_lines.append("CACHE-MISMATCH %s (cache disabled for this run; finding against the cache)"
+                               % " ".join(sorted(mismatch)))
+        if cache.rejected:
+            cache_lines.append("CACHE-REJECTED " + " ".join("%s=%d" % kv for kv in sorted(cache.rejected.items())))
+        if cache.deleted_corrupt:
+            cache_lines.append("CACHE-CORRUPT-DELETED %d" % cache.deleted_corrupt)
+
+    baseline_lines = []
+    base_doc = None
+    if opts.baseline:
+        try:
+            base = read_baseline(native_path(opts.baseline))
+        except OSError as e:
+            print("axtest: cannot read baseline %s: %s" % (opts.baseline, e), file=sys.stderr)
+            return 2
+        new, now_passing = baseline_report(results, base)
+        baseline_lines.append("BASELINE OK" if not new else "NEW FAILURES: " + " ".join(new))
+        if now_passing:
+            baseline_lines.append("BASELINE NOW PASSING: " + " ".join(now_passing))
+        base_doc = {"file": opts.baseline, "ok": not new, "new_failures": new, "now_passing": now_passing}
 
     weak_entries = [e for e, o, _ms in results if is_weak_native_evidence(e, o)]
     line = total_line(results)
@@ -1200,16 +1772,31 @@ def main(argv=None):
             "features": sorted(runner.features),
             "results": [
                 {"id": e.test.id, "mode": e.label, "state": o.state, "message": o.msg, "ms": ms,
-                 "weak_native_evidence": is_weak_native_evidence(e, o)}
+                 "weak_native_evidence": is_weak_native_evidence(e, o), "cached": e.cached}
                 for e, o, ms in results
             ],
             "counts": {"total": total, "pass": counts["PASS"], "fail": fail, "skip": counts["SKIP"],
                        "xfail": counts["XFAIL"], "xpass": counts["XPASS"], "crash": counts["CRASH"],
-                       "timeout": counts["TIMEOUT"], "weak_native": len(weak_entries)},
+                       "timeout": counts["TIMEOUT"], "weak_native": len(weak_entries), "cached": cached_n},
             "total_line": line,
         }
+        if cache is not None:
+            doc["cache"] = {
+                "dir": cache_dir.as_posix(), "dep_source": glue.dep_mode, "read": cache.read,
+                "gate": opts.gate, "cached": cached_n, "stored": cache.stored,
+                "miss": miss_n,
+                "uncacheable": sum(1 for p in plans if not p.cacheable),
+                "sample_seed": sample_seed, "sample_n": sum(1 for p in plans if p.verify),
+                "hits": len(hits), "mismatch": sorted(mismatch), "rejected": cache.rejected,
+                "producer": cache.producer.as_dict(), "store_skipped": cache.store_skipped,
+            }
+        if base_doc is not None:
+            doc["baseline"] = base_doc
+        doc.update(doc_extra)
         sys.stdout.write(json.dumps(doc, ensure_ascii=False, indent=1) + "\n")
         sys.stdout.flush()
+        for ln in cache_lines + baseline_lines:
+            print(ln, file=sys.stderr)
         print(line, file=sys.stderr)
     else:
         for e, o, ms in results:
@@ -1226,6 +1813,8 @@ def main(argv=None):
         if opts.verbose:
             for e in weak_entries:
                 print("%-7s %s" % ("WEAK", e.name))
+        for ln in cache_lines + baseline_lines:
+            print(ln)
         print("WEAK-NATIVE %d" % len(weak_entries))
         print(line)
         sys.stdout.flush()
