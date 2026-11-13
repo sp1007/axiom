@@ -1,0 +1,741 @@
+// std.asyn.group - TaskGroup structured concurrency, panic containment (SPEC-34 AXS-EXEC-020..022, T422)
+//
+// `TaskGroup` owns the `TaskHandle` reference of every child it spawns. A child can never outlive
+// the group: `join_all` waits for all of them, and `Drop` cancels whatever is still running and waits
+// until every child future has been dropped (its destructors have run) before the group's memory is
+// released. When a child fails (reports a panic with `task_panic`) the group cancels its
+// `CancellationSource` (cooperative siblings observe the token), requests cancellation of every other
+// child task, and `join_all` returns the failure deterministically: `Panicked` when any child panicked,
+// otherwise `Cancelled` (explicit `cancel_all`, group deadline or parent token); the index of the
+// first panicked child is recorded in `failure_index`.
+//
+// Children are spawned on an `Executor` with `group_poll_fn` as their poll function and then handed to
+// the group with `adopt` (see the notes there for why the group cannot call `spawn` itself).
+//
+// Panic containment: the runtime has no unwinding, so a child cannot be rescued from a real `panic`.
+// Containment is cooperative: a child calls `task_panic(cx)` and then stops; `group_poll_fn` (the poll
+// function that group children must be spawned with) tears the future down and publishes the task as
+// `TASK_PANICKED`, which handles and groups report as `TaskResult.Panicked`.
+//
+// Handles are stored as raw task headers (`*mut TaskHeader`), so the group needs no `Vec`.
+module std.asyn.group
+
+use std.core.prelude.Context
+use std.core.prelude.Future
+use std.core.prelude.Poll
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.core.option.Option
+use std.core.result.Result
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.core.host.thread_yield
+use std.core.host.monotonic_ns
+
+use std.asyn.waker.TaskHeader
+use std.asyn.waker.TASK_IDLE
+use std.asyn.waker.TASK_POLLING
+use std.asyn.waker.TASK_NOTIFIED
+use std.asyn.waker.TASK_COMPLETED
+use std.asyn.waker.TASK_CANCELLED
+use std.asyn.waker.TASK_PANICKED
+use std.asyn.waker.FLAG_CANCEL_REQUESTED
+use std.asyn.waker.task_wake
+use std.asyn.waker.task_dec_ref
+
+use std.asyn.task.TaskId
+use std.asyn.task.TaskError
+use std.asyn.task.TaskResult
+use std.asyn.task.TaskHandle
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.task_take_output
+use std.asyn.task.task_wake_join_waker
+
+use std.asyn.executor.Executor
+use std.asyn.cancel.CancellationSource
+use std.asyn.cancel.CancellationToken
+use std.asyn.timeout.Deadline
+use std.asyn.governor.ResourceGovernor
+use std.asyn.governor.ResourceKind
+use std.asyn.governor.GovInner
+use std.asyn.governor.gov_retain
+use std.asyn.governor.gov_release_ref
+use std.asyn.governor.gov_try_acquire
+use std.asyn.governor.gov_release_units
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic fn needs_drop<T>() -> bool { false }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn drop_in_place<T>(p: *mut T) {}
+
+// State flag set by `task_panic`; consumed by `group_poll_fn`.
+pub const FLAG_PANIC_REQUESTED: u32 = 0x400u32
+
+// Index of the `Tasks` quota in a governor (see std.asyn.governor.kind_index).
+const KIND_TASKS: usize = 0usize
+
+// -----------------------------------------------------------------------------
+// Panic containment
+// -----------------------------------------------------------------------------
+
+// Report that the task currently being polled has panicked. The calling future should return right
+// after (`Poll.Pending` or any value): `group_poll_fn` drops the future and publishes the task as
+// `TASK_PANICKED` once the current poll returns. Has no effect outside a task.
+pub fn task_panic(cx: mut_view<Context>) {
+    let w = cx.waker();
+    let raw = w.raw.data as *mut TaskHeader;
+    if (raw as usize) != 0 {
+        unsafe {
+            (*raw).state.fetch_or(FLAG_PANIC_REQUESTED, Ordering.Release);
+        }
+    }
+}
+
+// Drop the future stored in the control block (once) and mark the slot empty.
+unsafe fn tcb_drop_future<F, T>(tcb: *mut TaskControlBlock<F, T>) {
+    if (*tcb).has_future {
+        let mut tmp: [1]F = [*address_of_mut((*tcb).future)];
+    }
+    (*tcb).has_future = false;
+}
+
+// Ask a group task to stop: set the cancel flag, then make sure the task will observe it. A task that
+// is IDLE is moved to NOTIFIED and scheduled; a task that is already queued (NOTIFIED) or running
+// (POLLING) needs no wake: `group_poll_fn` checks the flag when a poll starts and again when a poll
+// ends. Deliberately no retry loop: `task_wake` spins on a task that keeps re-waking itself, which
+// livelocks under the oracle's deterministic scheduler.
+pub fn group_request_cancel(raw: *mut TaskHeader) {
+    if (raw as usize) == 0 {
+        return;
+    }
+    unsafe {
+        (*raw).state.fetch_or(FLAG_CANCEL_REQUESTED, Ordering.AcqRel);
+    }
+    loop {
+        let s: u32 = unsafe { (*raw).state.load(Ordering.Acquire) };
+        if (s & 0x7u32) != TASK_IDLE {
+            return;
+        }
+        let queued: u32 = (s & 0xFFFFFFF8u32) | TASK_NOTIFIED;
+        let cas = unsafe { (*raw).state.compare_exchange(s, queued, Ordering.AcqRel, Ordering.Acquire) };
+        if cas.ok {
+            let s_fn = unsafe { (*raw).schedule_fn };
+            let s_addr = unsafe { *(address_of<fn(*mut TaskHeader)>(s_fn) as *const usize) };
+            if s_addr != 0usize {
+                s_fn(raw);
+            }
+            return;
+        }
+    }
+}
+
+// Poll function for tasks spawned by a `TaskGroup` (usable for any task). Differences to
+// `std.asyn.task.tcb_poll_fn`:
+//   - flag bits (cancel / detach) are preserved across the IDLE/NOTIFIED -> POLLING -> IDLE transitions,
+//     so a cancellation requested while the task is queued or running is never lost;
+//   - a task that called `task_panic` ends as `TASK_PANICKED` (future dropped, output discarded).
+pub fn group_poll_fn<F: Future<Output = T>, T>(tcb: *mut TaskControlBlock<F, T>, cx_raw: *mut u8) -> u32 {
+    let raw = tcb as *mut TaskHeader;
+
+    // IDLE/NOTIFIED -> POLLING while keeping the flag bits; observe a pending cancellation first.
+    let mut st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) };
+    loop {
+        if (st & FLAG_CANCEL_REQUESTED) != 0u32 {
+            unsafe {
+                tcb_drop_future<F, T>(tcb);
+                (*raw).state.store(TASK_CANCELLED, Ordering.Release);
+                task_wake_join_waker(raw);
+            }
+            return TASK_CANCELLED;
+        }
+        let want: u32 = (st & 0xFFFFFFF8u32) | TASK_POLLING;
+        let cas = unsafe { (*raw).state.compare_exchange(st, want, Ordering.AcqRel, Ordering.Acquire) };
+        if cas.ok {
+            break;
+        }
+        st = cas.val;
+    }
+
+    let p_cx = cx_raw as *mut Context;
+    let poll_res = unsafe { (*tcb).future.poll(mut_view(*p_cx)) };
+    let after: u32 = unsafe { (*raw).state.load(Ordering.Acquire) };
+    let panicked: bool = (after & FLAG_PANIC_REQUESTED) != 0u32;
+
+    match poll_res {
+        Poll.Ready(val) => {
+            if panicked {
+                unsafe {
+                    tcb_drop_future<F, T>(tcb);
+                    (*raw).state.store(TASK_PANICKED, Ordering.Release);
+                    task_wake_join_waker(raw);
+                }
+                return TASK_PANICKED;
+            }
+            unsafe {
+                tcb_drop_future<F, T>(tcb);
+                (*tcb).slot.output = val;
+                (*tcb).slot.has_output = true;
+                (*raw).state.store(TASK_COMPLETED, Ordering.Release);
+                task_wake_join_waker(raw);
+            }
+            TASK_COMPLETED
+        },
+        Poll.Pending => {
+            if panicked {
+                unsafe {
+                    tcb_drop_future<F, T>(tcb);
+                    (*raw).state.store(TASK_PANICKED, Ordering.Release);
+                    task_wake_join_waker(raw);
+                }
+                return TASK_PANICKED;
+            }
+            // POLLING -> IDLE (keeping flags); when a wake raced the poll the state is NOTIFIED and
+            // the task must be queued again. A cancellation requested while the task was polling
+            // also sends it straight back to the queue: `group_request_cancel` does not wake a task
+            // that is polling or queued, it relies on this check and on the check at poll start.
+            loop {
+                let s: u32 = unsafe { (*raw).state.load(Ordering.Acquire) };
+                if (s & 0x7u32) == TASK_POLLING {
+                    if (s & FLAG_CANCEL_REQUESTED) != 0u32 {
+                        let again: u32 = (s & 0xFFFFFFF8u32) | TASK_NOTIFIED;
+                        let c2 = unsafe { (*raw).state.compare_exchange(s, again, Ordering.AcqRel, Ordering.Acquire) };
+                        if c2.ok {
+                            let s_fn2 = unsafe { (*raw).schedule_fn };
+                            let s_addr2 = unsafe { *(address_of<fn(*mut TaskHeader)>(s_fn2) as *const usize) };
+                            if s_addr2 != 0usize {
+                                s_fn2(raw);
+                            }
+                            return TASK_NOTIFIED;
+                        }
+                    } else {
+                        let idle: u32 = (s & 0xFFFFFFF8u32) | TASK_IDLE;
+                        let cas = unsafe { (*raw).state.compare_exchange(s, idle, Ordering.AcqRel, Ordering.Acquire) };
+                        if cas.ok {
+                            return TASK_IDLE;
+                        }
+                    }
+                } else {
+                    let s_fn = unsafe { (*raw).schedule_fn };
+                    let s_addr = unsafe { *(address_of<fn(*mut TaskHeader)>(s_fn) as *const usize) };
+                    if s_addr != 0usize {
+                        s_fn(raw);
+                    }
+                    return TASK_NOTIFIED;
+                }
+            }
+        },
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Results container
+// -----------------------------------------------------------------------------
+
+// Dense array of the outputs of a fully successful `join_all`, in spawn order.
+//
+// `T` appears only behind a pointer, so the struct layout does not depend on it. Operations that need
+// the real size or drop glue of `T` are free generic functions (`results_get_ptr`,
+// `results_drop_all`): methods of a generic impl cannot use their impl-level type parameter for layout
+// or drop glue today (FU-F/FU-G). `Drop` releases the storage only; call `results_drop_all` first when
+// `T` has destructors.
+pub struct GroupResults<T> {
+    pub items: *mut T,
+    pub count: usize,
+    pub cap_units: usize,
+    pub elem_size: usize,
+    pub elem_align: usize,
+}
+
+impl<T> GroupResults<T> {
+    pub fn len(self: view<GroupResults<T>>) -> usize {
+        self.count
+    }
+}
+
+// Pointer to element `i` (`i < len()`).
+pub fn results_get_ptr<T>(r: view<GroupResults<T>>, i: usize) -> *const T {
+    unsafe { (r.items + i) as *const T }
+}
+
+// Run the destructors of all elements still in the container and empty it.
+pub fn results_drop_all<T>(r: mut_view<GroupResults<T>>) {
+    let n = r.count;
+    r.count = 0usize;
+    if needs_drop<T>() {
+        let base = r.items;
+        let mut i: usize = 0usize;
+        while i < n {
+            unsafe {
+                drop_in_place<T>(base + i);
+            }
+            i = i + 1usize;
+        }
+    }
+}
+
+impl<T> Drop for GroupResults<T> {
+    fn drop(self: mut_view<GroupResults<T>>) {
+        let items = self.items as *mut u8;
+        if (items as usize) == 0 {
+            return;
+        }
+        self.items = 0 as *mut T;
+        unsafe {
+            heap_free(items, self.cap_units * self.elem_size, self.elem_align);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// TaskGroup
+// -----------------------------------------------------------------------------
+
+pub enum GroupError {
+    Cancelled,
+    QuotaExceeded(ResourceKind),
+}
+
+// Structured-concurrency scope. All children must produce the same output type `T`, named by the
+// method-level parameter of `spawn<F, T>`, `try_next<T>`, `next_blocking<T>` and `join_all<T>` (the
+// spec's `TaskGroup<T>` cannot be written yet: impl-level generics are not monomorphised, FU-F/FU-G).
+// Using different `T` for one group is undefined; the compiler infers `T` from the future in `spawn`
+// and from the annotated result type in the other calls.
+pub struct TaskGroup {
+    pub cancel_source: CancellationSource,
+    // Heap array of task headers (null = slot already reaped); `used` slots, `cap` capacity.
+    pub tasks: *mut *mut TaskHeader,
+    pub used: usize,
+    pub cap: usize,
+    // Spawned children whose result has not been collected yet.
+    pub live: usize,
+    pub failed: bool,
+    // Index of the first child observed as panicked (valid when `failed`).
+    pub failure_index: usize,
+    // `*mut GovInner` with one reference held, or null.
+    pub governor: *mut GovInner,
+    // Absolute monotonic deadline for the whole group (`u64::MAX` = none) and whether it fired.
+    pub deadline_ns: u64,
+    pub timed_out: bool,
+}
+
+unsafe impl Send for TaskGroup {}
+impl !Copy for TaskGroup {}
+
+fn raw_is_terminal(raw: *mut TaskHeader) -> bool {
+    let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) } & 0x7u32;
+    st >= TASK_COMPLETED
+}
+
+// Take the final result of a terminal task and release the group's reference to it.
+fn reap_raw<T>(raw: *mut TaskHeader) -> TaskResult<T> {
+    let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) } & 0x7u32;
+    let res: TaskResult<T> = if st == TASK_COMPLETED {
+        TaskResult.Completed(unsafe { task_take_output<T>(raw) })
+    } else if st == TASK_CANCELLED {
+        TaskResult.Cancelled
+    } else {
+        TaskResult.Panicked
+    };
+    task_dec_ref(raw);
+    res
+}
+
+impl TaskGroup {
+    pub fn new() -> TaskGroup {
+        TaskGroup {
+            cancel_source: CancellationSource.new(),
+            tasks: 0 as *mut *mut TaskHeader,
+            used: 0usize,
+            cap: 0usize,
+            live: 0usize,
+            failed: false,
+            failure_index: 0usize,
+            governor: 0 as *mut GovInner,
+            deadline_ns: 0xFFFFFFFFFFFFFFFFu64,
+            timed_out: false,
+        }
+    }
+
+    // A group whose cancellation source is a child of `parent_token`: cancelling the parent cancels
+    // the group's token (and with it the cooperative children).
+    pub fn with_cancellation(parent_token: view<CancellationToken>) -> TaskGroup {
+        TaskGroup {
+            cancel_source: CancellationSource.child_of(parent_token),
+            tasks: 0 as *mut *mut TaskHeader,
+            used: 0usize,
+            cap: 0usize,
+            live: 0usize,
+            failed: false,
+            failure_index: 0usize,
+            governor: 0 as *mut GovInner,
+            deadline_ns: 0xFFFFFFFFFFFFFFFFu64,
+            timed_out: false,
+        }
+    }
+
+    // Charge one `Tasks` unit to `gov` per live child (released when the child is collected).
+    pub fn with_governor(gov: view<ResourceGovernor>) -> TaskGroup {
+        gov_retain(gov.inner);
+        TaskGroup {
+            cancel_source: CancellationSource.new(),
+            tasks: 0 as *mut *mut TaskHeader,
+            used: 0usize,
+            cap: 0usize,
+            live: 0usize,
+            failed: false,
+            failure_index: 0usize,
+            governor: gov.inner,
+            deadline_ns: 0xFFFFFFFFFFFFFFFFu64,
+            timed_out: false,
+        }
+    }
+
+    // Bound the whole group by `deadline`: once it passes, the group cancels itself (like
+    // `cancel_all`) the next time it is polled. Narrowing only: the earlier of the old and the new
+    // deadline wins, so a parent budget can be propagated into every group below it.
+    pub fn set_deadline(self: mut_view<TaskGroup>, deadline: Deadline) {
+        let new_ns: u64 = deadline.deadline_ns;
+        let old_ns: u64 = self.deadline_ns;
+        if new_ns < old_ns {
+            self.deadline_ns = new_ns;
+        }
+    }
+
+    // True once the group deadline cancelled the group.
+    pub fn is_timed_out(self: view<TaskGroup>) -> bool {
+        self.timed_out
+    }
+
+    pub fn cancellation_token(self: view<TaskGroup>) -> CancellationToken {
+        self.cancel_source.token()
+    }
+
+    pub fn live_count(self: view<TaskGroup>) -> usize {
+        self.live
+    }
+
+    pub fn is_failed(self: view<TaskGroup>) -> bool {
+        self.failed
+    }
+
+    pub fn is_cancelled(self: view<TaskGroup>) -> bool {
+        self.cancel_source.is_cancelled()
+    }
+
+    fn grow(self: mut_view<TaskGroup>) {
+        let new_cap = if self.cap == 0usize { 8usize } else { self.cap * 2usize };
+        let word = size_of<*mut TaskHeader>();
+        let raw = unsafe { heap_alloc(new_cap * word, word) };
+        let fresh = raw as *mut *mut TaskHeader;
+        let old = self.tasks;
+        let mut i: usize = 0usize;
+        while i < new_cap {
+            unsafe {
+                if i < self.used {
+                    *(fresh + i) = *(old + i);
+                } else {
+                    *(fresh + i) = 0 as *mut TaskHeader;
+                }
+            }
+            i = i + 1usize;
+        }
+        if (old as usize) != 0 {
+            unsafe {
+                heap_free(old as *mut u8, self.cap * word, word);
+            }
+        }
+        self.tasks = fresh;
+        self.cap = new_cap;
+    }
+
+    // Take ownership of a task spawned on an `Executor` (`exec.spawn(fut, poll_fn)`): from now on the
+    // group joins, cancels and reaps it. The task must have been spawned with `group_poll_fn` as its
+    // poll function (panic containment, race-free cancellation). When the group is cancelled/failed/
+    // timed out or the governor's task quota is full, the handle is refused: it is dropped here, which
+    // cancels the task (its future is dropped by the executor) -- spawn-then-refuse is chosen over
+    // spawn-through-the-group because the generic `spawn` of the executor cannot be wrapped yet
+    // (FU-E: the concurrency checker rejects it; its output type cannot be inferred).
+    pub fn adopt<T>(self: mut_view<TaskGroup>, handle: TaskHandle<T>) -> Result<TaskId, GroupError> {
+        let mut h = handle;
+        if self.failed || self.timed_out || self.cancel_source.is_cancelled() {
+            return Result.Err(GroupError.Cancelled);
+        }
+        if (self.governor as usize) != 0 {
+            if !gov_try_acquire(self.governor, KIND_TASKS, 1u64) {
+                return Result.Err(GroupError.QuotaExceeded(ResourceKind.Tasks));
+            }
+        }
+        if self.used == self.cap {
+            mut_view(*self).grow();
+        }
+        let raw = h.raw_task;
+        let id = h.task_id;
+        // The group takes over the handle's reference: neutralise the handle so its Drop is a no-op.
+        h.raw_task = 0 as *mut TaskHeader;
+        unsafe {
+            *(self.tasks + self.used) = raw;
+        }
+        self.used = self.used + 1usize;
+        self.live = self.live + 1usize;
+        Result.Ok(id)
+    }
+
+    // Request cancellation of the group: signal the token and ask every unfinished child to stop.
+    pub fn cancel_all(self: mut_view<TaskGroup>) {
+        self.cancel_source.cancel();
+        let mut i: usize = 0usize;
+        while i < self.used {
+            let raw = unsafe { *(self.tasks + i) };
+            if (raw as usize) != 0 {
+                if !raw_is_terminal(raw) {
+                    group_request_cancel(raw);
+                }
+            }
+            i = i + 1usize;
+        }
+    }
+
+    // Detect the first panicked child and, on detection, cancel the group (fail-fast); also fire the
+    // group deadline.
+    fn poll_failure(self: mut_view<TaskGroup>) {
+        if !self.timed_out && self.live > 0usize {
+            let now: u64 = monotonic_ns();
+            let limit: u64 = self.deadline_ns;
+            if now >= limit {
+                self.timed_out = true;
+                mut_view(*self).cancel_all();
+            }
+        }
+        if self.failed {
+            return;
+        }
+        let mut i: usize = 0usize;
+        while i < self.used {
+            let raw = unsafe { *(self.tasks + i) };
+            if (raw as usize) != 0 {
+                let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) } & 0x7u32;
+                if st == TASK_PANICKED {
+                    self.failed = true;
+                    self.failure_index = i;
+                    mut_view(*self).cancel_all();
+                    return;
+                }
+            }
+            i = i + 1usize;
+        }
+    }
+
+    // Detach slot `i` from the group (accounting included) and return its task header.
+    fn take_slot(self: mut_view<TaskGroup>, i: usize) -> *mut TaskHeader {
+        let raw = unsafe { *(self.tasks + i) };
+        unsafe {
+            *(self.tasks + i) = 0 as *mut TaskHeader;
+        }
+        self.live = self.live - 1usize;
+        if (self.governor as usize) != 0 {
+            gov_release_units(self.governor, KIND_TASKS, 1u64);
+        }
+        raw
+    }
+
+    // Non-blocking: collect the result of the lowest-index finished child, if any.
+    pub fn try_next<T>(self: mut_view<TaskGroup>) -> Option<TaskResult<T>> {
+        mut_view(*self).poll_failure();
+        let mut i: usize = 0usize;
+        while i < self.used {
+            let raw = unsafe { *(self.tasks + i) };
+            if (raw as usize) != 0 {
+                if raw_is_terminal(raw) {
+                    // A child may have panicked after `poll_failure` scanned but before this scan:
+                    // record the failure here (and cancel the siblings) before the slot is reaped.
+                    let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) } & 0x7u32;
+                    if st == TASK_PANICKED && !self.failed {
+                        self.failed = true;
+                        self.failure_index = i;
+                        mut_view(*self).cancel_all();
+                    }
+                    let taken = mut_view(*self).take_slot(i);
+                    let r: TaskResult<T> = reap_raw(taken);
+                    return Option.Some(r);
+                }
+            }
+            i = i + 1usize;
+        }
+        Option.None
+    }
+
+    // Blocking: wait (yielding the OS thread) for the next finished child; `None` when the group is
+    // empty. Must not be called from a thread the children need in order to make progress.
+    pub fn next_blocking<T>(self: mut_view<TaskGroup>) -> Option<TaskResult<T>> {
+        loop {
+            if self.live == 0usize {
+                return Option.None;
+            }
+            let r: Option<TaskResult<T>> = mut_view(*self).try_next();
+            match r {
+                Option.Some(v) => {
+                    return Option.Some(v);
+                },
+                Option.None => {
+                    unsafe {
+                        thread_yield();
+                    }
+                },
+            }
+        }
+    }
+
+    // Future flavour of `next_blocking` for use inside tasks whose children return `i64`: resolves to
+    // the next finished child, or `None` when the group is empty.
+    pub fn next(self: mut_view<TaskGroup>) -> GroupNext {
+        let p = unsafe { address_of_mut(*self) as *mut TaskGroup };
+        GroupNext { group: p }
+    }
+
+    // Wait for every child. Ok(outputs in spawn order) when all completed. On the first failure the
+    // remaining children are cancelled, all of them are awaited (their futures dropped), and the
+    // failure is returned: `Panicked` (lowest-index panicked child) or else `Cancelled` (explicit
+    // `cancel_all`, group deadline, or a parent token).
+    pub fn join_all<T>(mut self: TaskGroup) -> Result<GroupResults<T>, TaskError> {
+        loop {
+            mut_view(self).poll_failure();
+            let mut all_done = true;
+            let mut i: usize = 0usize;
+            while i < self.used {
+                let raw = unsafe { *(self.tasks + i) };
+                if (raw as usize) != 0 {
+                    if !raw_is_terminal(raw) {
+                        all_done = false;
+                        break;
+                    }
+                }
+                i = i + 1usize;
+            }
+            if all_done {
+                break;
+            }
+            unsafe {
+                thread_yield();
+            }
+        }
+
+        let n = self.live;
+        let cap = if n == 0usize { 1usize } else { n };
+        let out_raw = unsafe { heap_alloc(cap * size_of<T>(), align_of<T>()) };
+        let mut results = GroupResults {
+            items: out_raw as *mut T,
+            count: 0usize,
+            cap_units: cap,
+            elem_size: size_of<T>(),
+            elem_align: align_of<T>(),
+        };
+        let out = out_raw as *mut T;
+        let mut saw_panic = false;
+        let mut saw_cancel = false;
+        let mut i: usize = 0usize;
+        while i < self.used {
+            let raw = unsafe { *(self.tasks + i) };
+            if (raw as usize) != 0 {
+                let taken = mut_view(self).take_slot(i);
+                let r: TaskResult<T> = reap_raw(taken);
+                match r {
+                    TaskResult.Completed(v) => {
+                        unsafe {
+                            *(out + results.count) = v;
+                        }
+                        results.count = results.count + 1usize;
+                    },
+                    TaskResult.Cancelled => {
+                        saw_cancel = true;
+                    },
+                    TaskResult.Panicked => {
+                        saw_panic = true;
+                    },
+                }
+            }
+            i = i + 1usize;
+        }
+        if saw_panic || saw_cancel {
+            // Failure: the collected outputs are dropped here, then the failure is reported.
+            results_drop_all(mut_view(results));
+            if saw_panic {
+                return Result.Err(TaskError.Panicked);
+            }
+            return Result.Err(TaskError.Cancelled);
+        }
+        Result.Ok(results)
+    }
+}
+
+impl Drop for TaskGroup {
+    fn drop(self: mut_view<TaskGroup>) {
+        if (self.tasks as usize) == 0 {
+            // Never spawned anything (or already torn down).
+            gov_release_ref(self.governor);
+            self.governor = 0 as *mut GovInner;
+            return;
+        }
+        mut_view(*self).cancel_all();
+        // Drain: every child must reach a terminal state (future dropped) before the group goes away.
+        // Outputs of children that completed but were never collected are not dropped (the output
+        // type is unknown here; `TaskHandle` has the same limitation).
+        while self.live > 0usize {
+            let mut progressed = false;
+            let mut i: usize = 0usize;
+            while i < self.used {
+                let raw = unsafe { *(self.tasks + i) };
+                if (raw as usize) != 0 {
+                    if raw_is_terminal(raw) {
+                        let taken = mut_view(*self).take_slot(i);
+                        task_dec_ref(taken);
+                        progressed = true;
+                    }
+                }
+                i = i + 1usize;
+            }
+            if !progressed {
+                unsafe {
+                    thread_yield();
+                }
+            }
+        }
+        let word = size_of<*mut TaskHeader>();
+        unsafe {
+            heap_free(self.tasks as *mut u8, self.cap * word, word);
+        }
+        self.tasks = 0 as *mut *mut TaskHeader;
+        gov_release_ref(self.governor);
+        self.governor = 0 as *mut GovInner;
+    }
+}
+
+// Future returned by `TaskGroup.next`; the children's output type is `i64` (`type Output` cannot name
+// an impl-level generic yet, FU-B; `try_next<T>` serves every other output type).
+pub struct GroupNext {
+    pub group: *mut TaskGroup,
+}
+
+impl Future for GroupNext {
+    type Output = Option<TaskResult<i64>>;
+
+    fn poll(self: mut_view<GroupNext>, cx: mut_view<Context>) -> Poll<Option<TaskResult<i64>>> {
+        let g = self.group;
+        if unsafe { (*g).live } == 0usize {
+            return Poll.Ready(Option.None);
+        }
+        let r: Option<TaskResult<i64>> = unsafe { mut_view(*g).try_next() };
+        match r {
+            Option.Some(v) => {
+                return Poll.Ready(Option.Some(v));
+            },
+            Option.None => {
+                // No wait-queue integration for child completion yet: poll again.
+                let mut w = cx.waker();
+                view(w).wake_by_ref();
+                return Poll.Pending;
+            },
+        }
+    }
+}

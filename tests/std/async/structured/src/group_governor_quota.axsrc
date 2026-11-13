@@ -1,0 +1,213 @@
+module main
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.prelude.Context
+use std.core.host.heap_alloc
+use std.core.host.thread_yield
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.asyn.executor.Executor
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskError
+use std.asyn.task.TaskResult
+use std.asyn.task.TaskHandle
+use std.asyn.governor.ResourceGovernor
+use std.asyn.governor.ResourceKind
+use std.asyn.governor.ResourceError
+use std.asyn.group.TaskGroup
+use std.asyn.group.GroupResults
+use std.asyn.group.GroupError
+use std.asyn.group.group_poll_fn
+use std.asyn.group.results_get_ptr
+
+fn new_counter() -> *mut Atomic<i64> {
+    let raw = unsafe { heap_alloc(8, 8) };
+    let p = raw as *mut Atomic<i64>;
+    unsafe {
+        *p = Atomic.new(0i64);
+    }
+    p
+}
+
+// Completes with `val` once the shared `gate` flag is set; counts live instances in `alive`.
+struct Gate {
+    pub gate: *mut Atomic<i64>,
+    pub val: i64,
+    pub alive: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Gate {}
+unsafe impl Share for Gate {}
+
+fn make_gate(gate: *mut Atomic<i64>, val: i64, alive: *mut Atomic<i64>) -> Gate {
+    unsafe {
+        (*alive).fetch_add(1i64, Ordering.AcqRel);
+    }
+    Gate { gate: gate, val: val, alive: alive }
+}
+
+impl Future for Gate {
+    type Output = i64;
+    fn poll(self: mut_view<Gate>, cx: mut_view<Context>) -> Poll<i64> {
+        if unsafe { (*self.gate).load(Ordering.Acquire) } != 0i64 {
+            return Poll.Ready(self.val);
+        }
+        let mut w = cx.waker();
+        view(w).wake_by_ref();
+        Poll.Pending
+    }
+}
+
+impl Drop for Gate {
+    fn drop(self: mut_view<Gate>) {
+        unsafe {
+            (*self.alive).fetch_sub(1i64, Ordering.AcqRel);
+        }
+    }
+}
+
+fn poll_gate(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Gate, i64>;
+    group_poll_fn<Gate, i64>(tcb, cx)
+}
+
+fn adopt_gate(group: mut_view<TaskGroup>, exec: view<Executor>, g: Gate) -> Result<u64, GroupError> {
+    let h: TaskHandle<i64> = exec.spawn(g, poll_gate);
+    let r = mut_view(*group).adopt(h);
+    match r {
+        Result.Ok(id) => Result.Ok(id.id),
+        Result.Err(e) => Result.Err(e),
+    }
+}
+
+fn is_ok_id(r: Result<u64, GroupError>) -> bool {
+    match r {
+        Result.Ok(id) => true,
+        Result.Err(e) => false,
+    }
+}
+
+fn is_task_quota(r: Result<u64, GroupError>) -> bool {
+    match r {
+        Result.Ok(id) => false,
+        Result.Err(e) => match e {
+            GroupError.QuotaExceeded(k) => match k {
+                ResourceKind.Tasks => true,
+                _ => false,
+            },
+            GroupError.Cancelled => false,
+        },
+    }
+}
+
+fn set_flag(p: *mut Atomic<i64>) {
+    unsafe {
+        (*p).store(1i64, Ordering.Release);
+    }
+}
+
+pub fn main() -> i32 {
+    let exec = Executor.new(2);
+    let alive = new_counter();
+    let g0 = new_counter();
+    let g1 = new_counter();
+    let g2 = new_counter();
+    let g3 = new_counter();
+
+    // 1. A governed group admits at most `hard_limit` live children and releases a unit whenever a
+    // child is collected.
+    let gov = ResourceGovernor.new();
+    check(match gov.set_quota(ResourceKind.Tasks, 1u64, 2u64) { Result.Ok(u) => true, Result.Err(e) => false });
+    let mut group = TaskGroup.with_governor(view(gov));
+    check(is_ok_id(adopt_gate(mut_view(group), view(exec), make_gate(g0, 100i64, alive))));
+    check(is_ok_id(adopt_gate(mut_view(group), view(exec), make_gate(g1, 200i64, alive))));
+    check(gov.usage(ResourceKind.Tasks) == 2u64);
+    let peak = gov.usage(ResourceKind.Tasks);
+    // The third child is refused: no quota is charged and the refused task is cancelled.
+    check(is_task_quota(adopt_gate(mut_view(group), view(exec), make_gate(g2, 300i64, alive))));
+    check(gov.usage(ResourceKind.Tasks) == 2u64);
+    check(group.live_count() == 2usize);
+    while unsafe { (*alive).load(Ordering.Acquire) } != 2i64 {
+        thread_yield();
+    }
+
+    // Collect the first child: its unit goes back, so a new child fits again.
+    set_flag(g0);
+    let first: Option<TaskResult<i64>> = group.next_blocking();
+    check(match first {
+        Option.Some(r) => match r {
+            TaskResult.Completed(v) => v == 100i64,
+            _ => false,
+        },
+        Option.None => false,
+    });
+    check(gov.usage(ResourceKind.Tasks) == 1u64);
+    check(is_ok_id(adopt_gate(mut_view(group), view(exec), make_gate(g3, 400i64, alive))));
+    check(gov.usage(ResourceKind.Tasks) == 2u64);
+
+    // join_all collects everything and leaves the governor balanced.
+    set_flag(g1);
+    set_flag(g3);
+    let joined: Result<GroupResults<i64>, TaskError> = group.join_all();
+    let mut total: i64 = 0i64;
+    match joined {
+        Result.Ok(res) => {
+            check(res.len() == 2usize);
+            let mut q: usize = 0usize;
+            while q < res.len() {
+                total = total + unsafe { *results_get_ptr(view(res), q) };
+                q = q + 1usize;
+            }
+        },
+        Result.Err(e) => { check(false); },
+    }
+    check(total == 600i64);
+    check(gov.usage(ResourceKind.Tasks) == 0u64);
+
+    // 2. Dropping a governed group with live children also returns every unit.
+    {
+        let mut gd = TaskGroup.with_governor(view(gov));
+        let gate_never = new_counter();
+        check(is_ok_id(adopt_gate(mut_view(gd), view(exec), make_gate(gate_never, 1i64, alive))));
+        check(is_ok_id(adopt_gate(mut_view(gd), view(exec), make_gate(gate_never, 2i64, alive))));
+        check(gov.usage(ResourceKind.Tasks) == 2u64);
+    }
+    check(gov.usage(ResourceKind.Tasks) == 0u64);
+    check(unsafe { (*alive).load(Ordering.Acquire) } == 0i64);
+
+    // 3. A child governor is bound by its parent: the group's own limit (100) is not the one that
+    // refuses the fourth child, the parent's limit of 3 is.
+    let parent = ResourceGovernor.new();
+    check(match parent.set_quota(ResourceKind.Tasks, 2u64, 3u64) { Result.Ok(u) => true, Result.Err(e) => false });
+    let child = parent.child();
+    check(match child.set_quota(ResourceKind.Tasks, 50u64, 100u64) { Result.Ok(u) => true, Result.Err(e) => false });
+    {
+        let mut gc = TaskGroup.with_governor(view(child));
+        let gate_c = new_counter();
+        let mut n: i32 = 0i32;
+        while n < 3i32 {
+            check(is_ok_id(adopt_gate(mut_view(gc), view(exec), make_gate(gate_c, 7i64, alive))));
+            n = n + 1i32;
+        }
+        check(parent.usage(ResourceKind.Tasks) == 3u64);
+        check(child.usage(ResourceKind.Tasks) == 3u64);
+        check(is_task_quota(adopt_gate(mut_view(gc), view(exec), make_gate(gate_c, 7i64, alive))));
+        check(child.usage(ResourceKind.Tasks) == 3u64);
+    }
+    check(parent.usage(ResourceKind.Tasks) == 0u64);
+    check(child.usage(ResourceKind.Tasks) == 0u64);
+    while unsafe { (*alive).load(Ordering.Acquire) } != 0i64 {
+        thread_yield();
+    }
+
+    exec.shutdown();
+    let final_usage = gov.usage(ResourceKind.Tasks);
+
+    print("OK group_governor_quota ");
+    print_int(peak as i64);
+    print(" ");
+    print_int(final_usage as i64);
+    print("\n");
+    0
+}

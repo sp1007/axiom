@@ -1,0 +1,317 @@
+// std.asyn.governor - ResourceGovernor: hierarchical task/thread/fiber/memory quota accounting
+// (SPEC-34 AXS-EXEC-025, T422)
+//
+// A governor tracks, per `ResourceKind`, a current usage counter against a soft limit (pressure
+// `Warning` when reached) and a hard limit (admission fails with `QuotaExceeded(kind)`). A child
+// governor charges itself and every ancestor, all-or-nothing: when any level would exceed its hard
+// limit the charges already applied below it are rolled back, so a child can never exceed an
+// ancestor's hard limit and a failed admission leaves every counter unchanged.
+//
+// `ResourceGovernor` is a reference-counted handle (clone with `clone`); a child holds a reference to
+// its parent. `ResourceLease` is the RAII form: dropping it returns the units, also on cancellation.
+module std.asyn.governor
+
+use std.core.result.Result
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+
+const UNLIMITED: u64 = 0xFFFFFFFFFFFFFFFFu64
+
+@derive(Copy)
+pub enum ResourceKind {
+    Tasks,
+    Threads,
+    Fibers,
+    MemoryBytes,
+    IoOperations,
+}
+
+@derive(Copy)
+pub enum ResourcePressure {
+    Normal,
+    Warning,
+    Critical,
+    Exhausted,
+}
+
+@derive(Copy)
+pub enum ResourceError {
+    QuotaExceeded(ResourceKind),
+    InvalidBudget,
+}
+
+@derive(Copy)
+pub struct ResourceQuota {
+    pub soft_limit: u64,
+    pub hard_limit: u64,
+}
+
+pub fn kind_index(kind: ResourceKind) -> usize {
+    match kind {
+        ResourceKind.Tasks => 0usize,
+        ResourceKind.Threads => 1usize,
+        ResourceKind.Fibers => 2usize,
+        ResourceKind.MemoryBytes => 3usize,
+        ResourceKind.IoOperations => 4usize,
+    }
+}
+
+pub fn kind_from_index(idx: usize) -> ResourceKind {
+    if idx == 0usize {
+        return ResourceKind.Tasks;
+    }
+    if idx == 1usize {
+        return ResourceKind.Threads;
+    }
+    if idx == 2usize {
+        return ResourceKind.Fibers;
+    }
+    if idx == 3usize {
+        return ResourceKind.MemoryBytes;
+    }
+    ResourceKind.IoOperations
+}
+
+@repr(C)
+pub struct GovInner {
+    pub refs: Atomic<u32>,
+    // Parent `*mut GovInner` (a reference is held), stored opaque: the struct refers to itself.
+    pub parent: *mut u8,
+    pub soft: [5]u64,
+    pub hard: [5]u64,
+    pub used: [5]Atomic<u64>,
+}
+
+pub fn gov_new(parent: *mut GovInner) -> *mut GovInner {
+    let raw = unsafe { heap_alloc(size_of<GovInner>(), align_of<GovInner>()) };
+    let g = raw as *mut GovInner;
+    unsafe {
+        (*g).refs = Atomic.new(1u32);
+        (*g).parent = parent as *mut u8;
+        let mut i: usize = 0usize;
+        while i < 5usize {
+            (*g).soft[i] = UNLIMITED;
+            (*g).hard[i] = UNLIMITED;
+            (*g).used[i] = Atomic.new(0u64);
+            i = i + 1usize;
+        }
+    }
+    if (parent as usize) != 0 {
+        gov_retain(parent);
+    }
+    g
+}
+
+pub fn gov_retain(g: *mut GovInner) {
+    if (g as usize) != 0 {
+        unsafe {
+            (*g).refs.fetch_add(1u32, Ordering.Relaxed);
+        }
+    }
+}
+
+pub fn gov_release_ref(g: *mut GovInner) {
+    if (g as usize) == 0 {
+        return;
+    }
+    let prev = unsafe { (*g).refs.fetch_sub(1u32, Ordering.AcqRel) };
+    if prev != 1u32 {
+        return;
+    }
+    let parent = unsafe { (*g).parent as *mut GovInner };
+    unsafe {
+        heap_free(g as *mut u8, size_of<GovInner>(), align_of<GovInner>());
+    }
+    gov_release_ref(parent);
+}
+
+fn gov_charge_one(g: *mut GovInner, idx: usize, n: u64) -> bool {
+    loop {
+        let cur: u64 = unsafe { (*g).used[idx].load(Ordering.Acquire) };
+        let hard: u64 = unsafe { (*g).hard[idx] };
+        if cur > hard {
+            return false;
+        }
+        if n > hard - cur {
+            return false;
+        }
+        let cas = unsafe { (*g).used[idx].compare_exchange_weak(cur, cur + n, Ordering.AcqRel, Ordering.Acquire) };
+        if cas.ok {
+            return true;
+        }
+    }
+}
+
+fn gov_uncharge_one(g: *mut GovInner, idx: usize, n: u64) {
+    loop {
+        let cur: u64 = unsafe { (*g).used[idx].load(Ordering.Acquire) };
+        let next: u64 = if n > cur { 0u64 } else { cur - n };
+        let cas = unsafe { (*g).used[idx].compare_exchange_weak(cur, next, Ordering.AcqRel, Ordering.Acquire) };
+        if cas.ok {
+            return;
+        }
+    }
+}
+
+// Charge `n` units of kind `idx` to `g` and all ancestors. All-or-nothing.
+pub fn gov_try_acquire(g: *mut GovInner, idx: usize, n: u64) -> bool {
+    let mut cur = g;
+    let mut charged: usize = 0usize;
+    while (cur as usize) != 0 {
+        if !gov_charge_one(cur, idx, n) {
+            let mut r = g;
+            let mut i: usize = 0usize;
+            while i < charged {
+                gov_uncharge_one(r, idx, n);
+                r = unsafe { (*r).parent as *mut GovInner };
+                i = i + 1usize;
+            }
+            return false;
+        }
+        charged = charged + 1usize;
+        cur = unsafe { (*cur).parent as *mut GovInner };
+    }
+    true
+}
+
+// Return `n` units to `g` and all ancestors.
+pub fn gov_release_units(g: *mut GovInner, idx: usize, n: u64) {
+    let mut cur = g;
+    while (cur as usize) != 0 {
+        gov_uncharge_one(cur, idx, n);
+        cur = unsafe { (*cur).parent as *mut GovInner };
+    }
+}
+
+pub fn gov_usage(g: *mut GovInner, idx: usize) -> u64 {
+    unsafe { (*g).used[idx].load(Ordering.Acquire) }
+}
+
+pub fn gov_pressure(g: *mut GovInner, idx: usize) -> ResourcePressure {
+    let used: u64 = unsafe { (*g).used[idx].load(Ordering.Acquire) };
+    let soft: u64 = unsafe { (*g).soft[idx] };
+    let hard: u64 = unsafe { (*g).hard[idx] };
+    if used >= hard {
+        return ResourcePressure.Exhausted;
+    }
+    // Critical: within the last 10% of the hard limit.
+    if hard != UNLIMITED {
+        if hard - used <= hard / 10u64 {
+            return ResourcePressure.Critical;
+        }
+    }
+    if used >= soft {
+        return ResourcePressure.Warning;
+    }
+    ResourcePressure.Normal
+}
+
+pub struct ResourceGovernor {
+    pub inner: *mut GovInner,
+}
+
+unsafe impl Send for ResourceGovernor {}
+unsafe impl Share for ResourceGovernor {}
+impl !Copy for ResourceGovernor {}
+
+pub struct ResourceLease {
+    pub gov: *mut GovInner,
+    pub idx: usize,
+    pub amount: u64,
+}
+
+unsafe impl Send for ResourceLease {}
+impl !Copy for ResourceLease {}
+
+impl ResourceGovernor {
+    // A root governor with no limits (every quota is unlimited until `set_quota`).
+    pub fn new() -> ResourceGovernor {
+        ResourceGovernor { inner: gov_new(0 as *mut GovInner) }
+    }
+
+    // A child governor: its usage is also charged to this governor and its ancestors.
+    pub fn child(self: view<ResourceGovernor>) -> ResourceGovernor {
+        ResourceGovernor { inner: gov_new(self.inner) }
+    }
+
+    pub fn clone(self: view<ResourceGovernor>) -> ResourceGovernor {
+        gov_retain(self.inner);
+        ResourceGovernor { inner: self.inner }
+    }
+
+    pub fn set_quota(self: view<ResourceGovernor>, kind: ResourceKind, soft_limit: u64, hard_limit: u64) -> Result<(), ResourceError> {
+        if soft_limit > hard_limit {
+            return Result.Err(ResourceError.InvalidBudget);
+        }
+        let idx = kind_index(kind);
+        unsafe {
+            (*self.inner).soft[idx] = soft_limit;
+            (*self.inner).hard[idx] = hard_limit;
+        }
+        Result.Ok(())
+    }
+
+    pub fn quota(self: view<ResourceGovernor>, kind: ResourceKind) -> ResourceQuota {
+        let idx = kind_index(kind);
+        unsafe {
+            ResourceQuota {
+                soft_limit: (*self.inner).soft[idx],
+                hard_limit: (*self.inner).hard[idx],
+            }
+        }
+    }
+
+    pub fn acquire(self: view<ResourceGovernor>, kind: ResourceKind, n: u64) -> Result<(), ResourceError> {
+        if gov_try_acquire(self.inner, kind_index(kind), n) {
+            Result.Ok(())
+        } else {
+            Result.Err(ResourceError.QuotaExceeded(kind))
+        }
+    }
+
+    pub fn release(self: view<ResourceGovernor>, kind: ResourceKind, n: u64) {
+        gov_release_units(self.inner, kind_index(kind), n);
+    }
+
+    pub fn lease(self: view<ResourceGovernor>, kind: ResourceKind, n: u64) -> Result<ResourceLease, ResourceError> {
+        let idx = kind_index(kind);
+        if gov_try_acquire(self.inner, idx, n) {
+            gov_retain(self.inner);
+            Result.Ok(ResourceLease { gov: self.inner, idx: idx, amount: n })
+        } else {
+            Result.Err(ResourceError.QuotaExceeded(kind))
+        }
+    }
+
+    pub fn usage(self: view<ResourceGovernor>, kind: ResourceKind) -> u64 {
+        gov_usage(self.inner, kind_index(kind))
+    }
+
+    pub fn pressure(self: view<ResourceGovernor>, kind: ResourceKind) -> ResourcePressure {
+        gov_pressure(self.inner, kind_index(kind))
+    }
+}
+
+impl Drop for ResourceGovernor {
+    fn drop(self: mut_view<ResourceGovernor>) {
+        let g = self.inner;
+        self.inner = 0 as *mut GovInner;
+        gov_release_ref(g);
+    }
+}
+
+impl Drop for ResourceLease {
+    fn drop(self: mut_view<ResourceLease>) {
+        let g = self.gov;
+        if (g as usize) != 0 {
+            self.gov = 0 as *mut GovInner;
+            gov_release_units(g, self.idx, self.amount);
+            gov_release_ref(g);
+        }
+    }
+}

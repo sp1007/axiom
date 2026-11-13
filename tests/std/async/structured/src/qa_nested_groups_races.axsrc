@@ -1,0 +1,481 @@
+module main
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.prelude.Context
+use std.core.host.heap_alloc
+use std.core.host.thread_yield
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.asyn.executor.Executor
+use std.asyn.waker.TaskHeader
+use std.asyn.waker.TASK_COMPLETED
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskError
+use std.asyn.task.TaskResult
+use std.asyn.task.TaskHandle
+use std.asyn.task.TaskId
+use std.asyn.timeout.Deadline
+use std.asyn.cancel.CancelledFuture
+use std.asyn.cancel.CancellationToken
+use std.asyn.governor.ResourceGovernor
+use std.asyn.governor.ResourceKind
+use std.asyn.group.TaskGroup
+use std.asyn.group.GroupResults
+use std.asyn.group.GroupError
+use std.asyn.group.group_poll_fn
+use std.asyn.group.results_get_ptr
+use std.asyn.group.task_panic
+
+// QA additions for T422: nested groups (token tree through groups), the direction of failure
+// propagation, deadline-vs-completion race, quota edge (limit 0), small generic outputs.
+
+fn new_counter() -> *mut Atomic<i64> {
+    let raw = unsafe { heap_alloc(8, 8) };
+    let p = raw as *mut Atomic<i64>;
+    unsafe {
+        *p = Atomic.new(0i64);
+    }
+    p
+}
+
+fn born(alive: *mut Atomic<i64>) {
+    unsafe {
+        (*alive).fetch_add(1i64, Ordering.AcqRel);
+    }
+}
+
+fn died(alive: *mut Atomic<i64>) {
+    unsafe {
+        (*alive).fetch_sub(1i64, Ordering.AcqRel);
+    }
+}
+
+// Finishes with 5 as soon as its token is cancelled.
+struct Coop {
+    pub fut: CancelledFuture,
+    pub alive: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Coop {}
+
+impl Future for Coop {
+    type Output = i64;
+    fn poll(self: mut_view<Coop>, cx: mut_view<Context>) -> Poll<i64> {
+        match self.fut.poll(mut_view(*cx)) {
+            Poll.Ready(u) => Poll.Ready(5i64),
+            Poll.Pending => Poll.Pending,
+        }
+    }
+}
+
+impl Drop for Coop {
+    fn drop(self: mut_view<Coop>) {
+        died(self.alive);
+    }
+}
+
+fn poll_coop(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Coop, i64>;
+    group_poll_fn<Coop, i64>(tcb, cx)
+}
+
+// Reports a panic on the first poll.
+struct Failer {
+    pub alive: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Failer {}
+
+impl Future for Failer {
+    type Output = i64;
+    fn poll(self: mut_view<Failer>, cx: mut_view<Context>) -> Poll<i64> {
+        task_panic(mut_view(*cx));
+        Poll.Pending
+    }
+}
+
+impl Drop for Failer {
+    fn drop(self: mut_view<Failer>) {
+        died(self.alive);
+    }
+}
+
+fn poll_failer(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Failer, i64>;
+    group_poll_fn<Failer, i64>(tcb, cx)
+}
+
+// Runs forever (wakes itself) unless cancelled.
+struct Looper {
+    pub alive: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Looper {}
+
+impl Future for Looper {
+    type Output = i64;
+    fn poll(self: mut_view<Looper>, cx: mut_view<Context>) -> Poll<i64> {
+        let mut w = cx.waker();
+        view(w).wake_by_ref();
+        Poll.Pending
+    }
+}
+
+impl Drop for Looper {
+    fn drop(self: mut_view<Looper>) {
+        died(self.alive);
+    }
+}
+
+fn poll_looper(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Looper, i64>;
+    group_poll_fn<Looper, i64>(tcb, cx)
+}
+
+// Ready immediately with `val`.
+struct Quick {
+    pub val: i64,
+    pub alive: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Quick {}
+
+impl Future for Quick {
+    type Output = i64;
+    fn poll(self: mut_view<Quick>, cx: mut_view<Context>) -> Poll<i64> {
+        Poll.Ready(self.val)
+    }
+}
+
+impl Drop for Quick {
+    fn drop(self: mut_view<Quick>) {
+        died(self.alive);
+    }
+}
+
+fn poll_quick(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Quick, i64>;
+    group_poll_fn<Quick, i64>(tcb, cx)
+}
+
+// Small generic outputs: bool (1 byte) and a two-field struct (8 bytes).
+struct BoolFut {
+    pub v: bool,
+}
+
+unsafe impl Send for BoolFut {}
+
+impl Future for BoolFut {
+    type Output = bool;
+    fn poll(self: mut_view<BoolFut>, cx: mut_view<Context>) -> Poll<bool> {
+        Poll.Ready(self.v)
+    }
+}
+
+fn poll_bool(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<BoolFut, bool>;
+    group_poll_fn<BoolFut, bool>(tcb, cx)
+}
+
+struct Pair {
+    pub a: i32,
+    pub b: i32,
+}
+
+struct PairFut {
+    pub a: i32,
+    pub b: i32,
+}
+
+unsafe impl Send for PairFut {}
+
+impl Future for PairFut {
+    type Output = Pair;
+    fn poll(self: mut_view<PairFut>, cx: mut_view<Context>) -> Poll<Pair> {
+        Poll.Ready(Pair { a: self.a, b: self.b })
+    }
+}
+
+fn poll_pair(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<PairFut, Pair>;
+    group_poll_fn<PairFut, Pair>(tcb, cx)
+}
+
+fn is_ok(r: Result<TaskId, GroupError>) -> bool {
+    match r {
+        Result.Ok(id) => true,
+        Result.Err(e) => false,
+    }
+}
+
+fn is_cancelled_err(r: Result<TaskId, GroupError>) -> bool {
+    match r {
+        Result.Ok(id) => false,
+        Result.Err(e) => match e {
+            GroupError.Cancelled => true,
+            GroupError.QuotaExceeded(q) => false,
+        },
+    }
+}
+
+fn is_quota_err(r: Result<TaskId, GroupError>) -> bool {
+    match r {
+        Result.Ok(id) => false,
+        Result.Err(e) => match e {
+            GroupError.Cancelled => false,
+            GroupError.QuotaExceeded(q) => true,
+        },
+    }
+}
+
+fn add_coop(group: mut_view<TaskGroup>, exec: view<Executor>, tok: view<CancellationToken>, alive: *mut Atomic<i64>) {
+    born(alive);
+    let h: TaskHandle<i64> = exec.spawn(Coop { fut: tok.cancelled(), alive: alive }, poll_coop);
+    check(is_ok(mut_view(*group).adopt(h)));
+}
+
+fn add_quick(group: mut_view<TaskGroup>, exec: view<Executor>, val: i64, alive: *mut Atomic<i64>) {
+    born(alive);
+    let h: TaskHandle<i64> = exec.spawn(Quick { val: val, alive: alive }, poll_quick);
+    check(is_ok(mut_view(*group).adopt(h)));
+}
+
+// Spin until every adopted child is in a terminal state (without reaping it).
+fn wait_all_terminal(group: view<TaskGroup>) {
+    let mut i: usize = 0usize;
+    while i < group.used {
+        let raw = unsafe { *(group.tasks + i) };
+        if (raw as usize) != 0 {
+            loop {
+                let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) } & 0x7u32;
+                if st >= TASK_COMPLETED {
+                    break;
+                }
+                thread_yield();
+            }
+        }
+        i = i + 1usize;
+    }
+}
+
+fn sum_results(r: view<GroupResults<i64>>) -> i64 {
+    let mut s: i64 = 0i64;
+    let mut i: usize = 0usize;
+    while i < r.len() {
+        s = s + unsafe { *results_get_ptr(r, i) };
+        i = i + 1usize;
+    }
+    s
+}
+
+pub fn main() -> i32 {
+    let exec = Executor.new(4);
+    let alive = new_counter();
+
+    // A. Three-level group tree: cancelling the root cancels the tokens of every nested group and
+    // the cooperative children at every level finish (5 each); nothing is dropped twice.
+    {
+        let mut root = TaskGroup.new();
+        let root_tok = root.cancellation_token();
+        let mut mid = TaskGroup.with_cancellation(view(root_tok));
+        let mid_tok = mid.cancellation_token();
+        let mut leaf = TaskGroup.with_cancellation(view(mid_tok));
+        let leaf_tok = leaf.cancellation_token();
+        add_coop(mut_view(root), view(exec), view(root_tok), alive);
+        add_coop(mut_view(mid), view(exec), view(mid_tok), alive);
+        add_coop(mut_view(mid), view(exec), view(mid_tok), alive);
+        add_coop(mut_view(leaf), view(exec), view(leaf_tok), alive);
+        add_coop(mut_view(leaf), view(exec), view(leaf_tok), alive);
+        add_coop(mut_view(leaf), view(exec), view(leaf_tok), alive);
+        check(!mid.is_cancelled());
+        check(!leaf.is_cancelled());
+        mut_view(root).cancel_all();
+        mut_view(root).cancel_all();
+        check(mid.is_cancelled());
+        check(leaf.is_cancelled());
+        check(!mid.is_failed());
+        let lj: Result<GroupResults<i64>, TaskError> = leaf.join_all();
+        let ls = match lj {
+            Result.Ok(r) => r.len() as i64 * 100i64 + sum_results(view(r)),
+            Result.Err(e) => 0i64 - 1i64,
+        };
+        check(ls == 315i64);
+        let mj: Result<GroupResults<i64>, TaskError> = mid.join_all();
+        let ms = match mj {
+            Result.Ok(r) => r.len() as i64 * 100i64 + sum_results(view(r)),
+            Result.Err(e) => 0i64 - 1i64,
+        };
+        check(ms == 210i64);
+        // root: the cooperative child may have finished (5) or been cancelled by cancel_all before
+        // it ran; either way the group is consumed without waiting for anything else.
+        let rj: Result<GroupResults<i64>, TaskError> = root.join_all();
+        let rs = match rj {
+            Result.Ok(r) => 1i64,
+            Result.Err(e) => match e {
+                TaskError.Cancelled => 2i64,
+                TaskError.Panicked => 3i64,
+            },
+        };
+        check(rs == 1i64 || rs == 2i64);
+    }
+    check(unsafe { (*alive).load(Ordering.Acquire) } == 0i64);
+
+    // B. Failure propagates downwards only: a failing child of the inner group cancels the inner
+    // group (and its descendants) but not the outer group.
+    {
+        let mut outer = TaskGroup.new();
+        let outer_tok = outer.cancellation_token();
+        let mut inner = TaskGroup.with_cancellation(view(outer_tok));
+        let inner_tok = inner.cancellation_token();
+        let mut deep = TaskGroup.with_cancellation(view(inner_tok));
+        let deep_tok = deep.cancellation_token();
+        born(alive);
+        let hf: TaskHandle<i64> = exec.spawn(Failer { alive: alive }, poll_failer);
+        check(is_ok(inner.adopt(hf)));
+        add_coop(mut_view(deep), view(exec), view(deep_tok), alive);
+        let ij: Result<GroupResults<i64>, TaskError> = inner.join_all();
+        let panicked = match ij {
+            Result.Ok(r) => false,
+            Result.Err(e) => match e {
+                TaskError.Panicked => true,
+                TaskError.Cancelled => false,
+            },
+        };
+        check(panicked);
+        check(inner_tok.is_cancelled());
+        check(deep.is_cancelled());
+        check(!outer.is_cancelled());
+        check(!outer_tok.is_cancelled());
+        check(!outer.is_failed());
+        let dj: Result<GroupResults<i64>, TaskError> = deep.join_all();
+        check(match dj { Result.Ok(r) => r.len() == 1usize, Result.Err(e) => false });
+    }
+    check(unsafe { (*alive).load(Ordering.Acquire) } == 0i64);
+
+    // C. Deadline vs completion: children that finished before the deadline expired are not turned
+    // into failures by an already expired group deadline.
+    {
+        let mut g = TaskGroup.new();
+        add_quick(mut_view(g), view(exec), 3i64, alive);
+        add_quick(mut_view(g), view(exec), 4i64, alive);
+        wait_all_terminal(view(g));
+        g.set_deadline(Deadline.at_ns(0u64));
+        let j: Result<GroupResults<i64>, TaskError> = g.join_all();
+        let s = match j {
+            Result.Ok(r) => r.len() as i64 * 100i64 + sum_results(view(r)),
+            Result.Err(e) => 0i64 - 1i64,
+        };
+        check(s == 207i64);
+    }
+    // ... while an unfinished child at an expired deadline is cancelled (Cancelled, not a hang).
+    {
+        let mut g = TaskGroup.new();
+        g.set_deadline(Deadline.at_ns(0u64));
+        born(alive);
+        let h: TaskHandle<i64> = exec.spawn(Looper { alive: alive }, poll_looper);
+        check(is_ok(g.adopt(h)));
+        let j: Result<GroupResults<i64>, TaskError> = g.join_all();
+        check(match j { Result.Ok(r) => false, Result.Err(e) => match e { TaskError.Cancelled => true, TaskError.Panicked => false } });
+    }
+    check(unsafe { (*alive).load(Ordering.Acquire) } == 0i64);
+
+    // D. Quota edge: a hard limit of 0 refuses every child, nothing is leaked or charged; raising
+    // the limit afterwards admits children again (usage returns to 0 after collection).
+    {
+        let gov = ResourceGovernor.new();
+        check(match gov.set_quota(ResourceKind.Tasks, 0u64, 0u64) { Result.Ok(u) => true, Result.Err(e) => false });
+        let mut g = TaskGroup.with_governor(view(gov));
+        born(alive);
+        let h: TaskHandle<i64> = exec.spawn(Quick { val: 9i64, alive: alive }, poll_quick);
+        check(is_quota_err(g.adopt(h)));
+        check(gov.usage(ResourceKind.Tasks) == 0u64);
+        check(g.live_count() == 0usize);
+        check(match gov.set_quota(ResourceKind.Tasks, 1u64, 1u64) { Result.Ok(u) => true, Result.Err(e) => false });
+        add_quick(mut_view(g), view(exec), 9i64, alive);
+        check(gov.usage(ResourceKind.Tasks) == 1u64);
+        born(alive);
+        let h2: TaskHandle<i64> = exec.spawn(Quick { val: 1i64, alive: alive }, poll_quick);
+        check(is_quota_err(g.adopt(h2)));
+        let r: Option<TaskResult<i64>> = g.next_blocking();
+        check(match r { Option.Some(x) => match x { TaskResult.Completed(v) => v == 9i64, _ => false }, Option.None => false });
+        check(gov.usage(ResourceKind.Tasks) == 0u64);
+        let r2: Option<TaskResult<i64>> = g.next_blocking();
+        check(match r2 { Option.Some(x) => false, Option.None => true });
+    }
+    // wait for the refused tasks to be dropped by the executor
+    while unsafe { (*alive).load(Ordering.Acquire) } != 0i64 {
+        thread_yield();
+    }
+
+    // E. Small generic outputs (1-byte bool, 8-byte struct).
+    {
+        let mut g = TaskGroup.new();
+        let mut k: i32 = 0i32;
+        while k < 5i32 {
+            let h: TaskHandle<bool> = exec.spawn(BoolFut { v: k % 2i32 == 1i32 }, poll_bool);
+            check(is_ok(g.adopt(h)));
+            k = k + 1i32;
+        }
+        let j: Result<GroupResults<bool>, TaskError> = g.join_all();
+        let bits = match j {
+            Result.Ok(r) => {
+                let mut acc: i64 = 0i64;
+                let mut i: usize = 0usize;
+                while i < r.len() {
+                    let b: bool = unsafe { *results_get_ptr(view(r), i) };
+                    acc = acc * 2i64 + (if b { 1i64 } else { 0i64 });
+                    i = i + 1usize;
+                }
+                acc
+            },
+            Result.Err(e) => 0i64 - 1i64,
+        };
+        check(bits == 10i64);
+    }
+    {
+        let mut g = TaskGroup.new();
+        let mut k: i32 = 0i32;
+        while k < 4i32 {
+            let h: TaskHandle<Pair> = exec.spawn(PairFut { a: k, b: k * 10i32 }, poll_pair);
+            check(is_ok(g.adopt(h)));
+            k = k + 1i32;
+        }
+        let j: Result<GroupResults<Pair>, TaskError> = g.join_all();
+        let tot = match j {
+            Result.Ok(r) => {
+                let mut acc: i64 = 0i64;
+                let mut i: usize = 0usize;
+                while i < r.len() {
+                    let p = unsafe { results_get_ptr(view(r), i) };
+                    let a = unsafe { (*p).a };
+                    let b = unsafe { (*p).b };
+                    check(b == a * 10i32);
+                    acc = acc + a as i64 * 1000i64 + b as i64;
+                    i = i + 1usize;
+                }
+                acc
+            },
+            Result.Err(e) => 0i64 - 1i64,
+        };
+        check(tot == 6000i64 + 60i64);
+    }
+
+    // F. Adopting into a cancelled group is refused; the refused task is dropped.
+    {
+        let mut g = TaskGroup.new();
+        mut_view(g).cancel_all();
+        born(alive);
+        let h: TaskHandle<i64> = exec.spawn(Looper { alive: alive }, poll_looper);
+        check(is_cancelled_err(g.adopt(h)));
+    }
+    while unsafe { (*alive).load(Ordering.Acquire) } != 0i64 {
+        thread_yield();
+    }
+
+    exec.shutdown();
+    print("OK qa_nested_groups_races ");
+    print_int(unsafe { (*alive).load(Ordering.Acquire) });
+    print("\n");
+    0
+}

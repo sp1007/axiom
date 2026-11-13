@@ -1,0 +1,269 @@
+// std.asyn.timeout - Deadline, deadline-bounded polling and task timeouts (SPEC-34 AXS-EXEC-024, T422)
+//
+// A `Deadline` is an absolute monotonic timestamp (`host.monotonic_ns`). It is deliberately a separate
+// policy type from cancellation: an expired deadline becomes a `TimeoutError` (`poll_deadline`) or a
+// `TimeoutOutcome.TimedOut` (`Timeout` / `LocalTimeout` around a spawned task), and the future or task
+// that did not finish is dropped (its destructors run).
+//
+// There is no timer driver yet (E11.6 / T426 brings the OS timer queue), so a pending deadline wait
+// re-schedules itself with `wake_by_ref` on every poll and observes expiry by polling the clock. The
+// executor therefore keeps polling a task that waits on a deadline, which is correct but not idle-free.
+module std.asyn.timeout
+
+use std.core.prelude.Context
+use std.core.prelude.Future
+use std.core.prelude.Poll
+use std.core.result.Result
+use std.core.host.monotonic_ns
+use std.asyn.task.TaskHandle
+use std.asyn.task.LocalTaskHandle
+use std.asyn.task.TaskError
+
+const NEVER_NS: u64 = 0xFFFFFFFFFFFFFFFFu64
+
+@derive(Copy)
+pub struct Deadline {
+    pub deadline_ns: u64,
+}
+
+@derive(Copy)
+pub struct TimeoutError {
+    pub deadline_ns: u64,
+}
+
+impl Deadline {
+    pub fn at_ns(abs_ns: u64) -> Deadline {
+        Deadline { deadline_ns: abs_ns }
+    }
+
+    // `now + duration`, saturating at the maximum representable instant.
+    pub fn after_ns(duration_ns: u64) -> Deadline {
+        let now = monotonic_ns();
+        if duration_ns >= NEVER_NS - now {
+            return Deadline { deadline_ns: NEVER_NS };
+        }
+        Deadline { deadline_ns: now + duration_ns }
+    }
+
+    pub fn after_ms(duration_ms: u64) -> Deadline {
+        if duration_ms >= 18446744073709u64 {
+            return Deadline { deadline_ns: NEVER_NS };
+        }
+        Deadline.after_ns(duration_ms * 1000000u64)
+    }
+
+    // A deadline that never expires.
+    pub fn never() -> Deadline {
+        Deadline { deadline_ns: NEVER_NS }
+    }
+
+    pub fn is_expired_at(self: Deadline, now_ns: u64) -> bool {
+        now_ns >= self.deadline_ns
+    }
+
+    pub fn is_expired(self: Deadline) -> bool {
+        monotonic_ns() >= self.deadline_ns
+    }
+
+    pub fn remaining_ns_at(self: Deadline, now_ns: u64) -> u64 {
+        if now_ns >= self.deadline_ns {
+            return 0u64;
+        }
+        self.deadline_ns - now_ns
+    }
+
+    pub fn remaining_ns(self: Deadline) -> u64 {
+        self.remaining_ns_at(monotonic_ns())
+    }
+
+    // Budget narrowing: the effective deadline of a child operation is the earlier of the two.
+    pub fn min(self: Deadline, other: Deadline) -> Deadline {
+        // Locals, not `other.deadline_ns < self.deadline_ns {`: the parser reads `field <` as the
+        // start of generic arguments (reported as a follow-up in the T422 report, FU-A).
+        let mine: u64 = self.deadline_ns;
+        let theirs: u64 = other.deadline_ns;
+        if theirs < mine {
+            return other;
+        }
+        self
+    }
+
+    pub fn max(self: Deadline, other: Deadline) -> Deadline {
+        let mine: u64 = self.deadline_ns;
+        let theirs: u64 = other.deadline_ns;
+        if theirs > mine {
+            return other;
+        }
+        self
+    }
+}
+
+// Generic deadline-aware poll of `fut`: `Ready(Ok(v))` when it completes, `Ready(Err(TimeoutError))`
+// once the deadline has passed while it is still pending, otherwise `Pending` (after re-scheduling
+// the task, see the module comment). It is the building block for deadline adapters over any future:
+// call it from the `poll` of a concrete adapter type (a generic free function; see the limitations
+// below for why the adapter itself cannot be generic).
+pub fn poll_deadline<F: Future<Output = T>, T>(fut: mut_view<F>, deadline: Deadline, cx: mut_view<Context>) -> Poll<Result<T, TimeoutError>> {
+    match fut.poll(mut_view(*cx)) {
+        Poll.Ready(val) => {
+            return Poll.Ready(Result.Ok(val));
+        },
+        Poll.Pending => {
+            if deadline.is_expired() {
+                return Poll.Ready(Result.Err(TimeoutError { deadline_ns: deadline.deadline_ns }));
+            }
+            let mut w = cx.waker();
+            view(w).wake_by_ref();
+            return Poll.Pending;
+        },
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Timeout of a spawned task
+// -----------------------------------------------------------------------------
+//
+// The spec's `Timeout<F: Future>` is a generic adapter. Today the compiler cannot express it
+// (reported in the T422 report as follow-ups):
+//   FU-B  `type Output = ...T...` does not resolve impl-level generics;
+//   FU-C  a generic struct can have only one `Future` impl (the overlap check ignores the arguments);
+//   FU-F  inside `impl<F>` methods a struct with a generic-typed field is laid out with a placeholder
+//         for `F` (fields get reordered; `@repr(C)` with `F` last repairs the layout);
+//   FU-G  a trait-method call on an impl-level type parameter (`self.fut.poll(..)` in `impl<F>`) is
+//         resolved statically to the first `Future` impl in scope instead of `F`'s, and generic free
+//         functions called from such a method are not instantiated natively.
+// So the deadline adapters here are concrete: `Timeout` bounds a spawned task (`TaskHandle<i64>`,
+// the output type `TaskHandle` is a `Future` for) and cancels it when the deadline passes;
+// `LocalTimeout` does the same for a `LocalTaskHandle<i64>`.
+//
+// A `Timeout` that expires cancels the task cooperatively (its future is dropped by the executor at
+// the next poll, destructors run) and resolves to `Err(TimeoutError)`. Dropping a `Timeout` drops the
+// handle, which cancels an unfinished task as well (SPEC-34 AXS-EXEC-021).
+pub struct Timeout {
+    pub deadline: Deadline,
+    pub finished: bool,
+    pub handle: TaskHandle<i64>,
+}
+
+// Result of a timed-out-or-not wait for the task: the task's own result is flattened so a cancelled
+// or panicked task is distinguishable from an expired deadline.
+pub enum TimeoutOutcome {
+    Completed(i64),
+    TaskCancelled,
+    TaskPanicked,
+    TimedOut(TimeoutError),
+}
+
+impl Future for Timeout {
+    type Output = TimeoutOutcome;
+
+    fn poll(self: mut_view<Timeout>, cx: mut_view<Context>) -> Poll<TimeoutOutcome> {
+        if self.finished {
+            return Poll.Ready(TimeoutOutcome.TimedOut(TimeoutError { deadline_ns: self.deadline.deadline_ns }));
+        }
+        match self.handle.poll(mut_view(*cx)) {
+            Poll.Ready(r) => {
+                self.finished = true;
+                match r {
+                    Result.Ok(v) => {
+                        return Poll.Ready(TimeoutOutcome.Completed(v));
+                    },
+                    Result.Err(e) => {
+                        match e {
+                            TaskError.Cancelled => {
+                                return Poll.Ready(TimeoutOutcome.TaskCancelled);
+                            },
+                            TaskError.Panicked => {
+                                return Poll.Ready(TimeoutOutcome.TaskPanicked);
+                            },
+                        }
+                    },
+                }
+            },
+            Poll.Pending => {
+                if self.deadline.is_expired() {
+                    self.finished = true;
+                    view(self.handle).cancel();
+                    return Poll.Ready(TimeoutOutcome.TimedOut(TimeoutError { deadline_ns: self.deadline.deadline_ns }));
+                }
+                let mut w = cx.waker();
+                view(w).wake_by_ref();
+                return Poll.Pending;
+            },
+        }
+    }
+}
+
+pub struct LocalTimeout {
+    pub deadline: Deadline,
+    pub finished: bool,
+    pub handle: LocalTaskHandle<i64>,
+}
+
+impl Future for LocalTimeout {
+    type Output = TimeoutOutcome;
+
+    fn poll(self: mut_view<LocalTimeout>, cx: mut_view<Context>) -> Poll<TimeoutOutcome> {
+        if self.finished {
+            return Poll.Ready(TimeoutOutcome.TimedOut(TimeoutError { deadline_ns: self.deadline.deadline_ns }));
+        }
+        match self.handle.poll(mut_view(*cx)) {
+            Poll.Ready(r) => {
+                self.finished = true;
+                match r {
+                    Result.Ok(v) => {
+                        return Poll.Ready(TimeoutOutcome.Completed(v));
+                    },
+                    Result.Err(e) => {
+                        match e {
+                            TaskError.Cancelled => {
+                                return Poll.Ready(TimeoutOutcome.TaskCancelled);
+                            },
+                            TaskError.Panicked => {
+                                return Poll.Ready(TimeoutOutcome.TaskPanicked);
+                            },
+                        }
+                    },
+                }
+            },
+            Poll.Pending => {
+                if self.deadline.is_expired() {
+                    self.finished = true;
+                    view(self.handle).cancel();
+                    return Poll.Ready(TimeoutOutcome.TimedOut(TimeoutError { deadline_ns: self.deadline.deadline_ns }));
+                }
+                let mut w = cx.waker();
+                view(w).wake_by_ref();
+                return Poll.Pending;
+            },
+        }
+    }
+}
+
+pub fn with_deadline(deadline: Deadline, handle: TaskHandle<i64>) -> Timeout {
+    Timeout {
+        deadline: deadline,
+        finished: false,
+        handle: handle,
+    }
+}
+
+pub fn with_timeout_ns(duration_ns: u64, handle: TaskHandle<i64>) -> Timeout {
+    with_deadline(Deadline.after_ns(duration_ns), handle)
+}
+
+pub fn with_timeout_ms(duration_ms: u64, handle: TaskHandle<i64>) -> Timeout {
+    with_deadline(Deadline.after_ms(duration_ms), handle)
+}
+
+pub fn local_with_deadline(deadline: Deadline, handle: LocalTaskHandle<i64>) -> LocalTimeout {
+    LocalTimeout {
+        deadline: deadline,
+        finished: false,
+        handle: handle,
+    }
+}
+
+pub fn local_with_timeout_ms(duration_ms: u64, handle: LocalTaskHandle<i64>) -> LocalTimeout {
+    local_with_deadline(Deadline.after_ms(duration_ms), handle)
+}

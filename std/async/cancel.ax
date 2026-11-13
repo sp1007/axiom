@@ -1,0 +1,368 @@
+// std.asyn.cancel - Hierarchical cooperative cancellation (SPEC-34 AXS-EXEC-023, T422)
+//
+// A `CancellationSource` owns a shared `CancelState`; `CancellationToken`s are cloneable read
+// capabilities onto the same state. Cancelling a source flips the state to cancelled exactly once
+// (idempotent), wakes every registered `CancelledFuture`, and cancels every descendant source created
+// with `child_source` / `child_of`. Cancelling a child never affects its parent or siblings.
+//
+// Memory model: `CancelState` is a heap object with an atomic reference count. Sources, tokens,
+// `CancelledFuture`s and the parent's child list each hold one reference, so the state outlives every
+// observer. Waiter nodes are owned by their `CancelledFuture`; `cancel` only wakes them by reference,
+// the future unlinks and frees its own node (on completion or on drop), so dropping a pending future
+// can never corrupt the wait list (cancellation-safety contract of SPEC-34 AXS-EXEC-030).
+module std.asyn.cancel
+
+use std.core.prelude.RawWakerVTable
+use std.core.prelude.Waker
+use std.core.prelude.Context
+use std.core.prelude.Future
+use std.core.prelude.Poll
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.core.host.thread_yield
+use std.asyn.waker.waker_leak
+use std.asyn.waker.raw_waker_wake_by_ref
+use std.asyn.waker.raw_waker_drop
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+
+// A registered waiter. The waker is stored as a data/vtable pair that owns one reference
+// (see std.asyn.waker `waker_leak`).
+@repr(C)
+pub struct CancelWaiter {
+    pub waker_data: *const u8,
+    pub waker_vt: *const RawWakerVTable,
+    pub next: *mut CancelWaiter,
+}
+
+// Link in a parent's list of child states. `state` is the child's `*mut CancelState`, stored opaque
+// because `CancelState` is declared after this struct (forward-referenced pointee layout, T421 FU-1).
+@repr(C)
+pub struct ChildLink {
+    pub state: *mut u8,
+    pub next: *mut ChildLink,
+}
+
+@repr(C)
+pub struct CancelState {
+    pub refs: Atomic<u32>,
+    pub cancelled: Atomic<u32>,
+    pub lock: Atomic<u32>,
+    pub waiters: *mut CancelWaiter,
+    pub children: *mut ChildLink,
+}
+
+fn cs_lock(s: *mut CancelState) {
+    while unsafe { (*s).lock.compare_exchange(0u32, 1u32, Ordering.Acquire, Ordering.Relaxed).val != 0u32 } {
+        unsafe {
+            thread_yield();
+        }
+    }
+}
+
+fn cs_unlock(s: *mut CancelState) {
+    unsafe {
+        (*s).lock.store(0u32, Ordering.Release);
+    }
+}
+
+// New state with reference count 1 (owned by the caller).
+pub fn cancel_state_new() -> *mut CancelState {
+    let raw = unsafe { heap_alloc(size_of<CancelState>(), align_of<CancelState>()) };
+    let s = raw as *mut CancelState;
+    unsafe {
+        (*s).refs = Atomic.new(1u32);
+        (*s).cancelled = Atomic.new(0u32);
+        (*s).lock = Atomic.new(0u32);
+        (*s).waiters = 0 as *mut CancelWaiter;
+        (*s).children = 0 as *mut ChildLink;
+    }
+    s
+}
+
+pub fn cancel_state_retain(s: *mut CancelState) {
+    if (s as usize) != 0 {
+        unsafe {
+            (*s).refs.fetch_add(1u32, Ordering.Relaxed);
+        }
+    }
+}
+
+pub fn cancel_state_release(s: *mut CancelState) {
+    if (s as usize) == 0 {
+        return;
+    }
+    let prev = unsafe { (*s).refs.fetch_sub(1u32, Ordering.AcqRel) };
+    if prev != 1u32 {
+        return;
+    }
+    // Last reference: release the child list (each link owns one child reference), then free.
+    let mut link = unsafe { (*s).children };
+    unsafe {
+        (*s).children = 0 as *mut ChildLink;
+    }
+    while (link as usize) != 0 {
+        let next = unsafe { (*link).next };
+        let child = unsafe { (*link).state as *mut CancelState };
+        unsafe {
+            heap_free(link as *mut u8, size_of<ChildLink>(), align_of<ChildLink>());
+        }
+        cancel_state_release(child);
+        link = next;
+    }
+    unsafe {
+        heap_free(s as *mut u8, size_of<CancelState>(), align_of<CancelState>());
+    }
+}
+
+pub fn cancel_state_is_cancelled(s: *mut CancelState) -> bool {
+    if (s as usize) == 0 {
+        return false;
+    }
+    unsafe { (*s).cancelled.load(Ordering.Acquire) != 0u32 }
+}
+
+// Cancel `s` and every descendant. Idempotent.
+pub fn cancel_state_cancel(s: *mut CancelState) {
+    if (s as usize) == 0 {
+        return;
+    }
+    cs_lock(s);
+    let prev = unsafe { (*s).cancelled.swap(1u32, Ordering.AcqRel) };
+    if prev != 0u32 {
+        cs_unlock(s);
+        return;
+    }
+    // Wake every registered waiter by reference; the owning future unlinks its own node.
+    let mut w = unsafe { (*s).waiters };
+    while (w as usize) != 0 {
+        unsafe {
+            raw_waker_wake_by_ref((*w).waker_data, (*w).waker_vt);
+            w = (*w).next;
+        }
+    }
+    // Detach the child list so descendants are cancelled without holding this lock.
+    let kids = unsafe { (*s).children };
+    unsafe {
+        (*s).children = 0 as *mut ChildLink;
+    }
+    cs_unlock(s);
+
+    let mut link = kids;
+    while (link as usize) != 0 {
+        let next = unsafe { (*link).next };
+        let child = unsafe { (*link).state as *mut CancelState };
+        unsafe {
+            heap_free(link as *mut u8, size_of<ChildLink>(), align_of<ChildLink>());
+        }
+        cancel_state_cancel(child);
+        cancel_state_release(child);
+        link = next;
+    }
+}
+
+// Create a child state of `parent` (reference count 1, owned by the caller). A child of an already
+// cancelled parent starts out cancelled.
+pub fn cancel_state_new_child(parent: *mut CancelState) -> *mut CancelState {
+    let child = cancel_state_new();
+    if (parent as usize) == 0 {
+        return child;
+    }
+    cs_lock(parent);
+    let parent_cancelled = unsafe { (*parent).cancelled.load(Ordering.Acquire) != 0u32 };
+    if parent_cancelled {
+        unsafe {
+            (*child).cancelled.store(1u32, Ordering.Release);
+        }
+    } else {
+        let raw_link = unsafe { heap_alloc(size_of<ChildLink>(), align_of<ChildLink>()) };
+        let link = raw_link as *mut ChildLink;
+        cancel_state_retain(child);
+        unsafe {
+            (*link).state = child as *mut u8;
+            (*link).next = (*parent).children;
+            (*parent).children = link;
+        }
+    }
+    cs_unlock(parent);
+    child
+}
+
+// Unlink `node` from the wait list of `s` (when still linked), drop its waker reference and free it.
+fn cs_remove_waiter(s: *mut CancelState, node: *mut CancelWaiter) {
+    cs_lock(s);
+    let mut prev = 0 as *mut CancelWaiter;
+    let mut cur = unsafe { (*s).waiters };
+    while (cur as usize) != 0 {
+        if (cur as usize) == (node as usize) {
+            unsafe {
+                if (prev as usize) == 0 {
+                    (*s).waiters = (*cur).next;
+                } else {
+                    (*prev).next = (*cur).next;
+                }
+            }
+            break;
+        }
+        prev = cur;
+        cur = unsafe { (*cur).next };
+    }
+    cs_unlock(s);
+    unsafe {
+        raw_waker_drop((*node).waker_data, (*node).waker_vt);
+        heap_free(node as *mut u8, size_of<CancelWaiter>(), align_of<CancelWaiter>());
+    }
+}
+
+// -----------------------------------------------------------------------------
+// CancellationSource / CancellationToken / CancelledFuture
+// -----------------------------------------------------------------------------
+
+pub struct CancellationSource {
+    pub state: *mut CancelState,
+}
+
+unsafe impl Send for CancellationSource {}
+unsafe impl Share for CancellationSource {}
+impl !Copy for CancellationSource {}
+
+pub struct CancellationToken {
+    pub state: *mut CancelState,
+}
+
+unsafe impl Send for CancellationToken {}
+unsafe impl Share for CancellationToken {}
+impl !Copy for CancellationToken {}
+
+pub struct CancelledFuture {
+    pub state: *mut CancelState,
+    pub node: *mut CancelWaiter,
+}
+
+unsafe impl Send for CancelledFuture {}
+impl !Copy for CancelledFuture {}
+
+impl CancellationSource {
+    pub fn new() -> CancellationSource {
+        CancellationSource { state: cancel_state_new() }
+    }
+
+    // A child source linked below `parent`: cancelling the parent cancels this source.
+    pub fn child_of(parent: view<CancellationToken>) -> CancellationSource {
+        CancellationSource { state: cancel_state_new_child(parent.state) }
+    }
+
+    pub fn child_source(self: view<CancellationSource>) -> CancellationSource {
+        CancellationSource { state: cancel_state_new_child(self.state) }
+    }
+
+    pub fn token(self: view<CancellationSource>) -> CancellationToken {
+        cancel_state_retain(self.state);
+        CancellationToken { state: self.state }
+    }
+
+    pub fn cancel(self: view<CancellationSource>) {
+        cancel_state_cancel(self.state);
+    }
+
+    pub fn is_cancelled(self: view<CancellationSource>) -> bool {
+        cancel_state_is_cancelled(self.state)
+    }
+}
+
+impl Drop for CancellationSource {
+    fn drop(self: mut_view<CancellationSource>) {
+        let s = self.state;
+        self.state = 0 as *mut CancelState;
+        cancel_state_release(s);
+    }
+}
+
+impl CancellationToken {
+    pub fn is_cancelled(self: view<CancellationToken>) -> bool {
+        cancel_state_is_cancelled(self.state)
+    }
+
+    pub fn clone(self: view<CancellationToken>) -> CancellationToken {
+        cancel_state_retain(self.state);
+        CancellationToken { state: self.state }
+    }
+
+    pub fn cancelled(self: view<CancellationToken>) -> CancelledFuture {
+        cancel_state_retain(self.state);
+        CancelledFuture {
+            state: self.state,
+            node: 0 as *mut CancelWaiter,
+        }
+    }
+}
+
+impl Drop for CancellationToken {
+    fn drop(self: mut_view<CancellationToken>) {
+        let s = self.state;
+        self.state = 0 as *mut CancelState;
+        cancel_state_release(s);
+    }
+}
+
+impl Future for CancelledFuture {
+    type Output = ();
+
+    fn poll(self: mut_view<CancelledFuture>, cx: mut_view<Context>) -> Poll<()> {
+        let s = self.state;
+        if (s as usize) == 0 {
+            return Poll.Ready(());
+        }
+        cs_lock(s);
+        if unsafe { (*s).cancelled.load(Ordering.Acquire) != 0u32 } {
+            cs_unlock(s);
+            let n = self.node;
+            if (n as usize) != 0 {
+                self.node = 0 as *mut CancelWaiter;
+                cs_remove_waiter(s, n);
+            }
+            return Poll.Ready(());
+        }
+        let n = self.node;
+        if (n as usize) == 0 {
+            let raw_n = unsafe { heap_alloc(size_of<CancelWaiter>(), align_of<CancelWaiter>()) };
+            let nn = raw_n as *mut CancelWaiter;
+            unsafe {
+                let lw = waker_leak(cx.waker());
+                (*nn).waker_data = lw.data;
+                (*nn).waker_vt = lw.vtable;
+                (*nn).next = (*s).waiters;
+                (*s).waiters = nn;
+            }
+            self.node = nn;
+        } else {
+            unsafe {
+                raw_waker_drop((*n).waker_data, (*n).waker_vt);
+                let lw = waker_leak(cx.waker());
+                (*n).waker_data = lw.data;
+                (*n).waker_vt = lw.vtable;
+            }
+        }
+        cs_unlock(s);
+        Poll.Pending
+    }
+}
+
+impl Drop for CancelledFuture {
+    fn drop(self: mut_view<CancelledFuture>) {
+        let s = self.state;
+        if (s as usize) == 0 {
+            return;
+        }
+        self.state = 0 as *mut CancelState;
+        let n = self.node;
+        if (n as usize) != 0 {
+            self.node = 0 as *mut CancelWaiter;
+            cs_remove_waiter(s, n);
+        }
+        cancel_state_release(s);
+    }
+}

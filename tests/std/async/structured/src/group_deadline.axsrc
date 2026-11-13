@@ -1,0 +1,188 @@
+module main
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.prelude.Context
+use std.core.host.heap_alloc
+use std.core.host.monotonic_ns
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.asyn.executor.Executor
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskError
+use std.asyn.task.TaskResult
+use std.asyn.task.TaskHandle
+use std.asyn.timeout.Deadline
+use std.asyn.cancel.CancelledFuture
+use std.asyn.group.TaskGroup
+use std.asyn.group.GroupError
+use std.asyn.group.GroupResults
+use std.asyn.group.group_poll_fn
+
+fn new_counter() -> *mut Atomic<i64> {
+    let raw = unsafe { heap_alloc(8, 8) };
+    let p = raw as *mut Atomic<i64>;
+    unsafe {
+        *p = Atomic.new(0i64);
+    }
+    p
+}
+
+struct Looper {
+    pub alive: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Looper {}
+unsafe impl Share for Looper {}
+
+impl Future for Looper {
+    type Output = i64;
+    fn poll(self: mut_view<Looper>, cx: mut_view<Context>) -> Poll<i64> {
+        let mut w = cx.waker();
+        view(w).wake_by_ref();
+        Poll.Pending
+    }
+}
+
+impl Drop for Looper {
+    fn drop(self: mut_view<Looper>) {
+        unsafe {
+            (*self.alive).fetch_sub(1i64, Ordering.AcqRel);
+        }
+    }
+}
+
+fn poll_looper(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Looper, i64>;
+    group_poll_fn<Looper, i64>(tcb, cx)
+}
+
+// Finishes with 5 when the group token fires (the deadline cancels the group, hence the token).
+struct Coop {
+    pub fut: CancelledFuture,
+    pub alive: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Coop {}
+unsafe impl Share for Coop {}
+
+impl Future for Coop {
+    type Output = i64;
+    fn poll(self: mut_view<Coop>, cx: mut_view<Context>) -> Poll<i64> {
+        match self.fut.poll(mut_view(*cx)) {
+            Poll.Ready(u) => Poll.Ready(5i64),
+            Poll.Pending => Poll.Pending,
+        }
+    }
+}
+
+impl Drop for Coop {
+    fn drop(self: mut_view<Coop>) {
+        unsafe {
+            (*self.alive).fetch_sub(1i64, Ordering.AcqRel);
+        }
+    }
+}
+
+fn poll_coop(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Coop, i64>;
+    group_poll_fn<Coop, i64>(tcb, cx)
+}
+
+fn born(alive: *mut Atomic<i64>) {
+    unsafe {
+        (*alive).fetch_add(1i64, Ordering.AcqRel);
+    }
+}
+
+pub fn main() -> i32 {
+    let exec = Executor.new(2);
+    let alive = new_counter();
+
+    let start = monotonic_ns();
+    let mut group = TaskGroup.new();
+    // The deadline only ever narrows: a later one afterwards does not extend the budget.
+    group.set_deadline(Deadline.after_ms(40u64));
+    group.set_deadline(Deadline.after_ms(3600000u64));
+    let tok = group.cancellation_token();
+
+    let mut k: i32 = 0i32;
+    while k < 2i32 {
+        born(alive);
+        let l = Looper { alive: alive };
+        let h: TaskHandle<i64> = exec.spawn(l, poll_looper);
+        check(match group.adopt(h) { Result.Ok(id) => true, Result.Err(e) => false });
+        k = k + 1i32;
+    }
+    born(alive);
+    let c = Coop { fut: tok.cancelled(), alive: alive };
+    let hc: TaskHandle<i64> = exec.spawn(c, poll_coop);
+    check(match group.adopt(hc) { Result.Ok(id) => true, Result.Err(e) => false });
+
+    check(!group.is_timed_out());
+    // Collect results one by one: the deadline fires inside next_blocking and cancels everything.
+    let mut reaped: i64 = 0i64;
+    let mut cancelled: i64 = 0i64;
+    let mut completed: i64 = 0i64;
+    loop {
+        let r: Option<TaskResult<i64>> = group.next_blocking();
+        match r {
+            Option.Some(res) => {
+                reaped = reaped + 1i64;
+                match res {
+                    TaskResult.Cancelled => { cancelled = cancelled + 1i64; },
+                    TaskResult.Completed(v) => {
+                        check(v == 5i64);
+                        completed = completed + 1i64;
+                    },
+                    TaskResult.Panicked => { check(false); },
+                }
+            },
+            Option.None => { break; },
+        }
+    }
+    let elapsed = monotonic_ns() - start;
+    check(group.is_timed_out());
+    check(group.is_cancelled());
+    check(!group.is_failed());
+    check(elapsed >= 40000000u64);
+    check(elapsed < 30000000000u64);
+    check(reaped == 3i64);
+    check(cancelled == 2i64 || cancelled == 3i64);
+    check(cancelled + completed == 3i64);
+    check(unsafe { (*alive).load(Ordering.Acquire) } == 0i64);
+
+    // A timed-out group refuses new children.
+    born(alive);
+    let late = Looper { alive: alive };
+    let hl: TaskHandle<i64> = exec.spawn(late, poll_looper);
+    check(match group.adopt(hl) { Result.Ok(id) => false, Result.Err(e) => match e { GroupError.Cancelled => true, GroupError.QuotaExceeded(q) => false } });
+
+    // join_all on an expired group reports Cancelled instead of waiting for the full budget.
+    let mut g2 = TaskGroup.new();
+    g2.set_deadline(Deadline.at_ns(0u64));
+    born(alive);
+    let l2 = Looper { alive: alive };
+    let h2: TaskHandle<i64> = exec.spawn(l2, poll_looper);
+    check(match g2.adopt(h2) { Result.Ok(id) => true, Result.Err(e) => false });
+    let joined: Result<GroupResults<i64>, TaskError> = g2.join_all();
+    let was_cancelled = match joined {
+        Result.Ok(r) => false,
+        Result.Err(e) => match e {
+            TaskError.Cancelled => true,
+            TaskError.Panicked => false,
+        },
+    };
+    check(was_cancelled);
+
+    exec.shutdown();
+    let a = unsafe { (*alive).load(Ordering.Acquire) };
+    check(a == 0i64);
+
+    print("OK group_deadline ");
+    print_int(reaped);
+    print(" ");
+    print_int(a);
+    print("\n");
+    0
+}

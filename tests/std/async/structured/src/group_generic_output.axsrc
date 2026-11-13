@@ -1,0 +1,177 @@
+module main
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.prelude.Context
+use std.core.host.heap_alloc
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.asyn.executor.Executor
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskError
+use std.asyn.task.TaskResult
+use std.asyn.task.TaskHandle
+use std.asyn.group.TaskGroup
+use std.asyn.group.GroupResults
+use std.asyn.group.group_poll_fn
+use std.asyn.group.task_panic
+use std.asyn.group.results_get_ptr
+use std.asyn.group.results_drop_all
+
+// A 24-byte output type with a destructor: it is neither 8 bytes wide nor trivially droppable, so it
+// checks that `TaskGroup` handles the real layout and drop glue of the output type.
+struct Pair {
+    pub a: i64,
+    pub b: i64,
+    pub live: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Pair {}
+
+fn make_pair(a: i64, b: i64, live: *mut Atomic<i64>) -> Pair {
+    unsafe {
+        (*live).fetch_add(1i64, Ordering.AcqRel);
+    }
+    Pair { a: a, b: b, live: live }
+}
+
+impl Drop for Pair {
+    fn drop(self: mut_view<Pair>) {
+        unsafe {
+            (*self.live).fetch_sub(1i64, Ordering.AcqRel);
+        }
+    }
+}
+
+// Produces `Pair { a: id, b: id * 10 }` after two yields; the task with `fail` set reports a panic.
+struct PairMaker {
+    pub id: i64,
+    pub step: i32,
+    pub fail: bool,
+    pub live: *mut Atomic<i64>,
+}
+
+unsafe impl Send for PairMaker {}
+unsafe impl Share for PairMaker {}
+
+impl Future for PairMaker {
+    type Output = Pair;
+    fn poll(self: mut_view<PairMaker>, cx: mut_view<Context>) -> Poll<Pair> {
+        let st = self.step;
+        if st < 2i32 {
+            self.step = st + 1i32;
+            let mut w = cx.waker();
+            view(w).wake_by_ref();
+            return Poll.Pending;
+        }
+        if self.fail {
+            task_panic(mut_view(*cx));
+        }
+        Poll.Ready(make_pair(self.id, self.id * 10i64, self.live))
+    }
+}
+
+fn poll_pair_maker(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<PairMaker, Pair>;
+    group_poll_fn<PairMaker, Pair>(tcb, cx)
+}
+
+fn new_counter() -> *mut Atomic<i64> {
+    let raw = unsafe { heap_alloc(8, 8) };
+    let p = raw as *mut Atomic<i64>;
+    unsafe {
+        *p = Atomic.new(0i64);
+    }
+    p
+}
+
+fn add_maker(group: mut_view<TaskGroup>, exec: view<Executor>, id: i64, fail: bool, live: *mut Atomic<i64>) {
+    let m = PairMaker { id: id, step: 0i32, fail: fail, live: live };
+    let h: TaskHandle<Pair> = exec.spawn(m, poll_pair_maker);
+    let r = mut_view(*group).adopt(h);
+    check(match r { Result.Ok(t) => true, Result.Err(e) => false });
+}
+
+pub fn main() -> i32 {
+    let exec = Executor.new(2);
+    let live = new_counter();
+
+    // 1. join_all with a 24-byte output type: values arrive in spawn order and the container can run
+    // the destructors of its elements.
+    let mut group = TaskGroup.new();
+    let mut i: i64 = 1i64;
+    while i <= 4i64 {
+        add_maker(mut_view(group), view(exec), i, false, live);
+        i = i + 1i64;
+    }
+    let joined: Result<GroupResults<Pair>, TaskError> = group.join_all();
+    let mut sum_a: i64 = 0i64;
+    let mut sum_b: i64 = 0i64;
+    match joined {
+        Result.Ok(res) => {
+            check(res.len() == 4usize);
+            let mut res_mut = res;
+            let mut k: usize = 0usize;
+            while k < res_mut.len() {
+                let p = results_get_ptr(view(res_mut), k);
+                check(unsafe { (*p).a } == (k as i64) + 1i64);
+                sum_a = sum_a + unsafe { (*p).a };
+                sum_b = sum_b + unsafe { (*p).b };
+                k = k + 1usize;
+            }
+            check(unsafe { (*live).load(Ordering.Acquire) } == 4i64);
+            results_drop_all(mut_view(res_mut));
+        },
+        Result.Err(e) => { check(false); },
+    }
+    check(sum_a == 10i64);
+    check(sum_b == 100i64);
+    check(unsafe { (*live).load(Ordering.Acquire) } == 0i64);
+
+    // 2. A failing child: join_all reports Panicked and the outputs of the siblings that did complete
+    // are dropped by join_all itself (no leaked Pair).
+    let mut g2 = TaskGroup.new();
+    add_maker(mut_view(g2), view(exec), 1i64, false, live);
+    add_maker(mut_view(g2), view(exec), 2i64, true, live);
+    add_maker(mut_view(g2), view(exec), 3i64, false, live);
+    let j2: Result<GroupResults<Pair>, TaskError> = g2.join_all();
+    let failed = match j2 {
+        Result.Ok(r) => 0i64,
+        Result.Err(e) => match e {
+            TaskError.Panicked => 1i64,
+            TaskError.Cancelled => 0i64,
+        },
+    };
+    check(failed == 1i64);
+    check(unsafe { (*live).load(Ordering.Acquire) } == 0i64);
+
+    // 3. try_next / next_blocking hand out TaskResult<Pair>: a completed output moves to the caller,
+    // whose binding drops it.
+    let mut g3 = TaskGroup.new();
+    add_maker(mut_view(g3), view(exec), 5i64, false, live);
+    add_maker(mut_view(g3), view(exec), 6i64, false, live);
+    let mut got: i64 = 0i64;
+    loop {
+        let r: Option<TaskResult<Pair>> = g3.next_blocking();
+        match r {
+            Option.Some(res) => {
+                match res {
+                    TaskResult.Completed(p) => { got = got + p.a; },
+                    _ => { check(false); },
+                }
+            },
+            Option.None => { break; },
+        }
+    }
+    check(got == 11i64);
+    check(unsafe { (*live).load(Ordering.Acquire) } == 0i64);
+
+    exec.shutdown();
+
+    print("OK group_generic_output ");
+    print_int(sum_b);
+    print(" ");
+    print_int(got);
+    print("\n");
+    0
+}

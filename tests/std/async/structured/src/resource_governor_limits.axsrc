@@ -1,0 +1,185 @@
+module main
+
+use std.core.option.Option
+use std.core.result.Result
+use std.asyn.governor.ResourceGovernor
+use std.asyn.governor.ResourceKind
+use std.asyn.governor.ResourcePressure
+use std.asyn.governor.ResourceError
+use std.asyn.governor.ResourceLease
+
+fn is_normal(p: ResourcePressure) -> bool {
+    match p {
+        ResourcePressure.Normal => true,
+        _ => false,
+    }
+}
+
+fn is_warning(p: ResourcePressure) -> bool {
+    match p {
+        ResourcePressure.Warning => true,
+        _ => false,
+    }
+}
+
+fn is_critical(p: ResourcePressure) -> bool {
+    match p {
+        ResourcePressure.Critical => true,
+        _ => false,
+    }
+}
+
+fn is_exhausted(p: ResourcePressure) -> bool {
+    match p {
+        ResourcePressure.Exhausted => true,
+        _ => false,
+    }
+}
+
+fn is_ok(r: Result<(), ResourceError>) -> bool {
+    match r {
+        Result.Ok(u) => true,
+        Result.Err(e) => false,
+    }
+}
+
+// True when `r` is exactly `QuotaExceeded(Tasks)`.
+fn is_tasks_exceeded(r: Result<(), ResourceError>) -> bool {
+    match r {
+        Result.Ok(u) => false,
+        Result.Err(e) => match e {
+            ResourceError.QuotaExceeded(k) => match k {
+                ResourceKind.Tasks => true,
+                _ => false,
+            },
+            ResourceError.InvalidBudget => false,
+        },
+    }
+}
+
+fn is_memory_exceeded(r: Result<(), ResourceError>) -> bool {
+    match r {
+        Result.Ok(u) => false,
+        Result.Err(e) => match e {
+            ResourceError.QuotaExceeded(k) => match k {
+                ResourceKind.MemoryBytes => true,
+                _ => false,
+            },
+            ResourceError.InvalidBudget => false,
+        },
+    }
+}
+
+fn is_invalid_budget(r: Result<(), ResourceError>) -> bool {
+    match r {
+        Result.Ok(u) => false,
+        Result.Err(e) => match e {
+            ResourceError.InvalidBudget => true,
+            ResourceError.QuotaExceeded(k) => false,
+        },
+    }
+}
+
+pub fn main() -> i32 {
+    let mut sections: i64 = 0i64;
+
+    // 1. Task limit: soft 2, hard 3; Warning at the soft limit, Exhausted and refusal at the hard one.
+    let gov = ResourceGovernor.new();
+    check(is_ok(gov.set_quota(ResourceKind.Tasks, 2u64, 3u64)));
+    check(is_normal(gov.pressure(ResourceKind.Tasks)));
+    check(is_ok(gov.acquire(ResourceKind.Tasks, 1u64)));
+    check(is_normal(gov.pressure(ResourceKind.Tasks)));
+    check(is_ok(gov.acquire(ResourceKind.Tasks, 1u64)));
+    check(is_warning(gov.pressure(ResourceKind.Tasks)));
+    check(is_ok(gov.acquire(ResourceKind.Tasks, 1u64)));
+    check(is_exhausted(gov.pressure(ResourceKind.Tasks)));
+    check(gov.usage(ResourceKind.Tasks) == 3u64);
+    check(is_tasks_exceeded(gov.acquire(ResourceKind.Tasks, 1u64)));
+    check(gov.usage(ResourceKind.Tasks) == 3u64);
+    gov.release(ResourceKind.Tasks, 1u64);
+    check(gov.usage(ResourceKind.Tasks) == 2u64);
+    check(is_ok(gov.acquire(ResourceKind.Tasks, 1u64)));
+    // other kinds are independent and unlimited by default
+    check(is_ok(gov.acquire(ResourceKind.Threads, 1000u64)));
+    check(gov.usage(ResourceKind.Threads) == 1000u64);
+    check(gov.usage(ResourceKind.Tasks) == 3u64);
+    sections = sections + 1i64;
+
+    // 2. Budgets are validated.
+    check(is_invalid_budget(gov.set_quota(ResourceKind.Threads, 10u64, 5u64)));
+    check(gov.quota(ResourceKind.Tasks).hard_limit == 3u64);
+    check(gov.quota(ResourceKind.Tasks).soft_limit == 2u64);
+    sections = sections + 1i64;
+
+    // 3. Hierarchy: a child is charged together with its parent, all-or-nothing.
+    let parent = ResourceGovernor.new();
+    check(is_ok(parent.set_quota(ResourceKind.MemoryBytes, 50u64, 100u64)));
+    let child_a = parent.child();
+    let child_b = parent.child();
+    check(is_ok(child_a.set_quota(ResourceKind.MemoryBytes, 500u64, 1000u64)));
+    check(is_ok(child_b.set_quota(ResourceKind.MemoryBytes, 500u64, 1000u64)));
+    check(is_ok(child_a.acquire(ResourceKind.MemoryBytes, 60u64)));
+    check(parent.usage(ResourceKind.MemoryBytes) == 60u64);
+    check(child_a.usage(ResourceKind.MemoryBytes) == 60u64);
+    // child_b has headroom of its own (1000) but the parent only has 40 left: refused, and the
+    // partial charge to child_b is rolled back.
+    check(is_memory_exceeded(child_b.acquire(ResourceKind.MemoryBytes, 50u64)));
+    check(child_b.usage(ResourceKind.MemoryBytes) == 0u64);
+    check(parent.usage(ResourceKind.MemoryBytes) == 60u64);
+    check(is_ok(child_b.acquire(ResourceKind.MemoryBytes, 40u64)));
+    check(parent.usage(ResourceKind.MemoryBytes) == 100u64);
+    check(is_exhausted(parent.pressure(ResourceKind.MemoryBytes)));
+    check(is_warning(child_b.pressure(ResourceKind.MemoryBytes)) == false);
+    child_a.release(ResourceKind.MemoryBytes, 60u64);
+    check(parent.usage(ResourceKind.MemoryBytes) == 40u64);
+    check(child_a.usage(ResourceKind.MemoryBytes) == 0u64);
+    sections = sections + 1i64;
+
+    // 4. Leases return their units when dropped.
+    let fibers = ResourceGovernor.new();
+    check(is_ok(fibers.set_quota(ResourceKind.Fibers, 1u64, 2u64)));
+    {
+        let l1 = fibers.lease(ResourceKind.Fibers, 1u64);
+        let l2 = fibers.lease(ResourceKind.Fibers, 1u64);
+        check(match l1 { Result.Ok(l) => true, Result.Err(e) => false });
+        check(match l2 { Result.Ok(l) => true, Result.Err(e) => false });
+        check(fibers.usage(ResourceKind.Fibers) == 2u64);
+        let l3 = fibers.lease(ResourceKind.Fibers, 1u64);
+        check(match l3 { Result.Ok(l) => false, Result.Err(e) => true });
+        check(fibers.usage(ResourceKind.Fibers) == 2u64);
+    }
+    check(fibers.usage(ResourceKind.Fibers) == 0u64);
+    sections = sections + 1i64;
+
+    // 5. Pressure levels: Normal < soft <= Warning, Critical in the last tenth, Exhausted at the limit.
+    let gp = ResourceGovernor.new();
+    check(is_ok(gp.set_quota(ResourceKind.IoOperations, 50u64, 100u64)));
+    check(is_ok(gp.acquire(ResourceKind.IoOperations, 49u64)));
+    check(is_normal(gp.pressure(ResourceKind.IoOperations)));
+    check(is_ok(gp.acquire(ResourceKind.IoOperations, 1u64)));
+    check(is_warning(gp.pressure(ResourceKind.IoOperations)));
+    check(is_ok(gp.acquire(ResourceKind.IoOperations, 41u64)));
+    check(gp.usage(ResourceKind.IoOperations) == 91u64);
+    check(is_critical(gp.pressure(ResourceKind.IoOperations)));
+    check(is_ok(gp.acquire(ResourceKind.IoOperations, 9u64)));
+    check(is_exhausted(gp.pressure(ResourceKind.IoOperations)));
+    sections = sections + 1i64;
+
+    // 6. A clone shares the counters; a child keeps its parent alive after the parent handle is gone.
+    let shared = gov.clone();
+    check(shared.usage(ResourceKind.Tasks) == 3u64);
+    check(is_tasks_exceeded(shared.acquire(ResourceKind.Tasks, 1u64)));
+    let orphan = {
+        let temp_parent = ResourceGovernor.new();
+        check(is_ok(temp_parent.set_quota(ResourceKind.Tasks, 1u64, 2u64)));
+        temp_parent.child()
+    };
+    check(is_ok(orphan.acquire(ResourceKind.Tasks, 2u64)));
+    check(is_tasks_exceeded(orphan.acquire(ResourceKind.Tasks, 1u64)));
+    sections = sections + 1i64;
+
+    print("OK resource_governor_limits ");
+    print_int(sections);
+    print("\n");
+    0
+}

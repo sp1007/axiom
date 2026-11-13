@@ -1,0 +1,163 @@
+module main
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.prelude.Context
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.asyn.executor.Executor
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskError
+use std.asyn.task.TaskResult
+use std.asyn.group.TaskGroup
+use std.asyn.group.GroupResults
+use std.asyn.group.results_get_ptr
+use std.asyn.task.TaskHandle
+use std.asyn.group.group_poll_fn
+
+// A child that yields three times, returns `val`, and tracks how many futures are alive: the counter
+// goes up when a child is built and down when its future is dropped.
+struct Worker {
+    pub val: i64,
+    pub step: i32,
+    pub alive: *mut Atomic<i64>,
+    pub finished: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Worker {}
+unsafe impl Share for Worker {}
+
+fn make_worker(val: i64, alive: *mut Atomic<i64>, finished: *mut Atomic<i64>) -> Worker {
+    unsafe {
+        (*alive).fetch_add(1i64, Ordering.AcqRel);
+    }
+    Worker { val: val, step: 0i32, alive: alive, finished: finished }
+}
+
+impl Future for Worker {
+    type Output = i64;
+    fn poll(self: mut_view<Worker>, cx: mut_view<Context>) -> Poll<i64> {
+        let st = self.step;
+        if st < 3i32 {
+            self.step = st + 1i32;
+            let mut w = cx.waker();
+            view(w).wake_by_ref();
+            return Poll.Pending;
+        }
+        unsafe {
+            (*self.finished).fetch_add(1i64, Ordering.AcqRel);
+        }
+        Poll.Ready(self.val)
+    }
+}
+
+impl Drop for Worker {
+    fn drop(self: mut_view<Worker>) {
+        unsafe {
+            (*self.alive).fetch_sub(1i64, Ordering.AcqRel);
+        }
+    }
+}
+
+fn poll_worker(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Worker, i64>;
+    group_poll_fn<Worker, i64>(tcb, cx)
+}
+
+fn new_counter() -> *mut Atomic<i64> {
+    let raw = unsafe { heap_alloc(8, 8) };
+    let p = raw as *mut Atomic<i64>;
+    unsafe {
+        *p = Atomic.new(0i64);
+    }
+    p
+}
+
+pub fn main() -> i32 {
+    let exec = Executor.new(4);
+    let alive = new_counter();
+    let finished = new_counter();
+
+    let mut group = TaskGroup.new();
+    let mut i: i64 = 0i64;
+    while i < 8i64 {
+        let w = make_worker(i + 1i64, alive, finished);
+        let h: TaskHandle<i64> = exec.spawn(w, poll_worker);
+        let spawned = group.adopt(h);
+        check(match spawned { Result.Ok(id) => true, Result.Err(e) => false });
+        i = i + 1i64;
+    }
+    check(group.live_count() == 8usize);
+    check(!group.is_failed());
+
+    // join_all waits for every child: all eight finished and all eight futures are gone by the time
+    // it returns.
+    let joined: Result<GroupResults<i64>, TaskError> = group.join_all();
+    let mut sum: i64 = 0i64;
+    let mut count: usize = 0usize;
+    match joined {
+        Result.Ok(results) => {
+            count = results.len();
+            let mut k: usize = 0usize;
+            while k < results.len() {
+                let p = results_get_ptr(view(results), k);
+                sum = sum + unsafe { *p };
+                // spawn order is preserved
+                check(unsafe { *p } == (k as i64) + 1i64);
+                k = k + 1usize;
+            }
+        },
+        Result.Err(e) => {
+            check(false);
+        },
+    }
+    check(count == 8usize);
+    check(sum == 36i64);
+    check(unsafe { (*finished).load(Ordering.Acquire) } == 8i64);
+    check(unsafe { (*alive).load(Ordering.Acquire) } == 0i64);
+
+    // A group that is consumed one result at a time with try_next/next_blocking.
+    let mut g2 = TaskGroup.new();
+    let mut j: i64 = 0i64;
+    while j < 5i64 {
+        let w = make_worker(100i64 + j, alive, finished);
+        let h: TaskHandle<i64> = exec.spawn(w, poll_worker);
+        let spawned = g2.adopt(h);
+        check(match spawned { Result.Ok(id) => true, Result.Err(e) => false });
+        j = j + 1i64;
+    }
+    let mut got: i64 = 0i64;
+    let mut n_done: i64 = 0i64;
+    loop {
+        let r: Option<TaskResult<i64>> = g2.next_blocking();
+        match r {
+            Option.Some(res) => {
+                match res {
+                    TaskResult.Completed(v) => {
+                        got = got + v;
+                        n_done = n_done + 1i64;
+                    },
+                    _ => { check(false); },
+                }
+            },
+            Option.None => { break; },
+        }
+    }
+    check(n_done == 5i64);
+    check(got == 510i64);
+    check(g2.live_count() == 0usize);
+
+    exec.shutdown();
+    let a = unsafe { (*alive).load(Ordering.Acquire) };
+
+    print("OK group_join_all ");
+    print_int(count as i64);
+    print(" ");
+    print_int(sum);
+    print(" ");
+    print_int(a);
+    print("\n");
+    0
+}

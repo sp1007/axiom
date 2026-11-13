@@ -1,0 +1,169 @@
+module main
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.prelude.RawWaker
+use std.core.prelude.RawWakerVTable
+use std.core.prelude.Waker
+use std.core.prelude.Context
+use std.asyn.executor.LocalExecutor
+use std.asyn.task.LocalTaskHandle
+use std.asyn.task.TaskResult
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.tcb_poll_fn
+use std.asyn.cancel.CancellationSource
+use std.asyn.cancel.CancellationToken
+use std.asyn.cancel.CancelledFuture
+
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+// Completes with `id` once its token is cancelled; appends `id` to the decimal log when it does.
+struct Waiter {
+    pub fut: CancelledFuture,
+    pub id: i64,
+    pub log: *mut i64,
+}
+
+impl Future for Waiter {
+    type Output = i64;
+    fn poll(self: mut_view<Waiter>, cx: mut_view<Context>) -> Poll<i64> {
+        match self.fut.poll(mut_view(*cx)) {
+            Poll.Ready(u) => {
+                unsafe {
+                    *self.log = *self.log * 10i64 + self.id;
+                }
+                Poll.Ready(self.id)
+            },
+            Poll.Pending => Poll.Pending,
+        }
+    }
+}
+
+fn poll_waiter(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Waiter, i64>;
+    tcb_poll_fn<Waiter, i64>(tcb, cx)
+}
+
+fn drain(exec: mut_view<LocalExecutor>) {
+    while mut_view(*exec).try_tick() {
+    }
+}
+
+fn null_context() -> Context {
+    Context {
+        waker_val: Waker {
+            raw: RawWaker {
+                data: 0 as *const u8,
+                vtable: 0 as *const RawWakerVTable,
+            },
+        },
+    }
+}
+
+pub fn main() -> i32 {
+    let mut log: i64 = 0i64;
+    let p_log = unsafe { address_of_mut(log) };
+    let mut exec = LocalExecutor.new();
+
+    // Tree: root -> { child -> grandchild, sibling }
+    let root = CancellationSource.new();
+    let child = root.child_source();
+    let grand = child.child_source();
+    let sibling = root.child_source();
+    let t_root = root.token();
+    let t_child = child.token();
+    let t_grand = grand.token();
+    let t_sibling = sibling.token();
+
+    let h_root: LocalTaskHandle<i64> = exec.spawn_local(Waiter { fut: t_root.cancelled(), id: 1i64, log: p_log }, poll_waiter);
+    let h_child: LocalTaskHandle<i64> = exec.spawn_local(Waiter { fut: t_child.cancelled(), id: 2i64, log: p_log }, poll_waiter);
+    let h_grand: LocalTaskHandle<i64> = exec.spawn_local(Waiter { fut: t_grand.cancelled(), id: 3i64, log: p_log }, poll_waiter);
+    let h_sib: LocalTaskHandle<i64> = exec.spawn_local(Waiter { fut: t_sibling.cancelled(), id: 4i64, log: p_log }, poll_waiter);
+
+    // Everyone registers and goes to sleep: nobody is cancelled yet.
+    drain(mut_view(exec));
+    check(!view(h_root).is_finished());
+    check(!view(h_child).is_finished());
+    check(!view(h_grand).is_finished());
+    check(!view(h_sib).is_finished());
+    check(!t_root.is_cancelled());
+    check(!t_grand.is_cancelled());
+
+    // Cancelling a child cancels its descendants but not its parent or siblings.
+    child.cancel();
+    check(child.is_cancelled());
+    check(t_child.is_cancelled());
+    check(t_grand.is_cancelled());
+    check(!t_root.is_cancelled());
+    check(!t_sibling.is_cancelled());
+    drain(mut_view(exec));
+    check(view(h_child).is_finished());
+    check(view(h_grand).is_finished());
+    check(!view(h_root).is_finished());
+    check(!view(h_sib).is_finished());
+
+    // Idempotent: a second cancel changes nothing and wakes nothing.
+    child.cancel();
+    drain(mut_view(exec));
+    check(log == 23i64);
+
+    // A new child of an already cancelled source starts cancelled.
+    let late = child.child_source();
+    check(late.is_cancelled());
+    check(late.token().is_cancelled());
+
+    // Cancelling the sibling, then the root (parent of everything).
+    sibling.cancel();
+    drain(mut_view(exec));
+    check(log == 234i64);
+    check(view(h_sib).is_finished());
+    root.cancel();
+    drain(mut_view(exec));
+    check(view(h_root).is_finished());
+    check(log == 2341i64);
+
+    // Every waiter completed with its own id.
+    let mut sum: i64 = 0i64;
+    let r1 = match h_root.join() { TaskResult.Completed(v) => v, _ => -100i64 };
+    let r2 = match h_child.join() { TaskResult.Completed(v) => v, _ => -100i64 };
+    let r3 = match h_grand.join() { TaskResult.Completed(v) => v, _ => -100i64 };
+    let r4 = match h_sib.join() { TaskResult.Completed(v) => v, _ => -100i64 };
+    sum = r1 + r2 + r3 + r4;
+    check(sum == 10i64);
+
+    // Dropping a pending CancelledFuture unlinks its waiter: a later cancel is harmless, and a
+    // future created after the cancel resolves at once.
+    let src2 = CancellationSource.new();
+    let tok2 = src2.token();
+    let mut cx = null_context();
+    {
+        let mut pending = tok2.cancelled();
+        let r = pending.poll(mut_view(cx));
+        check(match r { Poll.Pending => true, _ => false });
+        // polled twice: the registration is replaced, not duplicated
+        let r2b = pending.poll(mut_view(cx));
+        check(match r2b { Poll.Pending => true, _ => false });
+    }
+    src2.cancel();
+    check(tok2.is_cancelled());
+    let mut after = tok2.cancelled();
+    let ra = after.poll(mut_view(cx));
+    check(match ra { Poll.Ready(u) => true, _ => false });
+
+    // A token clone observes the same state and outlives its source.
+    let tok3 = {
+        let src3 = CancellationSource.new();
+        let t = src3.token();
+        let t2 = t.clone();
+        src3.cancel();
+        t2
+    };
+    check(tok3.is_cancelled());
+
+    print("OK cancel_token_tree ");
+    print_int(log);
+    print(" ");
+    print_int(4i64);
+    print("\n");
+    0
+}

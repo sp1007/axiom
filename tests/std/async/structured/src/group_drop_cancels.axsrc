@@ -1,0 +1,256 @@
+module main
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.prelude.Context
+use std.core.host.heap_alloc
+use std.core.host.thread_yield
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.asyn.executor.Executor
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskError
+use std.asyn.task.TaskResult
+use std.asyn.task.TaskHandle
+use std.asyn.cancel.CancelledFuture
+use std.asyn.cancel.CancellationSource
+use std.asyn.cancel.CancellationToken
+use std.asyn.group.TaskGroup
+use std.asyn.group.GroupResults
+use std.asyn.group.GroupError
+use std.asyn.group.group_poll_fn
+use std.asyn.group.results_get_ptr
+
+fn new_counter() -> *mut Atomic<i64> {
+    let raw = unsafe { heap_alloc(8, 8) };
+    let p = raw as *mut Atomic<i64>;
+    unsafe {
+        *p = Atomic.new(0i64);
+    }
+    p
+}
+
+fn born(alive: *mut Atomic<i64>) {
+    unsafe {
+        (*alive).fetch_add(1i64, Ordering.AcqRel);
+    }
+}
+
+fn died(alive: *mut Atomic<i64>) {
+    unsafe {
+        (*alive).fetch_sub(1i64, Ordering.AcqRel);
+    }
+}
+
+// Runs until cancelled.
+struct Looper {
+    pub alive: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Looper {}
+
+impl Future for Looper {
+    type Output = i64;
+    fn poll(self: mut_view<Looper>, cx: mut_view<Context>) -> Poll<i64> {
+        let mut w = cx.waker();
+        view(w).wake_by_ref();
+        Poll.Pending
+    }
+}
+
+impl Drop for Looper {
+    fn drop(self: mut_view<Looper>) {
+        died(self.alive);
+    }
+}
+
+fn poll_looper(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Looper, i64>;
+    group_poll_fn<Looper, i64>(tcb, cx)
+}
+
+// Parks without waking itself.
+struct Sleeper {
+    pub alive: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Sleeper {}
+
+impl Future for Sleeper {
+    type Output = i64;
+    fn poll(self: mut_view<Sleeper>, cx: mut_view<Context>) -> Poll<i64> {
+        Poll.Pending
+    }
+}
+
+impl Drop for Sleeper {
+    fn drop(self: mut_view<Sleeper>) {
+        died(self.alive);
+    }
+}
+
+fn poll_sleeper(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Sleeper, i64>;
+    group_poll_fn<Sleeper, i64>(tcb, cx)
+}
+
+// Finishes with `val` once its token is cancelled.
+struct Coop {
+    pub fut: CancelledFuture,
+    pub val: i64,
+    pub alive: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Coop {}
+
+impl Future for Coop {
+    type Output = i64;
+    fn poll(self: mut_view<Coop>, cx: mut_view<Context>) -> Poll<i64> {
+        match self.fut.poll(mut_view(*cx)) {
+            Poll.Ready(u) => Poll.Ready(self.val),
+            Poll.Pending => Poll.Pending,
+        }
+    }
+}
+
+impl Drop for Coop {
+    fn drop(self: mut_view<Coop>) {
+        died(self.alive);
+    }
+}
+
+fn poll_coop(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Coop, i64>;
+    group_poll_fn<Coop, i64>(tcb, cx)
+}
+
+fn add_looper(group: mut_view<TaskGroup>, exec: view<Executor>, alive: *mut Atomic<i64>) {
+    born(alive);
+    let h: TaskHandle<i64> = exec.spawn(Looper { alive: alive }, poll_looper);
+    let r = mut_view(*group).adopt(h);
+    check(match r { Result.Ok(id) => true, Result.Err(e) => false });
+}
+
+fn add_sleeper(group: mut_view<TaskGroup>, exec: view<Executor>, alive: *mut Atomic<i64>) {
+    born(alive);
+    let h: TaskHandle<i64> = exec.spawn(Sleeper { alive: alive }, poll_sleeper);
+    let r = mut_view(*group).adopt(h);
+    check(match r { Result.Ok(id) => true, Result.Err(e) => false });
+}
+
+// A scope that leaves with children still running because of an early return: the group is dropped
+// on the way out and must not leave any child behind.
+fn leave_early(exec: view<Executor>, alive: *mut Atomic<i64>, bail: bool) -> i64 {
+    let mut group = TaskGroup.new();
+    add_looper(mut_view(group), exec, alive);
+    add_sleeper(mut_view(group), exec, alive);
+    add_looper(mut_view(group), exec, alive);
+    if bail {
+        return 1i64;
+    }
+    2i64
+}
+
+pub fn main() -> i32 {
+    let exec = Executor.new(4);
+    let alive = new_counter();
+
+    // 1. Leaving the scope without join_all: Drop cancels and drains the six children.
+    {
+        let mut group = TaskGroup.new();
+        let mut k: i32 = 0i32;
+        while k < 4i32 {
+            add_looper(mut_view(group), view(exec), alive);
+            k = k + 1i32;
+        }
+        add_sleeper(mut_view(group), view(exec), alive);
+        add_sleeper(mut_view(group), view(exec), alive);
+        check(group.live_count() == 6usize);
+        check(unsafe { (*alive).load(Ordering.Acquire) } == 6i64);
+    }
+    check(unsafe { (*alive).load(Ordering.Acquire) } == 0i64);
+
+    // 2. Early exit paths of a function.
+    let e1 = leave_early(view(exec), alive, true);
+    check(unsafe { (*alive).load(Ordering.Acquire) } == 0i64);
+    let e2 = leave_early(view(exec), alive, false);
+    check(unsafe { (*alive).load(Ordering.Acquire) } == 0i64);
+    check(e1 == 1i64 && e2 == 2i64);
+
+    // 3. cancel_all makes a joined group report Cancelled (not a hang, not Ok).
+    {
+        let mut group = TaskGroup.new();
+        add_looper(mut_view(group), view(exec), alive);
+        add_sleeper(mut_view(group), view(exec), alive);
+        group.cancel_all();
+        check(group.is_cancelled());
+        let joined: Result<GroupResults<i64>, TaskError> = group.join_all();
+        let ok = match joined {
+            Result.Ok(r) => false,
+            Result.Err(e) => match e {
+                TaskError.Cancelled => true,
+                TaskError.Panicked => false,
+            },
+        };
+        check(ok);
+    }
+    check(unsafe { (*alive).load(Ordering.Acquire) } == 0i64);
+
+    // 4. A cancelled group refuses new children (and cancels the refused task's future).
+    {
+        let mut group = TaskGroup.new();
+        group.cancel_all();
+        born(alive);
+        let h: TaskHandle<i64> = exec.spawn(Looper { alive: alive }, poll_looper);
+        let r = group.adopt(h);
+        check(match r { Result.Ok(id) => false, Result.Err(e) => match e { GroupError.Cancelled => true, GroupError.QuotaExceeded(k) => false } });
+    }
+    // The refused handle was dropped by `adopt`: cancel is cooperative, so wait for the executor.
+    while unsafe { (*alive).load(Ordering.Acquire) } != 0i64 {
+        unsafe {
+            thread_yield();
+        }
+    }
+
+    // 5. Token propagation from a parent: cancelling the parent token cancels the group's token, which
+    // the cooperative children observe; join_all then succeeds with their values.
+    let parent = CancellationSource.new();
+    let parent_token = parent.token();
+    let mut group5 = TaskGroup.with_cancellation(view(parent_token));
+    let gt = group5.cancellation_token();
+    let mut c: i64 = 0i64;
+    while c < 3i64 {
+        born(alive);
+        let h: TaskHandle<i64> = exec.spawn(Coop { fut: gt.cancelled(), val: 10i64 + c, alive: alive }, poll_coop);
+        let r = group5.adopt(h);
+        check(match r { Result.Ok(id) => true, Result.Err(e) => false });
+        c = c + 1i64;
+    }
+    check(!group5.is_cancelled());
+    parent.cancel();
+    check(group5.is_cancelled());
+    let joined5: Result<GroupResults<i64>, TaskError> = group5.join_all();
+    let mut sum5: i64 = 0i64;
+    match joined5 {
+        Result.Ok(res) => {
+            let mut q: usize = 0usize;
+            while q < res.len() {
+                sum5 = sum5 + unsafe { *results_get_ptr(view(res), q) };
+                q = q + 1usize;
+            }
+        },
+        Result.Err(e) => { check(false); },
+    }
+    check(sum5 == 33i64);
+
+    exec.shutdown();
+    let a = unsafe { (*alive).load(Ordering.Acquire) };
+    check(a == 0i64);
+
+    print("OK group_drop_cancels ");
+    print_int(6i64);
+    print(" ");
+    print_int(a);
+    print("\n");
+    0
+}
