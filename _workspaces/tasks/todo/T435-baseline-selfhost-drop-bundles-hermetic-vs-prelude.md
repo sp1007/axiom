@@ -35,7 +35,7 @@ native and native-O1, and stay green when the implicitly loaded prelude grows.
 - Run the complete group `selfhost/drop/*` (d10..d12 included) and remove the T435 lines from the baseline.
 
 ## Acceptance
-- [ ] `selfhost/drop/qa_drop_d01.ax` .. `d07`, `d09` pass in `interp`, `native`, `native-O1` (exit 0, exact checks)
+- [ ] `selfhost/drop/qa_drop_d01.ax` .. `d07`, `d09`, `d10`, `d11`, `d12` (d10..d12 admitted to the baseline by ADR-0042 §1) pass in `interp`, `native`, `native-O1` (exit 0, exact checks)
   under `axiomc2.exe` built in `build-snap-T435`; `selfhost/drop/bundles_current.test` and `drop_oracle.test` pass.
 - [ ] Mutation proof in the report: one fixture byte changed makes the bundle fail (exit 300) in all three modes.
 - [ ] Complete suite: failing ids are a subset of the baseline after this task's removals; WEAK-NATIVE 0.
@@ -51,3 +51,4 @@ native and native-O1, and stay green when the implicitly loaded prelude grows.
 
 ## Log
 - 2026-11-13 07:40:00 created by axiom-architect (ADR-0041, complete-suite baseline)
+- 2026-11-13 axiom-architect (ADR-0042 §1): baseline lines for d10..d12 added under T435; T441 reuses this task's comparison method for `selfhost/interp_opt` and `selfhost/own_mir_verify`, so document it in the report

@@ -8,7 +8,7 @@ model: sonnet
 gate_model: sonnet
 depends: [T451]
 priority: 142
-status: doing
+status: done
 attempts: 1
 timeout_min: 1500
 paths: [compiler/interp, compiler/opt, tests/run/int128_interp, tests/opt/int128]
@@ -16,7 +16,7 @@ locks: [compiler/interp_opt/session.ax, compiler/mir/mir.ax, compiler/mir/builde
 spec: [spec/SPEC-40-integers.md, spec/SPEC-03-core-semantics.md, tasks/0327, tasks/0334]
 covers: [REQ-SIMD-176, REQ-SIMD-177, REQ-SIMD-264, REQ-SIMD-265]
 started: 2026-11-12 23:28:49
-agent: T452-impl
+finished: 2026-11-13 16:42:03
 ---
 # T452 — E12.1 — Oracle 128-bit evaluator, saturating/bit intrinsics & const folding
 
@@ -50,3 +50,4 @@ Implement exact 128-bit (`i128`/`u128`) arithmetic, saturating operations (`SatA
 - 2026-11-12 21:33:50 started (attempt 1) T452-impl
 - 2026-11-12 23:28:48 requeue: restart (not charged: attempt refunded)
 - 2026-11-12 23:28:49 started (attempt 1) T452-impl
+- 2026-11-13 16:42:03 accepted by QA -> done
