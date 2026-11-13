@@ -119,3 +119,17 @@ performance numbers are committed under `tests/perf/*.csv`.
 On a re-gate after fixes, read your previous `<ID>-qa.md`, verify each earlier finding is fixed
 (with its regression test), refresh the snapshot, re-run everything, and append a `## Round <n>`
 section; the file's last line is the verdict of the newest round.
+
+## Resource limits (owner rule 2026-11-12) — throttle, never cut scope
+
+The dev machine is a 4-core/16 GB laptop shared by several agents; `max_parallel` is 3. Resource limits slow a gate down, they never shrink what it checks: **the gate always runs the complete suite, including every `tests/selfhost/**` bundle, whatever it costs in time** (owner: evaluation quality is never reduced). Rules for everyone: `axtest -j 2` at most (never -j 8); one test run at a time per agent; never detach test runs with nohup; give long commands a generous timeout and run them in chunks (per directory/group) rather than skipping them; kill every axiomc2/python test process you started before finishing. The gate time limit is 3000 minutes (a full serial selfhost-bundle pass costs ~13-19 min per bundle).
+
+If the machine cannot finish the complete suite inside the limit, the gate does not pass on a subset: it continues in further chunks (the orchestrator will resume it) and the verdict is written only after everything ran. A QA file lists what ran (counts per group); "skipped" is never an acceptable entry for a required suite.
+
+### No isolation exemption (owner decision 2026-11-13, replaces the earlier isolation rule)
+
+Every gate runs the COMPLETE suite — every group, including every `tests/selfhost/**` id — for every task, however small or "obviously isolated" its change set is. Reason (owner): unrun tests hide regressions, and hidden regressions pile up across accepts and commits until they cannot be repaired (the 74 already-failing ids found at the T421 gate are exactly that debt). "Isolated, not run" and sampling are not acceptable evidence for a PASS.
+
+Baseline rule: the QA file lists the failing ids of the complete run. A PASS requires that the set of failing ids is a subset of `_workspaces/baseline-failures.txt` (the named list of known pre-existing failures; created from the T421 gate's list; each entry has a fix task on the board) AND no id outside it fails. A gate never adds an id to the baseline; only the architect does, with a fix task.
+
+If the complete run cannot finish inside the gate limit, the gate continues (resumed in chunks); it does not conclude on a subset. Making the complete run cheaper without dropping coverage is the job of the incremental-test task (per-test result cache keyed by the exact files the compiler loaded + compiler binary hash), not of the gate.
