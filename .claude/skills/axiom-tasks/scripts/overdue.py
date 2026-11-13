@@ -38,7 +38,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import taskctl  # noqa: E402
 
-DEFAULT = {"impl": 180, "fix": 180, "qa": 3000, "unblock": 60}
+DEFAULT = {"impl": 180, "fix": 180, "qa": 240, "unblock": 60, "fullrun": 3000}
 LONG = {"impl": 300, "fix": 300}
 LONG_PHASES = re.compile(r"^(P0-traceability|P10)\b")
 ROOT = taskctl.ROOT

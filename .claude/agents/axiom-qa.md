@@ -124,13 +124,14 @@ section; the file's last line is the verdict of the newest round.
 
 The dev machine is a 4-core/16 GB laptop shared by several agents (a selfhost bundle compile takes ~3.5 GB and 5-19 min; CPU is already saturated by two tasks). Rules for everyone: `axtest -j 2` at most; one test run at a time per agent; never detach runs with nohup; generous timeouts and chunked runs; kill every axiomc2/python test process you started before finishing.
 
-### Per-task gate scope
+### Per-task gate scope (target: the whole gate in about 60-90 minutes, hard cap 240)
 
-A task gate runs, from inside the snapshot:
+A task gate runs, from inside the snapshot, ONLY:
 1. the task's own tests and your adversarial tests (native evidence rule applies);
-2. the whole suite EXCEPT `tests/selfhost/**` (every other group, in full, chunked, `-j 2`);
-3. the `tests/selfhost/**` groups whose embedded compiler sources the change set touches: if the change set modifies a file under `compiler/` or `std/` (existing file), run the selfhost groups named after the touched modules (e.g. `compiler/mir` -> `selfhost/mir`, `mir_builder`..., found by grepping the group's generator/bundle for the touched paths); if it touches only new files nobody references (e.g. a new `std/async` module) none are required.
-PASS needs: every required run done and every failing id inside `_workspaces/baseline-failures.txt`. A failing id not on the baseline must be shown to fail identically at HEAD (then report BLOCKED-pre-existing with the proof for the architect to add) or it is caused by the task (FAIL). Never skip a required run; never add to the baseline yourself.
+2. the tests that can observe the change ("affected set"): every test directory/file that references a module, file or symbol the change set touches (grep the changed module paths, public names and `use`/import paths across `tests/` and `std/`), plus the selfhost groups named after touched compiler modules (e.g. `compiler/mir` -> `selfhost/mir`); for a task that only adds new files nobody references, the affected set is just its own tests;
+3. a SMOKE set: one representative test per top-level test group (`tests/<group>/`, about 30 tests, chosen by you, a different pick each time within the group, plus the always-included cases below), `-j 2`, which must finish in about 20 minutes. Always include: the Xin chào thế giới run test, one compile-fail ui test, one native-vs-interp diff test, `archcheck`.
+Everything else is NOT run by the gate; the periodic full run (below) covers it. The QA file lists what ran (affected set rule used, counts per group) and states the affected-set derivation so the architect can audit it.
+PASS needs: every test above done and every failing id inside `_workspaces/baseline-failures.txt`; a failing id outside the baseline must be shown to fail identically at HEAD (report it as new pre-existing for the architect, still PASS) or it is caused by the task (FAIL). The T437 task (`--dep-file`) later replaces the grep-based affected set with exact per-test file dependencies.
 
 ### Periodic full run (catches what the per-task scope skips)
 
