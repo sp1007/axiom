@@ -1,0 +1,156 @@
+module main
+
+// T421a regression: cancelling a task that keeps waking itself.
+//
+// `Looper` wakes itself on every poll and never completes, so it is almost always NOTIFIED (queued) or
+// POLLING when it is cancelled. Two defects are covered:
+//   - flag clobber: the poll function must keep the cancel flag across NOTIFIED -> POLLING -> IDLE; when
+//     it overwrites the state word the request is lost and the task keeps running. Main detects that
+//     (more than CLOBBER_LIMIT polls after the request), counts it, and re-sets the flag on the raw
+//     header to recover;
+//   - livelock: `TaskHandle.cancel` / `Drop` call `task_wake`, which must be wait-free against a task
+//     that changes its state all the time (a CAS retry loop never finishes under the MIR interpreter's
+//     deterministic scheduler: the test then hits its timeout).
+// Even iterations use `cancel()` + `join()`, odd iterations drop the handle without joining. Every
+// future must be dropped exactly once.
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.prelude.Context
+use std.core.host.heap_alloc
+use std.core.host.thread_yield
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.asyn.waker.TaskHeader
+use std.asyn.waker.FLAG_CANCEL_REQUESTED
+use std.asyn.waker.task_dec_ref
+use std.asyn.executor.Executor
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskResult
+use std.asyn.task.TaskHandle
+use std.asyn.task.tcb_poll_fn
+
+const ITERATIONS: i64 = 1000i64
+
+// Polls observed after a cancellation request before it counts as lost (correct code needs <= 2).
+const CLOBBER_LIMIT: i64 = 200i64
+
+struct Looper {
+    pub polls: *mut Atomic<i64>,
+    pub drops: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Looper {}
+unsafe impl Share for Looper {}
+
+impl Future for Looper {
+    type Output = i64;
+    fn poll(self: mut_view<Looper>, cx: mut_view<Context>) -> Poll<i64> {
+        unsafe {
+            (*self.polls).fetch_add(1i64, Ordering.AcqRel);
+        }
+        let mut w = cx.waker();
+        view(w).wake_by_ref();
+        Poll.Pending
+    }
+}
+
+impl Drop for Looper {
+    fn drop(self: mut_view<Looper>) {
+        unsafe {
+            (*self.drops).fetch_add(1i64, Ordering.AcqRel);
+        }
+    }
+}
+
+fn poll_looper(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Looper, i64>;
+    tcb_poll_fn<Looper, i64>(tcb, cx)
+}
+
+fn new_counter() -> *mut Atomic<i64> {
+    let raw = unsafe { heap_alloc(8, 8) };
+    let p = raw as *mut Atomic<i64>;
+    unsafe {
+        *p = Atomic.new(0i64);
+    }
+    p
+}
+
+fn load(p: *mut Atomic<i64>) -> i64 {
+    unsafe { (*p).load(Ordering.Acquire) }
+}
+
+// Wait until `done()` holds for the task; returns 1 when the cancellation request had to be repeated.
+fn wait_cancelled(raw: *mut TaskHeader, polls: *mut Atomic<i64>, drops: *mut Atomic<i64>, drops_goal: i64) -> i64 {
+    let mut base = load(polls);
+    let mut repeated: i64 = 0i64;
+    while load(drops) < drops_goal {
+        if load(polls) - base > CLOBBER_LIMIT {
+            // The request was lost: re-assert it directly on the header (the executor still holds a
+            // reference, the task is not terminal).
+            repeated = 1i64;
+            base = load(polls);
+            unsafe {
+                (*raw).state.fetch_or(FLAG_CANCEL_REQUESTED, Ordering.AcqRel);
+            }
+        }
+        thread_yield();
+    }
+    repeated
+}
+
+pub fn main() -> i32 {
+    let exec = Executor.new(2);
+    let polls = new_counter();
+    let drops = new_counter();
+
+    let mut clobbered: i64 = 0i64;
+    let mut cancelled: i64 = 0i64;
+    let mut i: i64 = 0i64;
+    while i < ITERATIONS {
+        let before = load(polls);
+        let h: TaskHandle<i64> = exec.spawn(Looper { polls: polls, drops: drops }, poll_looper);
+        // Main keeps its own reference so the header stays valid while it is observed.
+        let raw = h.raw_task;
+        unsafe {
+            (*raw).ref_count.fetch_add(1u32, Ordering.AcqRel);
+        }
+        // Let it cycle a few times so the request lands while it is queued or polling.
+        let want = before + 1i64 + (i % 5i64);
+        while load(polls) < want {
+            thread_yield();
+        }
+        if (i % 2i64) == 0i64 {
+            view(h).cancel();
+            clobbered = clobbered + wait_cancelled(raw, polls, drops, i + 1i64);
+            match h.join() {
+                TaskResult.Cancelled => {
+                    cancelled = cancelled + 1i64;
+                },
+                _ => {
+                    check(false);
+                },
+            }
+        } else {
+            {
+                let dropped = h;
+            }
+            clobbered = clobbered + wait_cancelled(raw, polls, drops, i + 1i64);
+        }
+        task_dec_ref(raw);
+        check(load(drops) == i + 1i64);
+        i = i + 1i64;
+    }
+    exec.shutdown();
+    check(load(drops) == ITERATIONS);
+
+    print("OK cancel_self_waking ");
+    print_int(cancelled);
+    print(" ");
+    print_int(load(drops));
+    print(" clobbered ");
+    print_int(clobbered);
+    print("\n");
+    0
+}

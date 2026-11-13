@@ -1,0 +1,178 @@
+module main
+
+// T421a regression: the join-waker slot of a task must never lose a wake.
+//
+// Each iteration spawns an `Inner` task and an `Outer` task on a 2-worker `Executor`; `Outer` awaits
+// the `TaskHandle<i64>` of `Inner` (TaskHandle's `Future` impl registers the join waker). Both spin a
+// varying number of steps first, so `Inner` completes at every offset around the moment `Outer`
+// registers. A lost wake leaves `Outer` IDLE forever although `Inner` is terminal; main detects that
+// (bounded observation), counts it, and recovers by cancelling `Outer`. Expected: no lost wake, and
+// every `Outer` returns `Inner`'s value + 1.
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.prelude.Context
+use std.core.host.heap_alloc
+use std.core.host.thread_yield
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.asyn.waker.TaskHeader
+use std.asyn.waker.TASK_IDLE
+use std.asyn.waker.TASK_COMPLETED
+use std.asyn.waker.task_dec_ref
+use std.asyn.executor.Executor
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskError
+use std.asyn.task.TaskResult
+use std.asyn.task.TaskHandle
+use std.asyn.task.tcb_poll_fn
+
+const ITERATIONS: i64 = 1000i64
+
+// Consecutive observations of "outer idle, inner terminal" that count as a lost wake.
+const LOST_LIMIT: i64 = 2000i64
+
+// Low state bits (covers both the 3-bit and the 4-bit state encodings).
+const LOW_MASK: u32 = 0xFu32
+
+fn spin(steps: i64, sink: *mut Atomic<i64>) {
+    let mut k: i64 = 0i64;
+    while k < steps {
+        unsafe {
+            (*sink).fetch_add(1i64, Ordering.Relaxed);
+        }
+        k = k + 1i64;
+    }
+}
+
+struct Inner {
+    pub delay: i64,
+    pub val: i64,
+    pub sink: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Inner {}
+unsafe impl Share for Inner {}
+
+impl Future for Inner {
+    type Output = i64;
+    fn poll(self: mut_view<Inner>, cx: mut_view<Context>) -> Poll<i64> {
+        spin(self.delay, self.sink);
+        Poll.Ready(self.val)
+    }
+}
+
+fn poll_inner(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Inner, i64>;
+    tcb_poll_fn<Inner, i64>(tcb, cx)
+}
+
+struct Outer {
+    pub h: TaskHandle<i64>,
+    pub delay: i64,
+    pub started: bool,
+    pub sink: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Outer {}
+unsafe impl Share for Outer {}
+
+impl Future for Outer {
+    type Output = i64;
+    fn poll(self: mut_view<Outer>, cx: mut_view<Context>) -> Poll<i64> {
+        if !self.started {
+            self.started = true;
+            spin(self.delay, self.sink);
+        }
+        match self.h.poll(mut_view(*cx)) {
+            Poll.Ready(r) => {
+                match r {
+                    Result.Ok(v) => Poll.Ready(v + 1i64),
+                    Result.Err(_) => Poll.Ready(-1i64),
+                }
+            },
+            Poll.Pending => Poll.Pending,
+        }
+    }
+}
+
+fn poll_outer(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Outer, i64>;
+    tcb_poll_fn<Outer, i64>(tcb, cx)
+}
+
+fn low_state(raw: *mut TaskHeader) -> u32 {
+    unsafe { (*raw).state.load(Ordering.Acquire) & LOW_MASK }
+}
+
+pub fn main() -> i32 {
+    let exec = Executor.new(2);
+    let sink_raw = unsafe { heap_alloc(8, 8) };
+    let sink = sink_raw as *mut Atomic<i64>;
+    unsafe {
+        *sink = Atomic.new(0i64);
+    }
+
+    let mut completed: i64 = 0i64;
+    let mut lost: i64 = 0i64;
+    let mut i: i64 = 0i64;
+    while i < ITERATIONS {
+        let val = i * 3i64;
+        let hi: TaskHandle<i64> = exec.spawn(Inner { delay: i % 37i64, val: val, sink: sink }, poll_inner);
+        // Main keeps its own reference to the inner control block while it observes the state.
+        let inner_raw = hi.raw_task;
+        unsafe {
+            (*inner_raw).ref_count.fetch_add(1u32, Ordering.AcqRel);
+        }
+        let ho: TaskHandle<i64> = exec.spawn(Outer { h: hi, delay: (i * 7i64) % 41i64, started: false, sink: sink }, poll_outer);
+        let outer_raw = ho.raw_task;
+
+        let mut idle_seen: i64 = 0i64;
+        let mut was_lost = false;
+        loop {
+            if view(ho).is_finished() {
+                break;
+            }
+            let inner_done = low_state(inner_raw) >= TASK_COMPLETED;
+            if low_state(outer_raw) == TASK_IDLE && inner_done {
+                idle_seen = idle_seen + 1i64;
+            } else {
+                idle_seen = 0i64;
+            }
+            if idle_seen > LOST_LIMIT {
+                was_lost = true;
+                view(ho).cancel();
+                while !view(ho).is_finished() {
+                    thread_yield();
+                }
+                break;
+            }
+            thread_yield();
+        }
+
+        let r = ho.join();
+        task_dec_ref(inner_raw);
+        if was_lost {
+            lost = lost + 1i64;
+        } else {
+            match r {
+                TaskResult.Completed(v) => {
+                    check(v == val + 1i64);
+                    completed = completed + 1i64;
+                },
+                _ => {
+                    check(false);
+                },
+            }
+        }
+        i = i + 1i64;
+    }
+    exec.shutdown();
+
+    print("OK join_waker_race ");
+    print_int(completed);
+    print(" lost ");
+    print_int(lost);
+    print("\n");
+    0
+}

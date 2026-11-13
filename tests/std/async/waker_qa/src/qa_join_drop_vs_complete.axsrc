@@ -1,0 +1,148 @@
+module main
+
+// T421a QA (adversarial): the awaiting side goes away while the awaited task completes.
+//
+// `Outer` awaits the `TaskHandle<i64>` of `Inner` (join waker = a reference to `Outer`'s task) and
+// returns an `Out` (destructor counted). Main drops `Outer`'s handle at a varying moment, so the
+// `Outer` cancellation, the `Inner` completion (which fires the join waker), the `Inner` cancellation
+// caused by dropping `Outer`'s future (its `TaskHandle` field cancels `Inner`) and the registration
+// of the join waker all race. Whatever `Outer` produced is stored in its control block and only
+// dropped when the last reference to `Outer` goes, so a join waker that is leaked (never woken nor
+// dropped) keeps `Outer` alive and shows up as a produced but never dropped `Out` ("leaked"); a waker
+// dropped twice frees `Outer` early (crash / drops > produced).
+
+use std.core.result.Result
+use std.core.prelude.Context
+use std.core.host.heap_alloc
+use std.core.host.thread_yield
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.asyn.executor.Executor
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskHandle
+use std.asyn.task.tcb_poll_fn
+
+const ITERATIONS: i64 = 300i64
+
+struct Inner {
+    pub delay: i64,
+}
+
+unsafe impl Send for Inner {}
+unsafe impl Share for Inner {}
+
+impl Future for Inner {
+    type Output = i64;
+    fn poll(self: mut_view<Inner>, cx: mut_view<Context>) -> Poll<i64> {
+        if self.delay > 0i64 {
+            self.delay = self.delay - 1i64;
+            let mut w = cx.waker();
+            view(w).wake_by_ref();
+            return Poll.Pending;
+        }
+        Poll.Ready(7i64)
+    }
+}
+
+fn poll_inner(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Inner, i64>;
+    tcb_poll_fn<Inner, i64>(tcb, cx)
+}
+
+struct Out {
+    pub drops: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Out {}
+unsafe impl Share for Out {}
+
+impl Drop for Out {
+    fn drop(self: mut_view<Out>) {
+        unsafe {
+            (*self.drops).fetch_add(1i64, Ordering.AcqRel);
+        }
+    }
+}
+
+struct Outer {
+    pub h: TaskHandle<i64>,
+    pub produced: *mut Atomic<i64>,
+    pub drops: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Outer {}
+unsafe impl Share for Outer {}
+
+impl Future for Outer {
+    type Output = Out;
+    fn poll(self: mut_view<Outer>, cx: mut_view<Context>) -> Poll<Out> {
+        match self.h.poll(mut_view(*cx)) {
+            Poll.Ready(r) => {
+                match r {
+                    Result.Ok(v) => {
+                        check(v == 7i64);
+                    },
+                    Result.Err(_) => {},
+                }
+                unsafe {
+                    (*self.produced).fetch_add(1i64, Ordering.AcqRel);
+                }
+                Poll.Ready(Out { drops: self.drops })
+            },
+            Poll.Pending => Poll.Pending,
+        }
+    }
+}
+
+fn poll_outer(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Outer, Out>;
+    tcb_poll_fn<Outer, Out>(tcb, cx)
+}
+
+fn new_counter() -> *mut Atomic<i64> {
+    let p = unsafe { heap_alloc(8usize, 8usize) as *mut Atomic<i64> };
+    unsafe {
+        *p = Atomic.new(0i64);
+    }
+    p
+}
+
+fn load(p: *mut Atomic<i64>) -> i64 {
+    unsafe { (*p).load(Ordering.Acquire) }
+}
+
+pub fn main() -> i32 {
+    let exec = Executor.new(2);
+    let produced = new_counter();
+    let drops = new_counter();
+
+    let mut i: i64 = 0i64;
+    while i < ITERATIONS {
+        let hi: TaskHandle<i64> = exec.spawn(Inner { delay: i % 6i64 }, poll_inner);
+        let ho: TaskHandle<Out> = exec.spawn(Outer { h: hi, produced: produced, drops: drops }, poll_outer);
+        let mut k: i64 = 0i64;
+        let pause = (i * 5i64) % 13i64;
+        while k < pause {
+            thread_yield();
+            k = k + 1i64;
+        }
+        {
+            let gone = ho;
+        }
+        i = i + 1i64;
+    }
+    exec.shutdown();
+
+    // After shutdown every worker has exited: each task is terminal and the executor references are
+    // gone; only a leaked waker could still pin an `Outer`.
+    let p = load(produced);
+    let d = load(drops);
+    check(d <= p);
+
+    print("OK qa_join_drop_vs_complete ");
+    print_int(ITERATIONS);
+    print(" leaked ");
+    print_int(p - d);
+    print("\n");
+    0
+}

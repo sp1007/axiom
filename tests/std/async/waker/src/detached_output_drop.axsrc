@@ -1,0 +1,223 @@
+module main
+
+// T421a regression: a completed task's stored output is dropped exactly once, whoever releases the
+// task last. `Out` counts its destructor runs; `Producer` counts the outputs it creates. Cases, each
+// N times on a 2-worker `Executor`:
+//   A detach before completion          B detach after completion
+//   C handle dropped after completion   D handle dropped while running (cancel races completion)
+//   E join, the caller drops the output F TaskGroup dropped with uncollected completed children
+// and G: a `LocalExecutor` task detached before it runs. Expected: drops == produced, and the
+// deterministic cases produced exactly their count.
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.prelude.Context
+use std.core.host.heap_alloc
+use std.core.host.thread_yield
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.asyn.executor.Executor
+use std.asyn.executor.LocalExecutor
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskResult
+use std.asyn.task.TaskHandle
+use std.asyn.task.LocalTaskHandle
+use std.asyn.task.tcb_poll_fn
+use std.asyn.group.TaskGroup
+use std.asyn.group.group_poll_fn
+
+const N: i64 = 50i64
+
+struct Out {
+    pub drops: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Out {}
+unsafe impl Share for Out {}
+
+impl Drop for Out {
+    fn drop(self: mut_view<Out>) {
+        unsafe {
+            (*self.drops).fetch_add(1i64, Ordering.AcqRel);
+        }
+    }
+}
+
+// Yields `steps` times, then produces an `Out`.
+struct Producer {
+    pub steps: i32,
+    pub produced: *mut Atomic<i64>,
+    pub drops: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Producer {}
+unsafe impl Share for Producer {}
+
+impl Future for Producer {
+    type Output = Out;
+    fn poll(self: mut_view<Producer>, cx: mut_view<Context>) -> Poll<Out> {
+        if self.steps > 0i32 {
+            self.steps = self.steps - 1i32;
+            let mut w = cx.waker();
+            view(w).wake_by_ref();
+            return Poll.Pending;
+        }
+        unsafe {
+            (*self.produced).fetch_add(1i64, Ordering.AcqRel);
+        }
+        Poll.Ready(Out { drops: self.drops })
+    }
+}
+
+fn poll_producer(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Producer, Out>;
+    tcb_poll_fn<Producer, Out>(tcb, cx)
+}
+
+fn poll_group_producer(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Producer, Out>;
+    group_poll_fn<Producer, Out>(tcb, cx)
+}
+
+fn new_counter() -> *mut Atomic<i64> {
+    let raw = unsafe { heap_alloc(8, 8) };
+    let p = raw as *mut Atomic<i64>;
+    unsafe {
+        *p = Atomic.new(0i64);
+    }
+    p
+}
+
+fn load(p: *mut Atomic<i64>) -> i64 {
+    unsafe { (*p).load(Ordering.Acquire) }
+}
+
+fn wait_finished(h: view<TaskHandle<Out>>) {
+    while !h.is_finished() {
+        thread_yield();
+    }
+}
+
+// Wait (bounded) until `*p` reaches `goal`; returns the final value.
+fn settle(p: *mut Atomic<i64>, goal: i64) -> i64 {
+    let mut spins: i64 = 0i64;
+    while load(p) < goal && spins < 2000000i64 {
+        spins = spins + 1i64;
+        thread_yield();
+    }
+    load(p)
+}
+
+pub fn main() -> i32 {
+    let exec = Executor.new(2);
+    let produced = new_counter();
+    let drops = new_counter();
+    let mut expected: i64 = 0i64;
+    let mut i: i64 = 0i64;
+
+    // A: detach before completion.
+    while i < N {
+        let h: TaskHandle<Out> = exec.spawn(Producer { steps: 3i32, produced: produced, drops: drops }, poll_producer);
+        h.detach();
+        i = i + 1i64;
+    }
+    expected = expected + N;
+    check(settle(drops, expected) == expected);
+
+    // B: detach after completion.
+    i = 0i64;
+    while i < N {
+        let h: TaskHandle<Out> = exec.spawn(Producer { steps: (i % 3i64) as i32, produced: produced, drops: drops }, poll_producer);
+        wait_finished(view(h));
+        h.detach();
+        i = i + 1i64;
+    }
+    expected = expected + N;
+    check(settle(drops, expected) == expected);
+
+    // C: handle dropped after completion.
+    i = 0i64;
+    while i < N {
+        let h: TaskHandle<Out> = exec.spawn(Producer { steps: (i % 2i64) as i32, produced: produced, drops: drops }, poll_producer);
+        wait_finished(view(h));
+        {
+            let gone = h;
+        }
+        i = i + 1i64;
+    }
+    expected = expected + N;
+    check(settle(drops, expected) == expected);
+
+    // E: join; the joined output is dropped by the caller.
+    i = 0i64;
+    while i < N {
+        let h: TaskHandle<Out> = exec.spawn(Producer { steps: 1i32, produced: produced, drops: drops }, poll_producer);
+        match h.join() {
+            TaskResult.Completed(o) => {
+                let mine = o;
+            },
+            _ => {
+                check(false);
+            },
+        }
+        i = i + 1i64;
+    }
+    expected = expected + N;
+    check(settle(drops, expected) == expected);
+    check(load(produced) == expected);
+
+    // F: a TaskGroup dropped while its completed children were never collected.
+    {
+        let mut g = TaskGroup.new();
+        i = 0i64;
+        while i < N {
+            let h: TaskHandle<Out> = exec.spawn(Producer { steps: 1i32, produced: produced, drops: drops }, poll_group_producer);
+            let mut done = false;
+            while !done {
+                done = view(h).is_finished();
+                thread_yield();
+            }
+            let adopted = g.adopt(h);
+            check(match adopted { Result.Ok(_) => true, Result.Err(_) => false });
+            i = i + 1i64;
+        }
+    }
+    expected = expected + N;
+    check(settle(drops, expected) == expected);
+    check(load(produced) == expected);
+
+    // D: handle dropped while the task may still run: completion and cancellation race; whatever was
+    // produced must be dropped.
+    i = 0i64;
+    while i < N {
+        let h: TaskHandle<Out> = exec.spawn(Producer { steps: (i % 4i64) as i32, produced: produced, drops: drops }, poll_producer);
+        {
+            let gone = h;
+        }
+        i = i + 1i64;
+    }
+    exec.shutdown();
+    let total_produced = load(produced);
+    check(total_produced >= expected);
+    check(settle(drops, total_produced) == total_produced);
+
+    // G: LocalExecutor, detached before the first poll.
+    let mut lexec = LocalExecutor.new();
+    i = 0i64;
+    while i < N {
+        let h: LocalTaskHandle<Out> = lexec.spawn_local(Producer { steps: 2i32, produced: produced, drops: drops }, poll_producer);
+        h.detach();
+        i = i + 1i64;
+    }
+    lexec.run();
+    let all_produced = load(produced);
+    check(all_produced == total_produced + N);
+    check(load(drops) == all_produced);
+
+    print("OK detached_output_drop ");
+    print_int(expected + N);
+    print(" ");
+    print_int(load(drops) - all_produced);
+    print("\n");
+    0
+}

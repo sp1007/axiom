@@ -1,0 +1,210 @@
+module main
+
+// T421a regression: `Waker.wake`, `wake_by_ref`, `clone` and `Drop` dispatch through the `RawWaker`'s
+// vtable (SPEC-33), so a user-defined waker works. The user waker counts every vtable call; its data
+// pointer is a `Counts` block, not a task header, so a hard-wired executor path corrupts the counters
+// (or crashes). Part 2 uses the user waker as the `Context` waker of a `TaskHandle` await: the join
+// waker is registered through `clone` and fired through `wake` from an executor worker thread.
+// Invariant: originals + clones == wakes (by value) + drops.
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.prelude.Context
+use std.core.prelude.RawWaker
+use std.core.prelude.RawWakerVTable
+use std.core.prelude.Waker
+use std.core.host.heap_alloc
+use std.core.host.thread_yield
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.asyn.executor.Executor
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskError
+use std.asyn.task.TaskHandle
+use std.asyn.task.tcb_poll_fn
+
+@repr(C)
+struct Counts {
+    pub vt: *const RawWakerVTable,
+    pub clones: Atomic<i64>,
+    pub wakes: Atomic<i64>,
+    pub wake_refs: Atomic<i64>,
+    pub drops: Atomic<i64>,
+}
+
+fn uw_clone(data: *const u8) -> RawWaker {
+    let c = data as *mut Counts;
+    unsafe {
+        (*c).clones.fetch_add(1i64, Ordering.AcqRel);
+        RawWaker { data: data, vtable: (*c).vt }
+    }
+}
+
+fn uw_wake(data: *const u8) {
+    let c = data as *mut Counts;
+    unsafe {
+        (*c).wakes.fetch_add(1i64, Ordering.AcqRel);
+    }
+}
+
+fn uw_wake_by_ref(data: *const u8) {
+    let c = data as *mut Counts;
+    unsafe {
+        (*c).wake_refs.fetch_add(1i64, Ordering.AcqRel);
+    }
+}
+
+fn uw_drop(data: *const u8) {
+    let c = data as *mut Counts;
+    unsafe {
+        (*c).drops.fetch_add(1i64, Ordering.AcqRel);
+    }
+}
+
+fn new_counts() -> *mut Counts {
+    let vt_raw = unsafe { heap_alloc(32usize, 8usize) };
+    let vt = vt_raw as *mut RawWakerVTable;
+    let c_raw = unsafe { heap_alloc(40usize, 8usize) };
+    let c = c_raw as *mut Counts;
+    unsafe {
+        (*vt).clone = uw_clone;
+        (*vt).wake = uw_wake;
+        (*vt).wake_by_ref = uw_wake_by_ref;
+        (*vt).drop_waker = uw_drop;
+        (*c).vt = vt as *const RawWakerVTable;
+        (*c).clones = Atomic.new(0i64);
+        (*c).wakes = Atomic.new(0i64);
+        (*c).wake_refs = Atomic.new(0i64);
+        (*c).drops = Atomic.new(0i64);
+    }
+    c
+}
+
+fn user_waker(c: *mut Counts) -> Waker {
+    Waker { raw: RawWaker { data: c as *const u8, vtable: unsafe { (*c).vt } } }
+}
+
+fn count_clones(c: *mut Counts) -> i64 {
+    unsafe { (*c).clones.load(Ordering.Acquire) }
+}
+
+fn count_wakes(c: *mut Counts) -> i64 {
+    unsafe { (*c).wakes.load(Ordering.Acquire) }
+}
+
+fn count_wake_refs(c: *mut Counts) -> i64 {
+    unsafe { (*c).wake_refs.load(Ordering.Acquire) }
+}
+
+fn count_drops(c: *mut Counts) -> i64 {
+    unsafe { (*c).drops.load(Ordering.Acquire) }
+}
+
+// Pending until `*gate` is non-zero, re-waking itself meanwhile; then Ready(41).
+struct Gated {
+    pub gate: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Gated {}
+unsafe impl Share for Gated {}
+
+impl Future for Gated {
+    type Output = i64;
+    fn poll(self: mut_view<Gated>, cx: mut_view<Context>) -> Poll<i64> {
+        if unsafe { (*self.gate).load(Ordering.Acquire) } != 0i64 {
+            return Poll.Ready(41i64);
+        }
+        let mut w = cx.waker();
+        view(w).wake_by_ref();
+        Poll.Pending
+    }
+}
+
+fn poll_gated(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Gated, i64>;
+    tcb_poll_fn<Gated, i64>(tcb, cx)
+}
+
+pub fn main() -> i32 {
+    let c = new_counts();
+
+    // Part 1: the four Waker operations on one user waker (one original).
+    {
+        let w = user_waker(c);
+        let w2 = view(w).clone();
+        view(w2).wake_by_ref();
+        w2.wake();
+        {
+            let w3 = view(w).clone();
+        }
+    }
+    check(count_clones(c) == 2i64);
+    check(count_wake_refs(c) == 1i64);
+    check(count_wakes(c) == 1i64);
+    check(count_drops(c) == 2i64);
+
+    // Part 2: await a TaskHandle with the user waker as Context waker (second original).
+    let exec = Executor.new(1);
+    let gate_raw = unsafe { heap_alloc(8, 8) };
+    let gate = gate_raw as *mut Atomic<i64>;
+    unsafe {
+        *gate = Atomic.new(0i64);
+    }
+    let mut out: i64 = 0i64;
+    {
+        let mut cx = Context { waker_val: user_waker(c) };
+        let mut h: TaskHandle<i64> = exec.spawn(Gated { gate: gate }, poll_gated);
+        // Two pending polls: the second registration replaces (drops) the first join waker.
+        let p1 = mut_view(h).poll(mut_view(cx));
+        let p2 = mut_view(h).poll(mut_view(cx));
+        check(match p1 { Poll.Pending => true, Poll.Ready(_) => false });
+        check(match p2 { Poll.Pending => true, Poll.Ready(_) => false });
+        unsafe {
+            (*gate).store(1i64, Ordering.Release);
+        }
+        // The completing worker fires the registered join waker through the vtable.
+        let mut spins: i64 = 0i64;
+        while count_wakes(c) < 2i64 {
+            spins = spins + 1i64;
+            check(spins < 100000000i64);
+            thread_yield();
+        }
+        match mut_view(h).poll(mut_view(cx)) {
+            Poll.Ready(r) => {
+                match r {
+                    Result.Ok(v) => {
+                        out = v;
+                    },
+                    Result.Err(_) => {
+                        check(false);
+                    },
+                }
+            },
+            Poll.Pending => {
+                check(false);
+            },
+        }
+    }
+    exec.shutdown();
+
+    let clones = count_clones(c);
+    let wakes = count_wakes(c);
+    let drops = count_drops(c);
+    check(clones == 4i64);
+    check(wakes == 2i64);
+    check(drops == 4i64);
+    check(2i64 + clones == wakes + drops);
+
+    print("OK user_waker_vtable ");
+    print_int(out);
+    print(" ");
+    print_int(clones);
+    print(" ");
+    print_int(count_wake_refs(c));
+    print(" ");
+    print_int(wakes);
+    print(" ");
+    print_int(drops);
+    print("\n");
+    0
+}

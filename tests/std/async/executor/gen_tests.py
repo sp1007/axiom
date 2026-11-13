@@ -597,8 +597,10 @@ pub fn main() -> i32 {
         (*raw).alloc_align = 8usize;
     }
     task_wake(raw);
-    let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) } & 0x7u32;
-    check(st == TASK_NOTIFIED);
+    // A wake during a poll leaves a sticky permit: POLLING|NOTIFIED (T421a state encoding), so the
+    // poller re-queues the task when the poll ends; the waker itself must not enqueue it.
+    let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) } & 0xFu32;
+    check(st == (TASK_POLLING | TASK_NOTIFIED));
     unsafe { heap_free(raw as *mut u8, sz, 8usize); }
 
     // 2. Full executor test with 50 racing poll/wake iterations

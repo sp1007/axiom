@@ -1,0 +1,174 @@
+module main
+
+// T421a QA (adversarial): wakes that race a running poll.
+//
+// `Hammered` never wakes itself: it completes once it has observed `goal` tokens. A foreign OS thread
+// adds the tokens one by one and wakes the task after each one (`task_wake`, the path of
+// `Waker.wake_by_ref` for task wakers), so most wakes land while the task is queued or polling. The
+// wake after the last token must never be lost (a poll that read the old token count must be
+// followed by another poll: the sticky POLLING|NOTIFIED permit), and two polls of the same task must
+// never overlap (a task queued twice would be polled concurrently by the two workers).
+// Expected: every task completes (lost 0) and no overlapping poll is seen (overlaps 0).
+
+use std.core.prelude.Context
+use std.core.host.heap_alloc
+use std.core.host.thread_yield
+use std.core.host.thread_spawn
+use std.core.host.thread_join
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.asyn.waker.TaskHeader
+use std.asyn.waker.task_wake
+use std.asyn.waker.task_dec_ref
+use std.asyn.executor.Executor
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskResult
+use std.asyn.task.TaskHandle
+use std.asyn.task.tcb_poll_fn
+
+const ITERATIONS: i64 = 200i64
+
+// Yields of main, after the hammer thread finished, before an unfinished task counts as lost.
+const STALL_LIMIT: i64 = 20000i64
+
+@repr(C)
+struct Shared {
+    pub raw: *mut TaskHeader,
+    pub goal: i64,
+    pub tokens: Atomic<i64>,
+    pub in_poll: Atomic<i64>,
+    pub overlaps: Atomic<i64>,
+    pub hammer_done: Atomic<i64>,
+}
+
+struct Hammered {
+    pub s: *mut Shared,
+    pub widen: i64,
+}
+
+unsafe impl Send for Hammered {}
+unsafe impl Share for Hammered {}
+
+impl Future for Hammered {
+    type Output = i64;
+    fn poll(self: mut_view<Hammered>, cx: mut_view<Context>) -> Poll<i64> {
+        let s = self.s;
+        if unsafe { (*s).in_poll.fetch_add(1i64, Ordering.AcqRel) } != 0i64 {
+            unsafe {
+                (*s).overlaps.fetch_add(1i64, Ordering.AcqRel);
+            }
+        }
+        let seen: i64 = unsafe { (*s).tokens.load(Ordering.Acquire) };
+        // Widen the poll window so wakes land inside it.
+        let mut k: i64 = 0i64;
+        while k < self.widen {
+            thread_yield();
+            k = k + 1i64;
+        }
+        unsafe {
+            (*s).in_poll.fetch_sub(1i64, Ordering.AcqRel);
+        }
+        if seen >= unsafe { (*s).goal } {
+            return Poll.Ready(seen);
+        }
+        Poll.Pending
+    }
+}
+
+fn poll_hammered(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Hammered, i64>;
+    tcb_poll_fn<Hammered, i64>(tcb, cx)
+}
+
+fn hammer(ctx: *mut u8) -> i64 {
+    let s = ctx as *mut Shared;
+    let goal: i64 = unsafe { (*s).goal };
+    let raw = unsafe { (*s).raw };
+    let mut k: i64 = 0i64;
+    while k < goal {
+        unsafe {
+            (*s).tokens.fetch_add(1i64, Ordering.AcqRel);
+        }
+        task_wake(raw);
+        if (k % 3i64) == 0i64 {
+            thread_yield();
+        }
+        k = k + 1i64;
+    }
+    unsafe {
+        (*s).hammer_done.store(1i64, Ordering.Release);
+    }
+    0i64
+}
+
+pub fn main() -> i32 {
+    let exec = Executor.new(2);
+    let s_raw = unsafe { heap_alloc(48usize, 8usize) };
+    let s = s_raw as *mut Shared;
+    let ret = unsafe { heap_alloc(8usize, 8usize) as *mut i64 };
+    unsafe {
+        (*s).overlaps = Atomic.new(0i64);
+    }
+
+    let mut lost: i64 = 0i64;
+    let mut i: i64 = 0i64;
+    while i < ITERATIONS {
+        let goal = 1i64 + (i % 20i64);
+        unsafe {
+            (*s).goal = goal;
+            (*s).tokens = Atomic.new(0i64);
+            (*s).in_poll = Atomic.new(0i64);
+            (*s).hammer_done = Atomic.new(0i64);
+        }
+        let h: TaskHandle<i64> = exec.spawn(Hammered { s: s, widen: i % 3i64 }, poll_hammered);
+        let raw = h.raw_task;
+        // Pin the header for the hammer thread (its wakes need a live reference).
+        unsafe {
+            (*raw).ref_count.fetch_add(1u32, Ordering.AcqRel);
+            (*s).raw = raw;
+        }
+        let th = unsafe { thread_spawn(hammer, s_raw, 0usize) };
+        check(th > 0i64);
+
+        let mut stall: i64 = 0i64;
+        let mut was_lost = false;
+        while !view(h).is_finished() {
+            if unsafe { (*s).hammer_done.load(Ordering.Acquire) } != 0i64 {
+                stall = stall + 1i64;
+            }
+            if stall > STALL_LIMIT {
+                was_lost = true;
+                // Recover: one more token-free wake lets the task observe the final count.
+                task_wake(raw);
+                stall = 0i64;
+            }
+            thread_yield();
+        }
+        unsafe {
+            thread_join(th, ret);
+        }
+        match h.join() {
+            TaskResult.Completed(v) => {
+                check(v == goal);
+            },
+            _ => {
+                check(false);
+            },
+        }
+        task_dec_ref(raw);
+        if was_lost {
+            lost = lost + 1i64;
+        }
+        i = i + 1i64;
+    }
+    exec.shutdown();
+
+    print("OK qa_wake_during_poll ");
+    print_int(ITERATIONS);
+    print(" overlaps ");
+    print_int(unsafe { (*s).overlaps.load(Ordering.Acquire) });
+    print(" lost ");
+    print_int(lost);
+    print("\n");
+    0
+}

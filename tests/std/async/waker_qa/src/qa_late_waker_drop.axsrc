@@ -1,0 +1,187 @@
+module main
+
+// T421a QA (adversarial): a task waker that outlives the task and is released on a foreign thread.
+//
+// `Stasher` clones its Context waker on the first poll and parks the reference outside the task (as a
+// data/vtable pair, the way wait queues keep wakers), then completes on the second poll with an `Out`
+// whose destructor is counted. The handle is detached (even i) or dropped after completion (odd i),
+// so the parked waker is the last reference. While it lives the output must NOT be dropped ("early"
+// counts outputs dropped too soon: the control block would be freed under a live waker). A separate
+// OS thread then uses the waker after the task finished: `wake_by_ref` and a clone/drop pair (both
+// must be harmless on a terminal task), and finally `wake`, which consumes the last reference: the
+// output is dropped exactly once, on that thread.
+
+use std.core.prelude.Context
+use std.core.prelude.RawWaker
+use std.core.prelude.RawWakerVTable
+use std.core.host.heap_alloc
+use std.core.host.thread_yield
+use std.core.host.thread_spawn
+use std.core.host.thread_join
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.asyn.waker.TaskHeader
+use std.asyn.waker.TASK_STATE_MASK
+use std.asyn.waker.TASK_COMPLETED
+use std.asyn.waker.waker_leak
+use std.asyn.waker.raw_waker_wake
+use std.asyn.waker.raw_waker_wake_by_ref
+use std.asyn.waker.raw_waker_clone
+use std.asyn.waker.raw_waker_drop
+use std.asyn.executor.Executor
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskHandle
+use std.asyn.task.tcb_poll_fn
+
+const ITERATIONS: i64 = 100i64
+const WAIT_LIMIT: i64 = 2000000i64
+
+@repr(C)
+struct Stash {
+    pub data: *const u8,
+    pub vt: *const RawWakerVTable,
+    pub parked: Atomic<i64>,
+    pub out_drops: Atomic<i64>,
+}
+
+struct Out {
+    pub st: *mut Stash,
+}
+
+unsafe impl Send for Out {}
+unsafe impl Share for Out {}
+
+impl Drop for Out {
+    fn drop(self: mut_view<Out>) {
+        unsafe {
+            (*self.st).out_drops.fetch_add(1i64, Ordering.AcqRel);
+        }
+    }
+}
+
+struct Stasher {
+    pub st: *mut Stash,
+    pub first: bool,
+}
+
+unsafe impl Send for Stasher {}
+unsafe impl Share for Stasher {}
+
+impl Future for Stasher {
+    type Output = Out;
+    fn poll(self: mut_view<Stasher>, cx: mut_view<Context>) -> Poll<Out> {
+        if self.first {
+            self.first = false;
+            let w = mut_view(*cx).waker();
+            let rw: RawWaker = waker_leak(w);
+            unsafe {
+                (*self.st).data = rw.data;
+                (*self.st).vt = rw.vtable;
+                (*self.st).parked.store(1i64, Ordering.Release);
+            }
+            let mut w2 = mut_view(*cx).waker();
+            view(w2).wake_by_ref();
+            return Poll.Pending;
+        }
+        Poll.Ready(Out { st: self.st })
+    }
+}
+
+fn poll_stasher(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Stasher, Out>;
+    tcb_poll_fn<Stasher, Out>(tcb, cx)
+}
+
+fn late_user(ctx: *mut u8) -> i64 {
+    let st = ctx as *mut Stash;
+    let data = unsafe { (*st).data };
+    let vt = unsafe { (*st).vt };
+    raw_waker_wake_by_ref(data, vt);
+    let c: RawWaker = raw_waker_clone(data, vt);
+    raw_waker_drop(c.data, c.vtable);
+    raw_waker_wake(data, vt);
+    0i64
+}
+
+fn is_terminal(data: *const u8) -> bool {
+    let raw = data as *mut TaskHeader;
+    (unsafe { (*raw).state.load(Ordering.Acquire) } & TASK_STATE_MASK) >= TASK_COMPLETED
+}
+
+fn wait_parked_and_terminal(st: *mut Stash) {
+    let mut spins: i64 = 0i64;
+    while unsafe { (*st).parked.load(Ordering.Acquire) } == 0i64 {
+        spins = spins + 1i64;
+        check(spins < WAIT_LIMIT);
+        thread_yield();
+    }
+    // The parked waker pins the control block: its state stays readable.
+    let data = unsafe { (*st).data };
+    spins = 0i64;
+    while !is_terminal(data) {
+        spins = spins + 1i64;
+        check(spins < WAIT_LIMIT);
+        thread_yield();
+    }
+}
+
+pub fn main() -> i32 {
+    let exec = Executor.new(2);
+    // 64 bytes although Stash needs 32: the MIR interpreter probes a thread_spawn context for the
+    // 40-byte std.thread packet header and reports AX_UNSAFE_INTERP_UB for a smaller allocation
+    // (compiler/interp/interp.ax HOST_INTR_THREAD_SPAWN; QA follow-up of T421a).
+    let st = unsafe { heap_alloc(64usize, 8usize) as *mut Stash };
+    let ret = unsafe { heap_alloc(8usize, 8usize) as *mut i64 };
+    unsafe {
+        (*st).out_drops = Atomic.new(0i64);
+    }
+
+    let mut early: i64 = 0i64;
+    let mut i: i64 = 0i64;
+    while i < ITERATIONS {
+        unsafe {
+            (*st).parked = Atomic.new(0i64);
+        }
+        let h: TaskHandle<Out> = exec.spawn(Stasher { st: st, first: true }, poll_stasher);
+        if (i % 2i64) == 0i64 {
+            h.detach();
+            wait_parked_and_terminal(st);
+        } else {
+            wait_parked_and_terminal(st);
+            let gone = h;
+        }
+        // Give a premature release every chance to happen.
+        let mut k: i64 = 0i64;
+        while k < 50i64 {
+            thread_yield();
+            k = k + 1i64;
+        }
+        if unsafe { (*st).out_drops.load(Ordering.Acquire) } != i {
+            early = early + 1i64;
+        }
+        let th = unsafe { thread_spawn(late_user, st as *mut u8, 0usize) };
+        check(th > 0i64);
+        unsafe {
+            thread_join(th, ret);
+        }
+        // The executor may still be releasing its own reference right after the poll: wait (bounded).
+        let mut spins: i64 = 0i64;
+        while unsafe { (*st).out_drops.load(Ordering.Acquire) } < i + 1i64 {
+            spins = spins + 1i64;
+            check(spins < WAIT_LIMIT);
+            thread_yield();
+        }
+        check(unsafe { (*st).out_drops.load(Ordering.Acquire) } == i + 1i64);
+        i = i + 1i64;
+    }
+    exec.shutdown();
+
+    print("OK qa_late_waker_drop ");
+    print_int(ITERATIONS);
+    print(" early ");
+    print_int(early);
+    print(" drops ");
+    print_int(unsafe { (*st).out_drops.load(Ordering.Acquire) });
+    print("\n");
+    0
+}

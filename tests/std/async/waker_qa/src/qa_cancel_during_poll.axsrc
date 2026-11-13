@@ -1,0 +1,219 @@
+module main
+
+// T421a QA (adversarial): cancellation requested while the task is inside its poll.
+//
+// `Gate` blocks its first poll until main has issued the request, then ends the poll. Modes (i % 4):
+//   0  `TaskHandle.cancel()` during the poll, poll returns Pending without waking itself: the cancel
+//      wake arrived during the poll (POLLING|NOTIFIED), so the task must be re-polled and cancelled.
+//   1  `cancel()` during the poll, poll returns Ready: completion wins, `join` yields the output.
+//   2  the handle is dropped during the poll (Drop cancels), poll returns Ready: the stored output
+//      must be dropped when the last reference goes.
+//   3  only the cancel flag is set on the header (no wake), poll returns Pending without waking:
+//      `task_end_poll_pending` must still re-queue the task so the request is observed.
+// A second call of the future's poll in modes 0/3 means the request was not observed at poll start
+// (counted in `late`, and the task would then park forever). Every future is dropped exactly once and
+// every produced output is dropped exactly once.
+
+use std.core.prelude.Context
+use std.core.host.heap_alloc
+use std.core.host.thread_yield
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.asyn.waker.TaskHeader
+use std.asyn.waker.FLAG_CANCEL_REQUESTED
+use std.asyn.waker.task_dec_ref
+use std.asyn.executor.Executor
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskResult
+use std.asyn.task.TaskHandle
+use std.asyn.task.tcb_poll_fn
+
+const ITERATIONS: i64 = 200i64
+const WAIT_LIMIT: i64 = 2000000i64
+
+@repr(C)
+struct Shared {
+    pub in_poll: Atomic<i64>,
+    pub sent: Atomic<i64>,
+    pub late: Atomic<i64>,
+    pub fut_drops: *mut Atomic<i64>,
+    pub out_made: Atomic<i64>,
+    pub out_drops: Atomic<i64>,
+}
+
+struct Out {
+    pub s: *mut Shared,
+}
+
+unsafe impl Send for Out {}
+unsafe impl Share for Out {}
+
+impl Drop for Out {
+    fn drop(self: mut_view<Out>) {
+        unsafe {
+            (*self.s).out_drops.fetch_add(1i64, Ordering.AcqRel);
+        }
+    }
+}
+
+struct Gate {
+    pub s: *mut Shared,
+    pub mode: i64,
+    pub polled: bool,
+}
+
+unsafe impl Send for Gate {}
+unsafe impl Share for Gate {}
+
+impl Future for Gate {
+    type Output = Out;
+    fn poll(self: mut_view<Gate>, cx: mut_view<Context>) -> Poll<Out> {
+        let s = self.s;
+        if self.polled {
+            // Only reachable when a cancel request was not observed at the start of the next poll.
+            unsafe {
+                (*s).late.fetch_add(1i64, Ordering.AcqRel);
+            }
+            return Poll.Pending;
+        }
+        self.polled = true;
+        unsafe {
+            (*s).in_poll.store(1i64, Ordering.Release);
+        }
+        while unsafe { (*s).sent.load(Ordering.Acquire) } == 0i64 {
+            thread_yield();
+        }
+        if self.mode == 1i64 || self.mode == 2i64 {
+            unsafe {
+                (*s).out_made.fetch_add(1i64, Ordering.AcqRel);
+            }
+            return Poll.Ready(Out { s: s });
+        }
+        Poll.Pending
+    }
+}
+
+impl Drop for Gate {
+    fn drop(self: mut_view<Gate>) {
+        unsafe {
+            (*(*self.s).fut_drops).fetch_add(1i64, Ordering.AcqRel);
+        }
+    }
+}
+
+fn poll_gate(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Gate, Out>;
+    tcb_poll_fn<Gate, Out>(tcb, cx)
+}
+
+fn wait_in_poll(s: *mut Shared) {
+    let mut spins: i64 = 0i64;
+    while unsafe { (*s).in_poll.load(Ordering.Acquire) } == 0i64 {
+        spins = spins + 1i64;
+        check(spins < WAIT_LIMIT);
+        thread_yield();
+    }
+}
+
+fn wait_finished(h: view<TaskHandle<Out>>) {
+    let mut spins: i64 = 0i64;
+    while !h.is_finished() {
+        spins = spins + 1i64;
+        check(spins < WAIT_LIMIT);
+        thread_yield();
+    }
+}
+
+fn wait_count(p: *mut Atomic<i64>, goal: i64) {
+    let mut spins: i64 = 0i64;
+    while unsafe { (*p).load(Ordering.Acquire) } < goal {
+        spins = spins + 1i64;
+        check(spins < WAIT_LIMIT);
+        thread_yield();
+    }
+}
+
+pub fn main() -> i32 {
+    let exec = Executor.new(2);
+    let s = unsafe { heap_alloc(48usize, 8usize) as *mut Shared };
+    unsafe {
+        (*s).late = Atomic.new(0i64);
+        let fd = heap_alloc(8usize, 8usize) as *mut Atomic<i64>;
+        *fd = Atomic.new(0i64);
+        (*s).fut_drops = fd;
+        (*s).out_made = Atomic.new(0i64);
+        (*s).out_drops = Atomic.new(0i64);
+    }
+
+    let mut cancelled: i64 = 0i64;
+    let mut completed: i64 = 0i64;
+    let mut i: i64 = 0i64;
+    while i < ITERATIONS {
+        let mode = i % 4i64;
+        unsafe {
+            (*s).in_poll = Atomic.new(0i64);
+            (*s).sent = Atomic.new(0i64);
+        }
+        let h: TaskHandle<Out> = exec.spawn(Gate { s: s, mode: mode, polled: false }, poll_gate);
+        wait_in_poll(s);
+        if mode == 2i64 {
+            {
+                let gone = h;
+            }
+            unsafe {
+                (*s).sent.store(1i64, Ordering.Release);
+            }
+            // The stored output is released with the last task reference (the executor's).
+            wait_count(unsafe { (*s).fut_drops }, i + 1i64);
+        } else {
+            if mode == 3i64 {
+                let raw = h.raw_task;
+                unsafe {
+                    (*raw).state.fetch_or(FLAG_CANCEL_REQUESTED, Ordering.AcqRel);
+                }
+            } else {
+                view(h).cancel();
+            }
+            unsafe {
+                (*s).sent.store(1i64, Ordering.Release);
+            }
+            wait_finished(view(h));
+            match h.join() {
+                TaskResult.Completed(o) => {
+                    check(mode == 1i64);
+                    let mine = o;
+                    completed = completed + 1i64;
+                },
+                TaskResult.Cancelled => {
+                    check(mode == 0i64 || mode == 3i64);
+                    cancelled = cancelled + 1i64;
+                },
+                TaskResult.Panicked => {
+                    check(false);
+                },
+            }
+            wait_count(unsafe { (*s).fut_drops }, i + 1i64);
+        }
+        i = i + 1i64;
+    }
+    exec.shutdown();
+
+    let made = unsafe { (*s).out_made.load(Ordering.Acquire) };
+    let out_drops = unsafe { (*s).out_drops.load(Ordering.Acquire) };
+    check(unsafe { (*s).late.load(Ordering.Acquire) } == 0i64);
+    check(made == 100i64);
+
+    print("OK qa_cancel_during_poll ");
+    print_int(ITERATIONS);
+    print(" cancelled ");
+    print_int(cancelled);
+    print(" completed ");
+    print_int(completed);
+    print(" futures ");
+    print_int(unsafe { (*(*s).fut_drops).load(Ordering.Acquire) });
+    print(" outputs ");
+    print_int(out_drops - made);
+    print("\n");
+    0
+}
+

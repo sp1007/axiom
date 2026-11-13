@@ -49,7 +49,14 @@ use std.asyn.task.TaskResult
 use std.asyn.task.TaskHandle
 use std.asyn.task.TaskControlBlock
 use std.asyn.task.task_take_output
-use std.asyn.task.task_wake_join_waker
+use std.asyn.task.task_finish
+use std.asyn.task.tcb_drop_future
+use std.asyn.task.tcb_drop_payload
+use std.asyn.waker.TASK_STATE_MASK
+use std.asyn.waker.task_state
+use std.asyn.waker.task_begin_poll
+use std.asyn.waker.task_end_poll_pending
+use std.asyn.waker.task_request_cancel
 
 use std.asyn.executor.Executor
 use std.asyn.cancel.CancellationSource
@@ -93,69 +100,33 @@ pub fn task_panic(cx: mut_view<Context>) {
     }
 }
 
-// Drop the future stored in the control block (once) and mark the slot empty.
-unsafe fn tcb_drop_future<F, T>(tcb: *mut TaskControlBlock<F, T>) {
-    if (*tcb).has_future {
-        let mut tmp: [1]F = [*address_of_mut((*tcb).future)];
-    }
-    (*tcb).has_future = false;
-}
-
-// Ask a group task to stop: set the cancel flag, then make sure the task will observe it. A task that
-// is IDLE is moved to NOTIFIED and scheduled; a task that is already queued (NOTIFIED) or running
-// (POLLING) needs no wake: `group_poll_fn` checks the flag when a poll starts and again when a poll
-// ends. Deliberately no retry loop: `task_wake` spins on a task that keeps re-waking itself, which
-// livelocks under the oracle's deterministic scheduler.
+// Ask a group task to stop: set the cancel flag and wake the task so a poll observes it. Kept as
+// the group-facing name; since T421a it is `task_request_cancel` (wait-free, no retry loop that could
+// livelock against a task that keeps re-waking itself).
 pub fn group_request_cancel(raw: *mut TaskHeader) {
-    if (raw as usize) == 0 {
-        return;
-    }
-    unsafe {
-        (*raw).state.fetch_or(FLAG_CANCEL_REQUESTED, Ordering.AcqRel);
-    }
-    loop {
-        let s: u32 = unsafe { (*raw).state.load(Ordering.Acquire) };
-        if (s & 0x7u32) != TASK_IDLE {
-            return;
-        }
-        let queued: u32 = (s & 0xFFFFFFF8u32) | TASK_NOTIFIED;
-        let cas = unsafe { (*raw).state.compare_exchange(s, queued, Ordering.AcqRel, Ordering.Acquire) };
-        if cas.ok {
-            let s_fn = unsafe { (*raw).schedule_fn };
-            let s_addr = unsafe { *(address_of<fn(*mut TaskHeader)>(s_fn) as *const usize) };
-            if s_addr != 0usize {
-                s_fn(raw);
-            }
-            return;
-        }
-    }
+    task_request_cancel(raw);
 }
 
-// Poll function for tasks spawned by a `TaskGroup` (usable for any task). Differences to
-// `std.asyn.task.tcb_poll_fn`:
-//   - flag bits (cancel / detach) are preserved across the IDLE/NOTIFIED -> POLLING -> IDLE transitions,
-//     so a cancellation requested while the task is queued or running is never lost;
-//   - a task that called `task_panic` ends as `TASK_PANICKED` (future dropped, output discarded).
+// Poll function for tasks spawned by a `TaskGroup` (usable for any task). Same state protocol as
+// `std.asyn.task.tcb_poll_fn` (flag bits preserved, cancel observed at poll start, null Context drops
+// the stored payload); in addition a task that called `task_panic` ends as `TASK_PANICKED` (future
+// dropped, output discarded).
 pub fn group_poll_fn<F: Future<Output = T>, T>(tcb: *mut TaskControlBlock<F, T>, cx_raw: *mut u8) -> u32 {
     let raw = tcb as *mut TaskHeader;
+    if (cx_raw as usize) == 0 {
+        unsafe {
+            tcb_drop_payload<F, T>(tcb);
+        }
+        return task_state(raw);
+    }
 
-    // IDLE/NOTIFIED -> POLLING while keeping the flag bits; observe a pending cancellation first.
-    let mut st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) };
-    loop {
-        if (st & FLAG_CANCEL_REQUESTED) != 0u32 {
-            unsafe {
-                tcb_drop_future<F, T>(tcb);
-                (*raw).state.store(TASK_CANCELLED, Ordering.Release);
-                task_wake_join_waker(raw);
-            }
-            return TASK_CANCELLED;
+    let st: u32 = task_begin_poll(raw);
+    if (st & FLAG_CANCEL_REQUESTED) != 0u32 {
+        unsafe {
+            tcb_drop_future<F, T>(tcb);
+            task_finish(raw, TASK_CANCELLED);
         }
-        let want: u32 = (st & 0xFFFFFFF8u32) | TASK_POLLING;
-        let cas = unsafe { (*raw).state.compare_exchange(st, want, Ordering.AcqRel, Ordering.Acquire) };
-        if cas.ok {
-            break;
-        }
-        st = cas.val;
+        return TASK_CANCELLED;
     }
 
     let p_cx = cx_raw as *mut Context;
@@ -166,10 +137,11 @@ pub fn group_poll_fn<F: Future<Output = T>, T>(tcb: *mut TaskControlBlock<F, T>,
     match poll_res {
         Poll.Ready(val) => {
             if panicked {
+                // The output is discarded (dropped here, at the end of this arm).
+                let discarded = val;
                 unsafe {
                     tcb_drop_future<F, T>(tcb);
-                    (*raw).state.store(TASK_PANICKED, Ordering.Release);
-                    task_wake_join_waker(raw);
+                    task_finish(raw, TASK_PANICKED);
                 }
                 return TASK_PANICKED;
             }
@@ -177,8 +149,7 @@ pub fn group_poll_fn<F: Future<Output = T>, T>(tcb: *mut TaskControlBlock<F, T>,
                 tcb_drop_future<F, T>(tcb);
                 (*tcb).slot.output = val;
                 (*tcb).slot.has_output = true;
-                (*raw).state.store(TASK_COMPLETED, Ordering.Release);
-                task_wake_join_waker(raw);
+                task_finish(raw, TASK_COMPLETED);
             }
             TASK_COMPLETED
         },
@@ -186,45 +157,12 @@ pub fn group_poll_fn<F: Future<Output = T>, T>(tcb: *mut TaskControlBlock<F, T>,
             if panicked {
                 unsafe {
                     tcb_drop_future<F, T>(tcb);
-                    (*raw).state.store(TASK_PANICKED, Ordering.Release);
-                    task_wake_join_waker(raw);
+                    task_finish(raw, TASK_PANICKED);
                 }
                 return TASK_PANICKED;
             }
-            // POLLING -> IDLE (keeping flags); when a wake raced the poll the state is NOTIFIED and
-            // the task must be queued again. A cancellation requested while the task was polling
-            // also sends it straight back to the queue: `group_request_cancel` does not wake a task
-            // that is polling or queued, it relies on this check and on the check at poll start.
-            loop {
-                let s: u32 = unsafe { (*raw).state.load(Ordering.Acquire) };
-                if (s & 0x7u32) == TASK_POLLING {
-                    if (s & FLAG_CANCEL_REQUESTED) != 0u32 {
-                        let again: u32 = (s & 0xFFFFFFF8u32) | TASK_NOTIFIED;
-                        let c2 = unsafe { (*raw).state.compare_exchange(s, again, Ordering.AcqRel, Ordering.Acquire) };
-                        if c2.ok {
-                            let s_fn2 = unsafe { (*raw).schedule_fn };
-                            let s_addr2 = unsafe { *(address_of<fn(*mut TaskHeader)>(s_fn2) as *const usize) };
-                            if s_addr2 != 0usize {
-                                s_fn2(raw);
-                            }
-                            return TASK_NOTIFIED;
-                        }
-                    } else {
-                        let idle: u32 = (s & 0xFFFFFFF8u32) | TASK_IDLE;
-                        let cas = unsafe { (*raw).state.compare_exchange(s, idle, Ordering.AcqRel, Ordering.Acquire) };
-                        if cas.ok {
-                            return TASK_IDLE;
-                        }
-                    }
-                } else {
-                    let s_fn = unsafe { (*raw).schedule_fn };
-                    let s_addr = unsafe { *(address_of<fn(*mut TaskHeader)>(s_fn) as *const usize) };
-                    if s_addr != 0usize {
-                        s_fn(raw);
-                    }
-                    return TASK_NOTIFIED;
-                }
-            }
+            // POLLING -> IDLE, or back to the queue when a wake or a cancel request arrived.
+            task_end_poll_pending(raw)
         },
     }
 }
@@ -324,13 +262,13 @@ unsafe impl Send for TaskGroup {}
 impl !Copy for TaskGroup {}
 
 fn raw_is_terminal(raw: *mut TaskHeader) -> bool {
-    let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) } & 0x7u32;
+    let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) } & TASK_STATE_MASK;
     st >= TASK_COMPLETED
 }
 
 // Take the final result of a terminal task and release the group's reference to it.
 fn reap_raw<T>(raw: *mut TaskHeader) -> TaskResult<T> {
-    let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) } & 0x7u32;
+    let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) } & TASK_STATE_MASK;
     let res: TaskResult<T> = if st == TASK_COMPLETED {
         TaskResult.Completed(unsafe { task_take_output<T>(raw) })
     } else if st == TASK_CANCELLED {
@@ -515,7 +453,7 @@ impl TaskGroup {
         while i < self.used {
             let raw = unsafe { *(self.tasks + i) };
             if (raw as usize) != 0 {
-                let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) } & 0x7u32;
+                let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) } & TASK_STATE_MASK;
                 if st == TASK_PANICKED {
                     self.failed = true;
                     self.failure_index = i;
@@ -550,7 +488,7 @@ impl TaskGroup {
                 if raw_is_terminal(raw) {
                     // A child may have panicked after `poll_failure` scanned but before this scan:
                     // record the failure here (and cancel the siblings) before the slot is reaped.
-                    let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) } & 0x7u32;
+                    let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) } & TASK_STATE_MASK;
                     if st == TASK_PANICKED && !self.failed {
                         self.failed = true;
                         self.failure_index = i;
@@ -679,8 +617,8 @@ impl Drop for TaskGroup {
         }
         mut_view(*self).cancel_all();
         // Drain: every child must reach a terminal state (future dropped) before the group goes away.
-        // Outputs of children that completed but were never collected are not dropped (the output
-        // type is unknown here; `TaskHandle` has the same limitation).
+        // Outputs of children that completed but were never collected are dropped when the last
+        // task reference goes (`default_task_drop` through the child's poll function).
         while self.live > 0usize {
             let mut progressed = false;
             let mut i: usize = 0usize;
