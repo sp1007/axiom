@@ -22,6 +22,7 @@ import os
 import struct
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 EXPECTED_PROBE_STDOUT = (
@@ -129,6 +130,55 @@ def verify_pe_reproducible(exe_a: Path, exe_b: Path) -> tuple[bool, str]:
     return True, "ok"
 
 
+# --- Load-aware step deadline (T440, ADR-0042 section 1) ------------------------------------------
+# All subprocess steps of this oracle share ONE wall-clock budget instead of fixed per-step timeouts:
+# the old fixed 180 s limit of the bundled `--interp` step was hit on the shared 4-core machine under
+# `-j 2` load and surfaced as a TimeoutExpired traceback (T422-qa section 7). ORACLE_BUDGET_S is 3x the
+# slowest measured wall time of the whole oracle at scale 1 (table in _workspaces/reports/T440-report.md).
+# It is multiplied by AXTEST_TIMEOUT_SCALE (default 1): set that variable to the runner's
+# `--timeout-scale` value when re-running a timed-out id (tools/axtest.py does not export it yet).
+# A hang anywhere stops the run at the deadline with one `TIMEOUT:` line on stderr and exit 1;
+# the manifest `timeout:` stays above the budget so the oracle reports first.
+ORACLE_BUDGET_S = 834.0
+
+
+def _timeout_scale() -> float:
+    try:
+        scale = float(os.environ.get("AXTEST_TIMEOUT_SCALE") or "1")
+    except ValueError:
+        return 1.0
+    return scale if scale > 0 else 1.0
+
+
+_DEADLINE = time.monotonic() + ORACLE_BUDGET_S * _timeout_scale()
+
+
+class OracleTimeout(Exception):
+    pass
+
+
+def bounded_run(cmd, **kwargs):
+    """subprocess.run with the time left of the oracle budget as its timeout."""
+    left = _DEADLINE - time.monotonic()
+    step = " ".join([os.path.basename(str(cmd[0]))] + [str(c) for c in cmd[1:3]])
+    if left <= 0:
+        raise OracleTimeout(f"budget exhausted before `{step}`")
+    try:
+        return subprocess.run(cmd, timeout=left, **kwargs)
+    except subprocess.TimeoutExpired:
+        raise OracleTimeout(
+            f"`{step}` killed after {left:.0f}s (budget {ORACLE_BUDGET_S:g}s x scale {_timeout_scale():g})"
+        ) from None
+
+
+def guarded_main(main_fn) -> int:
+    try:
+        return main_fn()
+    except OracleTimeout as e:
+        sys.stderr.write(f"TIMEOUT: {e}\n")
+        return 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--compiler", required=True)
@@ -154,14 +204,13 @@ def main() -> int:
     assemble_bundle(root, probe_path, bundled_ax)
 
     # 1. Run bundled probe in `--interp`
-    r_interp = subprocess.run(
+    r_interp = bounded_run(
         [str(compiler), "run", "--interp", str(bundled_ax)],
         cwd=str(root),
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=180,
     )
     if r_interp.returncode != 0:
         print(
@@ -186,14 +235,13 @@ def main() -> int:
         if exe_path.exists():
             exe_path.unlink()
 
-        r_build = subprocess.run(
+        r_build = bounded_run(
             [str(compiler), "build", "--stack-reserve=67108864", opt, "--verify-each", "-o", str(exe_path), str(bundled_ax)],
             cwd=str(root),
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=180,
         )
         if r_build.returncode != 0 or not exe_path.is_file():
             print(
@@ -205,14 +253,13 @@ def main() -> int:
 
         disk_cache_dir = out_dir / f"axiom_cache_{tag}"
         cache_arg = "--cache-dir=" + str(disk_cache_dir).replace("\\", "/")
-        r_native = subprocess.run(
+        r_native = bounded_run(
             [str(exe_path), cache_arg],
             cwd=str(root),
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=120,
         )
         if r_native.returncode != 0:
             print(
@@ -237,14 +284,13 @@ def main() -> int:
     exe_o2_b = out_dir / f"e18_2_incremental_O2_repro{exe_ext}"
     if exe_o2_b.exists():
         exe_o2_b.unlink()
-    r_repro = subprocess.run(
+    r_repro = bounded_run(
         [str(compiler), "build", "--stack-reserve=67108864", "-O2", "--verify-each", "-o", str(exe_o2_b), str(bundled_ax)],
         cwd=str(root),
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=180,
     )
     if r_repro.returncode != 0:
         print(f"FAIL: second -O2 build failed: {r_repro.stderr}", file=sys.stderr)
@@ -263,14 +309,13 @@ def main() -> int:
     for ax_file in fixtures:
         stdout_file = ax_file.with_suffix(".stdout")
         expected_out = stdout_file.read_text(encoding="utf-8").replace("\r\n", "\n") if stdout_file.is_file() else ""
-        ri = subprocess.run(
+        ri = bounded_run(
             [str(compiler), "run", "--interp", str(ax_file)],
             cwd=str(root),
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=60,
         )
         if ri.returncode != 0 or ri.stdout.replace("\r\n", "\n") != expected_out:
             print(f"FAIL: fixture {ax_file.name} --interp failed: {ri.stderr}", file=sys.stderr)
@@ -279,26 +324,24 @@ def main() -> int:
         fx_exe = out_dir / f"fx_{ax_file.stem}{exe_ext}"
         if fx_exe.exists():
             fx_exe.unlink()
-        rb = subprocess.run(
+        rb = bounded_run(
             [str(compiler), "build", "-O2", "--verify-each", "-o", str(fx_exe), str(ax_file)],
             cwd=str(root),
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=60,
         )
         if rb.returncode != 0 or not fx_exe.is_file():
             print(f"FAIL: fixture {ax_file.name} native build failed: {rb.stderr}", file=sys.stderr)
             return 1
-        rn = subprocess.run(
+        rn = bounded_run(
             [str(fx_exe)],
             cwd=str(root),
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=60,
         )
         if rn.returncode != ri.returncode or rn.stdout.replace("\r\n", "\n") != ri.stdout.replace("\r\n", "\n"):
             print(f"FAIL: fixture {ax_file.name} differential mismatch", file=sys.stderr)
@@ -314,4 +357,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(guarded_main(main))

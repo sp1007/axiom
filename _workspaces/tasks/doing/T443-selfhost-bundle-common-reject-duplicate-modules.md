@@ -8,12 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T452]
 priority: 20
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tests/selfhost/bundle_common.py, tests/selfhost/bundle_common_selftest.py]
 locks: [tests/selfhost]
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/SPEC-20-selfhost.md]
 covers: [REQ-TST-098]
+started: 2026-11-14 00:19:22
 ---
 # T443 — bundle_common rejects duplicate module names
 
@@ -39,3 +40,4 @@ bundle) fails at generation time with one clear message naming the module and th
 
 ## Log
 - 2026-11-13 created by axiom-architect (ADR-0042 §5, T430 follow-up)
+- 2026-11-14 00:19:22 started (attempt 1) 

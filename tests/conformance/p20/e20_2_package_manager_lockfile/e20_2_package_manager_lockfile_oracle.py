@@ -28,6 +28,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import time
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[3]
@@ -110,9 +111,9 @@ def get_axiomc(compiler: str, build_dir: str) -> str:
 
 
 def run_cmd(
-    cmd: list[str], cwd: str | pathlib.Path, timeout: int = 180
+    cmd: list[str], cwd: str | pathlib.Path
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    return bounded_run(
         cmd,
         cwd=str(cwd),
         text=True,
@@ -120,7 +121,6 @@ def run_cmd(
         errors="replace",
         capture_output=True,
         check=False,
-        timeout=timeout,
     )
 
 
@@ -209,6 +209,55 @@ def verify_production_exe_clean(exe_path: pathlib.Path) -> bool:
     return True
 
 
+# --- Load-aware step deadline (T440, ADR-0042 section 1) ------------------------------------------
+# All subprocess steps of this oracle share ONE wall-clock budget instead of fixed per-step timeouts:
+# the old fixed 180 s limit of the bundled `--interp` step was hit on the shared 4-core machine under
+# `-j 2` load and surfaced as a TimeoutExpired traceback (T422-qa section 7). ORACLE_BUDGET_S is 3x the
+# slowest measured wall time of the whole oracle at scale 1 (table in _workspaces/reports/T440-report.md).
+# It is multiplied by AXTEST_TIMEOUT_SCALE (default 1): set that variable to the runner's
+# `--timeout-scale` value when re-running a timed-out id (tools/axtest.py does not export it yet).
+# A hang anywhere stops the run at the deadline with one `TIMEOUT:` line on stderr and exit 1;
+# the manifest `timeout:` stays above the budget so the oracle reports first.
+ORACLE_BUDGET_S = 1407.0
+
+
+def _timeout_scale() -> float:
+    try:
+        scale = float(os.environ.get("AXTEST_TIMEOUT_SCALE") or "1")
+    except ValueError:
+        return 1.0
+    return scale if scale > 0 else 1.0
+
+
+_DEADLINE = time.monotonic() + ORACLE_BUDGET_S * _timeout_scale()
+
+
+class OracleTimeout(Exception):
+    pass
+
+
+def bounded_run(cmd, **kwargs):
+    """subprocess.run with the time left of the oracle budget as its timeout."""
+    left = _DEADLINE - time.monotonic()
+    step = " ".join([os.path.basename(str(cmd[0]))] + [str(c) for c in cmd[1:3]])
+    if left <= 0:
+        raise OracleTimeout(f"budget exhausted before `{step}`")
+    try:
+        return subprocess.run(cmd, timeout=left, **kwargs)
+    except subprocess.TimeoutExpired:
+        raise OracleTimeout(
+            f"`{step}` killed after {left:.0f}s (budget {ORACLE_BUDGET_S:g}s x scale {_timeout_scale():g})"
+        ) from None
+
+
+def guarded_main(main_fn) -> int:
+    try:
+        return main_fn()
+    except OracleTimeout as e:
+        sys.stderr.write(f"TIMEOUT: {e}\n")
+        return 1
+
+
 def main() -> int:
     if len(sys.argv) < 5:
         sys.stderr.write("usage: e20_2_package_manager_lockfile_oracle.py <compiler> <build> <tmp> <root>\n")
@@ -236,7 +285,7 @@ def main() -> int:
     )
 
     # 1a. Interpreter run
-    iproc = run_cmd([axiomc, "run", "--interp", "--std-root", str(clean_std), str(probe_bundle)], root, timeout=180)
+    iproc = run_cmd([axiomc, "run", "--interp", "--std-root", str(clean_std), str(probe_bundle)], root)
     if iproc.returncode != 0:
         sys.stderr.write(
             f"e20_2 probe --interp failed ({iproc.returncode}):\n{iproc.stdout}\n{iproc.stderr}\n"
@@ -269,14 +318,13 @@ def main() -> int:
                 str(bin_path),
             ],
             root,
-            timeout=240,
         )
         if bproc.returncode != 0:
             sys.stderr.write(
                 f"e20_2 probe {opt_label} build failed ({bproc.returncode}):\n{bproc.stdout}\n{bproc.stderr}\n"
             )
             return 1
-        rproc = run_cmd([str(bin_path)], root, timeout=120)
+        rproc = run_cmd([str(bin_path)], root)
         if rproc.returncode != 0:
             sys.stderr.write(
                 f"e20_2 probe {opt_label} run failed ({rproc.returncode}):\n{rproc.stdout}\n{rproc.stderr}\n"
@@ -304,7 +352,7 @@ def main() -> int:
         expected_out = stdout_file.read_text(encoding="utf-8").replace("\r\n", "\n")
 
         # 2a. Interp run
-        f_iproc = run_cmd([axiomc, "run", "--interp", "--std-root", str(clean_std), str(ax_file)], root, timeout=120)
+        f_iproc = run_cmd([axiomc, "run", "--interp", "--std-root", str(clean_std), str(ax_file)], root)
         if f_iproc.returncode != 0:
             sys.stderr.write(
                 f"Fixture {name} failed under --interp ({f_iproc.returncode}):\n{f_iproc.stdout}\n{f_iproc.stderr}\n"
@@ -332,14 +380,13 @@ def main() -> int:
                 str(f_bin),
             ],
             root,
-            timeout=120,
         )
         if f_bproc.returncode != 0:
             sys.stderr.write(
                 f"Fixture {name} native -O1 build failed ({f_bproc.returncode}):\n{f_bproc.stdout}\n{f_bproc.stderr}\n"
             )
             return 1
-        f_rproc = run_cmd([str(f_bin)], root, timeout=60)
+        f_rproc = run_cmd([str(f_bin)], root)
         if f_rproc.returncode != 0:
             sys.stderr.write(
                 f"Fixture {name} native -O1 run failed ({f_rproc.returncode}):\n{f_rproc.stdout}\n{f_rproc.stderr}\n"
@@ -360,4 +407,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(guarded_main(main))

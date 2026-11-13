@@ -8,7 +8,7 @@ model: opus
 gate_model: sonnet
 depends: []
 priority: 19
-status: doing
+status: done
 attempts: 1
 timeout_min: 600
 paths: [tests/conformance/p18/e18_1_query_engine, tests/conformance/p18/e18_2_incremental, tests/conformance/p18/e18_3_parallel, tests/conformance/p19/e19_1_lsp_server, tests/conformance/p19/e19_2_formatter, tests/conformance/p19/e19_4_diagnostics_ai, tests/conformance/p20/e20_2_package_manager_lockfile, tests/run/lsp_vfs]
@@ -16,7 +16,7 @@ locks: [_workspaces/baseline-failures.txt]
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/decisions/ADR-0041-complete-suite-baseline-and-test-cache.md, spec/SPEC-21-query-engine-semantic-db.md, spec/SPEC-100-lsp-server-ide-engine.md]
 covers: [REQ-TST-073, REQ-TST-074, REQ-TST-076]
 started: 2026-11-13 19:11:20
-agent: T440-impl
+finished: 2026-11-14 05:27:49
 ---
 # T440 — Baseline fix: oracle probes that fail under load (maybe-timeout)
 
@@ -59,3 +59,4 @@ shared machine or turned into a precisely diagnosed fix task; no oracle hides a 
 ## Log
 - 2026-11-13 created by axiom-architect (ADR-0042 §1, architect inbox 1)
 - 2026-11-13 19:11:20 started (attempt 1) T440-impl
+- 2026-11-14 05:27:49 accepted by QA -> done
