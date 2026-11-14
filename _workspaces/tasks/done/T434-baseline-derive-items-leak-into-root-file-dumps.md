@@ -8,13 +8,15 @@ model: sonnet
 gate_model: sonnet
 depends: [T452]
 priority: 12
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 900
 paths: [compiler/syntax, compiler/parser, tests/parse, tests/resolve, tests/hir, tests/typeck/basic.ax, tests/typeck/basic.thir, tests/typeck/generic]
 locks: [tests/selfhost, _workspaces/baseline-failures.txt]
 spec: [spec/decisions/ADR-0041-complete-suite-baseline-and-test-cache.md, spec/SPEC-61-reflection-derive.md, spec/SPEC-20-selfhost.md]
 covers: [REQ-TST-072, REQ-CORE-935, REQ-BOOT-085]
+started: 2026-11-14 10:57:46
+finished: 2026-11-14 20:49:31
 ---
 # T434 — Baseline fix: derive-generated items leak into root-file dumps
 
@@ -55,3 +57,5 @@ covers: [REQ-TST-072, REQ-CORE-935, REQ-BOOT-085]
 
 ## Log
 - 2026-11-13 07:40:00 created by axiom-architect (ADR-0041, complete-suite baseline)
+- 2026-11-14 10:57:46 started (attempt 1) T434-impl
+- 2026-11-14 20:49:31 accepted by QA -> done
