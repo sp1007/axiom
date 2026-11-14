@@ -390,9 +390,41 @@ def _ensure_host_heap_imports(src):
     return src
 
 
-def assemble_compiler_modules(mod_list, root=ROOT):
+def _canonical_module_name(name):
+    """Name a module is emitted under: `.mod` suffix and the reserved-keyword aliases folded away."""
+    if name.endswith(".mod"):
+        name = name[:-4]
+    if name == "compiler.own.move":
+        return "compiler.own.move_ck"
+    if name == "compiler.own.unsafe":
+        return "compiler.own.unsafe_ck"
+    return name
+
+
+def find_duplicate_modules(names):
+    """Returns the module names listed more than once (after normalisation), in first-seen order."""
+    seen = {}
+    dups = []
+    for raw in names:
+        key = _canonical_module_name(raw)
+        if key in seen:
+            if key not in dups:
+                dups.append(key)
+        else:
+            seen[key] = raw
+    return dups
+
+
+def assemble_compiler_modules(mod_list, root=ROOT, caller=None):
     files = compiler_module_files(root)
     names = [m[0] if isinstance(m, tuple) else m for m in mod_list]
+    dups = find_duplicate_modules(names)
+    if dups:
+        # T430 root cause: a repeated module surfaced as 126 AX_NAME_DUPLICATE errors inside a 30k-line
+        # bundle. Fail here, once, naming the module(s) and the caller; never de-duplicate silently.
+        if caller is None:
+            caller = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else "<unknown caller>"
+        raise ValueError("duplicate module(s) %s in module list of %s" % (dups, caller))
     name_set = set(names)
     has_own_session = (
         "compiler.own_mir_verify.session" in name_set
