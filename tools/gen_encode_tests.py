@@ -332,7 +332,7 @@ def rr_pairs_compact() -> list[tuple[int, int]]:
 
 
 class Vector:
-    __slots__ = ("entry", "asm", "c_stmt", "ax_stmt", "reset_relocs", "xfail_task", "xfail_enc")
+    __slots__ = ("entry", "asm", "c_stmt", "ax_stmt", "reset_relocs", "xfail_task", "xfail_enc", "ax_fixed")
 
     def __init__(
         self,
@@ -343,6 +343,7 @@ class Vector:
         reset_relocs: bool = False,
         xfail_task: str | None = None,
         xfail_enc: list[int] | None = None,
+        ax_fixed: bool = False,
     ):
         self.entry = entry
         self.asm = asm
@@ -351,6 +352,7 @@ class Vector:
         self.reset_relocs = reset_relocs
         self.xfail_task = xfail_task
         self.xfail_enc = xfail_enc
+        self.ax_fixed = ax_fixed
 
 
 def build_vectors() -> list[Vector]:
@@ -534,10 +536,13 @@ def build_vectors() -> list[Vector]:
     for reg in range(16):
         xfail_task = None
         xfail_enc = None
+        ax_fixed = False
         if reg >= 8:
-            # encode.c and encode.ax pass dst as rm (REX.B=0x49) instead of reg (REX.R=0x4C)
+            # Frozen bootstrap encode.c passes dst as rm (REX.B=0x49) instead of reg (REX.R=0x4C);
+            # compiler/target/x64/encode.ax emits REX.R=0x4C matching GNU as.
             xfail_task = "AX0-FIX-ENC-LEA-SYM-REX"
             xfail_enc = [0x49, 0x8D, 0x05 | ((reg & 7) << 3), 0x00, 0x00, 0x00, 0x00]
+            ax_fixed = True
         vecs.append(Vector(
             "ax_x64_lea_sym",
             f"leaq 0(%rip), {REGS_ASM[8][reg]}",
@@ -546,6 +551,7 @@ def build_vectors() -> list[Vector]:
             reset_relocs=True,
             xfail_task=xfail_task,
             xfail_enc=xfail_enc,
+            ax_fixed=ax_fixed,
         ))
 
     # 12..35. Binary ALU: add, or, and, sub, xor, cmp (_rr, _rm, _mr, _ri)
@@ -998,6 +1004,7 @@ pub const RELOC_X86_64_32: u32 = 2u32;
 pub const RELOC_X86_64_64: u32 = 3u32;
 pub const RELOC_X86_64_GOT32: u32 = 4u32;
 pub const RELOC_X86_64_PLT32: u32 = 5u32;
+pub const RELOC_X86_64_TLSREL: u32 = 6u32;
 
 pub const AX_RELOC_NONE: u32 = 0u32;
 pub const AX_RELOC_X86_64_PC32: u32 = 1u32;
@@ -1005,6 +1012,7 @@ pub const AX_RELOC_X86_64_32: u32 = 2u32;
 pub const AX_RELOC_X86_64_64: u32 = 3u32;
 pub const AX_RELOC_X86_64_GOT32: u32 = 4u32;
 pub const AX_RELOC_X86_64_PLT32: u32 = 5u32;
+pub const AX_RELOC_X86_64_TLSREL: u32 = 6u32;
 
 pub const SYM_LOCAL: u32 = 0u32;
 pub const SYM_GLOBAL: u32 = 1u32;
@@ -1159,7 +1167,7 @@ def render_ax_vectors(vecs: list[Vector], gnu_bytes_list: list[list[int]], encod
         for v, gnu_b in chunk:
             if v.reset_relocs:
                 lines.append("    sec.relocs_len = 0;")
-            if v.xfail_task is not None:
+            if v.xfail_task is not None and not v.ax_fixed:
                 assert v.xfail_enc is not None
                 lines.append(
                     f"    // skip-enc: {v.xfail_task} — {v.asm} "

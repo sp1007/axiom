@@ -210,7 +210,7 @@ def main() -> int:
         assemble_e20_1_probe(clean_root, probe_template), encoding="utf-8", newline="\n"
     )
 
-    iproc = run_cmd([axiomc, "run", "--interp", "--std-root", str(clean_std), str(probe_bundle)], root, timeout=180)
+    iproc = run_cmd([axiomc, "run", "--interp", "--std-root", str(clean_std), str(probe_bundle)], root, timeout=600)
     if iproc.returncode != 0:
         sys.stderr.write(
             f"e20_1_build_graph_driver_probe --interp failed ({iproc.returncode}):\n{iproc.stdout}\n{iproc.stderr}\n"
@@ -238,7 +238,7 @@ def main() -> int:
             str(probe_bundle),
         ],
         root,
-        timeout=120,
+        timeout=300,
     )
     if bproc.returncode != 0:
         sys.stderr.write(

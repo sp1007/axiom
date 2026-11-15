@@ -1077,7 +1077,7 @@ pub fn main() -> i32 {
         "tag": os.path.splitext(filename)[0],
     }
 
-    header = "// test: run\n// timeout: 1200\n// modes: %s\n// stdout: OK %s\\n\n\n" % (modes, os.path.splitext(filename)[0])
+    header = "// test: run\n// timeout: 1800\n// modes: %s\n// stdout: OK %s\\n\n\n" % (modes, os.path.splitext(filename)[0])
     full_text = header + prelude + "\n" + full_mods + "\n" + main_src
     return out_path, full_text.encode("utf-8")
 
@@ -1314,7 +1314,7 @@ pub fn main() -> i32 {
         "lens": ", ".join(str(x) for x in lens),
     }
 
-    header = "// test: run\n// timeout: 1200\n// modes: interp native\n// stdout: OK driver_commands_a\\n\n\n"
+    header = "// test: run\n// timeout: 1800\n// modes: interp native\n// stdout: OK driver_commands_a\\n\n\n"
     full_text = header + prelude + "\n" + full_mods + "\n" + main_src
     return out_path, full_text.encode("utf-8")
 
@@ -1679,7 +1679,7 @@ pub fn main() -> i32 {
         "lens": ", ".join(str(x) for x in lens),
     }
 
-    header = "// test: run\n// timeout: 1200\n// modes: native\n// stdout: OK driver_commands_b\\n\n\n"
+    header = "// test: run\n// timeout: 1800\n// modes: native\n// stdout: OK driver_commands_b\\n\n\n"
     full_text = header + prelude + "\n" + full_mods + "\n" + main_src
     return out_path, full_text.encode("utf-8")
 

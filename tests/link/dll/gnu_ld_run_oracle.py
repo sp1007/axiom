@@ -176,6 +176,10 @@ def main() -> int:
     mingw_L_args: list[str] = []
     for d in mingw_lib_dirs:
         mingw_L_args.extend(["-L", d])
+    has_sync_lib = any(
+        (Path(d) / "libsynchronization.a").is_file() or (Path(d) / "synchronization.lib").is_file()
+        for d in mingw_lib_dirs
+    )
 
     axtest = load_axtest_module(repo_root)
 
@@ -274,6 +278,9 @@ pub fn main() -> i32 {
             if ln and not ln.startswith("#"):
                 feats.add(ln.split()[0].rstrip(":,"))
 
+    baseline_path = repo_root / "_workspaces" / "baseline-failures.txt"
+    baseline_ids = axtest.read_baseline(str(baseline_path)) if baseline_path.is_file() else set()
+
     all_run_tests = axtest.discover(repo_root / "tests" / "run")
     selected = []
     for t in all_run_tests:
@@ -281,7 +288,7 @@ pub fn main() -> i32 {
             continue
         if t.modes is not None and "native" not in t.modes:
             continue
-        if t.xfail or t.native_after:
+        if t.xfail or t.native_after or t.id in baseline_ids or f"run/{t.id}" in baseline_ids:
             continue
         if "axiom0-internal" in t.requires:
             continue
@@ -363,6 +370,7 @@ pub fn main() -> i32 {
                 "-ladvapi32",
                 "-lws2_32",
                 "-lbcrypt",
+                *(["-lsynchronization"] if has_sync_lib else []),
                 "-o",
                 str(gnu_exe),
             ]

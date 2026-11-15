@@ -440,6 +440,7 @@ pub fn main() -> i32 {
     }
     let r3 = test_diagnostics();
     if r3 != 0 { return r3; }
+    print("OK %(tag)s\\n");
     0
 }
 """
@@ -487,8 +488,9 @@ def gen_diff_bundle(filename, modes, corpus, prelude, full_mods, axiom0, lite=Fa
         "lite": "true" if lite else "false",
         "nonexistent_rc": rc_a,
         "noinput_rc": rc_b,
+        "tag": os.path.splitext(filename)[0],
     }
-    header = "// test: run\n// timeout: 1800\n// modes: %s\n\n" % modes
+    header = "// test: run\n// timeout: 1800\n// modes: %s\n// stdout: OK %s\\n\n\n" % (modes, os.path.splitext(filename)[0])
     text = header + prelude + "\n" + full_mods + "\n" + main_src
     return out_path, text.encode("utf-8")
 

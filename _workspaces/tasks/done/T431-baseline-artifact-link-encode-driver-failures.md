@@ -8,13 +8,15 @@ model: sonnet
 gate_model: sonnet
 depends: [T452]
 priority: 16
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 900
 paths: [tests/run/artifact_container, tests/conformance/p18/e18_4_artifacts, tests/conformance/p18/e18_6_separate_compilation, tests/conformance/p20/e20_1_build_graph_driver, tests/driver/build_emit_obj.test, tests/link/dll, tests/encode, compiler/artifact, compiler/link, compiler/obj, compiler/build]
 locks: [tests/selfhost, compiler/driver, tools/gen_encode_tests.py, _workspaces/baseline-failures.txt]
 spec: [spec/decisions/ADR-0041-complete-suite-baseline-and-test-cache.md, spec/SPEC-24-artifact-format-module-interfaces.md, spec/SPEC-26-windows-artifact-kinds.md, spec/SPEC-27-separate-compilation-linker-v2.md, spec/SPEC-110-build-graph-driver.md]
 covers: [REQ-LNK-614, REQ-LNK-073, REQ-LNK-057, REQ-PKG-022]
+started: 2026-11-15 18:55:14
+finished: 2026-11-16 06:54:48
 ---
 # T431 — Baseline fix: artifact / link / encoder / build-path failures
 
@@ -53,3 +55,5 @@ dependency, SKIP through `requires:` and are reclassified `environment`).
 
 ## Log
 - 2026-11-13 07:40:00 created by axiom-architect (ADR-0041, complete-suite baseline)
+- 2026-11-15 18:55:14 started (attempt 1) t431-impl
+- 2026-11-16 06:54:48 accepted by QA -> done
