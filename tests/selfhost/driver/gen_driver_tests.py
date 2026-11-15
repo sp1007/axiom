@@ -895,6 +895,7 @@ pub fn main() -> i32 {
     if r3 != 0 { return r3; }
     let r4 = test_project_discovery();
     if r4 != 0 { return r4; }
+    print("OK driver_cli_and_project\\n");
     0
 }
 """ % {
@@ -904,7 +905,7 @@ pub fn main() -> i32 {
         "lens": ", ".join(str(x) for x in lens),
     }
 
-    header = "// test: run\n// timeout: 1200\n// modes: interp native\n\n"
+    header = "// test: run\n// timeout: 1200\n// modes: interp native\n// stdout: OK driver_cli_and_project\\n\n\n"
     full_text = header + prelude + "\n" + light_mods + "\n" + main_src
     return out_path, full_text.encode("utf-8")
 
@@ -1057,6 +1058,7 @@ pub fn main() -> i32 {
         }
         c = c + 1;
     }
+    print("OK %(tag)s\\n");
     0
 }
 """ % {
@@ -1072,9 +1074,10 @@ pub fn main() -> i32 {
         "case_out": ", ".join(str(x[4]) for x in case_meta),
         "case_err": ", ".join(str(x[5]) for x in case_meta),
         "use_fast_std": 1 if fast_std else 0,
+        "tag": os.path.splitext(filename)[0],
     }
 
-    header = "// test: run\n// timeout: 1200\n// modes: %s\n\n" % modes
+    header = "// test: run\n// timeout: 1200\n// modes: %s\n// stdout: OK %s\\n\n\n" % (modes, os.path.splitext(filename)[0])
     full_text = header + prelude + "\n" + full_mods + "\n" + main_src
     return out_path, full_text.encode("utf-8")
 
@@ -1301,6 +1304,7 @@ pub fn main() -> i32 {
     diag_buf_free(mut_view(err7));
     if !ok7 { return 16; }
 
+    print("OK driver_commands_a\\n");
     0
 }
 """ % {
@@ -1310,7 +1314,7 @@ pub fn main() -> i32 {
         "lens": ", ".join(str(x) for x in lens),
     }
 
-    header = "// test: run\n// timeout: 1200\n// modes: interp native\n\n"
+    header = "// test: run\n// timeout: 1200\n// modes: interp native\n// stdout: OK driver_commands_a\\n\n\n"
     full_text = header + prelude + "\n" + full_mods + "\n" + main_src
     return out_path, full_text.encode("utf-8")
 
@@ -1542,7 +1546,7 @@ fn test_packages_and_mir_errors() -> i32 {
     0
 }
 
-fn run_build_into_check(argv: *const StrView, argc: usize, exp_blob_idx: usize) -> bool {
+fn run_build_into_check_mode(argv: *const StrView, argc: usize, exp_blob_idx: usize, write_to_disk: bool) -> bool {
     let dopts = unsafe { driver_options_alloc() };
     let mut out_b = diag_buf_new();
     let mut err_b = diag_buf_new();
@@ -1561,7 +1565,7 @@ fn run_build_into_check(argv: *const StrView, argc: usize, exp_blob_idx: usize) 
             mut_view(out_b),
             mut_view(err_b),
             bin_ptr,
-            false
+            write_to_disk
         )
     };
     let ok = brc == AX_EXIT_OK && err_b.len == 0 && coff_buf_matches_blob(view(bin_buf), exp_blob_idx);
@@ -1570,6 +1574,10 @@ fn run_build_into_check(argv: *const StrView, argc: usize, exp_blob_idx: usize) 
     diag_buf_free(mut_view(err_b));
     unsafe { driver_options_dealloc(dopts); }
     ok
+}
+
+fn run_build_into_check(argv: *const StrView, argc: usize, exp_blob_idx: usize) -> bool {
+    run_build_into_check_mode(argv, argc, exp_blob_idx, false)
 }
 
 fn test_build_pipeline() -> i32 {
@@ -1602,15 +1610,7 @@ fn test_build_pipeline() -> i32 {
     set_arg_blob(argv, 5, 9);
     if !run_build_into_check(ap, 6, 18) { return 22; }
 
-    // 4. build -o out_mem.exe tests/modules/hello/src/main.ax (multi-file package native build)
-    set_arg_blob(argv, 0, 0);
-    set_arg_blob(argv, 1, 3);
-    set_arg_blob(argv, 2, 5);
-    set_arg_blob(argv, 3, 7);
-    set_arg_blob(argv, 4, 10);
-    if !run_build_into_check(ap, 5, 19) { return 23; }
-
-    // 5. Real disk output via driver_run_args with unique monotonic_ns filename + cleanup
+    // 4. build -o <tmp> tests/modules/hello/src/main.ax (multi-file package native build)
     let mut path_buf = diag_buf_new();
     let pfx = blob_sv(20);
     let sfx = blob_sv(21);
@@ -1619,6 +1619,20 @@ fn test_build_pipeline() -> i32 {
     diag_buf_push_u32(mut_view(path_buf), stamp);
     diag_buf_push_bytes(mut_view(path_buf), sfx.ptr, sfx.len);
     let tmp_sv = StrView { ptr: path_buf.ptr as *const u8, len: path_buf.len };
+
+    set_arg_blob(argv, 0, 0);
+    set_arg_blob(argv, 1, 3);
+    set_arg_blob(argv, 2, 5);
+    sv_slot_set(argv, 3, view(tmp_sv));
+    set_arg_blob(argv, 4, 10);
+    let pkg_ok = run_build_into_check_mode(ap, 5, 19, true);
+    let _ = unsafe { remove(tmp_sv.ptr, tmp_sv.len) };
+    if !pkg_ok {
+        diag_buf_free(mut_view(path_buf));
+        return 23;
+    }
+
+    // 5. Real disk output via driver_run_args with unique monotonic_ns filename + cleanup
 
     set_arg_blob(argv, 0, 0);
     set_arg_blob(argv, 1, 3);
@@ -1655,6 +1669,7 @@ pub fn main() -> i32 {
     if r1 != 0 { return r1; }
     let r2 = test_build_pipeline();
     if r2 != 0 { return r2; }
+    print("OK driver_commands_b\\n");
     0
 }
 """ % {
@@ -1664,7 +1679,7 @@ pub fn main() -> i32 {
         "lens": ", ".join(str(x) for x in lens),
     }
 
-    header = "// test: run\n// timeout: 1200\n// modes: native\n\n"
+    header = "// test: run\n// timeout: 1200\n// modes: native\n// stdout: OK driver_commands_b\\n\n\n"
     full_text = header + prelude + "\n" + full_mods + "\n" + main_src
     return out_path, full_text.encode("utf-8")
 
@@ -2006,6 +2021,7 @@ pub fn main() -> i32 {
     if r1 != 0 { return r1; }
     let r2 = test_path_and_discovery_seams();
     if r2 != 0 { return r2; }
+    print("OK driver_boundary_edges\\n");
     0
 }
 """ % {
@@ -2015,7 +2031,7 @@ pub fn main() -> i32 {
         "lens": ", ".join(str(x) for x in lens),
     }
 
-    header = "// test: run\n// timeout: 1200\n// modes: interp native\n\n"
+    header = "// test: run\n// timeout: 1200\n// modes: interp native\n// stdout: OK driver_boundary_edges\\n\n\n"
     full_text = header + prelude + "\n" + light_mods + "\n" + main_src
     return out_path, full_text.encode("utf-8")
 
@@ -2023,7 +2039,11 @@ pub fn main() -> i32 {
 def main():
     check_mode = ("--check" in sys.argv[1:]) or ("check" in sys.argv[1:])
     refresh_goldens = "--refresh-goldens" in sys.argv[1:]
-    axiom0 = find_exe(["build/axiom0.exe", "build/axiom0"]) if refresh_goldens else None
+    axiom0 = (
+        find_exe(["build/axiomc2.exe", "build/axiomc.exe", "build/axiom0.exe", "build/axiom0"])
+        if refresh_goldens
+        else None
+    )
     for i, a in enumerate(sys.argv[1:]):
         if a == "--axiom0" and i + 2 <= len(sys.argv[1:]):
             axiom0 = sys.argv[i + 2]

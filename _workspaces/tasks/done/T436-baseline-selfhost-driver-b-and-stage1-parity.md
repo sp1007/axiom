@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T452]
 priority: 15
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 900
 paths: [tests/selfhost/driver, tests/selfhost/stage1]
 locks: [tests/selfhost, compiler/driver, _workspaces/baseline-failures.txt]
 spec: [spec/decisions/ADR-0041-complete-suite-baseline-and-test-cache.md, spec/SPEC-20-selfhost.md, spec/SPEC-00-bootstrap.md]
 covers: [REQ-BOOT-085, REQ-BLD-030, REQ-TST-089]
+started: 2026-11-15 13:38:03
+finished: 2026-11-15 18:53:52
 ---
 # T436 — Baseline fix: selfhost driver bundles and stage-1 parity
 
@@ -47,3 +49,5 @@ covers: [REQ-BOOT-085, REQ-BLD-030, REQ-TST-089]
 
 ## Log
 - 2026-11-13 07:40:00 created by axiom-architect (ADR-0041, complete-suite baseline)
+- 2026-11-15 13:38:03 started (attempt 1) impl-argon
+- 2026-11-15 18:53:52 accepted by QA -> done
