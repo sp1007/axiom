@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T452, T434]
 priority: 13
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 900
 paths: [std/core, std/future, std/sync, tests/modules/prelude_implicit, tests/typeck/async, tests/std/core/qa_generic_method.ax, tests/run/trait2, tests/std/channel]
-locks: [tests/selfhost, compiler/types/typeck.ax, compiler/resolve, compiler/traits, compiler/driver, _workspaces/baseline-failures.txt]
+locks: [tests/selfhost, compiler/types/typeck.ax, compiler/resolve, compiler/traits, compiler/driver, compiler/mir/builder.ax, compiler/mir/async_lower.ax, _workspaces/baseline-failures.txt]
 spec: [spec/decisions/ADR-0041-complete-suite-baseline-and-test-cache.md, spec/SPEC-31-atomics.md, spec/SPEC-33-async.md, spec/SPEC-04-core-extensibility.md, spec/SPEC-61-reflection-derive.md]
 covers: [REQ-CONC-014, REQ-ASY-023]
+started: 2026-11-14 20:51:25
+finished: 2026-11-15 10:54:22
 ---
 # T432 — Baseline fix: prelude/std regressions after the P11 prelude additions
 
@@ -58,3 +60,5 @@ longer introduces colliding bare names.
 
 ## Log
 - 2026-11-13 07:40:00 created by axiom-architect (ADR-0041, complete-suite baseline)
+- 2026-11-14 20:51:25 started (attempt 1) T432-impl
+- 2026-11-15 10:54:22 accepted by QA -> done
