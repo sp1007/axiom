@@ -117,8 +117,7 @@ manifest is cached only when it declares every input with `cache-inputs: <paths 
   files the running program opens, so without the declaration a cached PASS survives a change of that file.
 - Tests whose result depends on addresses (ASLR) or wall-clock timing are not deterministic and are not admitted;
   make them deterministic or `nocache:` (ADR-0042 §5, T437a G3).
-- The periodic full run is executed with `--no-cache` (axiom-qa.md "Periodic full run"); it is what re-validates
-  every cached entry.
+- Periodic sweeps are 2-tier (axiom-qa.md "Periodic full run"): every 25 tasks runs all non-selfhost ids + `selfhost/bundles_current.test` with `--gate` (`--verify-sample`); phase gates (`T311`–`T323`) run the entire suite incl. `tests/selfhost/**` with `--no-cache` to re-validate every cached entry from scratch.
 
 The runner builds nothing: build first. The build that counts for a task is the one in its snapshot
 (`taskctl.py snapshot <ID>` → `build-snap-<ID>/`, build directory `build-snap-<ID>/build`), so the
