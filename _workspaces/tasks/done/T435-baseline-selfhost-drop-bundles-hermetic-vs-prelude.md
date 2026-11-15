@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T452, T432]
 priority: 14
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 900
 paths: [tests/selfhost/drop]
 locks: [tests/selfhost, _workspaces/baseline-failures.txt]
 spec: [spec/decisions/ADR-0041-complete-suite-baseline-and-test-cache.md, spec/SPEC-12-drop.md, spec/SPEC-20-selfhost.md]
 covers: [REQ-TST-089, REQ-BOOT-085]
+started: 2026-11-15 10:56:08
+finished: 2026-11-15 13:36:45
 ---
 # T435 — Baseline fix: selfhost drop bundles independent of prelude contents
 
@@ -52,3 +54,5 @@ native and native-O1, and stay green when the implicitly loaded prelude grows.
 ## Log
 - 2026-11-13 07:40:00 created by axiom-architect (ADR-0041, complete-suite baseline)
 - 2026-11-13 axiom-architect (ADR-0042 §1): baseline lines for d10..d12 added under T435; T441 reuses this task's comparison method for `selfhost/interp_opt` and `selfhost/own_mir_verify`, so document it in the report
+- 2026-11-15 10:56:08 started (attempt 1) T435-impl
+- 2026-11-15 13:36:45 accepted by QA -> done

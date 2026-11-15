@@ -31,6 +31,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
 FIXTURES = os.path.join(HERE, "fixtures")
+STD_MINIMAL = "tests/selfhost/drop/std_minimal"
 sys.path.insert(0, os.path.join(ROOT, "tests", "selfhost"))
 
 import bundle_common as bc  # noqa: E402
@@ -152,7 +153,7 @@ def run(cmd):
 
 
 def oracle_output(oracle, rel, pre):
-    cmd = [oracle, "--std-root", "std"]
+    cmd = [oracle, "--std-root", STD_MINIMAL]
     if pre:
         cmd.append("--pre")
     cmd.append(rel)
@@ -224,7 +225,7 @@ def cmd_goldens(args):
     oracle = arg_value(args, "--oracle")
     axiom0 = arg_value(args, "--axiom0")
     for name in fixture_names():
-        pre = run([axiom0, "inspect", "--emit=mir", fixture_rel(name)])
+        pre = run([axiom0, "inspect", "--std-root", STD_MINIMAL, "--emit=mir", fixture_rel(name)])
         if pre != oracle_output(oracle, fixture_rel(name), True):
             raise SystemExit("%s: oracle --pre differs from inspect --emit=mir" % name)
         write_bytes(fixture_path(name, ".pre.mir"), pre)
