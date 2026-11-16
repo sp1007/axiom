@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T452, T432]
 priority: 17
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 900
 paths: [tests/ui/concurrency/data_race, tests/conformance/p11/e11_1_concurrency/ui_unsync_mutable_statics.ax, tests/ui/struct, tests/run/slice/qa_slice_inverted_panic.ax, tests/run/parse/terminator_one_line_items.ax, tests/typeck/int128]
 locks: [tests/selfhost, compiler/types/typeck.ax, compiler/own, compiler/verify, compiler/syntax, compiler/mir/builder.ax, _workspaces/baseline-failures.txt]
 spec: [spec/decisions/ADR-0041-complete-suite-baseline-and-test-cache.md, spec/SPEC-30-concurrency.md, spec/SPEC-11-capability.md, spec/SPEC-03-core-semantics.md, spec/SPEC-40-integers.md, spec/diagnostics.md]
 covers: [REQ-CONC-004, REQ-CONC-065, REQ-SIMD-176]
+started: 2026-11-16 06:58:12
+finished: 2026-11-16 23:03:25
 ---
 # T433 — Baseline fix: missing diagnostics/panics and int128 typeck
 
@@ -54,3 +56,5 @@ panics these tests encode.
 
 ## Log
 - 2026-11-13 07:40:00 created by axiom-architect (ADR-0041, complete-suite baseline)
+- 2026-11-16 06:58:12 started (attempt 1) t433-impl
+- 2026-11-16 23:03:25 accepted by QA -> done

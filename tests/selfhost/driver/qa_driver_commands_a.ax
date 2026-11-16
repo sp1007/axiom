@@ -29793,6 +29793,206 @@ fn typeck_extract_fn_sym_from_arg(cx: view<TypeckCtx>, arg: *const HirExpr) -> u
     0u32
 }
 
+fn tc_write_u128_le(dst: *mut u8, dst_cap: usize, lo: u64, hi: u64, elem_sz: usize) {
+    if (dst as usize) == 0 || dst_cap == 0 || elem_sz == 0 { return; }
+    let limit = if elem_sz < dst_cap { elem_sz } else { dst_cap };
+    let mut b: usize = 0;
+    while b < limit && b < 8 {
+        unsafe { *(dst + b) = ((lo >> ((b as u64) * 8u64)) & 0xffu64) as u8; }
+        b = b + 1;
+    }
+    while b < limit && b < 16 {
+        let sh = ((b - 8) as u64) * 8u64;
+        unsafe { *(dst + b) = ((hi >> sh) & 0xffu64) as u8; }
+        b = b + 1;
+    }
+}
+
+fn tc_align_up_usize(off: usize, al: usize) -> usize {
+    if al <= 1 { return off; }
+    let rem = off % al;
+    if rem == 0 { off } else { off + (al - rem) }
+}
+
+fn tc_eval_tls_const_bytes(
+    cx: mut_view<TypeckCtx>,
+    expr: *const HirExpr,
+    ty_v: u32,
+    dst: *mut u8,
+    dst_cap: usize,
+    out_err: mut_view<u32>,
+    depth: usize
+) -> bool {
+    if (expr as usize) == 0 || depth > 16 || (cx.thir as usize) == 0 {
+        return false;
+    }
+    let mut lo: u64 = 0u64;
+    let mut hi: u64 = 0u64;
+    if eval_const_expr_u128(mut_view(*cx), expr, mut_view(lo), mut_view(hi), mut_view(*out_err)) {
+        let r_ty = resolve_ty(mut_view(*cx), (TypeId { v: ty_v }));
+        let tk = kind_of(mut_view(*cx), (TypeId { v: r_ty.v }));
+        let mut norm_lo: u64 = lo;
+        let mut norm_hi: u64 = hi;
+        if tk != 0u8 {
+            tc_norm_u128_for_kind(tk, lo, hi, mut_view(norm_lo), mut_view(norm_hi));
+        }
+        let esz = if r_ty.v != 0u32 {
+            unsafe { type_size(r_ty, view((*cx.thir).interner)) as usize }
+        } else {
+            dst_cap
+        };
+        tc_write_u128_le(dst, dst_cap, norm_lo, norm_hi, esz);
+        return true;
+    }
+    if *out_err != 0u32 {
+        return false;
+    }
+
+    let ek = unsafe { (*expr).kind };
+    let r_ty = resolve_ty(mut_view(*cx), (TypeId { v: ty_v }));
+    let t = if r_ty.v != 0u32 {
+        unsafe { type_get(view((*cx.thir).interner), r_ty) }
+    } else {
+        0 as *mut AxType
+    };
+
+    if ek == HIR_EXPR_UNSAFE || ek == HIR_EXPR_BLOCK || ek == HIR_EXPR_COMPTIME {
+        let blk: *mut HirBlock = unsafe { (*expr).block };
+        if (blk as usize) != 0 && (unsafe { (*blk).stmts as usize }) != 0 {
+            let s0: *mut HirStmt = unsafe { (*blk).stmts };
+            if (unsafe { (*s0).next as usize }) == 0 &&
+               (unsafe { (*s0).kind }) == HIR_STMT_EXPR &&
+               !(unsafe { (*s0).has_semi }) {
+                return tc_eval_tls_const_bytes(
+                    cx,
+                    unsafe { (*s0).expr as *const HirExpr },
+                    ty_v,
+                    dst,
+                    dst_cap,
+                    out_err,
+                    depth + 1
+                );
+            }
+        }
+        return false;
+    }
+
+    if ek == HIR_EXPR_STRUCT {
+        if (t as usize) == 0 || (unsafe { (*t).kind }) != TY_STRUCT {
+            return false;
+        }
+        let sdef = unsafe { (*t).def as *const HirItem };
+        if (sdef as usize) == 0 {
+            return false;
+        }
+        let fc = unsafe { (*t).field_count };
+        let ftypes = unsafe { (*t).fields };
+        let mut fdecl: *mut HirFieldDecl = unsafe { (*sdef).struct_fields };
+        let mut off: usize = 0;
+        let mut fi: usize = 0;
+        while fi < fc && (fdecl as usize) != 0 {
+            let fty_v = unsafe { (*typeid_at(ftypes, fi)).v };
+            let f_sz = unsafe { type_size(TypeId { v: fty_v }, view((*cx.thir).interner)) as usize };
+            let raw_al = unsafe { type_align(TypeId { v: fty_v }, view((*cx.thir).interner)) as usize };
+            let f_al = if raw_al > 0 { raw_al } else { 1 };
+            off = tc_align_up_usize(off, f_al);
+            let decl_name_v = unsafe { (*fdecl).name.v };
+            let mut matched_e: *const HirExpr = 0 as *const HirExpr;
+            let mut finit: *mut HirFieldInit = unsafe { (*expr).fields };
+            while (finit as usize) != 0 {
+                if (unsafe { (*finit).name.v }) == decl_name_v {
+                    matched_e = unsafe { (*finit).expr as *const HirExpr };
+                    break;
+                }
+                finit = unsafe { (*finit).next };
+            }
+            if (matched_e as usize) == 0 {
+                return false;
+            }
+            let sub_dst = if (dst as usize) != 0 && off < dst_cap { unsafe { dst + off } } else { 0 as *mut u8 };
+            let sub_cap = if off < dst_cap { dst_cap - off } else { 0 };
+            if !tc_eval_tls_const_bytes(mut_view(*cx), matched_e, fty_v, sub_dst, sub_cap, mut_view(*out_err), depth + 1) {
+                return false;
+            }
+            off = off + f_sz;
+            fi = fi + 1;
+            fdecl = unsafe { (*fdecl).next };
+        }
+        return fi == fc;
+    }
+
+    if ek == HIR_EXPR_TUPLE {
+        if (unsafe { (*expr).elems as usize }) == 0 {
+            return true;
+        }
+        if (t as usize) == 0 || (unsafe { (*t).kind }) != TY_TUPLE {
+            return false;
+        }
+        let fc = unsafe { (*t).field_count };
+        let ftypes = unsafe { (*t).fields };
+        let mut el: *mut HirExpr = unsafe { (*expr).elems };
+        let mut off: usize = 0;
+        let mut fi: usize = 0;
+        while fi < fc && (el as usize) != 0 {
+            let fty_v = unsafe { (*typeid_at(ftypes, fi)).v };
+            let f_sz = unsafe { type_size(TypeId { v: fty_v }, view((*cx.thir).interner)) as usize };
+            let raw_al = unsafe { type_align(TypeId { v: fty_v }, view((*cx.thir).interner)) as usize };
+            let f_al = if raw_al > 0 { raw_al } else { 1 };
+            off = tc_align_up_usize(off, f_al);
+            let sub_dst = if (dst as usize) != 0 && off < dst_cap { unsafe { dst + off } } else { 0 as *mut u8 };
+            let sub_cap = if off < dst_cap { dst_cap - off } else { 0 };
+            if !tc_eval_tls_const_bytes(mut_view(*cx), el as *const HirExpr, fty_v, sub_dst, sub_cap, mut_view(*out_err), depth + 1) {
+                return false;
+            }
+            off = off + f_sz;
+            fi = fi + 1;
+            el = unsafe { (*el).next };
+        }
+        return fi == fc && (el as usize) == 0;
+    }
+
+    if ek == HIR_EXPR_ARRAY {
+        if (t as usize) == 0 || (unsafe { (*t).kind }) != TY_ARRAY {
+            return false;
+        }
+        let el_ty_v = unsafe { (*t).elem.v };
+        let el_sz = unsafe { type_size(TypeId { v: el_ty_v }, view((*cx.thir).interner)) as usize };
+        let arr_len = unsafe { (*t).array_len as usize };
+        if (unsafe { (*expr).count_expr as usize }) != 0 {
+            let first_e: *const HirExpr = unsafe { (*expr).elems as *const HirExpr };
+            if (first_e as usize) == 0 {
+                return false;
+            }
+            let mut ai: usize = 0;
+            while ai < arr_len {
+                let off = mul_usize(ai, el_sz);
+                let sub_dst = if (dst as usize) != 0 && off < dst_cap { unsafe { dst + off } } else { 0 as *mut u8 };
+                let sub_cap = if off < dst_cap { dst_cap - off } else { 0 };
+                if !tc_eval_tls_const_bytes(mut_view(*cx), first_e, el_ty_v, sub_dst, sub_cap, mut_view(*out_err), depth + 1) {
+                    return false;
+                }
+                ai = ai + 1;
+            }
+            return true;
+        }
+        let mut cur_e: *mut HirExpr = unsafe { (*expr).elems };
+        let mut ai: usize = 0;
+        while ai < arr_len && (cur_e as usize) != 0 {
+            let off = mul_usize(ai, el_sz);
+            let sub_dst = if (dst as usize) != 0 && off < dst_cap { unsafe { dst + off } } else { 0 as *mut u8 };
+            let sub_cap = if off < dst_cap { dst_cap - off } else { 0 };
+            if !tc_eval_tls_const_bytes(mut_view(*cx), cur_e as *const HirExpr, el_ty_v, sub_dst, sub_cap, mut_view(*out_err), depth + 1) {
+                return false;
+            }
+            ai = ai + 1;
+            cur_e = unsafe { (*cur_e).next };
+        }
+        return ai == arr_len && (cur_e as usize) == 0;
+    }
+
+    false
+}
+
 fn typeck_eval_tls_aggregate(
     cx: mut_view<TypeckCtx>,
     cexpr: *const HirExpr,
@@ -29832,7 +30032,40 @@ fn typeck_eval_tls_aggregate(
     }
 
     if fn_sym_v == 0u32 {
-        return false;
+        if (cx.thir as usize) == 0 { return false; }
+        let raw_sz = if ty_v != 0u32 {
+            unsafe { type_size(TypeId { v: ty_v }, view((*cx.thir).interner)) as usize }
+        } else {
+            0
+        };
+        let raw_al = if ty_v != 0u32 {
+            unsafe { type_align(TypeId { v: ty_v }, view((*cx.thir).interner)) as usize }
+        } else {
+            0
+        };
+        let c_sz = if raw_sz > 0 { raw_sz } else { 1 };
+        let c_al = if raw_al > 0 { raw_al } else { 1 };
+        let c_buf = unsafe { arena_alloc_raw(mut_view((*cx.thir).interner.arena), c_sz, c_al) };
+        if (c_buf as usize) == 0 { return false; }
+        let mut c_zi: usize = 0;
+        while c_zi < c_sz {
+            unsafe { *(c_buf + c_zi) = 0u8; }
+            c_zi = c_zi + 1;
+        }
+        let mut dummy_err: u32 = 0u32;
+        if !tc_eval_tls_const_bytes(mut_view(*cx), cexpr, ty_v, c_buf, c_sz, mut_view(dummy_err), 0) {
+            return false;
+        }
+        out_cv.kind = CONST_AGGREGATE;
+        out_cv.ty = TypeId { v: ty_v };
+        out_cv.int_val = 0u64;
+        out_cv.str_bytes = 0 as *const u8;
+        out_cv.str_len = 0;
+        out_cv.agg_data = c_buf;
+        out_cv.agg_size = c_sz;
+        out_cv.agg_align = c_al;
+        out_cv.alloc_id = 0u32;
+        return true;
     }
 
     let mut sz: usize = 24;
@@ -30908,12 +31141,50 @@ fn tc_sym_in_active_scope(cx: view<TypeckCtx>, sym_v: u32) -> bool {
     false
 }
 
+fn tc_resolve_generic_param_sym(cx: mut_view<TypeckCtx>, it: *const HirItem, sym_v: u32) -> TypeId {
+    if (it as usize) == 0 || sym_v == 0u32 || (cx.thir as usize) == 0 {
+        return (TypeId { v: 0u32 });
+    }
+    let gps: *mut HirGenericParams = unsafe { (*it).generic_params };
+    if (gps as usize) == 0 {
+        return (TypeId { v: 0u32 });
+    }
+    let mut idx: u32 = 0u32;
+    let mut gp: *mut HirGenericParam = unsafe { (*gps).params };
+    while (gp as usize) != 0 {
+        if (unsafe { (*gp).symbol.v }) == sym_v {
+            let mut p_name = unsafe { (*gp).name };
+            if p_name.v == 0u32 && (cx.str_in as usize) != 0 && (cx.db as usize) != 0 {
+                let sp_f = unsafe { (*gp).span.file.v };
+                if sp_f != 0u32 {
+                    let sp_s = unsafe { (*gp).span.start };
+                    let sp_e = unsafe { (*gp).span.end };
+                    let sv = unsafe {
+                        source_db_span_text(view(*cx.db), Span { file: (FileId { v: sp_f }), start: sp_s, end: sp_e })
+                    };
+                    if sv.len > 0 && (sv.ptr as usize) != 0 {
+                        p_name = unsafe { interner_intern_bytes(mut_view(*cx.str_in), sv.ptr, sv.len) };
+                    }
+                }
+            }
+            return unsafe { intern_param_ty(mut_view((*cx.thir).interner), (StrId { v: p_name.v }), idx) };
+        }
+        idx = idx + 1u32;
+        gp = unsafe { (*gp).next };
+    }
+    (TypeId { v: 0u32 })
+}
+
 pub fn lookup_path_type(cx: mut_view<TypeckCtx>, path: view<HirPath>, out_args: mut_view<GenericArgsSlice>) -> TypeId {
     if path.symbol.v != 0u32 {
         let in_active = tc_sym_in_active_scope(view(*cx), path.symbol.v);
         if in_active {
             let st = unsafe { thir_get_symbol_type(view(*cx.thir), (SymbolId { v: path.symbol.v })) };
             if st.v != 0u32 { return (TypeId { v: st.v }); }
+            let gp_fn = tc_resolve_generic_param_sym(mut_view(*cx), cx.current_fn, path.symbol.v);
+            if gp_fn.v != 0u32 { return gp_fn; }
+            let gp_im = tc_resolve_generic_param_sym(mut_view(*cx), cx.current_impl, path.symbol.v);
+            if gp_im.v != 0u32 { return gp_im; }
         }
 
         if (cx.hir as usize) != 0 {
@@ -31157,6 +31428,41 @@ fn lookup_path_type_by_name(
         if tc_sv_is_5(view(name), 117u8, 115u8, 105u8, 122u8, 101u8) { return (TypeId { v: (*cx.thir).interner.t_usize.v }); }
         if tc_sv_is_3(view(name), 115u8, 116u8, 114u8) || tc_sv_is_3(view(name), 83u8, 116u8, 114u8) {
             return (TypeId { v: (*cx.thir).interner.t_str.v });
+        }
+    }
+
+    if (path.generic_args as usize) == 0 && (cx.str_in as usize) != 0 {
+        if (cx.current_fn as usize) != 0 {
+            let gps_f: *mut HirGenericParams = unsafe { (*cx.current_fn).generic_params };
+            if (gps_f as usize) != 0 {
+                let mut idx_f: usize = 0;
+                let mut gp_f: *mut HirGenericParam = unsafe { (*gps_f).params };
+                while ((gp_f as usize) != 0) {
+                    let gname_id_f = unsafe { (*gp_f).name.v };
+                    let gp_name_f = unsafe { interner_get(view(*cx.str_in), (StrId { v: gname_id_f })) };
+                    if sv_eq(view(gp_name_f), view(name)) {
+                        return unsafe { intern_param_ty(mut_view((*cx.thir).interner), (StrId { v: gname_id_f }), idx_f as u32) };
+                    }
+                    idx_f = idx_f + 1;
+                    gp_f = unsafe { (*gp_f).next };
+                }
+            }
+        }
+        if (cx.current_impl as usize) != 0 {
+            let gps_i: *mut HirGenericParams = unsafe { (*cx.current_impl).generic_params };
+            if (gps_i as usize) != 0 {
+                let mut idx_i: usize = 0;
+                let mut gp_i: *mut HirGenericParam = unsafe { (*gps_i).params };
+                while ((gp_i as usize) != 0) {
+                    let gname_id_i = unsafe { (*gp_i).name.v };
+                    let gp_name_i = unsafe { interner_get(view(*cx.str_in), (StrId { v: gname_id_i })) };
+                    if sv_eq(view(gp_name_i), view(name)) {
+                        return unsafe { intern_param_ty(mut_view((*cx.thir).interner), (StrId { v: gname_id_i }), idx_i as u32) };
+                    }
+                    idx_i = idx_i + 1;
+                    gp_i = unsafe { (*gp_i).next };
+                }
+            }
         }
     }
 
@@ -37469,27 +37775,34 @@ fn verify_closure_at_boundary(
                 } else {
                     base_ty
                 };
-                let ok_send = unsafe {
-                    type_satisfies_auto_trait(
-                        view(*cx.hir),
-                        view(*cx.thir),
-                        (TypeId { v: send_check_ty.v }),
-                        1u8,
-                        10007u32,
-                        view(send_sv),
-                        view(*cx.str_in),
-                        view(*cx.db),
-                        0
-                    )
+                let is_scoped_shared_view = if boundary_kind == 4u8 {
+                    kind_of(mut_view(*cx), (TypeId { v: send_check_ty.v })) == TY_VIEW
+                } else {
+                    false
                 };
-                if !ok_send {
-                    emit_spawn_capture_diag(
-                        mut_view(*cx),
-                        AX_CONC_CAPTURE_NOT_SEND,
-                        Span { file: (FileId { v: diag_sp.file.v }), start: diag_sp.start, end: diag_sp.end },
-                        (StrId { v: cname.v }),
-                        (TypeId { v: send_check_ty.v })
-                    );
+                if !is_scoped_shared_view {
+                    let ok_send = unsafe {
+                        type_satisfies_auto_trait(
+                            view(*cx.hir),
+                            view(*cx.thir),
+                            (TypeId { v: send_check_ty.v }),
+                            1u8,
+                            10007u32,
+                            view(send_sv),
+                            view(*cx.str_in),
+                            view(*cx.db),
+                            0
+                        )
+                    };
+                    if !ok_send {
+                        emit_spawn_capture_diag(
+                            mut_view(*cx),
+                            AX_CONC_CAPTURE_NOT_SEND,
+                            Span { file: (FileId { v: diag_sp.file.v }), start: diag_sp.start, end: diag_sp.end },
+                            (StrId { v: cname.v }),
+                            (TypeId { v: send_check_ty.v })
+                        );
+                    }
                 }
             }
         }
@@ -37649,7 +37962,7 @@ fn scan_spawn_boundaries_expr(cx: mut_view<TypeckCtx>, expr: *const HirExpr, is_
                                 aname,
                                 (TypeId { v: arg_ty.v })
                             );
-                        } else if (sk == 1u8 || sk == 4u8) && (cx.db as usize) != 0 {
+                        } else if (sk == 1u8 || sk == 4u8) && (cx.db as usize) != 0 && !(sk == 4u8 && kind_of(mut_view(*cx), (TypeId { v: arg_ty.v })) == TY_VIEW) {
                             let ok_send = unsafe {
                                 type_satisfies_auto_trait(
                                     view(*cx.hir),
@@ -66112,6 +66425,7 @@ pub struct UnsafeChecker {
     pub bind_count: usize,
     pub bind_cap: usize,
     pub has_tls: bool,
+    pub suppress_branch_diags: bool,
 }
 
 unsafe fn conc_proj_at(base: *mut ConcProj, idx: usize) -> *mut ConcProj {
@@ -66488,7 +66802,7 @@ fn report_conc_diag(
     note1: StrView,
     note2: StrView
 ) {
-    if (c.sink as usize) == 0 {
+    if (c.sink as usize) == 0 || c.suppress_branch_diags {
         return;
     }
     let notes = unsafe { arena_alloc_raw(mut_view((*c.sink).arena), mul_usize(2, size_of<StrView>()), align_of<StrView>()) as *mut StrView };
@@ -67699,6 +68013,39 @@ fn conc_collect_block(
     }
 }
 
+fn conc_expr_base_shared_view_ty(
+    c: view<UnsafeChecker>,
+    expr: *const HirExpr,
+    local_syms: *mut u32,
+    local_count: usize
+) -> TypeId {
+    let mut cur = expr;
+    let mut depth: usize = 0;
+    while (cur as usize) != 0 && depth < 16 {
+        let ck = unsafe { (*cur).kind };
+        if ck == HIR_EXPR_PATH {
+            let sym_v = unsafe { (*cur).path.symbol.v };
+            let name_v = unsafe { (*cur).path.name.v };
+            if conc_is_local_to_closure(sym_v, local_syms, local_count) {
+                return TypeId { v: 0u32 };
+            }
+            let b = conc_lookup_bind(c, sym_v, name_v);
+            if (b as usize) != 0 && (unsafe { (*b).is_view }) && !(unsafe { (*b).is_mut_view }) {
+                return unsafe { (*b).ty };
+            }
+            return TypeId { v: 0u32 };
+        } else if ck == HIR_EXPR_FIELD || ck == HIR_EXPR_TUPLE_INDEX || ck == HIR_EXPR_INDEX {
+            cur = unsafe { (*cur).base as *const HirExpr };
+        } else if (ck == HIR_EXPR_UNARY && (unsafe { (*cur).op }) == UNOP_DEREF) || ck == HIR_EXPR_VIEW || ck == HIR_EXPR_CAST {
+            cur = unsafe { (*cur).inner as *const HirExpr };
+        } else {
+            return TypeId { v: 0u32 };
+        }
+        depth = depth + 1;
+    }
+    TypeId { v: 0u32 }
+}
+
 fn conc_collect_expr(
     c: mut_view<UnsafeChecker>,
     expr: *const HirExpr,
@@ -67774,6 +68121,7 @@ fn conc_collect_expr(
                 }
             }
             let mut is_w = false;
+            let mut reported_vns = false;
             if ek == HIR_EXPR_PATH {
                 let sym_v = unsafe { (*expr).path.symbol.v };
                 let name_v = unsafe { (*expr).path.name.v };
@@ -67788,6 +68136,7 @@ fn conc_collect_expr(
                         let bty = unsafe { (*b).ty };
                         if !conc_type_is_share(view(*c), bty) {
                             conc_report_view_not_share(mut_view(*c), conc_copy_span(view(sp)), reg.root_name);
+                            reported_vns = true;
                         }
                     } else if is_unscoped_spawn && !reg.from_unsafe_static && !reg.from_unsafe_ptr {
                         return;
@@ -67805,8 +68154,13 @@ fn conc_collect_expr(
                 }
             }
             let ety = unsafe_get_expr_ty(view(*c), expr);
-            if !is_w && !is_unscoped_spawn && !reg.is_sync_wrapper {
-                if !conc_type_is_share(view(*c), ety) {
+            if !is_w && !reported_vns && !is_unscoped_spawn && !reg.is_sync_wrapper {
+                let v_root_ty = if ek != HIR_EXPR_PATH && !reg.from_guard && !reg.from_tls {
+                    conc_expr_base_shared_view_ty(view(*c), expr, local_syms, *local_count)
+                } else {
+                    TypeId { v: 0u32 }
+                };
+                if !conc_type_is_share(view(*c), ety) || (v_root_ty.v != 0u32 && !conc_type_is_share(view(*c), v_root_ty)) {
                     conc_report_view_not_share(mut_view(*c), conc_copy_span(view(sp)), reg.root_name);
                 }
             }
@@ -68248,6 +68602,7 @@ pub fn unsafe_check_block(c: mut_view<UnsafeChecker>, block: *const HirBlock) {
         let branches = unsafe { arena_alloc_raw(mut_view((*c.sink).arena), mul_usize(task_count, size_of<ConcBranch>()), align_of<ConcBranch>()) as *mut ConcBranch };
         let mut tidx: usize = 0;
         let mut ts = unsafe { (*block).stmts as *const HirStmt };
+        c.suppress_branch_diags = true;
         while (ts as usize) != 0 && tidx < task_count {
             let mut is_unsc = false;
             let t_arg = conc_stmt_extract_spawn_task(view(*c), ts, mut_view(is_unsc));
@@ -68262,6 +68617,7 @@ pub fn unsafe_check_block(c: mut_view<UnsafeChecker>, block: *const HirBlock) {
             }
             ts = unsafe { (*ts).next as *const HirStmt };
         }
+        c.suppress_branch_diags = false;
         let mut i: usize = 0;
         while i < tidx {
             let mut j = i + 1;
@@ -68612,6 +68968,7 @@ pub fn unsafe_check(
         bind_count: 0,
         bind_cap: bind_cap,
         has_tls: any_tls,
+        suppress_branch_diags: false,
     };
 
     let mut it = hir.items as *const HirItem;
@@ -72306,26 +72663,6 @@ pub fn verify_mir_cap(
                                     view(s_span),
                                     59
                                 );
-                            }
-                        } else if target_pc > 0 {
-                            let mut pi: usize = 0;
-                            while pi < target_pc {
-                                let pr = unsafe { mir_proj_at((*stmt).rvalue.place.projs, pi) };
-                                if (unsafe { (*pr).kind }) == MIR_PROJ_SUB_SLICE && (unsafe { (*pr).has_from }) && (unsafe { (*pr).has_to }) {
-                                    let mut cs: u64 = 0u64;
-                                    let mut ce: u64 = 0u64;
-                                    if verify_resolve_const_usize(body, unsafe { (*pr).from_local.v }, mut_view(cs), 0) &&
-                                       verify_resolve_const_usize(body, unsafe { (*pr).to_local.v }, mut_view(ce), 0) &&
-                                       cs > ce {
-                                        verify_emit_diag(
-                                            mut_view(*sink),
-                                            AX_VERIFY_TYPE_MISMATCH,
-                                            view(s_span),
-                                            59
-                                        );
-                                    }
-                                }
-                                pi = pi + 1;
                             }
                         }
                         if dst_loc < lc && dst_pc == 0 {

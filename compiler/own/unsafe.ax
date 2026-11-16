@@ -214,6 +214,7 @@ pub struct UnsafeChecker {
     pub bind_count: usize,
     pub bind_cap: usize,
     pub has_tls: bool,
+    pub suppress_branch_diags: bool,
 }
 
 unsafe fn conc_proj_at(base: *mut ConcProj, idx: usize) -> *mut ConcProj {
@@ -590,7 +591,7 @@ fn report_conc_diag(
     note1: StrView,
     note2: StrView
 ) {
-    if (c.sink as usize) == 0 {
+    if (c.sink as usize) == 0 || c.suppress_branch_diags {
         return;
     }
     let notes = unsafe { arena_alloc_raw(mut_view((*c.sink).arena), mul_usize(2, size_of<StrView>()), align_of<StrView>()) as *mut StrView };
@@ -1801,6 +1802,39 @@ fn conc_collect_block(
     }
 }
 
+fn conc_expr_base_shared_view_ty(
+    c: view<UnsafeChecker>,
+    expr: *const HirExpr,
+    local_syms: *mut u32,
+    local_count: usize
+) -> TypeId {
+    let mut cur = expr;
+    let mut depth: usize = 0;
+    while (cur as usize) != 0 && depth < 16 {
+        let ck = unsafe { (*cur).kind };
+        if ck == HIR_EXPR_PATH {
+            let sym_v = unsafe { (*cur).path.symbol.v };
+            let name_v = unsafe { (*cur).path.name.v };
+            if conc_is_local_to_closure(sym_v, local_syms, local_count) {
+                return TypeId { v: 0u32 };
+            }
+            let b = conc_lookup_bind(c, sym_v, name_v);
+            if (b as usize) != 0 && (unsafe { (*b).is_view }) && !(unsafe { (*b).is_mut_view }) {
+                return unsafe { (*b).ty };
+            }
+            return TypeId { v: 0u32 };
+        } else if ck == HIR_EXPR_FIELD || ck == HIR_EXPR_TUPLE_INDEX || ck == HIR_EXPR_INDEX {
+            cur = unsafe { (*cur).base as *const HirExpr };
+        } else if (ck == HIR_EXPR_UNARY && (unsafe { (*cur).op }) == UNOP_DEREF) || ck == HIR_EXPR_VIEW || ck == HIR_EXPR_CAST {
+            cur = unsafe { (*cur).inner as *const HirExpr };
+        } else {
+            return TypeId { v: 0u32 };
+        }
+        depth = depth + 1;
+    }
+    TypeId { v: 0u32 }
+}
+
 fn conc_collect_expr(
     c: mut_view<UnsafeChecker>,
     expr: *const HirExpr,
@@ -1876,6 +1910,7 @@ fn conc_collect_expr(
                 }
             }
             let mut is_w = false;
+            let mut reported_vns = false;
             if ek == HIR_EXPR_PATH {
                 let sym_v = unsafe { (*expr).path.symbol.v };
                 let name_v = unsafe { (*expr).path.name.v };
@@ -1890,6 +1925,7 @@ fn conc_collect_expr(
                         let bty = unsafe { (*b).ty };
                         if !conc_type_is_share(view(*c), bty) {
                             conc_report_view_not_share(mut_view(*c), conc_copy_span(view(sp)), reg.root_name);
+                            reported_vns = true;
                         }
                     } else if is_unscoped_spawn && !reg.from_unsafe_static && !reg.from_unsafe_ptr {
                         return;
@@ -1907,8 +1943,13 @@ fn conc_collect_expr(
                 }
             }
             let ety = unsafe_get_expr_ty(view(*c), expr);
-            if !is_w && !is_unscoped_spawn && !reg.is_sync_wrapper {
-                if !conc_type_is_share(view(*c), ety) {
+            if !is_w && !reported_vns && !is_unscoped_spawn && !reg.is_sync_wrapper {
+                let v_root_ty = if ek != HIR_EXPR_PATH && !reg.from_guard && !reg.from_tls {
+                    conc_expr_base_shared_view_ty(view(*c), expr, local_syms, *local_count)
+                } else {
+                    TypeId { v: 0u32 }
+                };
+                if !conc_type_is_share(view(*c), ety) || (v_root_ty.v != 0u32 && !conc_type_is_share(view(*c), v_root_ty)) {
                     conc_report_view_not_share(mut_view(*c), conc_copy_span(view(sp)), reg.root_name);
                 }
             }
@@ -2350,6 +2391,7 @@ pub fn unsafe_check_block(c: mut_view<UnsafeChecker>, block: *const HirBlock) {
         let branches = unsafe { arena_alloc_raw(mut_view((*c.sink).arena), mul_usize(task_count, size_of<ConcBranch>()), align_of<ConcBranch>()) as *mut ConcBranch };
         let mut tidx: usize = 0;
         let mut ts = unsafe { (*block).stmts as *const HirStmt };
+        c.suppress_branch_diags = true;
         while (ts as usize) != 0 && tidx < task_count {
             let mut is_unsc = false;
             let t_arg = conc_stmt_extract_spawn_task(view(*c), ts, mut_view(is_unsc));
@@ -2364,6 +2406,7 @@ pub fn unsafe_check_block(c: mut_view<UnsafeChecker>, block: *const HirBlock) {
             }
             ts = unsafe { (*ts).next as *const HirStmt };
         }
+        c.suppress_branch_diags = false;
         let mut i: usize = 0;
         while i < tidx {
             let mut j = i + 1;
@@ -2714,6 +2757,7 @@ pub fn unsafe_check(
         bind_count: 0,
         bind_cap: bind_cap,
         has_tls: any_tls,
+        suppress_branch_diags: false,
     };
 
     let mut it = hir.items as *const HirItem;
