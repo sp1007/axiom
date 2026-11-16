@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T452, T435]
 priority: 18
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 900
 paths: [tests/selfhost/interp_opt, tests/selfhost/own_mir_verify]
 locks: [tests/selfhost, _workspaces/baseline-failures.txt]
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/decisions/ADR-0041-complete-suite-baseline-and-test-cache.md, spec/SPEC-12-drop.md, spec/SPEC-20-selfhost.md]
 covers: [REQ-TST-089, REQ-TST-034]
+started: 2026-11-16 23:11:39
+finished: 2026-11-17 03:21:28
 ---
 # T441 — Baseline fix: selfhost MIR comparisons outside `selfhost/drop`
 
@@ -49,3 +51,5 @@ interp, native and native-O1 and stay green when the implicitly loaded prelude g
 
 ## Log
 - 2026-11-13 created by axiom-architect (ADR-0042 §1, architect inbox 1)
+- 2026-11-16 23:11:39 started (attempt 1) t441-impl
+- 2026-11-17 03:21:28 accepted by QA -> done

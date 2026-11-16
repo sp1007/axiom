@@ -37,6 +37,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
+STD_MINIMAL = "tests/selfhost/drop/std_minimal"
 sys.path.insert(0, os.path.join(ROOT, "tests", "selfhost"))
 
 import bundle_common as bc  # noqa: E402
@@ -725,7 +726,7 @@ def apply_opt_dce_to_mir_text(mir_bytes):
 
 
 def run_axiom0_mir_opt(axiom0, rel_ax):
-    cmd = [os.path.abspath(axiom0), "inspect", "--emit=mir", "-O1", rel_ax]
+    cmd = [os.path.abspath(axiom0), "inspect", "--std-root", STD_MINIMAL, "--emit=mir", "-O1", rel_ax]
     res = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if res.returncode != 0:
         raise SystemExit("axiom0 inspect --emit=mir -O1 failed on %s: %s" % (rel_ax, res.stderr.decode("utf-8", "replace")))
@@ -757,7 +758,7 @@ def run_axiom0_mir_opt(axiom0, rel_ax):
 
 
 def run_axiom0_run(axiom0, rel_ax, opt_O1=False):
-    cmd = [os.path.abspath(axiom0), "run", "--interp"]
+    cmd = [os.path.abspath(axiom0), "run", "--std-root", STD_MINIMAL, "--interp"]
     if opt_O1:
         cmd.append("-O1")
     cmd.append(rel_ax)

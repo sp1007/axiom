@@ -22,6 +22,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
+STD_MINIMAL = "tests/selfhost/drop/std_minimal"
 sys.path.insert(0, os.path.join(ROOT, "tests", "selfhost"))
 
 import bundle_common as bc  # noqa: E402
@@ -247,7 +248,7 @@ def find_exe(default_rels):
 
 
 def run_oracle_drop(oracle, rel_ax):
-    cmd = [os.path.abspath(oracle), "--std-root", "std", rel_ax]
+    cmd = [os.path.abspath(oracle), "--std-root", STD_MINIMAL, rel_ax]
     res = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if res.returncode != 0:
         raise SystemExit("oracle failed on %s: %s" % (rel_ax, res.stderr.decode("utf-8", "replace")))
@@ -259,7 +260,7 @@ def run_oracle_drop(oracle, rel_ax):
 
 
 def run_axiom0_check_stderr(axiom0, rel_ax):
-    cmd = [os.path.abspath(axiom0), "check", rel_ax]
+    cmd = [os.path.abspath(axiom0), "check", "--std-root", STD_MINIMAL, rel_ax]
     res = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if res.returncode == 0:
         raise SystemExit("expected axiom0 check to fail on %s" % rel_ax)
