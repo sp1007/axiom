@@ -418,6 +418,13 @@ address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` 
 - since: T572
 - check: execution, UI diagnostic, and conformance tests in tests/run/index_autoderef (T571), tests/ui/index_autoderef (T571), and tests/conformance/p14/e14_5_index_autoderef (T572) verify view/mut_view index auto-deref, evaluation order, bounds checks, old-element Drop on assignment, rejection of writes through immutable views (`AX_TYPE_ASSIGN_IMMUTABLE`), and rejection of raw-pointer indexing (`AX_TYPE_CANNOT_INDEX`)
 
+### INV-SEM-008 — Declaration order is not semantic; ADT type graphs may be cyclic
+- statement: A struct/enum field type may name a struct/enum declared later in the same or another module (including `std.*` modules) and may reach its own type through pointers, function types and generic instances; the field gets the real type, never the error type. ADT type identity is (definition, type arguments); every type substitution returns its input unchanged when no argument changes and interns a new instance as a field-less shell before substituting fields/payloads, so no substitution recurses forever on a cyclic graph.
+- source: ADR-0043 §1; SPEC-03; T421 FU-1, FU-3; REQ-LAY-136
+- verify: tests/run/layout_fwd_pointee
+- since: T444
+- check: run tests (interp, native, native-O1, exact `// stdout:`) for forward pointees, self/mutual references, a forward enum by value, generic cycles and a `Waker` field in a `std.*` module
+
 ## 9. Bootstrap scope
 
 ### INV-BOOT-001 — axiom0 implements exactly the self-host subset
@@ -447,6 +454,13 @@ address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` 
 - verify: .claude/skills/axiom-tasks/scripts/harness_check.py
 - since: T087
 - check: harness_check rejects other commits that touch `bootstrap/axiom0` once the tag exists (harness_check.py already exists and already implements the freeze check; T087 creates the tag that activates it)
+
+### INV-BOOT-005 — Symbol ids are one opaque space
+- statement: In axiom0 and in axiomc a `SymbolId` comes from a single per-compilation counter shared by user, std and extern symbols; two distinct symbols never share an id whatever the program size, and no code derives a property (std, extern) from the numeric value of an id — such properties are stored per symbol.
+- source: ADR-0043 §2; REQ-RES-060
+- verify: tests/run/symbol_id_space
+- since: T164
+- check: a generated program with more than 30000 user symbols and generic functions ahead of extern calls compiles and runs in interp and native; the self-host bootstrap (stage 1-3) succeeds
 
 ## 10. Invariants stated in SPEC-01 / SPEC-02
 

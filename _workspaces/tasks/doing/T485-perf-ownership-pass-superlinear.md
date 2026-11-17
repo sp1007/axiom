@@ -8,13 +8,15 @@ model: opus
 gate_model: opus
 depends: []
 priority: 15
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 900
 paths: [compiler/own, tests/perf/own_scaling]
 locks: [compiler/mir/builder.ax, compiler/types/typeck.ax]
 spec: [spec/SPEC-76-performance-contract.md, spec/SPEC-20-selfhost.md, spec/SPEC-03-core-semantics.md]
 covers: [REQ-OPT-292]
+started: 2026-11-17 19:46:03
+agent: T485-impl
 ---
 # T485 — Perf: make the `own` pass scale linearly
 
@@ -42,3 +44,6 @@ the 10.6 h serial suite, and almost all of it is compiler time. Lex+parse+resolv
 - Self-host fixpoint still holds (stage-2 == stage-3 as in the existing selfhost check).
 - Report before/after `--time-passes` for at least 3 large bundles; target: `own` ≥ 5× faster on
   `qa_backend_unit.ax`. If a target is not reached, explain what remains.
+
+## Log
+- 2026-11-17 19:46:03 started (attempt 1) T485-impl
