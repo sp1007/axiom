@@ -6,8 +6,8 @@ owner: axiom-backend
 reviewer: axiom-qa
 model: opus
 gate_model: opus
-depends: []
-priority: 15
+depends: [T164]
+priority: 10
 status: todo
 attempts: 0
 timeout_min: 900
