@@ -8,7 +8,7 @@ model: sonnet
 gate_model: sonnet
 depends: [T481]
 priority: 20
-status: doing
+status: done
 attempts: 1
 timeout_min: 300
 paths: [tests/run/saturating_native, tests/ui/backend_ice]
@@ -16,7 +16,7 @@ locks: [compiler/lir/builder.ax, compiler/lir/lir.ax, compiler/target/x64, compi
 spec: [spec/SPEC-40-integers.md, spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md]
 covers: [REQ-LIR-007]
 started: 2026-11-17 19:46:03
-agent: T481a-impl
+finished: 2026-11-18 04:49:12
 ---
 # T481a — Follow-up T481: harden saturating lowering and backend ICE reporting
 
@@ -53,3 +53,4 @@ change for correct programs; native saturating results stay bit-identical to the
 
 ## Log
 - 2026-11-17 19:46:03 started (attempt 1) T481a-impl
+- 2026-11-18 04:49:12 accepted by QA -> done
