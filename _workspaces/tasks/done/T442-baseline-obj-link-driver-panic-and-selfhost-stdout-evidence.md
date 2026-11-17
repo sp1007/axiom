@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T452, T436]
 priority: 18
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 900
 paths: [tests/selfhost/obj_link_driver, tests/selfhost/driver/gen_driver_tests.py, tests/selfhost/driver/qa_driver_commands_a.ax, tests/selfhost/driver/qa_driver_commands_b.ax, tests/selfhost/driver/qa_driver_inspect_diff_a.ax, tests/selfhost/driver/qa_driver_inspect_diff_b.ax]
 locks: [tests/selfhost, _workspaces/baseline-failures.txt]
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/decisions/ADR-0041-complete-suite-baseline-and-test-cache.md, spec/SPEC-20-selfhost.md]
 covers: [REQ-TST-095, REQ-TST-046]
+started: 2026-11-17 03:23:20
+finished: 2026-11-17 07:23:09
 ---
 # T442 — Baseline fix: obj_link_driver bundles and native evidence of the driver bundles
 
@@ -50,3 +52,5 @@ covers: [REQ-TST-095, REQ-TST-046]
 
 ## Log
 - 2026-11-13 created by axiom-architect (ADR-0042 §1, architect inbox 1)
+- 2026-11-17 03:23:20 started (attempt 1) t442-impl
+- 2026-11-17 07:23:09 accepted by QA -> done

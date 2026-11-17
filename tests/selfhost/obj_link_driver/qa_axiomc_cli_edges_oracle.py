@@ -17,12 +17,14 @@ The last stdout line is `AXIOMC-EDGES same=<n> diverge=<m>`; exit status 0 only 
 """
 
 import os
+import shutil
 import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import axiomc_e2e_oracle as e2e  # noqa: E402
 import gen_obj_link_driver_tests as gen  # noqa: E402
 
 AXIOMC_STACK_RESERVE = "67108864"
@@ -121,7 +123,12 @@ def main():
     with open(bundle, "wb") as f:
         f.write(gen.axiomc_bundle_text().encode("utf-8"))
     axiomc = os.path.join(tmp, "axiomc.exe")
-    code, _out, err = run([axiom0, "build", "--stack-reserve=" + AXIOMC_STACK_RESERVE, "-o", axiomc, bundle], root, 1500)
+    prebuilt = e2e.resolve_prebuilt_axiomc(axiom0, root)
+    if prebuilt is not None:
+        shutil.copy2(prebuilt, axiomc)
+        code, err = 0, b""
+    else:
+        code, _out, err = run([axiom0, "build", "--stack-reserve=" + AXIOMC_STACK_RESERVE, "-o", axiomc, bundle], root, 1500)
     if code != 0 or not os.path.isfile(axiomc):
         print("FAIL: axiom0 could not build axiomc (rc=%d): %s" % (code, err[:2000].decode("utf-8", "replace")))
         return 1

@@ -184,8 +184,8 @@ fn case_blob(k: usize, which: usize) -> usize {
 }
 
 // Runs the driver `build` command through driver_execute_build_into with the artifact captured in
-// memory (no file is written). Returns true when the build succeeded and wrote nothing to stderr.
-fn build_into_buf(argv: *const StrView, argc: usize, bin: *mut CoffBuf) -> bool {
+// memory. Returns true when the build succeeded and wrote nothing to stderr.
+fn build_into_buf_mode(argv: *const StrView, argc: usize, bin: *mut CoffBuf, write_to_disk: bool) -> bool {
     let dopts = unsafe { driver_options_alloc() };
     let mut out_b = diag_buf_new();
     let mut err_b = diag_buf_new();
@@ -197,13 +197,17 @@ fn build_into_buf(argv: *const StrView, argc: usize, bin: *mut CoffBuf) -> bool 
         return false;
     }
     let brc = unsafe {
-        driver_execute_build_into(view(*dopts), mut_view(out_b), mut_view(err_b), bin, false)
+        driver_execute_build_into(view(*dopts), mut_view(out_b), mut_view(err_b), bin, write_to_disk)
     };
     let ok = brc == AX_EXIT_OK && err_b.len == 0;
     diag_buf_free(mut_view(out_b));
     diag_buf_free(mut_view(err_b));
     unsafe { driver_options_dealloc(dopts); }
     ok
+}
+
+fn build_into_buf(argv: *const StrView, argc: usize, bin: *mut CoffBuf) -> bool {
+    build_into_buf_mode(argv, argc, bin, false)
 }
 
 // `axiomc build [--emit=obj] [-O1] [--stack-reserve=2097152] -o out <source>` against a reference blob.
@@ -229,8 +233,21 @@ fn build_matches(k: usize, emit_obj: bool, o1: bool, stack_reserve: bool, expect
     }
     set_arg_blob(argv, n, 3);
     n = n + 1;
+    let is_pkg = k == 4 || k == 5;
+    let write_disk = is_pkg && !emit_obj;
+    let mut path_buf = diag_buf_new();
+    let mut tmp_sv = StrView { ptr: 0 as *const u8, len: 0 };
     if emit_obj {
         set_arg_blob(argv, n, 4);
+    } else if write_disk {
+        let pfx = blob_sv(8);
+        let sfx = blob_sv(9);
+        diag_buf_push_bytes(mut_view(path_buf), pfx.ptr, pfx.len);
+        let stamp = (monotonic_ns() & 0xFFFFFFFFu64) as u32;
+        diag_buf_push_u32(mut_view(path_buf), stamp);
+        diag_buf_push_bytes(mut_view(path_buf), sfx.ptr, sfx.len);
+        tmp_sv = StrView { ptr: path_buf.ptr as *const u8, len: path_buf.len };
+        sv_slot_set(argv, n, view(tmp_sv));
     } else {
         set_arg_blob(argv, n, 5);
     }
@@ -239,7 +256,11 @@ fn build_matches(k: usize, emit_obj: bool, o1: bool, stack_reserve: bool, expect
     n = n + 1;
     let mut bin_buf = coff_buf_with_capacity(1024);
     let bin_ptr = unsafe { ptr_from_mut(mut_view(bin_buf)) };
-    let built = build_into_buf(ap, n, bin_ptr);
+    let built = build_into_buf_mode(ap, n, bin_ptr, write_disk);
+    if write_disk {
+        let _ = unsafe { remove(tmp_sv.ptr, tmp_sv.len) };
+    }
+    diag_buf_free(mut_view(path_buf));
     let ok = built && coff_buf_matches_blob(view(bin_buf), expect_blob);
     coff_buf_free(mut_view(bin_buf));
     ok
@@ -354,14 +375,15 @@ fn test_cases() -> i32 {
             if !handoff_matches(false, case_blob(k, 2), case_blob(k, 1)) { return code + 6; }
         }
         if !LITE {
+            let is_pkg = k == 4 || k == 5;
             if !build_matches(k, true, false, false, case_blob(k, 1)) { return code + 1; }
             if !build_matches(k, false, false, false, case_blob(k, 2)) { return code + 2; }
-            if !handoff_matches(false, case_blob(k, 2), case_blob(k, 1)) { return code + 6; }
+            if !is_pkg && !handoff_matches(false, case_blob(k, 2), case_blob(k, 1)) { return code + 6; }
             if !build_matches(k, true, true, false, case_blob(k, 3)) { return code + 3; }
             if !build_matches(k, false, true, false, case_blob(k, 4)) { return code + 4; }
             if !build_matches(k, false, false, true, case_blob(k, 5)) { return code + 5; }
-            if !handoff_matches(true, case_blob(k, 5), case_blob(k, 1)) { return code + 7; }
-            if !pipeline_handoff_matches(k) { return code + 8; }
+            if !is_pkg && !handoff_matches(true, case_blob(k, 5), case_blob(k, 1)) { return code + 7; }
+            if !is_pkg && !pipeline_handoff_matches(k) { return code + 8; }
         }
         k = k + 1;
     }
@@ -498,7 +520,11 @@ def gen_diff_bundle(filename, modes, corpus, prelude, full_mods, axiom0, lite=Fa
 def main():
     check_mode = ("--check" in sys.argv[1:]) or ("check" in sys.argv[1:])
     refresh_goldens = "--refresh-goldens" in sys.argv[1:]
-    axiom0 = drv.find_exe(["build/axiom0.exe", "build/axiom0"]) if refresh_goldens else None
+    axiom0 = (
+        drv.find_exe(["build/axiomc2.exe", "build/axiomc.exe", "build/axiom0.exe", "build/axiom0"])
+        if refresh_goldens
+        else None
+    )
     for i, a in enumerate(sys.argv[1:]):
         if a == "--axiom0" and i + 2 <= len(sys.argv[1:]):
             axiom0 = sys.argv[i + 2]

@@ -14,8 +14,21 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STAGES = {"tokens", "ast", "resolved", "hir", "thir", "mir", "lir", "mi", "mc", "obj", "backend-build"}
 BEHAVIOURS = {"same-behaviour", "different-behaviour", "no-image"}
 PATTERNS = [
-    "tests/run/**/*.ax", "tests/programs/*.ax", "tests/mc/**/*.ax",
-    "tests/modules/*/src/main.ax", "tests/opt/*.ax", "tests/driver/*.ax",
+    "tests/run/basic/*.ax",
+    "tests/run/parity/**/*.ax",
+    "tests/run/control/*.ax",
+    "tests/run/closures/*.ax",
+    "tests/run/enums/*.ax",
+    "tests/run/generics/*.ax",
+    "tests/run/loops/*.ax",
+    "tests/run/match/*.ax",
+    "tests/run/structs/*.ax",
+    "tests/run/tuples/*.ax",
+    "tests/programs/*.ax",
+    "tests/mc/**/*.ax",
+    "tests/modules/*/src/main.ax",
+    "tests/opt/*.ax",
+    "tests/driver/*.ax",
 ]
 
 

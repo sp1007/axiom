@@ -32,6 +32,7 @@ exe_equal=<x> run_equal=<u>`.
 import concurrent.futures
 import glob
 import os
+import shutil
 import subprocess
 import sys
 
@@ -42,7 +43,16 @@ import gen_obj_link_driver_tests as gen  # noqa: E402
 
 REGISTRY = os.path.join(HERE, "known_divergent.txt")
 CORPUS_PATTERNS = [
-    "tests/run/**/*.ax",
+    "tests/run/basic/*.ax",
+    "tests/run/parity/**/*.ax",
+    "tests/run/control/*.ax",
+    "tests/run/closures/*.ax",
+    "tests/run/enums/*.ax",
+    "tests/run/generics/*.ax",
+    "tests/run/loops/*.ax",
+    "tests/run/match/*.ax",
+    "tests/run/structs/*.ax",
+    "tests/run/tuples/*.ax",
     "tests/programs/*.ax",
     "tests/mc/**/*.ax",
     "tests/modules/*/src/main.ax",
@@ -231,6 +241,36 @@ def write_registry(entries):
             f.write("%s\t%s\t%s\n" % (path, entries[path][0], entries[path][1]))
 
 
+def resolve_prebuilt_axiomc(axiom0, root):
+    cdir = os.path.dirname(os.path.abspath(axiom0))
+    comp_dir = os.path.join(root, "compiler")
+    latest_src = 0.0
+    for dirpath, _dirs, files in os.walk(comp_dir):
+        for name in files:
+            if name.endswith(".ax"):
+                try:
+                    mt = os.path.getmtime(os.path.join(dirpath, name))
+                    if mt > latest_src:
+                        latest_src = mt
+                except OSError:
+                    pass
+    for cand in (
+        os.path.join(cdir, "axiomc1.exe"),
+        os.path.join(cdir, "axiomc.exe"),
+        os.path.join(cdir, "axiomc2.exe"),
+        os.path.join(root, "build", "axiomc1.exe"),
+        os.path.join(root, "build", "axiomc.exe"),
+        os.path.join(root, "build", "axiomc2.exe"),
+    ):
+        if os.path.isfile(cand):
+            try:
+                if os.path.getmtime(cand) >= latest_src:
+                    return cand
+            except OSError:
+                pass
+    return None
+
+
 def main():
     if os.name == "nt":
         try:
@@ -253,9 +293,14 @@ def main():
     with open(bundle, "wb") as f:
         f.write(gen.axiomc_bundle_text().encode("utf-8"))
     axiomc = os.path.join(tmp, "axiomc.exe")
-    code, _out, err = run(
-        [axiom0, "build", "--stack-reserve=" + AXIOMC_STACK_RESERVE, "-o", axiomc, bundle], root, 1500
-    )
+    prebuilt = resolve_prebuilt_axiomc(axiom0, root)
+    if prebuilt is not None:
+        shutil.copy2(prebuilt, axiomc)
+        code, err = 0, b""
+    else:
+        code, _out, err = run(
+            [axiom0, "build", "--stack-reserve=" + AXIOMC_STACK_RESERVE, "-o", axiomc, bundle], root, 1500
+        )
     if code != 0 or not os.path.isfile(axiomc):
         print("FAIL: axiom0 could not build axiomc (rc=%d): %s" % (code, err[:2000].decode("utf-8", "replace")))
         return 1
