@@ -74050,6 +74050,9 @@ use compiler.mir.mir.MIR_BINOP_SUB
 use compiler.mir.mir.MIR_BINOP_WRAPPING_ADD
 use compiler.mir.mir.MIR_BINOP_WRAPPING_SUB
 use compiler.mir.mir.MIR_BINOP_WRAPPING_MUL
+use compiler.mir.mir.MIR_BINOP_SAT_ADD
+use compiler.mir.mir.MIR_BINOP_SAT_SUB
+use compiler.mir.mir.MIR_BINOP_SAT_MUL
 use compiler.mir.mir.MIR_CONST_STR
 use compiler.mir.mir.MIR_LOCAL_CONST
 use compiler.mir.mir.MIR_LOCAL_TLS
@@ -74211,6 +74214,7 @@ pub struct LirBuilder {
     pub cur_insts: *mut LirInst,
     pub cur_inst_count: usize,
     pub cur_inst_cap: usize,
+    pub has_ice: bool,
 }
 
 unsafe fn vreg_id_at(base: *mut LirVRegId, idx: usize) -> *mut LirVRegId {
@@ -75124,7 +75128,7 @@ fn lower_operand(b: mut_view<LirBuilder>, op: view<MirOperand>) -> u32 {
     0u32
 }
 
-fn lower_binop(op: u8, is_signed: bool) -> u8 {
+fn lower_binop_checked(b: mut_view<LirBuilder>, op: u8, is_signed: bool) -> u8 {
     if op == MIR_BINOP_ADD { return LIR_INST_ADD; }
     if op == MIR_BINOP_SUB { return LIR_INST_SUB; }
     if op == MIR_BINOP_MUL { return LIR_INST_MUL; }
@@ -75145,7 +75149,160 @@ fn lower_binop(op: u8, is_signed: bool) -> u8 {
     if op == MIR_BINOP_WRAPPING_ADD { return LIR_INST_ADD; }
     if op == MIR_BINOP_WRAPPING_SUB { return LIR_INST_SUB; }
     if op == MIR_BINOP_WRAPPING_MUL { return LIR_INST_MUL; }
+    b.has_ice = true;
     LIR_INST_ADD
+}
+
+fn lb_norm_int_const(raw: u64, bw: u32, is_signed: bool) -> u64 {
+    if bw == 8u32 {
+        let low = raw & 0xFFu64;
+        if is_signed && (low & 0x80u64) != 0u64 {
+            return low | 0xFFFFFFFFFFFFFF00u64;
+        }
+        return low;
+    }
+    if bw == 16u32 {
+        let low = raw & 0xFFFFu64;
+        if is_signed && (low & 0x8000u64) != 0u64 {
+            return low | 0xFFFFFFFFFFFF0000u64;
+        }
+        return low;
+    }
+    if bw == 32u32 {
+        let low = raw & 0xFFFFFFFFu64;
+        if is_signed && (low & 0x80000000u64) != 0u64 {
+            return low | 0xFFFFFFFF00000000u64;
+        }
+        return low;
+    }
+    raw
+}
+
+fn lower_sat_operand(
+    b: mut_view<LirBuilder>,
+    op: view<MirOperand>,
+    int_ty_v: u32,
+    bw: u32,
+    is_signed: bool
+) -> u32 {
+    if op.kind == MIR_OP_CONST {
+        let cval = lb_norm_int_const(op.constant.val, bw, is_signed);
+        return emit_const(mut_view(*b), cval, int_ty_v);
+    }
+    let raw_v = lower_operand(mut_view(*b), op);
+    if bw < 64u32 {
+        let zero_v = emit_const(mut_view(*b), 0u64, int_ty_v);
+        let clean_v = make_vreg(mut_view(*b), int_ty_v);
+        emit_bin_inst(mut_view(*b), LIR_INST_BIT_OR, clean_v, raw_v, zero_v);
+        return clean_v;
+    }
+    raw_v
+}
+
+fn lower_saturating_binop(
+    b: mut_view<LirBuilder>,
+    rv: view<MirRvalue>,
+    dest_ty_v: u32
+) -> u32 {
+    let mut op_ty_v: u32 = 0u32;
+    let op_ty_ptr = unsafe { address_of_mut(op_ty_v) };
+    let is_signed = operand_is_signed(mut_view(*b), view(rv.lhs), op_ty_ptr);
+    let int_ty_v: u32 = if op_ty_v != 0u32 { op_ty_v } else { dest_ty_v };
+    let out_ty_v: u32 = if dest_ty_v != 0u32 { dest_ty_v } else { int_ty_v };
+    let sz = unsafe { type_size(TypeId { v: int_ty_v }, view(*b.interner)) };
+    if sz != 1u32 && sz != 2u32 && sz != 4u32 && sz != 8u32 {
+        b.has_ice = true;
+        return emit_const(mut_view(*b), 0u64, out_ty_v);
+    }
+    let bw = sz * 8u32;
+    let lhs = lower_sat_operand(mut_view(*b), view(rv.lhs), int_ty_v, bw, is_signed);
+    let rhs = lower_sat_operand(mut_view(*b), view(rv.rhs), int_ty_v, bw, is_signed);
+
+    let bop = rv.bin_op;
+    let wrap_kind: u8 = if bop == MIR_BINOP_SAT_ADD {
+        LIR_INST_ADD
+    } else if bop == MIR_BINOP_SAT_SUB {
+        LIR_INST_SUB
+    } else {
+        LIR_INST_MUL
+    };
+    let ovf_kind: u8 = if bop == MIR_BINOP_SAT_ADD {
+        if is_signed { LIR_INST_SADD_OVERFLOW } else { LIR_INST_UADD_OVERFLOW }
+    } else if bop == MIR_BINOP_SAT_SUB {
+        if is_signed { LIR_INST_SSUB_OVERFLOW } else { LIR_INST_USUB_OVERFLOW }
+    } else {
+        if is_signed { LIR_INST_SMUL_OVERFLOW } else { LIR_INST_UMUL_OVERFLOW }
+    };
+
+    let bool_ty = unsafe { (*b.interner).t_bool.v };
+    let u64_ty = unsafe { (*b.interner).t_u64.v };
+    let i64_ty = unsafe { (*b.interner).t_i64.v };
+
+    let wrap_v = make_vreg(mut_view(*b), out_ty_v);
+    emit_bin_inst(mut_view(*b), wrap_kind, wrap_v, lhs, rhs);
+
+    let ovf_v = make_vreg(mut_view(*b), bool_ty);
+    let ovf_inst = push_new_inst(mut_view(*b), ovf_kind);
+    unsafe {
+        (*ovf_inst).dest.v = ovf_v;
+        (*ovf_inst).lhs.v = lhs;
+        (*ovf_inst).rhs.v = rhs;
+        (*ovf_inst).bit_width = bw;
+    }
+
+    let mut sat_v: u32 = 0u32;
+    if !is_signed {
+        if bop == MIR_BINOP_SAT_SUB {
+            sat_v = emit_const(mut_view(*b), 0u64, out_ty_v);
+        } else {
+            let umax: u64 = if bw == 8u32 {
+                0xFFu64
+            } else if bw == 16u32 {
+                0xFFFFu64
+            } else if bw == 32u32 {
+                0xFFFFFFFFu64
+            } else {
+                0xFFFFFFFFFFFFFFFFu64
+            };
+            sat_v = emit_const(mut_view(*b), umax, out_ty_v);
+        }
+    } else {
+        let smax: u64 = if bw == 8u32 {
+            0x7Fu64
+        } else if bw == 16u32 {
+            0x7FFFu64
+        } else if bw == 32u32 {
+            0x7FFFFFFFu64
+        } else {
+            0x7FFFFFFFFFFFFFFFu64
+        };
+        let mut sign_src: u32 = lhs;
+        if bop == MIR_BINOP_SAT_MUL {
+            let xor_signs = make_vreg(mut_view(*b), i64_ty);
+            emit_bin_inst(mut_view(*b), LIR_INST_BIT_XOR, xor_signs, lhs, rhs);
+            sign_src = xor_signs;
+        }
+        let c63 = emit_const(mut_view(*b), 63u64, u64_ty);
+        let sign_mask = make_vreg(mut_view(*b), i64_ty);
+        emit_bin_inst(mut_view(*b), LIR_INST_SAR, sign_mask, sign_src, c63);
+        let smax_v = emit_const(mut_view(*b), smax, i64_ty);
+        sat_v = make_vreg(mut_view(*b), out_ty_v);
+        emit_bin_inst(mut_view(*b), LIR_INST_BIT_XOR, sat_v, smax_v, sign_mask);
+    }
+
+    let zero64 = emit_const(mut_view(*b), 0u64, u64_ty);
+    let mask_ovf = make_vreg(mut_view(*b), u64_ty);
+    emit_bin_inst(mut_view(*b), LIR_INST_SUB, mask_ovf, zero64, ovf_v);
+
+    let diff_v = make_vreg(mut_view(*b), u64_ty);
+    emit_bin_inst(mut_view(*b), LIR_INST_BIT_XOR, diff_v, sat_v, wrap_v);
+
+    let masked_v = make_vreg(mut_view(*b), u64_ty);
+    emit_bin_inst(mut_view(*b), LIR_INST_BIT_AND, masked_v, diff_v, mask_ovf);
+
+    let dest = make_vreg(mut_view(*b), out_ty_v);
+    emit_bin_inst(mut_view(*b), LIR_INST_BIT_XOR, dest, wrap_v, masked_v);
+    dest
 }
 
 fn operand_is_signed(b: mut_view<LirBuilder>, op: view<MirOperand>, out_ty: *mut u32) -> bool {
@@ -75200,6 +75357,8 @@ fn lower_rvalue(b: mut_view<LirBuilder>, rv: view<MirRvalue>, dest_ty_v: u32) ->
             kind = if is_signed { LIR_INST_SDIV_OVERFLOW } else { LIR_INST_UDIV_OVERFLOW };
         } else if bop == MIR_BINOP_REM {
             kind = if is_signed { LIR_INST_SREM_OVERFLOW } else { LIR_INST_UREM_OVERFLOW };
+        } else {
+            b.has_ice = true;
         }
         let dest = make_vreg(mut_view(*b), dest_ty_v);
         let bw = (unsafe { type_size(TypeId { v: op_ty_v }, view(*b.interner)) }) * 8u32;
@@ -75213,10 +75372,14 @@ fn lower_rvalue(b: mut_view<LirBuilder>, rv: view<MirRvalue>, dest_ty_v: u32) ->
         return dest;
     }
     if rvk == MIR_RVALUE_BINARY_OP {
+        let bop = rv.bin_op;
+        if bop == MIR_BINOP_SAT_ADD || bop == MIR_BINOP_SAT_SUB || bop == MIR_BINOP_SAT_MUL {
+            return lower_saturating_binop(mut_view(*b), rv, dest_ty_v);
+        }
         let lhs = lower_operand(mut_view(*b), view(rv.lhs));
         let rhs = lower_operand(mut_view(*b), view(rv.rhs));
         let is_signed = operand_is_signed(mut_view(*b), view(rv.lhs), 0 as *mut u32);
-        let kind = lower_binop(rv.bin_op, is_signed);
+        let kind = lower_binop_checked(mut_view(*b), bop, is_signed);
         let dest = make_vreg(mut_view(*b), dest_ty_v);
         emit_bin_inst(mut_view(*b), kind, dest, lhs, rhs);
         return dest;
@@ -76216,6 +76379,7 @@ pub fn lir_lower_ext_opt(
         cur_insts: 0 as *mut LirInst,
         cur_inst_count: 0,
         cur_inst_cap: 0,
+        has_ice: false,
     };
 
     let mut i: usize = 0;
@@ -76347,6 +76511,10 @@ pub fn lir_lower_ext_opt(
         }
 
         i = i + 1;
+    }
+
+    if b.has_ice {
+        return 0 as *mut LirBody;
     }
 
     unsafe {
@@ -90611,6 +90779,8 @@ use compiler.kernel.interner.interner_get
 use compiler.source.span.Span
 use compiler.source.manager.SourceDatabase
 use compiler.source.manager.source_db_span_text
+use compiler.diag.code.DiagCode
+use compiler.diag.code.AX_ICE_INTERNAL
 use compiler.diag.format.DiagBuffer
 use compiler.diag.format.diag_buf_push_byte
 use compiler.diag.format.diag_buf_push_bytes
@@ -90620,6 +90790,7 @@ use compiler.diag.json.ax_diag_render_json
 use compiler.kernel_source_diag.session.CompilerSession
 use compiler.kernel_source_diag.session.session_error_count
 use compiler.kernel_source_diag.session.session_has_errors
+use compiler.kernel_source_diag.session.session_report_code
 use compiler.lex.token.Token
 use compiler.lex.token.Comment
 use compiler.lex.token.LexResult
@@ -90802,6 +90973,32 @@ const BACKEND_STR_TABLE: [62]u8 = [
     46u8, 76u8, 112u8, 97u8, 110u8, 105u8, 99u8, 46u8,
     95u8, 95u8, 97u8, 120u8, 95u8, 102u8, 110u8, 95u8,
 ];
+
+const BACKEND_ICE_MSG: [23]u8 = [
+    105u8, 110u8, 116u8, 101u8, 114u8, 110u8, 97u8, 108u8, 32u8,
+    99u8, 111u8, 109u8, 112u8, 105u8, 108u8, 101u8, 114u8, 32u8,
+    101u8, 114u8, 114u8, 111u8, 114u8,
+];
+
+fn backend_report_ice(sess: mut_view<CompilerSession>, span: Span) {
+    let dst = arena_alloc_raw(mut_view(sess.arena), 24, 1);
+    let mut i: usize = 0;
+    while i < 23 {
+        unsafe {
+            *(dst + i) = BACKEND_ICE_MSG[i];
+        }
+        i = i + 1;
+    }
+    unsafe {
+        *(dst + 23) = 0u8;
+    }
+    session_report_code(
+        mut_view(*sess),
+        DiagCode { v: AX_ICE_INTERNAL },
+        span,
+        StrView { ptr: dst as *const u8, len: 23 }
+    );
+}
 
 fn interner_mut_ptr(s: mut_view<StrInterner>) -> *mut StrInterner {
     unsafe { address_of_mut(s.bytes.head) as *mut StrInterner }
@@ -92794,6 +92991,8 @@ pub fn session_emit_lir_hir(
                 if (lir_body as usize) != 0 {
                     lir_print(mut_view(*out), unsafe { view(*lir_body) });
                     fn_count = fn_count + 1;
+                } else {
+                    backend_report_ice(mut_view(*sess), unsafe { (*it).span });
                 }
             }
         }
@@ -92876,6 +93075,8 @@ pub fn session_emit_mi_hir(
                 if (mi_body as usize) != 0 {
                     x64_mi_print(unsafe { view(*mi_body) }, mut_view(*out));
                     fn_count = fn_count + 1;
+                } else {
+                    backend_report_ice(mut_view(*sess), unsafe { (*it).span });
                 }
             }
         }
@@ -92978,6 +93179,7 @@ pub fn session_emit_mc_hir(
                     run_opt
                 );
                 if v_err != X64_VERIFY_OK {
+                    backend_report_ice(mut_view(*sess), unsafe { (*it).span });
                     objmodel_free(mut_view(obj));
                     return false;
                 }
@@ -93161,6 +93363,7 @@ pub fn session_emit_objmodel_hir(
             run_opt
         );
         if v_err != X64_VERIFY_OK {
+            backend_report_ice(mut_view(*sess), unsafe { (*fn_item).span });
             return false;
         }
 

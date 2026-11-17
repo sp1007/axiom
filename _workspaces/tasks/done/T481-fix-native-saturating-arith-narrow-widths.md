@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T452]
 priority: 20
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 900
 paths: [tests/run/saturating_native]
 locks: [compiler/lir/builder.ax, compiler/lir/lir.ax, compiler/target/x64, compiler/backend/session.ax, tests/selfhost]
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/SPEC-40-integers.md, spec/SPEC-04-core-extensibility.md]
 covers: [REQ-CORE-230, REQ-LIR-007, REQ-SIMD-264]
+started: 2026-11-17 07:27:46
+finished: 2026-11-17 16:40:09
 ---
 # T481 — Fix: native saturating arithmetic for 8..64-bit integers
 
@@ -51,3 +53,5 @@ u64, usize, i8, i16, i32, i64, isize`, matching the oracle bit for bit; T453 the
 
 ## Log
 - 2026-11-13 created by axiom-architect (ADR-0042 §3; T452-qa FINDING-3)
+- 2026-11-17 07:27:46 started (attempt 1) t481-impl
+- 2026-11-17 16:40:09 accepted by QA -> done
