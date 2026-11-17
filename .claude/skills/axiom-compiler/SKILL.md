@@ -97,8 +97,14 @@ them from any directory.
      your work by a build of the main tree (their unfinished files may break it).
      Build and test in your snapshot: `python .claude/skills/axiom-tasks/scripts/taskctl.py snapshot <ID>`
      creates/refreshes build-snap-<ID>/ (last commit + only your changes; run it again after each
-     batch of edits). Build there (build dir build-snap-<ID>/build) and run the full suite there with
-     --compiler pointing at that build. Quick local builds may use build-<ID> in the main tree.
+     batch of edits; it also regenerates every selfhost bundle inside the snapshot). Build there
+     (build dir build-snap-<ID>/build) and run the full suite there with --compiler pointing at that
+     build. Quick local builds may use build-<ID> in the main tree.
+     Generated selfhost bundles (files written by tests/selfhost/**/gen_*.py, listed in
+     tests/selfhost/generated-files.txt) are NOT yours: never run a generator in write mode in the main
+     tree, never edit, list or commit a bundle — snapshot regenerates them, accept commits them. Edit
+     generator inputs instead (compiler/ modules, *.ax.in templates, gen_*.py). Exception: deliberately
+     refreshed axiom0 goldens (--refresh-goldens) — then list that bundle; it is an input.
      Write _workspaces/reports/<ID>-report.md (format in the axiom-tasks skill) with an exact
      "## Files changed" list (`- path` per line, every created/modified/deleted file) and, as its
      LAST line, "STATUS: COMPLETE round=0" (or "STATUS: BLOCKED <reason>"). Do not commit or push; do not
@@ -127,6 +133,9 @@ them from any directory.
      snapshot. Never build or test the main working tree: other tasks are half-way through edits there.
    - `python .claude/skills/axiom-tasks/scripts/taskctl.py changes <ID>` lists what will be committed;
      any REFUSED line (unlisted changed file, entry outside the task's paths, glob) is a FAIL finding.
+     Generated selfhost bundles are regenerated in the snapshot (`taskctl snapshot` prints
+     "bundles regenerated"; "BUNDLES FAILED" is a FAIL finding) and committed by accept; they are
+     tested in the snapshot like any changed file and never listed.
    - Tests you add: write them in the MAIN tree under the task's paths, list them under
      "## Files changed" in the QA file, rerun `taskctl.py snapshot <ID>` and test again.
    - Write _workspaces/reports/<ID>-qa.md: a "## Round <n>" section, and as the LAST line of the file
@@ -135,7 +144,15 @@ them from any directory.
 5. On the QA result (read the last `VERDICT:` line of `<ID>-qa.md`, not the chat summary):
    - **PASS** → `python $S/taskctl.py accept <ID>` — one command that re-checks the verdict, checks
      the change set, moves the task to `done/` and makes the single commit (code + both reports +
-     board). Exit 1 = refused, task still in `doing/`: read the `REFUSED` lines. An
+     board), after regenerating the selfhost bundles on the current HEAD + the change set (~2–3 min)
+     and staging the ones that change. **Exit 5 = REGATE** (task still in `doing/`): HEAD moved since
+     the gate (another task was accepted) and both change sets meet in a bundle, or the sources changed
+     after the gate, so some bundle about to be committed was never tested. `build-snap-<ID>` already
+     holds the rebased tree: run `taskctl.py snapshot <ID>` and spawn the gate again for the same round
+     with the extra line "Rebase gate: HEAD moved; run taskgate in the refreshed snapshot (own tests +
+     affected set), skip the manual adversarial steps already done; append VERDICT: PASS|FAIL
+     round=<n> (rebase)". PASS → `accept` again; FAIL → the normal fix round. Never bypass a REGATE.
+     Exit 1 = refused, task still in `doing/`: read the `REFUSED` lines. An
      unlisted changed file under the task's paths → if it clearly belongs to the task, rerun with
      `--include-unlisted`; otherwise send it back to the owner agent. A failed git commit (hook) rolls
      the task back to `doing/`: fix the cause, rerun `accept`; never `--no-verify`.

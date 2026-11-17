@@ -12,7 +12,7 @@ status: todo
 attempts: 0
 timeout_min: 900
 paths: [tests/run/o1_neg_carry_repro]
-locks: [compiler/opt, compiler/mir/builder.ax, compiler/lir/builder.ax, compiler/target/x64, tests/selfhost]
+locks: [compiler/opt, compiler/mir/builder.ax, compiler/lir/builder.ax, compiler/target/x64]
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/SPEC-40-integers.md, spec/SPEC-20-selfhost.md]
 covers: [REQ-TST-043, REQ-TST-090]
 ---

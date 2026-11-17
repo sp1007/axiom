@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T452]
 priority: 21
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 900
 paths: [compiler/types/layout.ax, tests/run/layout_fwd_pointee]
 locks: [compiler/types/types.ax, compiler/types/typeck.ax, compiler/resolve, compiler/lir/builder.ax, tests/selfhost]
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/SPEC-03-core-semantics.md, spec/SPEC-33-async.md]
 covers: [REQ-TST-072, REQ-TST-084]
+started: 2026-11-17 17:12:06
+agent: T444-impl
 ---
 # T444 — Fix: layout through forward-referenced pointees and lang-item fields in std modules
 
@@ -50,3 +52,4 @@ natively (T421 FU-1, FU-3; ADR-0042 §2).
 
 ## Log
 - 2026-11-13 created by axiom-architect (ADR-0042 §2; T421 FU-1, FU-3)
+- 2026-11-17 17:12:06 started (attempt 1) T444-impl

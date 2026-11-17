@@ -11,7 +11,7 @@ priority: 156
 status: todo
 attempts: 0
 paths: [compiler/syntax, compiler/hir, compiler/types, tests/ui/layout]
-locks: [compiler/lex, compiler/resolve, compiler/own, compiler/mir, compiler/diag/code.ax, tests/selfhost]
+locks: [compiler/lex, compiler/resolve, compiler/own, compiler/mir, compiler/diag/code.ax]
 spec: [spec/SPEC-51-raw-memory-volatile-mmio-layout.md, 0067, 0072, tasks/0328]
 covers: [REQ-ABI-036, REQ-ABI-041, REQ-FFI-097, REQ-FFI-098, REQ-RES-135]
 ---

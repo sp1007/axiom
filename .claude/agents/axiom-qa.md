@@ -28,7 +28,13 @@ Use the `general-purpose` capabilities: you must build, run and write scripts, n
    FAIL finding.
 2. Build and test **only inside the task snapshot** `build-snap-<ID>/` (the orchestrator creates it;
    refresh with `taskctl.py snapshot <ID>`), never in the main working tree where other tasks are
-   mid-edit: `cmake -S build-snap-<ID>/bootstrap/axiom0 -B build-snap-<ID>/build -G Ninja
+   mid-edit. The snapshot regenerates every generated selfhost bundle from its own sources
+   (`tests/selfhost/generated-files.txt`; the files appear as working-tree changes, so `taskgate`
+   selects their tests as part of the affected set); "BUNDLES FAILED" from `snapshot` is a FAIL
+   finding. Bundles are never listed under `## Files changed` and never regenerated in the main tree
+   (accept regenerates and commits them; owner decision 2026-11-17). A **rebase gate** (accept
+   exited 5 REGATE: another task was accepted after your gate and both change sets meet in a bundle)
+   re-runs `taskgate` in the refreshed snapshot and appends `VERDICT: … round=<n> (rebase)`: `cmake -S build-snap-<ID>/bootstrap/axiom0 -B build-snap-<ID>/build -G Ninja
    -DCMAKE_C_COMPILER=gcc && cmake --build build-snap-<ID>/build`; also clang if portable code
    changed. Warnings are failures. **Spec/doc-only tasks** (architect tasks, or anything before the
    build exists): skip build/test steps and instead check completeness against the acceptance list,

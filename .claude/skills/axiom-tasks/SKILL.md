@@ -31,7 +31,8 @@ python $S/taskctl.py next --max 3           # parallel-safe ready tasks
 python $S/taskctl.py start T010 --agent T010-impl
 python $S/taskctl.py snapshot T010          # isolated build tree build-snap-T010 (create / refresh)
 python $S/taskctl.py changes T010           # dry run: what accept would commit, or why it refuses
-python $S/taskctl.py accept T010            # QA PASS -> done + ONE commit (the only way to close a task)
+python $S/taskctl.py accept T010            # QA PASS -> done + ONE commit (the only way to close a task);
+                                            # exit 5 = REGATE (re-gate in the refreshed snapshot first)
 python $S/taskctl.py block T010 --reason "needs ADR on X"
 python $S/taskctl.py requeue T010 --reason "agent crashed"            # charged attempt
 python $S/taskctl.py requeue T010 --infra --reason "rate limit"       # not charged
@@ -69,6 +70,19 @@ Three mechanisms, all enforced by `taskctl`:
    task is not in HEAD and not in this task's change set, so it cannot break the gate. Re-running
    `snapshot` refreshes in place (build directories inside are kept, so rebuilds are incremental).
    Engineers use the same snapshot for their own full-suite run before reporting.
+2a. **Generated selfhost bundles belong to the harness, not to tasks** (owner decision 2026-11-17).
+   The files written by `tests/selfhost/**/gen_*.py` (`tests/selfhost/generated-files.txt`) are never
+   edited, regenerated in the main tree, listed or committed by an agent, and no task locks the whole
+   `tests/selfhost` tree (harness_check refuses it; lock `tests/selfhost/bundle_common.py` or a
+   `tests/selfhost/<area>` directory when you edit those). `snapshot` runs every generator inside the
+   snapshot (~70 s at `-j 3`) and records the base commit + bundle blob ids in
+   `_workspaces/locks/snap-<ID>.json`. `accept` refreshes the snapshot onto the current HEAD, regenerates,
+   runs every generator with `--check`, and stages the bundles that change in the task's one commit
+   (an unlisted stale bundle in the main tree is ignored, never staged from there). If a bundle it
+   would commit is neither what the gate tested nor HEAD's (HEAD moved and the change sets meet in it,
+   or sources changed after the gate) accept exits **5 REGATE** and the task is re-gated in the
+   refreshed snapshot. A change set of only `spec/`, `_workspaces/`, `.claude/` or `*.md` skips the
+   regeneration. Tool: `python $S/bundles.py regen|check|list [--root DIR]`.
 3. **One commit per accepted task, containing only that task.** `accept` stages literal paths from
    the reports, refuses when a changed file under the task's own paths is not listed (work would be
    lost), refuses entries inside another running task's paths, and never stages `docs/` or git-ignored
@@ -187,6 +201,7 @@ STATUS: COMPLETE round=0
   nothing else on the line that could be mistaken for a path. Numbered items, table rows, bold and
   backticks are understood; globs are refused; a directory is accepted only inside the task's own
   `paths`. `accept` refuses when a changed file under the task's paths is missing from the list.
+  Generated selfhost bundles are not listed (accept regenerates and commits them; rule 2a).
 - The **last line** is the completion marker: `STATUS: COMPLETE round=<n>` (n = 0 for the first
   implementation, 1 or 2 after a QA fix round) or `STATUS: BLOCKED <reason>`. Write it last, only when
   everything above is true. A report without it is treated as unfinished work after a restart.

@@ -12,7 +12,7 @@ status: todo
 attempts: 0
 timeout_min: 600
 paths: [compiler/own/unsafe.ax, tests/ui/concurrency/spawn_contract]
-locks: [compiler/types/typeck.ax, tests/selfhost]
+locks: [compiler/types/typeck.ax]
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/SPEC-30-concurrency.md, spec/SPEC-34-executors-fibers.md]
 covers: [REQ-TST-072, REQ-TST-035]
 ---

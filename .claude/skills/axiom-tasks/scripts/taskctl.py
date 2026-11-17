@@ -27,7 +27,15 @@ Optional keys: locks (shared files, honoured like paths), needs (requirement ids
 reqcov), timeout_min (hang limit for impl/fix, see overdue.py), unblocks, unblock_failures,
 superseded_by.
 
-Commands (exit 0 ok, 1 refused/check failed, 2 usage or board error, 3 wait, 4 parked):
+Generated selfhost bundles (owner decision 2026-11-17): the files written by tests/selfhost/**/gen_*.py
+(list: tests/selfhost/generated-files.txt, plus every X with an X.in template) belong to the harness,
+not to tasks. An unlisted change to one of them in the main tree is ignored (never staged, never a
+REFUSED entry); `snapshot` regenerates them inside the snapshot and `accept` regenerates them on the
+current HEAD + the task's change set and stages them in the task's commit (see bundles.py). A listed
+generated file (legacy report, or a bundle whose axiom0 goldens were refreshed on purpose) is copied
+into the snapshot as an input and regenerated over.
+
+Commands (exit 0 ok, 1 refused/check failed, 2 usage or board error, 3 wait, 4 parked, 5 re-gate):
     status [--json]            board summary; --json adds total/finished for the tick
     list [todo|doing|done|blocked|deferred|parked]
     next [--max N]             ready tasks: deps done, not blocked, paths/locks disjoint from doing,
@@ -40,7 +48,15 @@ Commands (exit 0 ok, 1 refused/check failed, 2 usage or board error, 3 wait, 4 p
                                the ONLY way to close a task: checks that the last VERDICT line of
                                <ID>-qa.md is PASS, checks the change set (see commit), moves the
                                task to done and commits code + reports + board in ONE commit; if
-                               the commit fails the task goes back to doing
+                               the commit fails the task goes back to doing. Before that it
+                               refreshes build-snap-<ID> onto the current HEAD + the change set,
+                               regenerates every bundle there, runs every generator with --check
+                               and stages the bundles the commit changes. A changed bundle whose
+                               content is neither what the gate's snapshot tested (record
+                               _workspaces/locks/snap-<ID>.json) nor HEAD's — HEAD moved since the
+                               gate and the two change sets meet in that bundle, or the sources
+                               changed after the gate — is untested: exit 5 (REGATE, task stays in
+                               doing; re-gate in the refreshed snapshot, then accept again)
     finish ID                  doing -> done without committing (manual repair only; prefer accept)
     commit ID [--include-unlisted|--allow-unlisted] [--all]
                                commit a done task (repair path used by reconcile): files listed in
@@ -68,9 +84,13 @@ Commands (exit 0 ok, 1 refused/check failed, 2 usage or board error, 3 wait, 4 p
     snapshot ID [--dir D] [--remove]
                                isolated build tree: git worktree of HEAD at build-snap-<ID> plus
                                exactly this task's change set (listed files + every changed file
-                               under its paths). Run again to refresh in place (build dirs inside
-                               are kept). QA gates build and test only there, so another task's
-                               half-written files can never fail a gate.
+                               under its paths, unlisted generated bundles excepted), then every
+                               generator in write mode inside it (the snapshot's bundles match its
+                               sources) and records the base commit + bundle blob ids for accept.
+                               Exit 1 when a generator fails (the snapshot is still created). Run
+                               again to refresh in place (build dirs inside are kept). QA gates
+                               build and test only there, so another task's half-written files can
+                               never fail a gate.
     block ID --reason TEXT     doing|todo -> todo with status blocked
     requeue ID --reason TEXT [--infra|--no-attempt]
                                doing -> todo; after 3 charged attempts it blocks instead.
@@ -112,6 +132,12 @@ for _s in (sys.stdout, sys.stderr):
         _s.reconfigure(encoding="utf-8")
     except Exception:
         pass
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+try:
+    import bundles  # noqa: E402  (same directory; absent only in a stripped-down copy of taskctl.py)
+except ImportError:
+    bundles = None
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 
@@ -680,8 +706,30 @@ def report_status(tid):
     return (m.group(1), int(m.group(2) or 0)) if m else (None, None)
 
 
+_GENERATED = None
+
+
+def generated_set():
+    """Generated selfhost bundle files (cheap: manifest of the working copy and of HEAD + templates)."""
+    global _GENERATED
+    if bundles is None:
+        return set()
+    if _GENERATED is None:
+        head = git("show", f"HEAD:{bundles.MANIFEST}", check=False)
+        _GENERATED = bundles.known_generated(ROOT, head.stdout if head.returncode == 0 else None)
+    return _GENERATED
+
+
+def is_generated(f):
+    return _norm(f) in generated_set()
+
+
 def changeset(tasks, t, include_unlisted=False, allow_unlisted=False, snapshot=False):
-    """Compute what to stage for task t. Returns (files, problems, notes)."""
+    """Compute what to stage for task t. Returns (files, problems, notes).
+
+    Unlisted changes to generated bundle files are never part of the change set (they are stale copies
+    in the shared main tree; snapshot/accept regenerate them). Listed generated files are kept: they are
+    an input (axiom0 goldens) and are regenerated over in the snapshot and at accept."""
     tid = t["meta"]["id"]
     own = own_paths(t)
     reports = [os.path.relpath(p, ROOT).replace("\\", "/") for p in report_paths(tid)]
@@ -714,7 +762,11 @@ def changeset(tasks, t, include_unlisted=False, allow_unlisted=False, snapshot=F
                                 "list the files instead")
                 continue
             got = dirty_under([e])
-            files.update(got)
+            gen = [f for f in got if is_generated(f)]
+            if gen:
+                notes.append(f"skip {len(gen)} generated bundle file(s) under directory entry '{e}' "
+                             "(regenerated by snapshot/accept)")
+            files.update(f for f in got if not is_generated(f))
             listed_real += 1
             continue
         if os.path.exists(full):
@@ -729,9 +781,17 @@ def changeset(tasks, t, include_unlisted=False, allow_unlisted=False, snapshot=F
         else:
             notes.append(f"listed but neither present nor tracked (ignored): {e}")
             continue
-        if not any(under(e, p) for p in own) and e not in reports:
+        if is_generated(e):
+            notes.append(f"listed generated file {e}: copied as an input, regenerated by snapshot/accept "
+                         "(tasks no longer need to list bundles)")
+        elif not any(under(e, p) for p in own) and e not in reports:
             notes.append(f"WARN {e} is outside the task's paths/locks — make sure it belongs to {tid}")
     unlisted = [f for f in dirty_under(own) if f not in files]
+    stale = [f for f in unlisted if is_generated(f)]
+    if stale:
+        notes.append(f"skip {len(stale)} unlisted generated bundle file(s) in the main tree "
+                     "(regenerated by snapshot/accept, never staged from the main tree)")
+        unlisted = [f for f in unlisted if not is_generated(f)]
     if unlisted:
         if include_unlisted or snapshot:
             files.update(unlisted)
@@ -758,19 +818,21 @@ def stage(files):
     git("add", "-A", "--", os.path.relpath(BOARD, ROOT).replace("\\", "/"))
 
 
-def do_commit(t, files, subject_extra=""):
+def do_commit(t, files, subject_extra="", prestaged=()):
     m = t["meta"]
     tr = trailer().strip()
     tail = f"\n\n{tr}\n" if tr else "\n"
     msg = (f"{m['id']}: {m.get('title', '')}\n\nTask {m['id']} ({m.get('owner', '')}) accepted by QA."
            f"{subject_extra}{tail}")
-    return commit_files(files, msg, m["id"])
+    return commit_files(files, msg, m["id"], prestaged)
 
 
-def commit_files(files, msg, label):
+def commit_files(files, msg, label, prestaged=()):
     """Stage exactly `files` plus the board and commit. True = committed, None = nothing to commit,
-    False = git commit failed (hooks are never bypassed)."""
-    stage(files)
+    False = git commit failed (hooks are never bypassed). `prestaged` are already in the index (bundles
+    staged from the snapshot) and are part of the commit as they are."""
+    stage([f for f in files if f not in prestaged])
+    files = list(files) + [f for f in prestaged if f not in files]
     staged = git("-c", "core.quotepath=false", "diff", "--cached", "--name-only").stdout.split("\n")
     staged = [s for s in staged if s.strip()]
     board = os.path.relpath(BOARD, ROOT).replace("\\", "/")
@@ -794,6 +856,17 @@ def commit_files(files, msg, label):
         return False
     print(git("log", "--oneline", "-1").stdout.strip())
     return True
+
+
+NO_BUNDLE_INPUT = ("spec/", "_workspaces/", ".claude/")
+
+
+def touches_bundle_inputs(files):
+    """False when no file of the change set can be read by a bundle generator (specs, board, reports,
+    harness, Markdown): accept then skips the ~2 min regeneration. Anything else (compiler/, std/,
+    tests/, tools/, bootstrap/ ...) regenerates."""
+    return (bundles is not None and any(not (f.startswith(NO_BUNDLE_INPUT) or f.endswith(".md")) for f in files)
+            and bool(bundles.generators(ROOT)))
 
 
 def cmd_commit_report(tasks, report, subject):
@@ -865,7 +938,10 @@ def cmd_commit(tasks, tid, flags):
     print_plan(files, problems, notes)
     if problems:
         die(f"{t['meta']['id']}: commit refused ({len(problems)} problem(s)); nothing staged", 1)
-    r = do_commit(t, files)
+    prestaged = []
+    if "--all" not in flags and touches_bundle_inputs(files):
+        files, prestaged = bundles_for_commit(tasks, t, files, gate_check=False)
+    r = do_commit(t, files, prestaged=prestaged)
     if r is False:
         die("git commit failed", 1)
     return r
@@ -888,12 +964,17 @@ def cmd_accept(tasks, tid, flags):
     print_plan(files, problems, notes)
     if problems:
         die(f"{i}: accept refused ({len(problems)} problem(s)); task left in doing, nothing staged", 1)
+    prestaged = []
+    if touches_bundle_inputs(files):
+        files, prestaged = bundles_for_commit(tasks, t, files, gate_check=True)  # exit 5 = REGATE
+    else:
+        print("bundles: change set cannot affect a generated bundle (spec/board/harness/Markdown only)")
     t["meta"]["status"] = "done"
     t["meta"]["finished"] = now()
     t["meta"].pop("agent", None)
     log(t, "accepted by QA -> done")
     move(t, "done")
-    r = do_commit(t, files)
+    r = do_commit(t, files, prestaged=prestaged)
     if r is False:
         git("reset", "-q", check=False)
         t["meta"]["status"] = "doing"
@@ -901,6 +982,8 @@ def cmd_accept(tasks, tid, flags):
         log(t, "accept rolled back: git commit failed")
         move(t, "doing")
         die(f"{i}: git commit failed; task moved back to doing (fix the cause, rerun accept)", 1)
+    if os.path.exists(snap_record_path(i)):
+        os.remove(snap_record_path(i))
     print("done:", os.path.relpath(t["path"], ROOT))
 
 
@@ -929,7 +1012,10 @@ def cmd_reconcile(tasks, do_commit_flag):
             ok = False
             print(f"{i}: reconcile refused; fix the report and rerun")
             continue
-        r = do_commit(t, files, "\n(reconciled after an interrupted accept)")
+        prestaged = []
+        if touches_bundle_inputs(files):
+            files, prestaged = bundles_for_commit(tasks, t, files, gate_check=False)
+        r = do_commit(t, files, "\n(reconciled after an interrupted accept)", prestaged)
         if r is None:
             log(t, "reconciled: nothing to commit (already in history under another subject)")
             save(t)
@@ -1014,23 +1100,27 @@ def cmd_recover(tasks, tid, stage_arg, round_arg):
     return action
 
 
-def cmd_snapshot(tasks, tid, d, remove):
-    t = get(tasks, tid)
-    i = t["meta"]["id"]
+def snap_dir(i, d=None):
     d = os.path.abspath(d or os.path.join(ROOT, f"build-snap-{i}"))
     if under(ROOT, d) or os.path.normcase(d) == os.path.normcase(ROOT):
         die(f"snapshot: {d} is the repository itself", 1)
+    return d
 
-    def drop():
-        git("worktree", "remove", "--force", d, check=False)
-        if os.path.exists(d):
-            shutil.rmtree(d, ignore_errors=True)
-        git("worktree", "prune", check=False)
 
-    if remove:
-        drop()
-        print("removed", d)
-        return
+def snap_record_path(i):
+    return os.path.join(LOCKS, f"snap-{i}.json")
+
+
+def drop_worktree(d):
+    git("worktree", "remove", "--force", d, check=False)
+    if os.path.exists(d):
+        shutil.rmtree(d, ignore_errors=True)
+    git("worktree", "prune", check=False)
+
+
+def prepare_snapshot(tasks, t, d):
+    """Worktree d = HEAD + exactly t's change set. Returns (head, refreshed, copied, deleted, notes,
+    problems, files) where `files` is the change set (listed generated inputs included)."""
     head = git("rev-parse", "HEAD").stdout.strip()
     refreshed = False
     if os.path.isfile(os.path.join(d, ".git")):
@@ -1043,7 +1133,7 @@ def cmd_snapshot(tasks, tid, d, remove):
                      and wt("checkout", "-q", "--detach", head).returncode == 0)
     if not refreshed:
         if os.path.exists(d):
-            drop()
+            drop_worktree(d)
         git("worktree", "prune", check=False)
         git("worktree", "add", "--detach", "-q", d, head)
     files, problems, notes = changeset(tasks, t, snapshot=True)
@@ -1057,12 +1147,144 @@ def cmd_snapshot(tasks, tid, d, remove):
         elif os.path.exists(dst):
             os.remove(dst)
             deleted += 1
+    return head, refreshed, copied, deleted, notes, problems, files
+
+
+def blob_ids(cwd, paths):
+    """{path: git blob id} of the files of `paths` that exist under cwd (git hash-object, with filters)."""
+    have = [p for p in paths if os.path.isfile(os.path.join(cwd, p))]
+    if not have:
+        return {}
+    r = subprocess.run(["git", "hash-object", "--stdin-paths"], cwd=cwd, input="\n".join(have) + "\n",
+                       capture_output=True, text=True, encoding="utf-8")
+    if r.returncode != 0:
+        die(f"git hash-object failed in {cwd}:\n{r.stderr}", 1)
+    return dict(zip(have, r.stdout.split()))
+
+
+def head_blob_ids(paths):
+    if not paths:
+        return {}
+    r = git_lit("-c", "core.quotepath=false", "ls-tree", "-r", "HEAD", "--", *paths, check=False)
+    out = {}
+    for line in r.stdout.splitlines():
+        meta, _, path = line.partition("\t")
+        out[path] = meta.split()[2]
+    return out
+
+
+def regen_snapshot(i, d, head, record=True):
+    """Regenerate every bundle of the snapshot d. Returns the bundles.Result; on success (and `record`)
+    writes the gate record, on failure removes it."""
+    r = bundles.regen(d)
+    print(r.summary("regenerated in " + os.path.basename(d)))
+    rec = snap_record_path(i)
+    if not r.ok:
+        print("BUNDLES FAILED (the snapshot's bundles are not current; a gate cannot pass):")
+        print(r.failure_text())
+        if record and os.path.exists(rec):
+            os.remove(rec)
+        return r
+    if record:
+        os.makedirs(LOCKS, exist_ok=True)
+        with open(rec, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump({"task": i, "base": head, "time": now(), "blobs": blob_ids(d, r.outputs)}, fh, indent=1)
+            fh.write("\n")
+    return r
+
+
+def cmd_snapshot(tasks, tid, d, remove):
+    t = get(tasks, tid)
+    i = t["meta"]["id"]
+    d = snap_dir(i, d)
+    if remove:
+        drop_worktree(d)
+        if os.path.exists(snap_record_path(i)):
+            os.remove(snap_record_path(i))
+        print("removed", d)
+        return
+    head, refreshed, copied, deleted, notes, problems, _ = prepare_snapshot(tasks, t, d)
     for n in notes:
         print(n)
     for p in problems:
         print("WARN", p)
     print(f"snapshot {d}  ({'refreshed' if refreshed else 'created'}: HEAD {head[:7]} + {copied} changed, "
           f"{deleted} deleted file(s) of {i})")
+    r = regen_snapshot(i, d, head)
+    if not r.ok:
+        sys.exit(1)
+
+
+def bundles_for_commit(tasks, t, files, gate_check):
+    """Regenerate the bundles for t's commit on the current HEAD + t's change set (in build-snap-<ID>),
+    run every generator with --check there, and bring the bundles the commit changes into the main tree.
+    Returns (files, prestaged): the change set without generated files plus the regenerated bundles to
+    stage from the working tree, and the bundles staged straight into the index (their main-tree copy
+    is dirty and inside another running task's paths/locks, so it is left untouched).
+    gate_check: exit 5 (REGATE) when a changed bundle differs from what the gate's snapshot tested."""
+    i = t["meta"]["id"]
+    d = snap_dir(i)
+    head, _ref, _c, _d, _notes, _probs, listed = prepare_snapshot(tasks, t, d)
+    r = regen_snapshot(i, d, head, record=False)
+    if not r.ok:
+        die(f"{i}: bundle regeneration failed on HEAD {head[:7]} + the change set; task left in doing, "
+            "nothing staged (fix the generator/sources, re-gate)", 1)
+    c = bundles.run(d, check=True)
+    print(c.summary("--check in " + os.path.basename(d)))
+    if not c.ok:
+        print(c.failure_text())
+        die(f"{i}: a generator's --check fails right after regeneration (non-deterministic generator?); "
+            "nothing staged", 1)
+    gen = sorted(set(r.outputs))
+    new, old = blob_ids(d, gen), head_blob_ids(gen)
+    changed = [p for p in gen if new.get(p) != old.get(p)]
+    if gate_check and changed:
+        rec_path = snap_record_path(i)
+        try:
+            with open(rec_path, encoding="utf-8") as fh:
+                rec = json.load(fh)
+        except (OSError, ValueError):
+            rec = None
+        if rec is not None:
+            tested, base = rec.get("blobs", {}), rec.get("base", "")
+            untested = [p for p in changed if new.get(p) != tested.get(p)]
+        else:  # snapshot made by the pre-2026-11-17 taskctl: it held HEAD's bundles + the listed ones
+            base = "(none)"
+            main = blob_ids(ROOT, [p for p in changed if p in listed])
+            untested = [p for p in changed if not (p in listed and main.get(p) == new.get(p))]
+            print(f"WARN {i}: no gate record {os.path.relpath(rec_path, ROOT)}; assuming the gate tested "
+                  "HEAD's bundles plus the listed ones")
+        if untested:
+            why = "HEAD moved since the gate" if base != head else "the change set changed after the gate"
+            print(f"REGATE {i}: {len(untested)} bundle(s) this commit would change were never tested "
+                  f"(gate base {base[:7]}, HEAD {head[:7]}: {why}):")
+            for p in untested[:40]:
+                print("  " + p)
+            print(f"  -> re-gate (QA 'rebase' round: taskctl snapshot {i}, taskgate in build-snap-{i}), "
+                  "then accept again; the task stays in doing")
+            sys.exit(5)
+    others = {x: own_paths(o) for x, o in tasks.items() if o["dir"] == "doing" and x != i}
+    dirty = set(dirty_under(changed)) if changed else set()
+    keep = [f for f in files if f not in gen and not is_generated(f)]
+    prestaged = []
+    for p in changed:
+        src, dst = os.path.join(d, p), os.path.join(ROOT, p)
+        held = [x for x, ps in others.items() if any(under(p, q) for q in ps)]
+        if p in dirty and held:
+            # another running task may hold a deliberate input there (refreshed goldens): index only
+            sha = subprocess.run(["git", "hash-object", "-w", f"--path={p}", src], cwd=ROOT,
+                                 capture_output=True, text=True, encoding="utf-8").stdout.strip()
+            git_lit("update-index", "--add", "--cacheinfo", f"100644,{sha},{p}")
+            prestaged.append(p)
+            print(f"note: {p} staged from the snapshot; main-tree copy untouched (dirty, inside the "
+                  f"paths/locks of running task {', '.join(held)})")
+            continue
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copyfile(src, dst)
+        keep.append(p)
+    print(f"bundles: {len(changed)} generated file(s) change in this commit"
+          + (f" ({len(prestaged)} staged index-only)" if prestaged else ""))
+    return sorted(set(keep)), prestaged
 
 
 # ---------------------------------------------------------------- unblock / park

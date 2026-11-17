@@ -8,7 +8,8 @@ throw-away repositories under the system temp directory and drives them there:
     A  synthetic 10-task board  — scheduling, accept/commit, snapshot, recovery, unblock caps, infra
     B  copy of the real board   — validate, duplicate ids, task template, harness_check
     C  tiny boards              — wrong root, empty board, stuck, finished, guard hook
-Run it after every change to taskctl.py, autopilot.py, overdue.py, reqcov.py, harness_check.py or
+    D  generated selfhost bundles — snapshot regeneration, accept staging, REGATE, legacy
+Run it after every change to taskctl.py, bundles.py, autopilot.py, overdue.py, reqcov.py, harness_check.py or
 .claude/hooks/guard.py. --keep leaves the temporary repositories for inspection.
 """
 import datetime as dt
@@ -207,7 +208,8 @@ def test_a(a):
           "docs/" not in hf and "tool.exe" not in hf and "M docs/base/owner.md" in status(a)
           and sh(["git", "diff", "--cached", "--name-only"], a)[1] == "", hf + status(a))
     body = sh(["git", "log", "-1", "--format=%B"], a)[1]
-    check("A4-25 trailer has no hard-coded model name", "Co-Authored-By: Gemini <noreply@google.com>" in body, body)
+    check("A4-25 trailer has no hard-coded model name",
+          not any(w in body for w in ("Claude", "Gemini", "Opus", "Sonnet", "Co-Authored-By")), body)
     env = dict(BASE_ENV, AXIOM_COMMIT_TRAILER="Co-Authored-By: X <x@example.invalid>")
 
     # ---- parallel batch after the critical task
@@ -538,10 +540,12 @@ def test_b():
     print(f"     copy of the real board: {out.splitlines()[-1]}; pre-existing errors: {base_errors}")
     check("B validate runs on a copy of the real board without crashing", rc in (0, 1) and "Traceback" not in out, out[-300:])
     todo = os.path.join(b, "_workspaces", "tasks", "todo")
-    src = [f for f in os.listdir(todo) if f.startswith("T004-")][0]
+    src = sorted(f for f in os.listdir(todo) if f.startswith("T") and f.endswith(".md"))[0]
+    dup_id = src.split("-")[0]
     shutil.copy2(os.path.join(todo, src), os.path.join(todo, "T999-dup.md"))
     rc, out = tc(b, "validate")
-    check("A4-03 validate reports a duplicate id (and the wrong file name)", rc == 1 and "duplicate id T004" in out, out[-400:])
+    check("A4-03 validate reports a duplicate id (and the wrong file name)",
+          rc == 1 and f"duplicate id {dup_id}" in out, out[-400:])
     rc, out = tc(b, "status")
     check("A4-03 every other command refuses a board with duplicate ids (exit 2)", rc == 2 and "duplicate id" in out, out[-300:])
     hc = [sys.executable, os.path.join(b, SCRIPTS, "harness_check.py")]
@@ -557,7 +561,7 @@ def test_b():
             shutil.copy2(proposals[-1], os.path.join(b, "proposed-settings.json"))
             hc += ["--settings", os.path.join(b, "proposed-settings.json")]
     rc, out = sh(hc, b)
-    check("harness_check reports the duplicate id", rc == 1 and "duplicate id T004" in out, out[-600:])
+    check("harness_check reports the duplicate id", rc == 1 and f"duplicate id {dup_id}" in out, out[-600:])
     os.remove(os.path.join(todo, "T999-dup.md"))
 
     # template with inline comments (the old SKILL.md template), malformed fields
@@ -692,6 +696,156 @@ def test_c():
         check(f"guard with clean docs/: `{cmd}` allowed (never blocks legitimate work)", rc == 0, out)
 
 
+# =============================================================== repo D (generated selfhost bundles)
+GEN_SRC = '''#!/usr/bin/env python3
+import os, sys
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
+MODS = %r
+OUT = %r
+
+
+def main(argv):
+    src = "".join(open(os.path.join(ROOT, "compiler", m), encoding="utf-8").read() for m in MODS)
+    data = "// generated\\n" + src
+    path = os.path.join(ROOT, *OUT.split("/"))
+    if "--check" in argv:
+        ok = os.path.exists(path) and open(path, encoding="utf-8", newline="").read() == data
+        print(OUT + (" up to date" if ok else " DIFFERS"))
+        return 0 if ok else 1
+    with open(path, "w", encoding="utf-8", newline="\\n") as fh:
+        fh.write(data)
+    print("wrote " + OUT)
+    return 0
+
+
+sys.exit(main(sys.argv[1:]))
+'''
+
+
+def bundles_cli(root, *args):
+    return sh([sys.executable, os.path.join(root, SCRIPTS, "bundles.py"), *args], root)
+
+
+def show_head(root, path):
+    return sh(["git", "show", f"HEAD:{path}"], root)[1]
+
+
+def pass_gate(root, tid, files):
+    write(root, f"_workspaces/reports/{tid}-report.md",
+          f"# {tid}\n## Files changed\n" + "".join(f"- {f}\n" for f in files) + "\nSTATUS: COMPLETE round=0\n")
+    write(root, f"_workspaces/reports/{tid}-qa.md", "# QA\nVERDICT: PASS round=0\n")
+
+
+def test_d():
+    d = new_repo("D")
+    B1, B2, MAN = "tests/selfhost/demo/bundle.ax", "tests/selfhost/demo2/bundle2.ax", "tests/selfhost/generated-files.txt"
+    write(d, "tests/selfhost/demo/gen_demo_tests.py", GEN_SRC % (["a.ax", "b.ax"], B1))
+    write(d, "tests/selfhost/demo2/gen_demo2_tests.py", GEN_SRC % (["c.ax"], B2))
+    for m in "abc":
+        write(d, f"compiler/{m}.ax", f"{m}0\n")
+    rc, out = bundles_cli(d, "regen", "--root", d)
+    check("D bundles.py regen writes every bundle and the manifest",
+          rc == 0 and open(os.path.join(d, B1)).read() == "// generated\na0\nb0\n"
+          and B1 in open(os.path.join(d, MAN)).read() and B2 in open(os.path.join(d, MAN)).read(), out)
+    T = "_workspaces/tasks/todo/"
+    write(d, T + "T010-a.md", task("T010", 20, [], ["compiler/a.ax", "tests/selfhost/demo"]))
+    write(d, T + "T011-b.md", task("T011", 21, [], ["compiler/b.ax"]))
+    write(d, T + "T012-c.md", task("T012", 22, [], ["compiler/c.ax"]))
+    write(d, T + "T013-spec.md", task("T013", 23, [], ["spec/x"]))
+    write(d, T + "T014-legacy.md", task("T014", 24, ["T010"], ["compiler/a.ax"], "locks: [tests/selfhost]\n"))
+    write(d, T + "T015-late.md", task("T015", 25, ["T011"], ["compiler/b.ax"]))
+    write(d, T + "T016-broken.md", task("T016", 26, ["T015"], ["compiler/c.ax"]))
+    commit_all(d)
+    rc, out = bundles_cli(d, "check", "--root", d)
+    check("D bundles.py check passes on a fresh tree", rc == 0 and "0 FAILED" not in out, out)
+    for i in ("T010", "T011", "T012", "T013"):
+        tc(d, "start", i, "--agent", i + "-impl")
+    write(d, "compiler/a.ax", "a1\n")
+    write(d, "compiler/b.ax", "b1\n")
+    write(d, "compiler/c.ax", "c1\n")
+    write(d, "tests/selfhost/demo/t1.test", "cmd: x\n")                  # hand-written selfhost test of T010
+    write(d, B1, "garbage left by an in-flight task\n")                  # stale bundle in the main tree
+    write(d, "spec/x/s.md", "spec\n")
+    pass_gate(d, "T010", ["compiler/a.ax", "tests/selfhost/demo/t1.test"])
+    pass_gate(d, "T011", ["compiler/b.ax"])
+    pass_gate(d, "T012", ["compiler/c.ax"])
+    pass_gate(d, "T013", ["spec/x/s.md"])
+
+    rc, out = tc(d, "changes", "T010")
+    check("stale generated bundle under the task's paths is neither REFUSED nor in the change set",
+          rc == 0 and "REFUSED" not in out and "generated bundle" in out and B1 not in out.split("generated")[0], out)
+    rc, out = tc(d, "snapshot", "T010")
+    s10 = os.path.join(d, "build-snap-T010")
+    rec10 = os.path.join(d, "_workspaces", "locks", "snap-T010.json")
+    check("snapshot regenerates the bundles from the snapshot's sources (not the main tree's stale copy)",
+          rc == 0 and open(os.path.join(s10, B1)).read() == "// generated\na1\nb0\n"
+          and os.path.exists(rec10) and "regenerated" in out, out)
+    rec = json.load(open(rec10, encoding="utf-8"))
+    check("snapshot records the base commit and the bundle blob ids",
+          rec.get("base") == sh(["git", "rev-parse", "HEAD"], d)[1] and B1 in rec.get("blobs", {}), str(rec))
+    for i in ("T011", "T012"):
+        rc, out = tc(d, "snapshot", i)
+    rc, out = tc(d, "accept", "T011")
+    check("accept stages the regenerated bundle in the task's single commit",
+          rc == 0 and show_head(d, B1) == "// generated\na0\nb1" and B1 in head_files(d)
+          and head_files(d).startswith("T011:"), out + head_files(d))
+    check("a dirty bundle inside a running task's paths is staged index-only (main-tree copy untouched)",
+          open(os.path.join(d, B1)).read().startswith("garbage") and "staged from the snapshot" in out, out)
+    check("accept removes the gate record", not os.path.exists(os.path.join(d, "_workspaces", "locks", "snap-T011.json")))
+    rc, out = tc(d, "accept", "T012")
+    check("HEAD moved but no shared bundle changed untested -> accept proceeds",
+          rc == 0 and show_head(d, B2) == "// generated\nc1" and where(d, "T012")[0] == "done", out)
+    rc, out = tc(d, "accept", "T010")
+    check("HEAD moved and the change sets meet in a bundle -> exit 5 REGATE, task stays in doing",
+          rc == 5 and "REGATE T010" in out and B1 in out and "HEAD moved" in out
+          and where(d, "T010")[0] == "doing" and sh(["git", "diff", "--cached", "--name-only"], d)[1] == "", out)
+    rc, out = tc(d, "snapshot", "T010")             # the re-gate's snapshot (rebase onto the new HEAD)
+    rc, out = tc(d, "accept", "T010")
+    check("after the re-gate snapshot the accept commits the combined bundle; main-tree copy refreshed",
+          rc == 0 and show_head(d, B1) == "// generated\na1\nb1"
+          and open(os.path.join(d, B1)).read() == "// generated\na1\nb1\n"
+          and "t1.test" in head_files(d), out + head_files(d))
+    rc, out = tc(d, "accept", "T013")
+    check("a spec-only change set skips the regeneration (no snapshot built)",
+          rc == 0 and "cannot affect a generated bundle" in out
+          and not os.path.exists(os.path.join(d, "build-snap-T013")), out)
+
+    # legacy task: holds tests/selfhost, regenerated in the main tree and lists the bundle, no gate record
+    tc(d, "start", "T014", "--agent", "T014-impl")
+    write(d, "compiler/a.ax", "a2\n")
+    sh([sys.executable, os.path.join(d, "tests/selfhost/demo/gen_demo_tests.py")], d)
+    pass_gate(d, "T014", ["compiler/a.ax", B1])
+    rc, out = tc(d, "accept", "T014")
+    check("legacy task listing its regenerated bundle, no gate record -> accepted with a WARN",
+          rc == 0 and "no gate record" in out and show_head(d, B1) == "// generated\na2\nb1", out)
+
+    # sources changed after the gate
+    tc(d, "start", "T015", "--agent", "T015-impl")
+    write(d, "compiler/b.ax", "b2\n")
+    pass_gate(d, "T015", ["compiler/b.ax"])
+    tc(d, "snapshot", "T015")
+    write(d, "compiler/b.ax", "b3\n")
+    rc, out = tc(d, "accept", "T015")
+    check("change set edited after the gate's snapshot -> REGATE",
+          rc == 5 and "changed after the gate" in out and where(d, "T015")[0] == "doing", out)
+    tc(d, "snapshot", "T015")
+    rc, out = tc(d, "accept", "T015")
+    check("re-gated T015 accepted with the edited source's bundle", rc == 0 and show_head(d, B1).endswith("b3"), out)
+
+    # a generator failure
+    tc(d, "start", "T016", "--agent", "T016-impl")
+    os.remove(os.path.join(d, "compiler", "c.ax"))
+    pass_gate(d, "T016", ["compiler/c.ax"])
+    rc, out = tc(d, "snapshot", "T016")
+    check("snapshot exits 1 and records nothing when a generator fails",
+          rc == 1 and "BUNDLES FAILED" in out
+          and not os.path.exists(os.path.join(d, "_workspaces", "locks", "snap-T016.json")), out)
+    rc, out = tc(d, "accept", "T016")
+    check("accept refuses when the regeneration fails", rc == 1 and where(d, "T016")[0] == "doing", out)
+    sh(["git", "worktree", "prune"], d)
+
+
 def main():
     rmtree(TR)
     os.makedirs(TR)
@@ -699,6 +853,7 @@ def main():
     test_a(a)
     test_b()
     test_c()
+    test_d()
     bad = [n for n, ok in results if not ok]
     print(f"\n{len(results) - len(bad)}/{len(results)} checks passed")
     for n in bad:
@@ -706,7 +861,7 @@ def main():
     if "--keep" in sys.argv:
         print("kept:", TR)
     else:
-        for name in ("A", "B", "C"):  # drop snapshot worktrees cleanly before deleting
+        for name in ("A", "B", "C", "D"):  # drop snapshot worktrees cleanly before deleting
             sh(["git", "worktree", "prune"], os.path.join(TR, name))
         rmtree(TR)
     return 1 if bad else 0

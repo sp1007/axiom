@@ -39,7 +39,8 @@ never "the board is empty".
    finish. The next tick after the backoff expires resumes automatically.
 6. **Completions not yet processed** (arrived mid-turn or while the session was limited): for each
    running entry whose agent has reported, continue the orchestrator procedure from its stage (impl →
-   snapshot + gate; qa → `accept` or fix round; fix → gate; unblock → `commit-report` +
+   snapshot + gate; qa → `accept` (exit 5 REGATE → `snapshot` + rebase gate, axiom-compiler step 5)
+   or fix round; fix → gate; unblock → `commit-report` +
    `unblock-end`). A result that is an infrastructure error goes to "Infrastructure failures"
    (`requeue --infra` / drop, `autopilot.py infra-fail`), never to block or unblock.
 7. **Hung or silent agents** — `python $S/overdue.py`, one line per entry with an action:
