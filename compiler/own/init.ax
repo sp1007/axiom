@@ -5,9 +5,7 @@ module compiler.own.init
 use std.core.host.heap_alloc
 use std.core.host.heap_free
 use compiler.kernel.arena.Arena
-use compiler.kernel.arena.ArenaChunk
 use compiler.kernel.arena.arena_alloc_raw
-use compiler.kernel.arena.arena_destroy
 use compiler.kernel.id.FileId
 use compiler.kernel.id.TypeId
 use compiler.kernel.interner.StrInterner
@@ -81,7 +79,6 @@ use compiler.mir.mir.mir_proj_at
 use compiler.mir.mir.mir_stmt_at
 use compiler.own.cap.MirCapTracker
 use compiler.own.cap.mir_cap_tracker_add
-use compiler.own.cap.mir_cap_tracker_new
 use compiler.own.cap.own_cap_check
 use compiler.own.move.OWN_MOVED
 use compiler.own.move.OWN_OWNED
@@ -98,6 +95,7 @@ use compiler.own.move.own_u32_at
 use compiler.own.move.path_ctx_free
 use compiler.own.move.path_ctx_init
 use compiler.own.move.path_node_at
+use compiler.own.move.ptr_copy_nonoverlapping
 use compiler.own.move.resolve_place
 use compiler.own.move.update_parent
 
@@ -440,17 +438,8 @@ pub fn own_visit_bb(v: mut_view<OwnVisitor>, bb: view<MirBb>) {
 }
 
 fn copy_own_states(dst: *mut OwnStateInfo, src: *const OwnStateInfo, count: usize) {
-    let mut i: usize = 0;
-    while (i < count) {
-        let dp = unsafe { own_state_at_mut(dst, i) };
-        let sp = unsafe { own_state_at(src, i) };
-        unsafe {
-            (*dp).state = (*sp).state;
-            (*dp).move_loc.file.v = (*sp).move_loc.file.v;
-            (*dp).move_loc.start = (*sp).move_loc.start;
-            (*dp).move_loc.end = (*sp).move_loc.end;
-        }
-        i = i + 1;
+    unsafe {
+        ptr_copy_nonoverlapping<u8>(src as *const u8, dst as *mut u8, mul_usize(count, size_of<OwnStateInfo>()));
     }
 }
 
@@ -466,16 +455,14 @@ pub fn own_check(
         return;
     }
 
-    let ctx_raw = unsafe { heap_alloc(size_of<PathCtx>(), align_of<PathCtx>()) };
-    let ctx = ctx_raw as *mut PathCtx;
-    let ctx_init_p = ctx;
+    let ctx = unsafe { heap_alloc(size_of<PathCtx>(), align_of<PathCtx>()) } as *mut PathCtx;
     unsafe {
-        (*ctx_init_p).nodes = 0 as *mut PathNode;
-        (*ctx_init_p).count = 0;
-        (*ctx_init_p).cap = 0;
-        (*ctx_init_p).local_roots = 0 as *mut u32;
-        (*ctx_init_p).local_count = 0;
-        path_ctx_init(mut_view(*ctx_init_p), view(*body), thir, str_in);
+        (*ctx).nodes = 0 as *mut PathNode;
+        (*ctx).count = 0;
+        (*ctx).cap = 0;
+        (*ctx).local_roots = 0 as *mut u32;
+        (*ctx).local_count = 0;
+        path_ctx_init(mut_view(*ctx), view(*body), thir, str_in);
     }
 
     let bb_count = body.bb_count;
@@ -483,26 +470,27 @@ pub fn own_check(
     let node_count = if ctx_cnt > 0 { ctx_cnt } else { 1 };
     let state_arr_bytes = mul_usize(node_count, size_of<OwnStateInfo>());
     let bb_in_bytes = mul_usize(bb_count, size_of<*mut OwnStateInfo>());
-    let bb_in_raw = unsafe { heap_alloc(bb_in_bytes, align_of<*mut OwnStateInfo>()) };
-    let bb_in = bb_in_raw as *mut *mut OwnStateInfo;
+    let bb_in = unsafe { heap_alloc(bb_in_bytes, align_of<*mut OwnStateInfo>()) } as *mut *mut OwnStateInfo;
 
     let mut i: usize = 0;
     while (i < bb_count) {
-        let row_raw = unsafe { heap_alloc(state_arr_bytes, align_of<OwnStateInfo>()) };
-        let row = row_raw as *mut OwnStateInfo;
-        let mut j: usize = 0;
-        while (j < ctx_cnt) {
-            let cell = unsafe { own_state_at_mut(row, j) };
-            unsafe {
-                (*cell).state = OWN_UNINIT;
-                (*cell).move_loc.file.v = 0u32;
-                (*cell).move_loc.start = 0u32;
-                (*cell).move_loc.end = 0u32;
+        let row = unsafe { heap_alloc(state_arr_bytes, align_of<OwnStateInfo>()) } as *mut OwnStateInfo;
+        if i == 0 {
+            let mut j: usize = 0;
+            while (j < ctx_cnt) {
+                let cell = unsafe { own_state_at_mut(row, j) };
+                unsafe {
+                    (*cell).state = OWN_UNINIT;
+                    (*cell).move_loc.file.v = 0u32;
+                    (*cell).move_loc.start = 0u32;
+                    (*cell).move_loc.end = 0u32;
+                }
+                j = j + 1;
             }
-            j = j + 1;
+        } else {
+            copy_own_states(row, unsafe { *own_state_ptr_at_mut(bb_in, 0) } as *const OwnStateInfo, ctx_cnt);
         }
-        let slot = unsafe { own_state_ptr_at_mut(bb_in, i) };
-        unsafe { *slot = row; }
+        unsafe { *own_state_ptr_at_mut(bb_in, i) = row; }
         i = i + 1;
     }
 
@@ -547,8 +535,7 @@ pub fn own_check(
         i = i + 1;
     }
 
-    let vis_raw = unsafe { heap_alloc(bb_count, 1) };
-    let visited = vis_raw;
+    let visited = unsafe { heap_alloc(bb_count, 1) };
     i = 0;
     while (i < bb_count) {
         unsafe { *(visited + i) = 0u8; }
@@ -556,15 +543,9 @@ pub fn own_check(
     }
     unsafe { *visited = 1u8; }
 
-    let cap_arena_raw = unsafe { heap_alloc(size_of<Arena>(), align_of<Arena>()) };
-    let cap_arena = cap_arena_raw as *mut Arena;
-    let cap_init_p = cap_arena;
-    unsafe {
-        (*cap_init_p).head = 0 as *mut ArenaChunk;
-    }
-    let cap_tracker = unsafe { mir_cap_tracker_new(mut_view(*cap_init_p)) };
-    let temp_raw = unsafe { heap_alloc(state_arr_bytes, align_of<OwnStateInfo>()) };
-    let temp = temp_raw as *mut OwnStateInfo;
+    // T485: the capability tracker that used to be filled here was never read (own_cap_check is
+    // the capability analysis); a null tracker makes own_visit_rvalue skip it.
+    let temp = unsafe { heap_alloc(state_arr_bytes, align_of<OwnStateInfo>()) } as *mut OwnStateInfo;
 
     let mut v = OwnVisitor {
         state: temp,
@@ -573,8 +554,8 @@ pub fn own_check(
         report: false,
         body: unsafe { address_of(*body) },
         thir: unsafe { address_of(*thir) },
-        cap_tracker: cap_tracker,
-        cap_arena: cap_arena,
+        cap_tracker: 0 as *mut MirCapTracker,
+        cap_arena: 0 as *mut Arena,
     };
 
     let mut changed = true;
@@ -673,15 +654,11 @@ pub fn own_check(
         }
         i = i + 1;
     }
-    let ctx_free_p = ctx;
-    let cap_free_p = cap_arena;
     unsafe {
         heap_free(bb_in as *mut u8, bb_in_bytes, align_of<*mut OwnStateInfo>());
         heap_free(temp as *mut u8, state_arr_bytes, align_of<OwnStateInfo>());
         heap_free(visited, bb_count, 1);
-        path_ctx_free(mut_view(*ctx_free_p));
+        path_ctx_free(mut_view(*ctx));
         heap_free(ctx as *mut u8, size_of<PathCtx>(), align_of<PathCtx>());
-        arena_destroy(mut_view(*cap_free_p));
-        heap_free(cap_arena as *mut u8, size_of<Arena>(), align_of<Arena>());
     }
 }

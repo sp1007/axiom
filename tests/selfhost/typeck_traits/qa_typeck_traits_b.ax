@@ -31166,7 +31166,7 @@ pub fn lookup_path_type(cx: mut_view<TypeckCtx>, path: view<HirPath>, out_args: 
                                 return instantiate_path(mut_view(*cx), sty, it, path, mut_view(*out_args));
                             }
                         }
-                        let it_t = unsafe { thir_get_item_type(view(*cx.thir), it) };
+                        let it_t = tc_item_type_on_demand(mut_view(*cx), it);
                         if it_t.v != 0u32 {
                             return instantiate_path(mut_view(*cx), (TypeId { v: it_t.v }), it, path, mut_view(*out_args));
                         }
@@ -31232,7 +31232,7 @@ pub fn lookup_path_type(cx: mut_view<TypeckCtx>, path: view<HirPath>, out_args: 
                                 return instantiate_path(mut_view(*cx), sty, it, path, mut_view(*out_args));
                             }
                         }
-                        let it_t = unsafe { thir_get_item_type(view(*cx.thir), it) };
+                        let it_t = tc_item_type_on_demand(mut_view(*cx), it);
                         if it_t.v != 0u32 {
                             return instantiate_path(mut_view(*cx), (TypeId { v: it_t.v }), it, path, mut_view(*out_args));
                         }
@@ -31454,7 +31454,7 @@ fn lookup_path_type_by_name(
                 }
                 let struct_name = StrView { ptr: name.ptr, len: s_len };
                 if sv_eq(view(it_name), view(struct_name)) {
-                    let t = unsafe { thir_get_item_type(view(*cx.thir), it) };
+                    let t = tc_item_type_on_demand(mut_view(*cx), it);
                     if t.v != 0u32 {
                         return instantiate_path(mut_view(*cx), (TypeId { v: t.v }), it, path, mut_view(*out_args));
                     }
@@ -31476,7 +31476,7 @@ fn lookup_path_type_by_name(
                 }
                 let enum_name = StrView { ptr: name.ptr, len: e_len };
                 if sv_eq(view(it_name), view(enum_name)) {
-                    let t = unsafe { thir_get_item_type(view(*cx.thir), it) };
+                    let t = tc_item_type_on_demand(mut_view(*cx), it);
                     if t.v != 0u32 {
                         return instantiate_path(mut_view(*cx), (TypeId { v: t.v }), it, path, mut_view(*out_args));
                     }
@@ -39355,13 +39355,49 @@ fn tc_item_is_prelude_or_std(interner: view<StrInterner>, it: *const HirItem) ->
     false
 }
 
+// T444 (T421 FU-1, FU-3): struct and enum types are registered on demand. A field type naming a struct or enum
+// that is declared later (or in a std module whose items come later in the item list, e.g. the prelude's
+// `RawWaker.vtable: *const RawWakerVTable`) registers that item first (`tc_item_type_on_demand`) instead of
+// resolving to the error type, whose layout is empty (every field at offset 0). Registration interns a field-less
+// shell (identity = def + args) before converting the field types, so a cycle through pointers
+// (`struct A { b: *mut B }` / `struct B { a: *mut A }`, `struct L { next: *mut L }`) finds the in-progress type;
+// the fields are filled into the interned type afterwards.
+fn tc_item_type_on_demand(cx: mut_view<TypeckCtx>, it: *mut HirItem) -> TypeId {
+    let t = unsafe { thir_get_item_type(view(*cx.thir), it) };
+    if t.v != 0u32 || (it as usize) == 0 {
+        return (TypeId { v: t.v });
+    }
+    if (cx.str_in as usize) == 0 && (cx.db as usize) == 0 {
+        return (TypeId { v: 0u32 });
+    }
+    let ik = unsafe { (*it).kind };
+    if ik == HIR_ITEM_STRUCT {
+        tc_register_single_struct(mut_view(*cx), it, cx.thir);
+    } else if ik == HIR_ITEM_ENUM {
+        tc_register_single_enum(mut_view(*cx), it, cx.thir);
+    }
+    unsafe { thir_get_item_type(view(*cx.thir), it) }
+}
+
 fn tc_register_single_struct(
     cx: mut_view<TypeckCtx>,
     top_it: *mut HirItem,
     thir_ptr: *mut Thir
 ) {
+    let done = unsafe { thir_get_item_type(view(*thir_ptr), top_it) };
+    if done.v != 0u32 {
+        return;
+    }
+    let saved_fn = cx.current_fn;
+    let saved_impl = cx.current_impl;
+    let saved_self = cx.self_ty.v;
     let mut arg_cnt: usize = 0;
     let args = build_item_generic_param_args(mut_view(*cx), top_it, mut_view(arg_cnt));
+    let is_rc = item_has_repr_c(view(*cx), top_it);
+    let shell_id = unsafe {
+        intern_struct_ty(mut_view((*thir_ptr).interner), is_rc, top_it, 0 as *mut TypeId, 0, args, arg_cnt)
+    };
+    unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: shell_id.v })); }
     cx.current_fn = top_it;
     cx.current_impl = 0 as *const HirItem;
     cx.self_ty.v = 0u32;
@@ -39405,14 +39441,20 @@ fn tc_register_single_struct(
             }
         }
     }
-    let is_rc = item_has_repr_c(view(*cx), top_it);
-    let st_id = unsafe { intern_struct_ty(mut_view((*thir_ptr).interner), is_rc, top_it, flds, f_cnt, args, arg_cnt) };
-    unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: st_id.v })); }
+    let st_id = TypeId { v: shell_id.v };
+    let st_t = unsafe { type_get(view((*thir_ptr).interner), (TypeId { v: st_id.v })) };
+    unsafe {
+        (*st_t).fields = flds;
+        (*st_t).field_count = f_cnt;
+        (*st_t).is_repr_c = is_rc;
+    }
     let s_sym = unsafe { (*top_it).symbol };
     if s_sym.v != 0u32 && arg_cnt == 0 && (cx.str_in as usize) == 0 && (cx.db as usize) == 0 {
         unsafe { thir_set_sym_type(mut_view(*thir_ptr), (SymbolId { v: s_sym.v }), (TypeId { v: st_id.v })); }
     }
-    cx.current_fn = 0 as *const HirItem;
+    cx.current_fn = saved_fn;
+    cx.current_impl = saved_impl;
+    cx.self_ty.v = saved_self;
 }
 
 fn tc_register_single_enum(
@@ -39420,8 +39462,27 @@ fn tc_register_single_enum(
     top_it: *mut HirItem,
     thir_ptr: *mut Thir
 ) {
+    let done = unsafe { thir_get_item_type(view(*thir_ptr), top_it) };
+    if done.v != 0u32 {
+        return;
+    }
+    let saved_fn = cx.current_fn;
+    let saved_impl = cx.current_impl;
+    let saved_self = cx.self_ty.v;
     let mut arg_cnt: usize = 0;
     let args = build_item_generic_param_args(mut_view(*cx), top_it, mut_view(arg_cnt));
+    let shell_id = unsafe {
+        intern_enum_ty(
+            mut_view((*thir_ptr).interner),
+            top_it,
+            args,
+            arg_cnt,
+            0 as *mut *mut TypeId,
+            0 as *mut usize,
+            0
+        )
+    };
+    unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: shell_id.v })); }
     cx.current_fn = top_it;
     cx.current_impl = 0 as *const HirItem;
     cx.self_ty.v = 0u32;
@@ -39490,23 +39551,20 @@ fn tc_register_single_enum(
             v = unsafe { (*v).next };
         }
     }
-    let en_id = unsafe {
-        intern_enum_ty(
-            mut_view((*thir_ptr).interner),
-            top_it,
-            args,
-            arg_cnt,
-            v_fields,
-            v_counts,
-            v_cnt
-        )
-    };
-    unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: en_id.v })); }
+    let en_id = TypeId { v: shell_id.v };
+    let en_t = unsafe { type_get(view((*thir_ptr).interner), (TypeId { v: en_id.v })) };
+    unsafe {
+        (*en_t).variant_fields = v_fields;
+        (*en_t).variant_field_counts = v_counts;
+        (*en_t).variant_count = v_cnt;
+    }
     let e_sym = unsafe { (*top_it).symbol };
     if e_sym.v != 0u32 && arg_cnt == 0 && (cx.str_in as usize) == 0 && (cx.db as usize) == 0 {
         unsafe { thir_set_sym_type(mut_view(*thir_ptr), (SymbolId { v: e_sym.v }), (TypeId { v: en_id.v })); }
     }
-    cx.current_fn = 0 as *const HirItem;
+    cx.current_fn = saved_fn;
+    cx.current_impl = saved_impl;
+    cx.self_ty.v = saved_self;
 }
 
 fn tc_resolve_type_alias(
@@ -39523,6 +39581,75 @@ fn tc_resolve_type_alias(
         if !is_error(mut_view(*cx), (TypeId { v: computed.v })) && computed.v != 0u32 {
             unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: computed.v })); }
         }
+    }
+}
+
+// T444: substitutes `n` field types of a generic definition with an instance's args (arena copy).
+fn tc_subst_ids(cx: mut_view<TypeckCtx>, src: *mut TypeId, n: usize, gargs: view<GenericArgsSlice>) -> *mut TypeId {
+    if n == 0 {
+        return 0 as *mut TypeId;
+    }
+    let out = unsafe {
+        arena_alloc_raw(mut_view((*cx.thir).interner.arena), mul_usize(n, size_of<TypeId>()), align_of<TypeId>()) as *mut TypeId
+    };
+    let mut j: usize = 0;
+    while (j < n) {
+        let nf = unsafe {
+            subst_ty_with_vars(mut_view((*cx.thir).interner), mut_view(cx.type_vars), (TypeId { v: (*typeid_at(src, j)).v }), gargs)
+        };
+        unsafe { (*typeid_at(out, j)).v = nf.v; }
+        j = j + 1;
+    }
+    out
+}
+
+// T444: a generic struct/enum instance interned while its definition was still a field-less shell (a cycle of
+// generic types registered on demand, e.g. `struct A<T> { b: *mut B<T> }` / `struct B<T> { a: *mut A<u8> }`) has no
+// fields. Once every definition is complete, such instances take their fields from the definition, substituted
+// with the instance's args. (Kept small on purpose: see the T444 report on axiom0 symbol ids.)
+fn tc_refresh_adt_instances(cx: mut_view<TypeckCtx>) {
+    let mut i: usize = 1;
+    while (i < (unsafe { (*cx.thir).interner.len })) {
+        let t = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: i as u32 })) };
+        let mut bt: *mut AxType = 0 as *mut AxType;
+        if (t as usize) != 0 && (unsafe { (*t).arg_count }) > 0 && (unsafe { (*t).def as usize }) != 0 &&
+            (((unsafe { (*t).kind }) == TY_STRUCT && (unsafe { (*t).field_count }) == 0) ||
+             ((unsafe { (*t).kind }) == TY_ENUM && (unsafe { (*t).variant_count }) == 0)) {
+            let base = unsafe { thir_get_item_type(view(*cx.thir), (*t).def) };
+            if base.v != 0u32 && (base.v as usize) != i {
+                bt = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: base.v })) };
+                if (bt as usize) != 0 && (unsafe { (*bt).kind }) != (unsafe { (*t).kind }) {
+                    bt = 0 as *mut AxType;
+                }
+            }
+        }
+        if (bt as usize) != 0 {
+            let gargs = GenericArgsSlice { args: unsafe { (*t).args }, count: unsafe { (*t).arg_count } };
+            if (unsafe { (*t).kind }) == TY_STRUCT {
+                unsafe {
+                    (*t).fields = tc_subst_ids(mut_view(*cx), (*bt).fields, (*bt).field_count, view(gargs));
+                    (*t).field_count = (*bt).field_count;
+                    (*t).is_repr_c = (*bt).is_repr_c;
+                }
+            } else if (unsafe { (*bt).variant_count }) > 0 && (unsafe { (*bt).variant_fields as usize }) != 0 {
+                let vfs = unsafe {
+                    arena_alloc_raw(mut_view((*cx.thir).interner.arena), mul_usize((*bt).variant_count, size_of<*mut TypeId>()), align_of<*mut TypeId>()) as *mut *mut TypeId
+                };
+                let mut v: usize = 0;
+                while (v < (unsafe { (*bt).variant_count })) {
+                    unsafe {
+                        *typeid_ptr_at(vfs, v) = tc_subst_ids(mut_view(*cx), *typeid_ptr_at((*bt).variant_fields, v), *usize_at((*bt).variant_field_counts, v), view(gargs));
+                    }
+                    v = v + 1;
+                }
+                unsafe {
+                    (*t).variant_fields = vfs;
+                    (*t).variant_field_counts = (*bt).variant_field_counts;
+                    (*t).variant_count = (*bt).variant_count;
+                }
+            }
+        }
+        i = i + 1;
     }
 }
 
@@ -39568,6 +39695,7 @@ fn typeck_pass1a(cx: mut_view<TypeckCtx>, hir_file: view<HirFile>, thir_ptr: *mu
         }
         top_it = unsafe { (*top_it).next };
     }
+    tc_refresh_adt_instances(mut_view(*cx));
 }
 
 fn typeck_pass1b_and_2(
