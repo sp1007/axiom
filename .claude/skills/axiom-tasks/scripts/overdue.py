@@ -17,6 +17,7 @@ of files under the task's paths/locks, its _workspaces/reports/<ID>-* files and 
 (build-<ID>, build-qa-<ID>, build-snap-<ID>) and an optional running[ID].worktree directory.
 
     "probe_min": 45       a running agent silent (no file activity) this long gets a probe message
+    "probe_early_min": 20 an agent that has touched no file at all since it started gets a probe this early
 
 One line per entry needing attention: ID, agent, stage, minutes, limit, idle minutes, reason, action:
     kill   (overdue and idle, or past the hard cap)  -> TaskStop + the tick's hang handling
@@ -103,6 +104,7 @@ def main():
     idle_min = int(state.get("idle_min", 30))
     hard_factor = float(state.get("hard_factor", 2))
     probe_min = int(state.get("probe_min", 45))
+    probe_early_min = int(state.get("probe_early_min", 20))
     session = taskctl.session_token() or state.get("session_id")
     tasks = taskctl.load_all([], allow_empty=True)
     now = dt.datetime.now()
@@ -127,14 +129,21 @@ def main():
             if taskctl.ival(task["meta"], "timeout_min", 0) > 0:
                 limit = taskctl.ival(task["meta"], "timeout_min")
         minutes = int((now - since).total_seconds() // 60)
-        if minutes < min(limit + 1, probe_min):
+        if minutes < min(limit + 1, probe_early_min, probe_min):
             continue
         last = newest_mtime(activity_paths(tid, task, r))
         idle = None if last is None else min(minutes, int((now.timestamp() - last) // 60))
+        # no file touched since the agent started: it may have died before doing anything
+        # (2026-11-18: T164's first agent was silent for 80 min before the 45-min probe caught it)
+        untouched = last is None or last < since.timestamp()
         if minutes <= limit:
             # not overdue yet, but silent: after a rate limit or API error the agent may be dead in
             # this same session. A message is harmless to a live agent and resumes a dead one.
-            if idle is None or idle >= probe_min:
+            if untouched and minutes >= probe_early_min:
+                out.append({**base, "minutes": minutes, "limit": limit, "idle": idle,
+                            "reason": f"no file touched since start ({probe_early_min}+ min)",
+                            "action": "probe"})
+            elif idle is None or idle >= probe_min:
                 out.append({**base, "minutes": minutes, "limit": limit, "idle": idle,
                             "reason": f"no file activity for {probe_min}+ min", "action": "probe"})
             continue

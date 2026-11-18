@@ -475,6 +475,21 @@ def test_a(a):
     lines = {ln.split("\t")[0]: ln for ln in out.splitlines()}
     check("A4-07 silent agent inside its limit (died on a rate limit in the same session) -> probe",
           "T008" in lines and lines["T008"].endswith("probe") and "T009" not in lines and "T006" not in lines, out)
+    # an agent that has touched nothing since it started is probed early (probe_early_min 20), before probe_min 45
+    stj["running"] = {"T006": {"agent": "T006-impl", "stage": "impl", "round": 0, "since": since(25), "session": sess}}
+    json.dump(stj, open(os.path.join(a, "_workspaces", "autopilot.json"), "w", encoding="utf-8"))
+    for d, _, fs in os.walk(a):
+        if os.sep + ".git" in d:
+            continue
+        for f in fs:
+            os.utime(os.path.join(d, f), (old, old))
+    rc, out = od(a, env=env2)
+    lines = {ln.split("\t")[0]: ln for ln in out.splitlines()}
+    check("overdue: nothing touched since start, 25 min -> early probe",
+          "T006" in lines and lines["T006"].endswith("probe") and "since start" in lines["T006"], out)
+    write(a, "src/mir/m.c", "z\n")
+    rc, out = od(a, env=env2)
+    check("overdue: a file touched after start, 25 min -> no probe yet", "T006" not in out, out)
     for i in ("T006", "T008", "T009"):
         tc(a, "requeue", i, "--no-attempt", "--reason", "hung while progressing")
     check("requeue --no-attempt does not charge", "attempts: 0" in where(a, "T009")[1], where(a, "T009")[1])
