@@ -14,6 +14,7 @@
 #include "driver/mono.h"
 #include "driver/build_native/data_syms.h"
 #include "types/layout/layout.h"
+#include "kernel/base.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -501,33 +502,61 @@ void ax_stage_build_native(AxDriverState *st) {
                     }
                     func_start = text_sec->bytes_len;
 
-                    char name_buf[256];
+                    char *name_buf = NULL;
                     if (inst->mangled_name.v != 0) {
                         StrView name = ax_interner_get(&st->interner, inst->mangled_name);
-                        snprintf(name_buf, 256, "%.*s", (int)name.len, name.ptr);
+                        name_buf = ax_xmalloc(name.len + 1);
+                        if (name.len > 0) {
+                            memcpy(name_buf, name.ptr, name.len);
+                        }
+                        name_buf[name.len] = '\0';
                     } else {
-                        snprintf(name_buf, 256, "__ax_fn_%u", (uint32_t)item->fn.symbol.v);
+                        name_buf = ax_xmalloc(32);
+                        snprintf(name_buf, 32, "__ax_fn_%u", (uint32_t)item->fn.symbol.v);
                     }
 
 
                     ax_x64_frame_emit_prologue(text_sec, &layout);
 
-                    uint32_t bb_offsets[1024] = {0};
-                    struct { uint32_t fixup; uint32_t target; } fixups[1024];
-                    uint32_t num_fixups = 0;
+                    typedef struct AxBranchFixup {
+                        uint32_t fixup;
+                        uint32_t target;
+                    } AxBranchFixup;
 
-                    for (size_t b = 0; b < mi_body->bb_count; b++) {
+                    size_t bb_count = mi_body->bb_count;
+                    uint32_t *bb_offsets = ax_xcalloc(bb_count ? bb_count : 1, sizeof(uint32_t));
+                    size_t fixup_cap = 0;
+                    for (size_t b = 0; b < bb_count; b++) {
+                        AxX64MIBb *mbb = &mi_body->bbs[b];
+                        for (AxX64MI *mi = mbb->first_inst; mi != NULL; mi = mi->next) {
+                            if (mi->opcode == AX_X64_MI_JMP || mi->opcode == AX_X64_MI_JCC || mi->opcode == AX_X64_MI_ASSERT) {
+                                fixup_cap++;
+                            }
+                        }
+                    }
+                    AxBranchFixup *fixups = ax_xcalloc(fixup_cap ? fixup_cap : 1, sizeof(AxBranchFixup));
+                    size_t num_fixups = 0;
+
+                    for (size_t b = 0; b < bb_count; b++) {
                         bb_offsets[b] = text_sec->bytes_len;
                         AxX64MIBb *mbb = &mi_body->bbs[b];
                         for (AxX64MI *inst = mbb->first_inst; inst != NULL; inst = inst->next) {
                             if (inst->opcode == AX_X64_MI_JMP) {
+                                if (num_fixups >= fixup_cap) {
+                                    fixups = ax_grow_array(fixups, &fixup_cap, sizeof(AxBranchFixup), num_fixups + 1);
+                                }
                                 fixups[num_fixups].fixup = text_sec->bytes_len + 1;
-                                fixups[num_fixups].target = inst->ops[0].imm;
+                                fixups[num_fixups].target = (inst->ops[0].imm >= 0 && (uint64_t)inst->ops[0].imm < (uint64_t)bb_count)
+                                    ? (uint32_t)inst->ops[0].imm : UINT32_MAX;
                                 num_fixups++;
                                 ax_x64_jmp(text_sec, 0);
                             } else if (inst->opcode == AX_X64_MI_JCC) {
+                                if (num_fixups >= fixup_cap) {
+                                    fixups = ax_grow_array(fixups, &fixup_cap, sizeof(AxBranchFixup), num_fixups + 1);
+                                }
                                 fixups[num_fixups].fixup = text_sec->bytes_len + 2;
-                                fixups[num_fixups].target = inst->ops[1].imm;
+                                fixups[num_fixups].target = (inst->ops[1].imm >= 0 && (uint64_t)inst->ops[1].imm < (uint64_t)bb_count)
+                                    ? (uint32_t)inst->ops[1].imm : UINT32_MAX;
                                 num_fixups++;
                                 ax_x64_jcc(text_sec, (uint8_t)inst->ops[0].imm, 0);
 
@@ -552,19 +581,25 @@ void ax_stage_build_native(AxDriverState *st) {
                                     ax_x64_lea_sym(text_sec, inst->ops[0].reg, (ax_symbol_id_t){ inst->ops[1].sym });
                                 }
                             } else if (inst->opcode == AX_X64_MI_ASSERT) {
+                                if (num_fixups >= fixup_cap) {
+                                    fixups = ax_grow_array(fixups, &fixup_cap, sizeof(AxBranchFixup), num_fixups + 1);
+                                }
                                 fixups[num_fixups].fixup = text_sec->bytes_len + 2;
-                                fixups[num_fixups].target = inst->ops[0].imm;
+                                fixups[num_fixups].target = (inst->ops[0].imm >= 0 && (uint64_t)inst->ops[0].imm < (uint64_t)bb_count)
+                                    ? (uint32_t)inst->ops[0].imm : UINT32_MAX;
                                 num_fixups++;
                                 ax_x64_jcc(text_sec, 0x4, 0); // JE over panic block
                                 text_sec = ax_objmodel_get_section(&obj, text_sec_id); // Refresh text_sec pointer
                                 ax_section_t *rdata_sec = ax_objmodel_get_section(&obj, my_rdata_sec_id);
                                 uint32_t str_offset = rdata_sec->bytes_len;
                                 const char *msg = inst->msg ? inst->msg : "assertion failed";
-                                char formatted_msg[256];
-                                snprintf(formatted_msg, sizeof(formatted_msg), "panic: %s\n", msg);
-                                uint32_t len = strlen(formatted_msg);
+                                size_t msg_cap = strlen(msg) + 10;
+                                char *formatted_msg = ax_xmalloc(msg_cap);
+                                snprintf(formatted_msg, msg_cap, "panic: %s\n", msg);
+                                uint32_t len = (uint32_t)strlen(formatted_msg);
                                 ax_section_add_bytes(rdata_sec, (const uint8_t*)formatted_msg, len);
                                 ax_section_add_byte(rdata_sec, 0);
+                                ax_xfree(formatted_msg);
                                 
                                 char panic_sym_name[64];
                                 ax_panic_sym_name(panic_sym_name, sizeof(panic_sym_name), panic_id++);
@@ -585,15 +620,32 @@ void ax_stage_build_native(AxDriverState *st) {
                     }
 
                     for (size_t i = 0; i < num_fixups; i++) {
+                        if ((size_t)fixups[i].target >= bb_count) {
+                            ax_xfree(bb_offsets);
+                            ax_xfree(fixups);
+                            ax_xfree(name_buf);
+                            AX_ICE("branch fixup target %u out of range (bb_count=%u)",
+                                   fixups[i].target, (unsigned)bb_count);
+                        }
+                        if ((size_t)fixups[i].fixup + 4 > text_sec->bytes_len) {
+                            ax_xfree(bb_offsets);
+                            ax_xfree(fixups);
+                            ax_xfree(name_buf);
+                            AX_ICE("branch fixup offset %u out of range (text_len=%u)",
+                                   fixups[i].fixup, (unsigned)text_sec->bytes_len);
+                        }
                         uint32_t target_off = bb_offsets[fixups[i].target];
                         uint32_t next_rip = fixups[i].fixup + 4;
                         int32_t rel32 = (int32_t)target_off - (int32_t)next_rip;
                         memcpy(text_sec->bytes + fixups[i].fixup, &rel32, 4);
                     }
+                    ax_xfree(bb_offsets);
+                    ax_xfree(fixups);
 
                     uint64_t func_size = text_sec->bytes_len - func_start;
                     ax_objmodel_add_symbol(&obj, strdup(name_buf), text_sec_id, func_start, func_size, AX_SYM_GLOBAL);
                     if (strcmp(name_buf, "main") == 0) { ax_objmodel_add_symbol(&obj, strdup("ax_main"), text_sec_id, func_start, func_size, AX_SYM_GLOBAL); }
+                    ax_xfree(name_buf);
                 }
             }
         }
@@ -620,12 +672,14 @@ void ax_stage_build_native(AxDriverState *st) {
     }
 
     // Default: write a temporary object file and link it.
-    char obj_path[1024];
-    snprintf(obj_path, sizeof(obj_path), "%s.obj", ax_opt_build_o);
+    size_t obj_path_cap = strlen(ax_opt_build_o) + 5;
+    char *obj_path = ax_xmalloc(obj_path_cap);
+    snprintf(obj_path, obj_path_cap, "%s.obj", ax_opt_build_o);
     
     if (!ax_coff_write(&obj, obj_path)) {
         st->failed = true;
         ax_objmodel_free(&obj);
+        ax_xfree(obj_path);
         return;
     }
     
@@ -644,6 +698,7 @@ void ax_stage_build_native(AxDriverState *st) {
     // We can clean up the object file if it's temporary, but it's optional.
     // For now we'll just leave it or remove it.
     remove(obj_path);
+    ax_xfree(obj_path);
 }
 
 

@@ -8,13 +8,15 @@ model: opus
 gate_model: opus
 depends: []
 priority: 0
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 600
 paths: [bootstrap/axiom0/src/driver/build_native, tests/run/parity/backend/many_branch_fixups.ax, tests/build_native, _workspaces/baseline-failures.txt]
 locks: []
 spec: [spec/SPEC-00-bootstrap.md, spec/SPEC-20-selfhost.md]
 covers: [REQ-BOOT-003, REQ-BLD-028]
+started: 2026-11-19 04:29:54
+finished: 2026-11-19 06:54:58
 ---
 # T166 â€” AX0-FIX-11: branch-fixup capacity in the axiom0 native emitter
 
@@ -76,3 +78,5 @@ limited to the defect; no new feature, no refactor of the emitter.
 
 ## Log
 - 2026-11-19 created by architect (unblock T491: root cause in frozen axiom0; supersedes T491)
+- 2026-11-19 04:29:54 started (attempt 1) T166-impl
+- 2026-11-19 06:54:58 accepted by QA -> done
