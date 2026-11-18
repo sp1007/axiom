@@ -11082,9 +11082,9 @@ pub struct SymEnv {
     pub cap: usize,
 }
 
-// SymbolId.v -> (module path, canonical name). Symbol ids are sparse (user ids from 1, std ids from 10000,
-// extern ids from 30000), so `index` maps an id to `slot + 1` in the append-only `module_paths` /
-// `canonical_names` arrays instead of indexing a dense table by id.
+// SymbolId.v -> (module path, canonical name). Since T164 every symbol (user, std, extern) comes from the single
+// counter `ResolveMap.next_symbol_v`, so ids are dense; `index` still maps an id to `slot + 1` in the append-only
+// `module_paths` / `canonical_names` arrays because only named items get an entry.
 pub struct NamingCtx {
     pub index: NodeMap,
     pub module_paths: *mut StrView,
@@ -11099,7 +11099,11 @@ pub struct ResolveMap {
     pub node_map: NodeMap,
     pub module_access_nodes: NodeMap,
     pub extern_nodes: NodeMap,
+    // T164 (INV-BOOT-005): the single SymbolId counter shared by user, std and extern symbols; after resolution
+    // it is the first free id (HIR lowering hands it to mono).
     pub next_symbol_v: u32,
+    // Unused since T164 (no separate std counter); kept only because test harness templates under tests/
+    // (`*.ax.in`) build `ResolveMap` literals naming it. Nothing reads it.
     pub next_std_symbol_v: u32,
     pub naming_ctx: *mut NamingCtx,
 }
@@ -11405,7 +11409,7 @@ pub fn resolve_map_init(rmap: mut_view<ResolveMap>) {
     nodemap_init(mut_view(rmap.module_access_nodes));
     nodemap_init(mut_view(rmap.extern_nodes));
     rmap.next_symbol_v = 1u32;
-    rmap.next_std_symbol_v = 10000u32;
+    rmap.next_std_symbol_v = 0u32;
     rmap.naming_ctx = 0 as *mut NamingCtx;
 }
 
@@ -12031,7 +12035,6 @@ pub struct ResolverEnv {
     pub alloc_scopes: *mut Scope,
     pub resolved_use_trees: NodeMap,
     pub ast_items: *mut AstItem,
-    pub next_extern_symbol_v: u32,
 }
 
 unsafe fn res_strid_slot(base: *mut StrId, idx: usize) -> *mut StrId {
@@ -12108,17 +12111,14 @@ fn next_symbol_id(
     sink: mut_view<DiagSink>,
     interner: mut_view<StrInterner>,
     rmap: mut_view<ResolveMap>, node: usize) -> SymbolId {
-    let mut v: u32 = 0u32;
-    if is_std_mod(env.current_module) {
-        if (unsafe { (*rmap).next_std_symbol_v }) == 0u32 {
-            unsafe { (*rmap).next_std_symbol_v = 10000u32; }
-        }
-        v = unsafe { (*rmap).next_std_symbol_v };
-        unsafe { (*rmap).next_std_symbol_v = v + 1u32; }
-    } else {
-        v = unsafe { (*rmap).next_symbol_v };
-        unsafe { (*rmap).next_symbol_v = v + 1u32; }
+    // T164 (AX0-FIX-10, ADR-0043 §2, INV-BOOT-005): user, std, extern and the synthetic prelude traits all draw
+    // from the one per-compilation counter, in allocation order (deterministic, lockstep with axiom0
+    // `new_symbol`). No code derives a property (std, extern) from the numeric value of an id.
+    if (unsafe { (*rmap).next_symbol_v }) == 0u32 {
+        unsafe { (*rmap).next_symbol_v = 1u32; }
     }
+    let v = unsafe { (*rmap).next_symbol_v };
+    unsafe { (*rmap).next_symbol_v = v + 1u32; }
     let id = SymbolId { v: v };
     id
 }
@@ -12129,13 +12129,8 @@ fn next_extern_symbol_id(
     sink: mut_view<DiagSink>,
     interner: mut_view<StrInterner>,
     rmap: mut_view<ResolveMap>, node: usize) -> SymbolId {
-    if env.next_extern_symbol_v == 0u32 {
-        env.next_extern_symbol_v = 30000u32;
-    }
-    let v = env.next_extern_symbol_v;
-    env.next_extern_symbol_v = v + 1u32;
-    let id = SymbolId { v: v };
-    id
+    // T164: extern symbols share the single counter (axiom0 `new_symbol_extern`).
+    next_symbol_id(mut_view(*env), mut_view(*arena), mut_view(*sink), mut_view(*interner), mut_view(*rmap), node)
 }
 
 fn make_symbol_into(
@@ -14001,11 +13996,36 @@ fn populate_prelude(
             node: 0,
             def_module: 0,
         };
-        s.id.v = 10100u32 + (f as u32);
+        // T164: synthetic prelude traits take ids from the single counter (formerly the fixed 10100 + f); the id is
+        // assigned by `assign_prelude_trait_ids` just before the body pass (axiom0 `ax_resolve` in lockstep).
+        s.id.v = 0u32;
         s.name.v = id.v;
         s.kind = SYM_TRAIT;
         s.vis = VIS_PUB;
         unsafe { symenv_insert(mut_view((*prelude).bindings), id.v, view(s)); }
+        f = f + 1;
+    }
+}
+
+// T164: ids of the synthetic prelude traits (`Fn`, `FnMut`, `FnOnce`, `Callable`), from the single counter, before
+// any body refers to them, so the collection-pass ids of every item stay unchanged. A binding replaced by a prelude
+// export of the same name keeps that export.
+fn assign_prelude_trait_ids(
+    env: mut_view<ResolverEnv>,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>,
+    interner: mut_view<StrInterner>,
+    rmap: mut_view<ResolveMap>, prelude: *mut Scope) {
+    let mut f: usize = 0;
+    while f < 4 {
+        let sv = res_str_in_arena(unsafe { mut_view(*arena) }, 178 + f);
+        let id = unsafe { interner_intern_bytes(mut_view(*interner), sv.ptr, sv.len) };
+        let s = unsafe { symenv_get(view((*prelude).bindings), id.v) };
+        if (s as usize) != 0 && (unsafe { (*s).id.v }) == 0u32 && (unsafe { (*s).node }) == 0 {
+            let nid = next_symbol_id(mut_view(*env), mut_view(*arena), mut_view(*sink), mut_view(*interner),
+                mut_view(*rmap), 0);
+            unsafe { (*s).id.v = nid.v; }
+        }
         f = f + 1;
     }
 }
@@ -14064,7 +14084,6 @@ pub fn resolve_file_into(
         resolved_use_trees: NodeMap { keys: 0 as *mut usize, vals: 0 as *mut SymbolId, states: 0 as *mut u8,
             len: 0, cap: 0 },
         ast_items: ast.items,
-        next_extern_symbol_v: 30000u32,
     };
     nodemap_init(mut_view(env.resolved_use_trees));
 
@@ -14178,6 +14197,9 @@ pub fn resolve_file_into(
         }
     }
 
+    assign_prelude_trait_ids(mut_view(env), mut_view(*arena), mut_view(*sink), mut_view(*interner), mut_view(*rmap),
+        prelude);
+
     env.current_module = env.root_module;
     it = ast.items;
     while (it as usize) != 0 {
@@ -14210,7 +14232,7 @@ pub fn resolve_file(
         },
         extern_nodes: NodeMap { keys: 0 as *mut usize, vals: 0 as *mut SymbolId, states: 0 as *mut u8, len: 0, cap: 0 },
         next_symbol_v: 1u32,
-        next_std_symbol_v: 10000u32,
+        next_std_symbol_v: 0u32,
         naming_ctx: 0 as *mut NamingCtx,
     };
     resolve_file_into(ast, arena, sink, interner, mut_view(rmap));
@@ -15080,7 +15102,7 @@ const CORPUS_DATA: [2738]u8 = [
     32u8, 34u8, 109u8, 97u8, 105u8, 110u8, 34u8, 10u8, 32u8, 32u8, 40u8, 66u8, 108u8, 111u8, 99u8, 107u8,
     10u8, 32u8, 32u8, 32u8, 32u8, 40u8, 83u8, 116u8, 109u8, 116u8, 76u8, 101u8, 116u8, 10u8, 32u8, 32u8,
     32u8, 32u8, 32u8, 32u8, 40u8, 80u8, 97u8, 116u8, 66u8, 105u8, 110u8, 100u8, 105u8, 110u8, 103u8, 32u8,
-    64u8, 83u8, 121u8, 109u8, 40u8, 50u8, 57u8, 41u8, 32u8, 102u8, 97u8, 108u8, 115u8, 101u8, 32u8, 34u8,
+    64u8, 83u8, 121u8, 109u8, 40u8, 51u8, 51u8, 41u8, 32u8, 102u8, 97u8, 108u8, 115u8, 101u8, 32u8, 34u8,
     120u8, 34u8, 41u8, 10u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 40u8, 69u8, 120u8, 112u8, 114u8, 80u8,
     111u8, 115u8, 116u8, 102u8, 105u8, 120u8, 10u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 40u8,
     69u8, 120u8, 112u8, 114u8, 80u8, 97u8, 116u8, 104u8, 10u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8,
@@ -15132,19 +15154,19 @@ const CORPUS_DATA: [2738]u8 = [
     86u8, 105u8, 115u8, 32u8, 112u8, 114u8, 105u8, 118u8, 41u8, 32u8, 102u8, 97u8, 108u8, 115u8, 101u8, 32u8,
     102u8, 97u8, 108u8, 115u8, 101u8, 32u8, 102u8, 97u8, 108u8, 115u8, 101u8, 32u8, 34u8, 34u8, 32u8, 34u8,
     109u8, 97u8, 105u8, 110u8, 34u8, 10u8, 32u8, 32u8, 40u8, 80u8, 97u8, 114u8, 97u8, 109u8, 32u8, 64u8,
-    83u8, 121u8, 109u8, 40u8, 50u8, 56u8, 41u8, 32u8, 102u8, 97u8, 108u8, 115u8, 101u8, 32u8, 34u8, 109u8,
+    83u8, 121u8, 109u8, 40u8, 51u8, 50u8, 41u8, 32u8, 102u8, 97u8, 108u8, 115u8, 101u8, 32u8, 34u8, 109u8,
     34u8, 10u8, 32u8, 32u8, 32u8, 32u8, 40u8, 84u8, 121u8, 112u8, 101u8, 80u8, 97u8, 116u8, 104u8, 10u8,
     32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 40u8, 80u8, 97u8, 116u8, 104u8, 83u8, 101u8, 103u8, 109u8, 101u8,
     110u8, 116u8, 32u8, 64u8, 83u8, 121u8, 109u8, 40u8, 50u8, 41u8, 32u8, 34u8, 105u8, 51u8, 50u8, 34u8,
     41u8, 41u8, 41u8, 10u8, 32u8, 32u8, 40u8, 66u8, 108u8, 111u8, 99u8, 107u8, 10u8, 32u8, 32u8, 32u8,
     32u8, 40u8, 83u8, 116u8, 109u8, 116u8, 76u8, 101u8, 116u8, 10u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8,
     40u8, 80u8, 97u8, 116u8, 66u8, 105u8, 110u8, 100u8, 105u8, 110u8, 103u8, 32u8, 64u8, 83u8, 121u8, 109u8,
-    40u8, 50u8, 57u8, 41u8, 32u8, 102u8, 97u8, 108u8, 115u8, 101u8, 32u8, 34u8, 121u8, 34u8, 41u8, 10u8,
+    40u8, 51u8, 51u8, 41u8, 32u8, 102u8, 97u8, 108u8, 115u8, 101u8, 32u8, 34u8, 121u8, 34u8, 41u8, 10u8,
     32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 40u8, 69u8, 120u8, 112u8, 114u8, 80u8, 111u8, 115u8, 116u8, 102u8,
     105u8, 120u8, 10u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 40u8, 69u8, 120u8, 112u8, 114u8,
     80u8, 97u8, 116u8, 104u8, 10u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 40u8,
     80u8, 97u8, 116u8, 104u8, 83u8, 101u8, 103u8, 109u8, 101u8, 110u8, 116u8, 32u8, 64u8, 83u8, 121u8, 109u8,
-    40u8, 50u8, 56u8, 41u8, 32u8, 34u8, 109u8, 34u8, 41u8, 41u8, 10u8, 32u8, 32u8, 32u8, 32u8, 32u8,
+    40u8, 51u8, 50u8, 41u8, 32u8, 34u8, 109u8, 34u8, 41u8, 41u8, 10u8, 32u8, 32u8, 32u8, 32u8, 32u8,
     32u8, 32u8, 32u8, 40u8, 80u8, 111u8, 115u8, 116u8, 102u8, 105u8, 120u8, 83u8, 101u8, 103u8, 32u8, 48u8,
     32u8, 34u8, 98u8, 97u8, 114u8, 34u8, 41u8, 41u8, 41u8, 41u8, 41u8, 10u8, 119u8, 97u8, 114u8, 110u8,
     105u8, 110u8, 103u8, 91u8, 65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 83u8, 72u8, 65u8, 68u8,
@@ -15172,7 +15194,7 @@ const CORPUS_DATA: [2738]u8 = [
     102u8, 97u8, 108u8, 115u8, 101u8, 32u8, 34u8, 34u8, 32u8, 34u8, 109u8, 97u8, 105u8, 110u8, 34u8, 10u8,
     32u8, 32u8, 40u8, 66u8, 108u8, 111u8, 99u8, 107u8, 10u8, 32u8, 32u8, 32u8, 32u8, 40u8, 83u8, 116u8,
     109u8, 116u8, 76u8, 101u8, 116u8, 10u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 40u8, 80u8, 97u8, 116u8,
-    66u8, 105u8, 110u8, 100u8, 105u8, 110u8, 103u8, 32u8, 64u8, 83u8, 121u8, 109u8, 40u8, 50u8, 54u8, 41u8,
+    66u8, 105u8, 110u8, 100u8, 105u8, 110u8, 103u8, 32u8, 64u8, 83u8, 121u8, 109u8, 40u8, 51u8, 48u8, 41u8,
     32u8, 102u8, 97u8, 108u8, 115u8, 101u8, 32u8, 34u8, 105u8, 51u8, 50u8, 34u8, 41u8, 10u8, 32u8, 32u8,
     32u8, 32u8, 32u8, 32u8, 40u8, 69u8, 120u8, 112u8, 114u8, 76u8, 105u8, 116u8, 101u8, 114u8, 97u8, 108u8,
     41u8, 41u8, 41u8, 41u8, 10u8, 119u8, 97u8, 114u8, 110u8, 105u8, 110u8, 103u8, 91u8, 65u8, 88u8, 95u8,
@@ -15202,20 +15224,19 @@ const CORPUS_DATA: [2738]u8 = [
     34u8, 109u8, 97u8, 105u8, 110u8, 34u8, 10u8, 32u8, 32u8, 40u8, 66u8, 108u8, 111u8, 99u8, 107u8, 10u8,
     32u8, 32u8, 32u8, 32u8, 40u8, 83u8, 116u8, 109u8, 116u8, 76u8, 101u8, 116u8, 10u8, 32u8, 32u8, 32u8,
     32u8, 32u8, 32u8, 40u8, 80u8, 97u8, 116u8, 66u8, 105u8, 110u8, 100u8, 105u8, 110u8, 103u8, 32u8, 64u8,
-    83u8, 121u8, 109u8, 40u8, 50u8, 54u8, 41u8, 32u8, 102u8, 97u8, 108u8, 115u8, 101u8, 32u8, 34u8, 97u8,
+    83u8, 121u8, 109u8, 40u8, 51u8, 48u8, 41u8, 32u8, 102u8, 97u8, 108u8, 115u8, 101u8, 32u8, 34u8, 97u8,
     34u8, 41u8, 10u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 40u8, 69u8, 120u8, 112u8, 114u8, 76u8, 105u8,
     116u8, 101u8, 114u8, 97u8, 108u8, 41u8, 41u8, 10u8, 32u8, 32u8, 32u8, 32u8, 40u8, 83u8, 116u8, 109u8,
     116u8, 76u8, 101u8, 116u8, 10u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 40u8, 80u8, 97u8, 116u8, 66u8,
-    105u8, 110u8, 100u8, 105u8, 110u8, 103u8, 32u8, 64u8, 83u8, 121u8, 109u8, 40u8, 50u8, 55u8, 41u8, 32u8,
+    105u8, 110u8, 100u8, 105u8, 110u8, 103u8, 32u8, 64u8, 83u8, 121u8, 109u8, 40u8, 51u8, 49u8, 41u8, 32u8,
     102u8, 97u8, 108u8, 115u8, 101u8, 32u8, 34u8, 97u8, 34u8, 41u8, 10u8, 32u8, 32u8, 32u8, 32u8, 32u8,
     32u8, 40u8, 69u8, 120u8, 112u8, 114u8, 76u8, 105u8, 116u8, 101u8, 114u8, 97u8, 108u8, 41u8, 41u8, 41u8,
     41u8, 10u8,
 ];
 
 const CORPUS_OFF: [27]u32 = [
-    0u32, 20u32, 90u32, 110u32, 183u32, 204u32, 339u32, 373u32, 455u32, 815u32, 815u32, 853u32,
-    906u32, 1085u32, 1273u32, 1316u32, 1381u32, 1740u32, 1966u32, 2006u32, 2053u32, 2197u32, 2421u32, 2461u32,
-    2524u32, 2738u32, 2738u32,
+    0u32, 20u32, 90u32, 110u32, 183u32, 204u32, 339u32, 373u32, 455u32, 815u32, 815u32, 853u32, 906u32, 1085u32, 1273u32, 1316u32,
+    1381u32, 1740u32, 1966u32, 2006u32, 2053u32, 2197u32, 2421u32, 2461u32, 2524u32, 2738u32, 2738u32,
 ];
 
 fn get_sv(a: mut_view<Arena>, c_data: view<[2738]u8>, c_off: view<[27]u32>, blob_idx: usize) -> StrView {

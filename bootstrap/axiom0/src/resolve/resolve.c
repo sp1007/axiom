@@ -14,7 +14,6 @@ void ax_resolve_map_init(AxResolveMap *map) {
     AxNodeMap_init(&map->module_access_nodes);
     AxNodeMap_init(&map->extern_nodes);
     map->next_symbol_v = 1;
-    map->next_std_symbol_v = 10000;
     map->module_naming_ctx = NULL;
 }
 
@@ -104,7 +103,6 @@ typedef struct Env {
     NamingCtx *naming;
     AxNodeMap resolved_use_trees;
     const AxAst *ast;
-    uint32_t next_extern_symbol_v;
 } Env;
 
 static Scope *push_scope(Env *env, Scope *parent) {
@@ -115,12 +113,15 @@ static Scope *push_scope(Env *env, Scope *parent) {
     return s;
 }
 
+/* T164 (AX0-FIX-10, ADR-0043 §2, INV-BOOT-005): every symbol -- user, std, extern and the synthetic prelude
+ * traits -- draws from the one per-compilation counter `next_symbol_v`, in allocation order (deterministic).
+ * No code may derive a property (std, extern) from the numeric value of an id; std-ness is the defining
+ * module's `is_std` / the module path recorded in the naming table. */
 static AxSymbolId new_symbol(Env *env, const void *node) {
-    bool is_std = (env->current_module && env->current_module->is_std);
-    if (!env->rmap->next_std_symbol_v) {
-        env->rmap->next_std_symbol_v = 10000;
+    if (!env->rmap->next_symbol_v) {
+        env->rmap->next_symbol_v = 1;
     }
-    uint32_t val = is_std ? env->rmap->next_std_symbol_v++ : env->rmap->next_symbol_v++;
+    uint32_t val = env->rmap->next_symbol_v++;
     AxSymbolId id = { val };
     if (id.v >= env->symbol_nodes_cap) {
         size_t new_cap = env->symbol_nodes_cap == 0 ? 64 : env->symbol_nodes_cap * 2;
@@ -152,40 +153,9 @@ static AxSymbolId new_symbol(Env *env, const void *node) {
     return id;
 }
 
+/* Extern symbols share the single counter (T164); kept as a named entry point for the extern-block pass. */
 static AxSymbolId new_symbol_extern(Env *env, const void *node) {
-    if (!env->next_extern_symbol_v) {
-        env->next_extern_symbol_v = 30000;
-    }
-    uint32_t val = env->next_extern_symbol_v++;
-    AxSymbolId id = { val };
-    if (id.v >= env->symbol_nodes_cap) {
-        size_t new_cap = env->symbol_nodes_cap == 0 ? 64 : env->symbol_nodes_cap * 2;
-        while (new_cap <= id.v) new_cap *= 2;
-        const void **new_nodes = ax_arena_alloc(env->arena, sizeof(void*) * new_cap, 8);
-        if (env->symbol_nodes) {
-            memcpy(new_nodes, env->symbol_nodes, sizeof(void*) * env->symbol_nodes_cap);
-        }
-        env->symbol_nodes = new_nodes;
-        env->symbol_nodes_cap = new_cap;
-    }
-    env->symbol_nodes[id.v] = node;
-
-    /* Expand naming metadata table */
-    if (env->naming) {
-        if (id.v >= env->naming->cap) {
-            size_t new_cap = env->naming->cap == 0 ? 64 : env->naming->cap * 2;
-            while (new_cap <= id.v) new_cap *= 2;
-            env->naming->module_paths = realloc(env->naming->module_paths, new_cap * sizeof(char *));
-            env->naming->canonical_names = realloc(env->naming->canonical_names, new_cap * sizeof(char *));
-            for (size_t i = env->naming->cap; i < new_cap; i++) {
-                env->naming->module_paths[i] = NULL;
-                env->naming->canonical_names[i] = NULL;
-            }
-            env->naming->cap = new_cap;
-        }
-    }
-
-    return id;
+    return new_symbol(env, node);
 }
 
 static void bind_node(Env *env, const void *node, AxSymbolId sym) {
@@ -1232,7 +1202,10 @@ AxResolveMap ax_resolve(AxAst *ast, AxArena *arena, AxDiagSink *sink, StrInterne
     const char *fn_traits[] = { "Fn", "FnMut", "FnOnce", "Callable" };
     for (size_t i = 0; i < sizeof(fn_traits)/sizeof(fn_traits[0]); i++) {
         StrId id = ax_intern_cstr(interner, fn_traits[i]);
-        Symbol s = { (AxSymbolId){ 10100 + (uint32_t)i }, NULL, SYM_ITEM, AX_VIS_PUB, NULL };
+        /* T164: synthetic prelude traits take ids from the single counter too (formerly the fixed 10100+i,
+         * which a program with more than 10100 symbols reused). The id is assigned just before the body pass
+         * (below), so the collection-pass ids of every item stay what they were (no golden churn for item ids). */
+        Symbol s = { (AxSymbolId){ 0 }, NULL, SYM_ITEM, AX_VIS_PUB, NULL };
         SymEnv_insert(&prelude->bindings, id.v, s);
     }
 
@@ -1351,6 +1324,16 @@ AxResolveMap ax_resolve(AxAst *ast, AxArena *arena, AxDiagSink *sink, StrInterne
                 }
             }
             break;
+        }
+    }
+
+    /* T164: ids of the synthetic prelude traits, from the single counter, before any body refers to them. A
+     * binding replaced by a std.core.prelude export of the same name keeps that export. */
+    for (size_t i = 0; i < sizeof(fn_traits)/sizeof(fn_traits[0]); i++) {
+        StrId id = ax_intern_cstr(interner, fn_traits[i]);
+        Symbol *s = SymEnv_get(&prelude->bindings, id.v);
+        if (s && s->id.v == 0 && s->node == NULL) {
+            s->id = new_symbol(&env, NULL);
         }
     }
 

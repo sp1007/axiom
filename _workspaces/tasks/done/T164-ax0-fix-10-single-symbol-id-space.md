@@ -8,13 +8,15 @@ model: opus
 gate_model: opus
 depends: []
 priority: 0
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 600
-paths: [bootstrap/axiom0/src/resolve, compiler/resolve, tests/run/symbol_id_space, tests/resolve]
-locks: [bootstrap/axiom0/src/driver/mono.c, compiler/traits/solver.ax, compiler/driver/pipeline.ax, compiler/hir/lower.ax]
+paths: [bootstrap/axiom0/src/resolve, compiler/resolve, compiler/hir/hir.ax, compiler/hir/lower.ax, compiler/driver/pipeline.ax, compiler/traits/solver.ax, tests/run/symbol_id_space, tests/resolve, tests/hir/basic.hir, tests/hir/control.hir, tests/hir/exprs.hir, tests/hir/more.hir, tests/typeck/basic.thir, tests/typeck/generic/generic_subst.thir, tests/typeck/async/async_basic_pos.thir, tests/selfhost/hir/qa_hir_corpus.ax.in, tests/selfhost/resolve/qa_resolve_corpus_neg_a.ax.in, tests/selfhost/resolve/qa_resolve_corpus_neg_b.ax.in, tests/selfhost/resolve/qa_resolve_corpus_neg_c.ax.in, tests/selfhost/resolve/qa_resolve_corpus_pos.ax.in, tests/selfhost/resolve_hir/qa_resolve_hir_corpus_neg_a.ax.in, tests/selfhost/resolve_hir/qa_resolve_hir_corpus_neg_b.ax.in, tests/selfhost/resolve_hir/qa_resolve_hir_corpus_neg_c.ax.in, tests/selfhost/resolve_hir/qa_resolve_hir_corpus_neg_d.ax.in, tests/selfhost/resolve_hir/qa_resolve_hir_corpus_pos_a.ax.in, tests/selfhost/resolve_hir/qa_resolve_hir_corpus_pos_b.ax.in, tests/selfhost/resolve_hir/qa_resolve_hir_corpus_pos_c.ax.in, tests/selfhost/resolve_hir/qa_resolve_hir_corpus_wide_a.ax.in, tests/selfhost/resolve_hir/qa_resolve_hir_corpus_wide_b.ax.in, tests/selfhost/resolve_hir/qa_resolve_hir_multifile_modules_b.ax.in, tests/selfhost/typeck/qa_typeck_a.ax.in]
+locks: [bootstrap/axiom0/src/driver/mono.c]
 spec: [spec/decisions/ADR-0043-cyclic-type-graphs-and-symbol-id-space.md, spec/decisions/ADR-0034-oracle-independence.md, spec/decisions/ADR-0035-axiomc-parity-symbols.md, spec/SPEC-20-selfhost.md]
 covers: [REQ-RES-060]
+started: 2026-11-18 13:46:59
+finished: 2026-11-19 03:35:43
 ---
 # T164 — AX0-FIX-10: one symbol-id space
 
@@ -70,3 +72,9 @@ headroom before `compiler.obj.writer` in bundle order). This is a bootstrap time
 
 ## Log
 - 2026-11-17 created by axiom-architect (unblock of T444, B2; ADR-0043 §2)
+- 2026-11-18 12:26:45 started (attempt 1) T164-impl
+- 2026-11-18 13:46:44 requeue: restart: impl agent unreachable, no work on disk (not charged: attempt refunded)
+- 2026-11-18 13:46:59 started (attempt 1) T164-impl
+- 2026-11-18 18:40 rescoped by orchestrator: impl reported BLOCKED only for paths (7 HIR/THIR goldens + 16 selfhost harness templates print/bake symbol ids that shift by ids only); paths extended, solver.ax/pipeline.ax moved from locks to paths; not charged
+- 2026-11-18 23:00 gate round 0 FAIL (solver std/user trait guess: F1 full std path bound, F2 user trait via module path vs prelude name, F3 re-export); orchestrator adds compiler/hir/hir.ax + lower.ax to paths for the QA-recommended HirPath domain field (no HirPath struct literals exist elsewhere)
+- 2026-11-19 03:35:43 accepted by QA -> done

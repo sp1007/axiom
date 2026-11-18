@@ -11086,9 +11086,9 @@ pub struct SymEnv {
     pub cap: usize,
 }
 
-// SymbolId.v -> (module path, canonical name). Symbol ids are sparse (user ids from 1, std ids from 10000,
-// extern ids from 30000), so `index` maps an id to `slot + 1` in the append-only `module_paths` /
-// `canonical_names` arrays instead of indexing a dense table by id.
+// SymbolId.v -> (module path, canonical name). Since T164 every symbol (user, std, extern) comes from the single
+// counter `ResolveMap.next_symbol_v`, so ids are dense; `index` still maps an id to `slot + 1` in the append-only
+// `module_paths` / `canonical_names` arrays because only named items get an entry.
 pub struct NamingCtx {
     pub index: NodeMap,
     pub module_paths: *mut StrView,
@@ -11103,7 +11103,11 @@ pub struct ResolveMap {
     pub node_map: NodeMap,
     pub module_access_nodes: NodeMap,
     pub extern_nodes: NodeMap,
+    // T164 (INV-BOOT-005): the single SymbolId counter shared by user, std and extern symbols; after resolution
+    // it is the first free id (HIR lowering hands it to mono).
     pub next_symbol_v: u32,
+    // Unused since T164 (no separate std counter); kept only because test harness templates under tests/
+    // (`*.ax.in`) build `ResolveMap` literals naming it. Nothing reads it.
     pub next_std_symbol_v: u32,
     pub naming_ctx: *mut NamingCtx,
 }
@@ -11409,7 +11413,7 @@ pub fn resolve_map_init(rmap: mut_view<ResolveMap>) {
     nodemap_init(mut_view(rmap.module_access_nodes));
     nodemap_init(mut_view(rmap.extern_nodes));
     rmap.next_symbol_v = 1u32;
-    rmap.next_std_symbol_v = 10000u32;
+    rmap.next_std_symbol_v = 0u32;
     rmap.naming_ctx = 0 as *mut NamingCtx;
 }
 
@@ -12035,7 +12039,6 @@ pub struct ResolverEnv {
     pub alloc_scopes: *mut Scope,
     pub resolved_use_trees: NodeMap,
     pub ast_items: *mut AstItem,
-    pub next_extern_symbol_v: u32,
 }
 
 unsafe fn res_strid_slot(base: *mut StrId, idx: usize) -> *mut StrId {
@@ -12112,17 +12115,14 @@ fn next_symbol_id(
     sink: mut_view<DiagSink>,
     interner: mut_view<StrInterner>,
     rmap: mut_view<ResolveMap>, node: usize) -> SymbolId {
-    let mut v: u32 = 0u32;
-    if is_std_mod(env.current_module) {
-        if (unsafe { (*rmap).next_std_symbol_v }) == 0u32 {
-            unsafe { (*rmap).next_std_symbol_v = 10000u32; }
-        }
-        v = unsafe { (*rmap).next_std_symbol_v };
-        unsafe { (*rmap).next_std_symbol_v = v + 1u32; }
-    } else {
-        v = unsafe { (*rmap).next_symbol_v };
-        unsafe { (*rmap).next_symbol_v = v + 1u32; }
+    // T164 (AX0-FIX-10, ADR-0043 §2, INV-BOOT-005): user, std, extern and the synthetic prelude traits all draw
+    // from the one per-compilation counter, in allocation order (deterministic, lockstep with axiom0
+    // `new_symbol`). No code derives a property (std, extern) from the numeric value of an id.
+    if (unsafe { (*rmap).next_symbol_v }) == 0u32 {
+        unsafe { (*rmap).next_symbol_v = 1u32; }
     }
+    let v = unsafe { (*rmap).next_symbol_v };
+    unsafe { (*rmap).next_symbol_v = v + 1u32; }
     let id = SymbolId { v: v };
     id
 }
@@ -12133,13 +12133,8 @@ fn next_extern_symbol_id(
     sink: mut_view<DiagSink>,
     interner: mut_view<StrInterner>,
     rmap: mut_view<ResolveMap>, node: usize) -> SymbolId {
-    if env.next_extern_symbol_v == 0u32 {
-        env.next_extern_symbol_v = 30000u32;
-    }
-    let v = env.next_extern_symbol_v;
-    env.next_extern_symbol_v = v + 1u32;
-    let id = SymbolId { v: v };
-    id
+    // T164: extern symbols share the single counter (axiom0 `new_symbol_extern`).
+    next_symbol_id(mut_view(*env), mut_view(*arena), mut_view(*sink), mut_view(*interner), mut_view(*rmap), node)
 }
 
 fn make_symbol_into(
@@ -14005,11 +14000,36 @@ fn populate_prelude(
             node: 0,
             def_module: 0,
         };
-        s.id.v = 10100u32 + (f as u32);
+        // T164: synthetic prelude traits take ids from the single counter (formerly the fixed 10100 + f); the id is
+        // assigned by `assign_prelude_trait_ids` just before the body pass (axiom0 `ax_resolve` in lockstep).
+        s.id.v = 0u32;
         s.name.v = id.v;
         s.kind = SYM_TRAIT;
         s.vis = VIS_PUB;
         unsafe { symenv_insert(mut_view((*prelude).bindings), id.v, view(s)); }
+        f = f + 1;
+    }
+}
+
+// T164: ids of the synthetic prelude traits (`Fn`, `FnMut`, `FnOnce`, `Callable`), from the single counter, before
+// any body refers to them, so the collection-pass ids of every item stay unchanged. A binding replaced by a prelude
+// export of the same name keeps that export.
+fn assign_prelude_trait_ids(
+    env: mut_view<ResolverEnv>,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>,
+    interner: mut_view<StrInterner>,
+    rmap: mut_view<ResolveMap>, prelude: *mut Scope) {
+    let mut f: usize = 0;
+    while f < 4 {
+        let sv = res_str_in_arena(unsafe { mut_view(*arena) }, 178 + f);
+        let id = unsafe { interner_intern_bytes(mut_view(*interner), sv.ptr, sv.len) };
+        let s = unsafe { symenv_get(view((*prelude).bindings), id.v) };
+        if (s as usize) != 0 && (unsafe { (*s).id.v }) == 0u32 && (unsafe { (*s).node }) == 0 {
+            let nid = next_symbol_id(mut_view(*env), mut_view(*arena), mut_view(*sink), mut_view(*interner),
+                mut_view(*rmap), 0);
+            unsafe { (*s).id.v = nid.v; }
+        }
         f = f + 1;
     }
 }
@@ -14068,7 +14088,6 @@ pub fn resolve_file_into(
         resolved_use_trees: NodeMap { keys: 0 as *mut usize, vals: 0 as *mut SymbolId, states: 0 as *mut u8,
             len: 0, cap: 0 },
         ast_items: ast.items,
-        next_extern_symbol_v: 30000u32,
     };
     nodemap_init(mut_view(env.resolved_use_trees));
 
@@ -14182,6 +14201,9 @@ pub fn resolve_file_into(
         }
     }
 
+    assign_prelude_trait_ids(mut_view(env), mut_view(*arena), mut_view(*sink), mut_view(*interner), mut_view(*rmap),
+        prelude);
+
     env.current_module = env.root_module;
     it = ast.items;
     while (it as usize) != 0 {
@@ -14214,7 +14236,7 @@ pub fn resolve_file(
         },
         extern_nodes: NodeMap { keys: 0 as *mut usize, vals: 0 as *mut SymbolId, states: 0 as *mut u8, len: 0, cap: 0 },
         next_symbol_v: 1u32,
-        next_std_symbol_v: 10000u32,
+        next_std_symbol_v: 0u32,
         naming_ctx: 0 as *mut NamingCtx,
     };
     resolve_file_into(ast, arena, sink, interner, mut_view(rmap));
@@ -15165,6 +15187,12 @@ pub struct HirPath {
     pub symbol: SymbolId,
     pub name: StrId,
     pub generic_args: *mut HirGenericArgs,
+    // T164 (ADR-0043 §2, INV-BOOT-005): domain of the item `symbol` names, from the resolver's naming table (never
+    // from the id's numeric value). `def_dom`: 0 = unknown (no naming entry: locals, resolver primitives such as
+    // `Copy`, synthetic HIR), 1 = user item, 2 = std item. `def_mod`: the defining module path ("std.core.cmp",
+    // "m", "" for the root module), copied into the HIR arena; set when `def_dom != 0` and known.
+    pub def_dom: u8,
+    pub def_mod: StrView,
 }
 
 pub struct HirVis {
@@ -16418,6 +16446,8 @@ use compiler.syntax.ast.TYPE_VIEW
 use compiler.resolve.symtab.ResolveMap
 use compiler.resolve.symtab.nodemap_contains
 use compiler.resolve.symtab.nodemap_get
+use compiler.resolve.symtab.resolve_symbol_module_path
+use compiler.resolve.symtab.resolve_symbol_canonical_name
 use compiler.hir.hir.HIR_EXPR_ARRAY
 use compiler.hir.hir.HIR_EXPR_AWAIT
 use compiler.hir.hir.HIR_EXPR_BINARY
@@ -16612,6 +16642,36 @@ fn get_symbol(ctx: view<LowerCtx>, rmap: view<ResolveMap>, node: usize) -> Symbo
     SymbolId { v: 0u32 }
 }
 
+// T164 (ADR-0043 §2, INV-BOOT-005): record the domain of the item a path names from the resolver's naming table
+// (module path per symbol; a trait reference carries the trait's collection id, which the table names exactly, also
+// through re-exports). Symbols without an entry (locals, generic parameters, resolver primitives) stay unknown.
+fn lower_path_domain(arena: mut_view<Arena>, rmap: view<ResolveMap>, dst: mut_view<HirPath>, sym: SymbolId) {
+    dst.def_dom = 0u8;
+    dst.def_mod = StrView { ptr: 0 as *const u8, len: 0 };
+    if sym.v == 0u32 {
+        return;
+    }
+    let canon = resolve_symbol_canonical_name(rmap, SymbolId { v: sym.v });
+    if canon.len == 0 || (canon.ptr as usize) == 0 {
+        return;
+    }
+    let mp = resolve_symbol_module_path(rmap, SymbolId { v: sym.v });
+    let n = mp.len;
+    let mut is_std = false;
+    if n > 0 && (mp.ptr as usize) != 0 {
+        is_std = unsafe { *(mp.ptr + 0) == 115u8 && *(mp.ptr + 1) == 116u8 && *(mp.ptr + 2) == 100u8 } &&
+            (n == 3 || unsafe { *(mp.ptr + 3) == 46u8 });
+        let buf = arena_alloc_raw(arena, n, 1);
+        let mut i: usize = 0;
+        while i < n {
+            unsafe { *(buf + i) = *(mp.ptr + i); }
+            i = i + 1;
+        }
+        dst.def_mod = StrView { ptr: buf as *const u8, len: n };
+    }
+    dst.def_dom = if is_std { 2u8 } else { 1u8 };
+}
+
 fn lower_path_into(ctx: mut_view<LowerCtx>, arena: mut_view<Arena>, rmap: view<ResolveMap>, sink: mut_view<DiagSink>, dst: mut_view<HirPath>, seg: *mut AstTypePathSegment) {
     if (seg as usize) == 0 {
         hir_set_span(mut_view(dst.span), Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 });
@@ -16629,6 +16689,7 @@ fn lower_path_into(ctx: mut_view<LowerCtx>, arena: mut_view<Arena>, rmap: view<R
     let sym = get_symbol(view(*ctx), view(*rmap), last as usize);
     dst.symbol.v = sym.v;
     dst.name.v = unsafe { (*last).name.v };
+    lower_path_domain(mut_view(*arena), view(*rmap), mut_view(*dst), SymbolId { v: sym.v });
     if sym.v == 0u32 && (unsafe { (*seg).next as usize }) == 0 && (ctx.interner as usize) != 0 {
         let sv = interner_get(unsafe { view(*ctx.interner) }, unsafe { (*seg).name });
         let is_i128 = sv_eq_cstr4(sv, 105u8, 49u8, 50u8, 56u8);
@@ -16642,6 +16703,8 @@ fn lower_path_into(ctx: mut_view<LowerCtx>, arena: mut_view<Arena>, rmap: view<R
             suppress_unresolved_at_span(mut_view(*sink), unsafe { (*seg).span });
         } else if is_future {
             dst.symbol.v = 10009u32;
+            // T164: the placeholder stands for the std prelude `Future` (it was a std-range id before T164).
+            dst.def_dom = 2u8;
             suppress_unresolved_at_span(mut_view(*sink), unsafe { (*seg).span });
         }
     }
@@ -23812,22 +23875,87 @@ pub fn traits_check_overlap(hir: view<HirFile>, sink: mut_view<DiagSink>) {
     }
 }
 
-fn sym_is_std_item(v: u32) -> bool {
-    v >= 10000u32 && v < 30000u32
+// T164 (ADR-0043 §2, INV-BOOT-005): std-ness is a stored per-symbol property — the defining module path that HIR
+// lowering records on every item (`HirItem.module_path`, first segment `std`), never the numeric value of the
+// SymbolId (user, std and extern ids share one counter).
+fn hir_item_is_std(it: *const HirItem, str_in: view<StrInterner>) -> bool {
+    if (it as usize) == 0 {
+        return false;
+    }
+    let count = unsafe { (*it).module_path.count };
+    let segs = unsafe { (*it).module_path.segments };
+    if count == 0 || (segs as usize) == 0 {
+        return false;
+    }
+    let s0 = unsafe { (*segs).v };
+    if s0 == 0u32 {
+        return false;
+    }
+    let sv = interner_get(str_in, StrId { v: s0 });
+    sv.len == 3 && unsafe { *(sv.ptr + 0) == 115u8 && *(sv.ptr + 1) == 116u8 && *(sv.ptr + 2) == 100u8 }
 }
 
+@intrinsic fn size_of<T>() -> usize { 0 }
+
+// Does the item's module path (`HirItem.module_path`, segments joined by '.') spell `m` exactly?
+fn hir_item_module_is(it: *const HirItem, m: StrView, str_in: view<StrInterner>) -> bool {
+    let count = unsafe { (*it).module_path.count };
+    let segs = unsafe { (*it).module_path.segments } as usize;
+    let mut pos: usize = 0;
+    let mut i: usize = 0;
+    while i < count {
+        if i > 0 {
+            if pos >= m.len || (unsafe { *(m.ptr + pos) }) != 46u8 {
+                return false;
+            }
+            pos = pos + 1;
+        }
+        let off = ((i as isize) * (size_of<StrId>() as isize)) as usize;
+        let sid = unsafe { (*((segs + off) as *const StrId)).v };
+        let sv = interner_get(str_in, StrId { v: sid });
+        if pos + sv.len > m.len {
+            return false;
+        }
+        let mut k: usize = 0;
+        while k < sv.len {
+            if (unsafe { *(sv.ptr + k) }) != (unsafe { *(m.ptr + pos + k) }) {
+                return false;
+            }
+            k = k + 1;
+        }
+        pos = pos + sv.len;
+        i = i + 1;
+    }
+    pos == m.len
+}
+
+// `site` is the referencing type path (may be null). A trait path never carries the HIR trait item's own symbol:
+// the resolver's collection pass gives the trait one id and its body pass rebinds the item node to the `Self`
+// symbol, so the lookup below normally falls back to the name. The trait is then chosen exactly by the domain HIR
+// lowering recorded on the path from the resolver's naming table (`HirPath.def_dom` / `def_mod`: the defining
+// module of the trait the reference names, also through re-exports and qualified paths). Without that record (no
+// site, or a symbol without a naming entry such as the resolver primitives `Copy`, `Send`, `Fn`), the former id-range
+// rule is kept without reading the id: such symbols are no std items, so the first user trait of that name matches.
+// T164 (ADR-0043 §2, INV-BOOT-005): no property is derived from the numeric value of a SymbolId.
 pub fn find_trait_item(
     hir: view<HirFile>,
     sym: SymbolId,
     name: view<StrView>,
+    site: *const HirType,
     str_in: view<StrInterner>,
     db: view<SourceDatabase>
 ) -> *mut HirItem {
+    let mut sym_def: *mut HirItem = 0 as *mut HirItem;
     if sym.v != 0u32 {
         let mut it_s: *mut HirItem = hir.items;
         while ((it_s as usize) != 0) {
-            if unsafe { (*it_s).kind } == HIR_ITEM_TRAIT && unsafe { (*it_s).symbol.v } == sym.v {
-                return it_s;
+            if unsafe { (*it_s).symbol.v } == sym.v {
+                if unsafe { (*it_s).kind } == HIR_ITEM_TRAIT {
+                    return it_s;
+                }
+                if (sym_def as usize) == 0 {
+                    sym_def = it_s;
+                }
             }
             it_s = unsafe { (*it_s).next };
         }
@@ -23836,22 +23964,46 @@ pub fn find_trait_item(
     if name_len == 0 {
         return 0 as *mut HirItem;
     }
+    // 0 = unknown (any domain), 1 = user, 2 = std.
+    let mut dom: u8 = 0u8;
+    let mut exact_mod: bool = false;
+    let mut def_mod = StrView { ptr: 0 as *const u8, len: 0 };
+    if sym.v != 0u32 {
+        if (sym_def as usize) != 0 {
+            dom = if hir_item_is_std(sym_def as *const HirItem, str_in) { 2u8 } else { 1u8 };
+        } else if (site as usize) != 0 && unsafe { (*site).kind } == HIR_TYPE_PATH &&
+                  unsafe { (*site).path.def_dom } != 0u8 {
+            dom = unsafe { (*site).path.def_dom };
+            def_mod = unsafe { (*site).path.def_mod };
+            exact_mod = dom == 1u8 || (def_mod.ptr as usize) != 0;
+        } else {
+            dom = 1u8;
+        }
+    }
+    let mut dom_tr: *mut HirItem = 0 as *mut HirItem;
     let mut it: *mut HirItem = hir.items;
     while ((it as usize) != 0) {
-        let k = unsafe { (*it).kind };
-        if k == HIR_ITEM_TRAIT {
+        if unsafe { (*it).kind } == HIR_ITEM_TRAIT {
             let it_sym = unsafe { (*it).symbol.v };
-            if sym.v == 0u32 || it_sym == 0u32 || it_sym >= 2147483648u32 ||
-               sym_is_std_item(sym.v) == sym_is_std_item(it_sym) {
+            let dom_ok = sym.v == 0u32 || it_sym == 0u32 || it_sym >= 2147483648u32 || dom == 0u8 ||
+                (dom == 2u8) == hir_item_is_std(it as *const HirItem, str_in);
+            if dom_ok {
                 let it_name = hir_item_name_sv(it, str_in, db);
                 if sv_eq(view(it_name), name) {
-                    return it;
+                    if !exact_mod || hir_item_module_is(it as *const HirItem, def_mod, str_in) {
+                        return it;
+                    }
+                    if (dom_tr as usize) == 0 {
+                        dom_tr = it;
+                    }
                 }
             }
         }
         it = unsafe { (*it).next };
     }
-    0 as *mut HirItem
+    // The defining module recorded by lowering has no trait of that name in this HIR (e.g. a synthetic copy):
+    // the first trait of the same domain is the best remaining answer.
+    dom_tr
 }
 
 pub fn find_trait_by_type_path(
@@ -23869,7 +24021,7 @@ pub fn find_trait_by_type_path(
     }
     let sym_v = unsafe { (*trait_path).path.symbol.v };
     let tr_name = hir_type_path_name_sv(trait_path, str_in, db);
-    find_trait_item(hir, SymbolId { v: sym_v }, view(tr_name), str_in, db)
+    find_trait_item(hir, SymbolId { v: sym_v }, view(tr_name), trait_path, str_in, db)
 }
 
 pub fn find_trait_default_method(
@@ -24558,6 +24710,7 @@ fn trait_auto_kind(
     hir: view<HirFile>,
     tr_sym_v: u32,
     tr_name: view<StrView>,
+    site: *const HirType,
     str_in: view<StrInterner>,
     db: view<SourceDatabase>
 ) -> u8 {
@@ -24568,7 +24721,7 @@ fn trait_auto_kind(
     if (tn_len == 0 && tr_sym_v == 10008u32) || is_share_trait_name(tr_name) {
         return 2u8;
     }
-    let tr_it = find_trait_item(hir, SymbolId { v: tr_sym_v }, tr_name, str_in, db);
+    let tr_it = find_trait_item(hir, SymbolId { v: tr_sym_v }, tr_name, site, str_in, db);
     if (tr_it as usize) != 0 && unsafe { (*tr_it).is_auto } {
         return 3u8;
     }
@@ -24812,7 +24965,7 @@ fn bound_implies_trait(
     }
     let b_sym_v = unsafe { (*b).path.symbol.v };
     let b_name = hir_type_path_name_sv(b, str_in, db);
-    let b_tr = find_trait_item(hir, SymbolId { v: b_sym_v }, view(b_name), str_in, db);
+    let b_tr = find_trait_item(hir, SymbolId { v: b_sym_v }, view(b_name), b, str_in, db);
     if (b_tr as usize) != 0 {
         let mut st: *mut HirType = unsafe { (*b_tr).supertraits };
         while (st as usize) != 0 {
@@ -25152,7 +25305,7 @@ fn satisfies_bound_depth(
 
     let tr_sym_v = unsafe { (*bound).path.symbol.v };
     let tr_name = hir_type_path_name_sv(bound, str_in, db);
-    let ak = trait_auto_kind(hir, tr_sym_v, view(tr_name), str_in, db);
+    let ak = trait_auto_kind(hir, tr_sym_v, view(tr_name), bound, str_in, db);
     if ak != 0u8 {
         return type_satisfies_auto_trait(hir, thir, TypeId { v: arg_v }, ak, tr_sym_v, view(tr_name), str_in, db, depth);
     }
@@ -25766,8 +25919,8 @@ pub fn check_send_share_impl_safety(
             if !unsafe { (*it).is_negative } && !unsafe { (*it).is_unsafe } {
                 let tr_sym_v = unsafe { (*tp).path.symbol.v };
                 let tr_name = hir_type_path_name_sv(tp, str_in, db);
-                let ak = trait_auto_kind(hir, tr_sym_v, view(tr_name), str_in, db);
-                let tr_it = find_trait_item(hir, SymbolId { v: tr_sym_v }, view(tr_name), str_in, db);
+                let ak = trait_auto_kind(hir, tr_sym_v, view(tr_name), tp as *const HirType, str_in, db);
+                let tr_it = find_trait_item(hir, SymbolId { v: tr_sym_v }, view(tr_name), tp as *const HirType, str_in, db);
                 let is_unsafe_tr = (tr_it as usize) != 0 && unsafe { (*tr_it).is_unsafe };
                 if ak == 1u8 || ak == 2u8 || is_unsafe_tr {
                     let sp_f = unsafe { (*it).span.file.v };
@@ -25799,7 +25952,7 @@ fn report_unsatisfied_bound_or_conc(
     if (bound as usize) != 0 && unsafe { (*bound).kind } == HIR_TYPE_PATH {
         let tr_sym_v = unsafe { (*bound).path.symbol.v };
         let tr_name = hir_type_path_name_sv(bound, str_in, db);
-        let ak = trait_auto_kind(hir, tr_sym_v, view(tr_name), str_in, db);
+        let ak = trait_auto_kind(hir, tr_sym_v, view(tr_name), bound, str_in, db);
         if ak == 1u8 || ak == 2u8 {
             emit_conc_bound_diag(hir, thir, arg_ty, ak, tr_sym_v, view(tr_name), str_in, db, sink, sp);
             return;
@@ -25920,7 +26073,7 @@ pub fn check_impl_supertraits(
                                 let tr_sym = unsafe { (*tr_it).symbol.v };
                                 if sdef_sym != 0u32 && sdef_sym < 2147483648u32 &&
                                    tr_sym != 0u32 && tr_sym < 2147483648u32 &&
-                                   sym_is_std_item(sdef_sym) != sym_is_std_item(tr_sym) {
+                                   hir_item_is_std(sdef, str_in) != hir_item_is_std(tr_it as *const HirItem, str_in) {
                                     domain_ok = false;
                                 }
                             }
@@ -31219,7 +31372,7 @@ pub fn lookup_path_type(cx: mut_view<TypeckCtx>, path: view<HirPath>, out_args: 
                                 return instantiate_path(mut_view(*cx), sty, it, path, mut_view(*out_args));
                             }
                         }
-                        let it_t = tc_item_type_on_demand(mut_view(*cx), it);
+                        let it_t = unsafe { thir_get_item_type(view(*cx.thir), it) };
                         if it_t.v != 0u32 {
                             return instantiate_path(mut_view(*cx), (TypeId { v: it_t.v }), it, path, mut_view(*out_args));
                         }
@@ -31285,7 +31438,7 @@ pub fn lookup_path_type(cx: mut_view<TypeckCtx>, path: view<HirPath>, out_args: 
                                 return instantiate_path(mut_view(*cx), sty, it, path, mut_view(*out_args));
                             }
                         }
-                        let it_t = tc_item_type_on_demand(mut_view(*cx), it);
+                        let it_t = unsafe { thir_get_item_type(view(*cx.thir), it) };
                         if it_t.v != 0u32 {
                             return instantiate_path(mut_view(*cx), (TypeId { v: it_t.v }), it, path, mut_view(*out_args));
                         }
@@ -31507,7 +31660,7 @@ fn lookup_path_type_by_name(
                 }
                 let struct_name = StrView { ptr: name.ptr, len: s_len };
                 if sv_eq(view(it_name), view(struct_name)) {
-                    let t = tc_item_type_on_demand(mut_view(*cx), it);
+                    let t = unsafe { thir_get_item_type(view(*cx.thir), it) };
                     if t.v != 0u32 {
                         return instantiate_path(mut_view(*cx), (TypeId { v: t.v }), it, path, mut_view(*out_args));
                     }
@@ -31529,7 +31682,7 @@ fn lookup_path_type_by_name(
                 }
                 let enum_name = StrView { ptr: name.ptr, len: e_len };
                 if sv_eq(view(it_name), view(enum_name)) {
-                    let t = tc_item_type_on_demand(mut_view(*cx), it);
+                    let t = unsafe { thir_get_item_type(view(*cx.thir), it) };
                     if t.v != 0u32 {
                         return instantiate_path(mut_view(*cx), (TypeId { v: t.v }), it, path, mut_view(*out_args));
                     }
@@ -39408,49 +39561,13 @@ fn tc_item_is_prelude_or_std(interner: view<StrInterner>, it: *const HirItem) ->
     false
 }
 
-// T444 (T421 FU-1, FU-3): struct and enum types are registered on demand. A field type naming a struct or enum
-// that is declared later (or in a std module whose items come later in the item list, e.g. the prelude's
-// `RawWaker.vtable: *const RawWakerVTable`) registers that item first (`tc_item_type_on_demand`) instead of
-// resolving to the error type, whose layout is empty (every field at offset 0). Registration interns a field-less
-// shell (identity = def + args) before converting the field types, so a cycle through pointers
-// (`struct A { b: *mut B }` / `struct B { a: *mut A }`, `struct L { next: *mut L }`) finds the in-progress type;
-// the fields are filled into the interned type afterwards.
-fn tc_item_type_on_demand(cx: mut_view<TypeckCtx>, it: *mut HirItem) -> TypeId {
-    let t = unsafe { thir_get_item_type(view(*cx.thir), it) };
-    if t.v != 0u32 || (it as usize) == 0 {
-        return (TypeId { v: t.v });
-    }
-    if (cx.str_in as usize) == 0 && (cx.db as usize) == 0 {
-        return (TypeId { v: 0u32 });
-    }
-    let ik = unsafe { (*it).kind };
-    if ik == HIR_ITEM_STRUCT {
-        tc_register_single_struct(mut_view(*cx), it, cx.thir);
-    } else if ik == HIR_ITEM_ENUM {
-        tc_register_single_enum(mut_view(*cx), it, cx.thir);
-    }
-    unsafe { thir_get_item_type(view(*cx.thir), it) }
-}
-
 fn tc_register_single_struct(
     cx: mut_view<TypeckCtx>,
     top_it: *mut HirItem,
     thir_ptr: *mut Thir
 ) {
-    let done = unsafe { thir_get_item_type(view(*thir_ptr), top_it) };
-    if done.v != 0u32 {
-        return;
-    }
-    let saved_fn = cx.current_fn;
-    let saved_impl = cx.current_impl;
-    let saved_self = cx.self_ty.v;
     let mut arg_cnt: usize = 0;
     let args = build_item_generic_param_args(mut_view(*cx), top_it, mut_view(arg_cnt));
-    let is_rc = item_has_repr_c(view(*cx), top_it);
-    let shell_id = unsafe {
-        intern_struct_ty(mut_view((*thir_ptr).interner), is_rc, top_it, 0 as *mut TypeId, 0, args, arg_cnt)
-    };
-    unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: shell_id.v })); }
     cx.current_fn = top_it;
     cx.current_impl = 0 as *const HirItem;
     cx.self_ty.v = 0u32;
@@ -39494,20 +39611,14 @@ fn tc_register_single_struct(
             }
         }
     }
-    let st_id = TypeId { v: shell_id.v };
-    let st_t = unsafe { type_get(view((*thir_ptr).interner), (TypeId { v: st_id.v })) };
-    unsafe {
-        (*st_t).fields = flds;
-        (*st_t).field_count = f_cnt;
-        (*st_t).is_repr_c = is_rc;
-    }
+    let is_rc = item_has_repr_c(view(*cx), top_it);
+    let st_id = unsafe { intern_struct_ty(mut_view((*thir_ptr).interner), is_rc, top_it, flds, f_cnt, args, arg_cnt) };
+    unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: st_id.v })); }
     let s_sym = unsafe { (*top_it).symbol };
     if s_sym.v != 0u32 && arg_cnt == 0 && (cx.str_in as usize) == 0 && (cx.db as usize) == 0 {
         unsafe { thir_set_sym_type(mut_view(*thir_ptr), (SymbolId { v: s_sym.v }), (TypeId { v: st_id.v })); }
     }
-    cx.current_fn = saved_fn;
-    cx.current_impl = saved_impl;
-    cx.self_ty.v = saved_self;
+    cx.current_fn = 0 as *const HirItem;
 }
 
 fn tc_register_single_enum(
@@ -39515,27 +39626,8 @@ fn tc_register_single_enum(
     top_it: *mut HirItem,
     thir_ptr: *mut Thir
 ) {
-    let done = unsafe { thir_get_item_type(view(*thir_ptr), top_it) };
-    if done.v != 0u32 {
-        return;
-    }
-    let saved_fn = cx.current_fn;
-    let saved_impl = cx.current_impl;
-    let saved_self = cx.self_ty.v;
     let mut arg_cnt: usize = 0;
     let args = build_item_generic_param_args(mut_view(*cx), top_it, mut_view(arg_cnt));
-    let shell_id = unsafe {
-        intern_enum_ty(
-            mut_view((*thir_ptr).interner),
-            top_it,
-            args,
-            arg_cnt,
-            0 as *mut *mut TypeId,
-            0 as *mut usize,
-            0
-        )
-    };
-    unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: shell_id.v })); }
     cx.current_fn = top_it;
     cx.current_impl = 0 as *const HirItem;
     cx.self_ty.v = 0u32;
@@ -39604,20 +39696,23 @@ fn tc_register_single_enum(
             v = unsafe { (*v).next };
         }
     }
-    let en_id = TypeId { v: shell_id.v };
-    let en_t = unsafe { type_get(view((*thir_ptr).interner), (TypeId { v: en_id.v })) };
-    unsafe {
-        (*en_t).variant_fields = v_fields;
-        (*en_t).variant_field_counts = v_counts;
-        (*en_t).variant_count = v_cnt;
-    }
+    let en_id = unsafe {
+        intern_enum_ty(
+            mut_view((*thir_ptr).interner),
+            top_it,
+            args,
+            arg_cnt,
+            v_fields,
+            v_counts,
+            v_cnt
+        )
+    };
+    unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: en_id.v })); }
     let e_sym = unsafe { (*top_it).symbol };
     if e_sym.v != 0u32 && arg_cnt == 0 && (cx.str_in as usize) == 0 && (cx.db as usize) == 0 {
         unsafe { thir_set_sym_type(mut_view(*thir_ptr), (SymbolId { v: e_sym.v }), (TypeId { v: en_id.v })); }
     }
-    cx.current_fn = saved_fn;
-    cx.current_impl = saved_impl;
-    cx.self_ty.v = saved_self;
+    cx.current_fn = 0 as *const HirItem;
 }
 
 fn tc_resolve_type_alias(
@@ -39634,75 +39729,6 @@ fn tc_resolve_type_alias(
         if !is_error(mut_view(*cx), (TypeId { v: computed.v })) && computed.v != 0u32 {
             unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: computed.v })); }
         }
-    }
-}
-
-// T444: substitutes `n` field types of a generic definition with an instance's args (arena copy).
-fn tc_subst_ids(cx: mut_view<TypeckCtx>, src: *mut TypeId, n: usize, gargs: view<GenericArgsSlice>) -> *mut TypeId {
-    if n == 0 {
-        return 0 as *mut TypeId;
-    }
-    let out = unsafe {
-        arena_alloc_raw(mut_view((*cx.thir).interner.arena), mul_usize(n, size_of<TypeId>()), align_of<TypeId>()) as *mut TypeId
-    };
-    let mut j: usize = 0;
-    while (j < n) {
-        let nf = unsafe {
-            subst_ty_with_vars(mut_view((*cx.thir).interner), mut_view(cx.type_vars), (TypeId { v: (*typeid_at(src, j)).v }), gargs)
-        };
-        unsafe { (*typeid_at(out, j)).v = nf.v; }
-        j = j + 1;
-    }
-    out
-}
-
-// T444: a generic struct/enum instance interned while its definition was still a field-less shell (a cycle of
-// generic types registered on demand, e.g. `struct A<T> { b: *mut B<T> }` / `struct B<T> { a: *mut A<u8> }`) has no
-// fields. Once every definition is complete, such instances take their fields from the definition, substituted
-// with the instance's args. (Kept small on purpose: see the T444 report on axiom0 symbol ids.)
-fn tc_refresh_adt_instances(cx: mut_view<TypeckCtx>) {
-    let mut i: usize = 1;
-    while (i < (unsafe { (*cx.thir).interner.len })) {
-        let t = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: i as u32 })) };
-        let mut bt: *mut AxType = 0 as *mut AxType;
-        if (t as usize) != 0 && (unsafe { (*t).arg_count }) > 0 && (unsafe { (*t).def as usize }) != 0 &&
-            (((unsafe { (*t).kind }) == TY_STRUCT && (unsafe { (*t).field_count }) == 0) ||
-             ((unsafe { (*t).kind }) == TY_ENUM && (unsafe { (*t).variant_count }) == 0)) {
-            let base = unsafe { thir_get_item_type(view(*cx.thir), (*t).def) };
-            if base.v != 0u32 && (base.v as usize) != i {
-                bt = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: base.v })) };
-                if (bt as usize) != 0 && (unsafe { (*bt).kind }) != (unsafe { (*t).kind }) {
-                    bt = 0 as *mut AxType;
-                }
-            }
-        }
-        if (bt as usize) != 0 {
-            let gargs = GenericArgsSlice { args: unsafe { (*t).args }, count: unsafe { (*t).arg_count } };
-            if (unsafe { (*t).kind }) == TY_STRUCT {
-                unsafe {
-                    (*t).fields = tc_subst_ids(mut_view(*cx), (*bt).fields, (*bt).field_count, view(gargs));
-                    (*t).field_count = (*bt).field_count;
-                    (*t).is_repr_c = (*bt).is_repr_c;
-                }
-            } else if (unsafe { (*bt).variant_count }) > 0 && (unsafe { (*bt).variant_fields as usize }) != 0 {
-                let vfs = unsafe {
-                    arena_alloc_raw(mut_view((*cx.thir).interner.arena), mul_usize((*bt).variant_count, size_of<*mut TypeId>()), align_of<*mut TypeId>()) as *mut *mut TypeId
-                };
-                let mut v: usize = 0;
-                while (v < (unsafe { (*bt).variant_count })) {
-                    unsafe {
-                        *typeid_ptr_at(vfs, v) = tc_subst_ids(mut_view(*cx), *typeid_ptr_at((*bt).variant_fields, v), *usize_at((*bt).variant_field_counts, v), view(gargs));
-                    }
-                    v = v + 1;
-                }
-                unsafe {
-                    (*t).variant_fields = vfs;
-                    (*t).variant_field_counts = (*bt).variant_field_counts;
-                    (*t).variant_count = (*bt).variant_count;
-                }
-            }
-        }
-        i = i + 1;
     }
 }
 
@@ -39748,7 +39774,6 @@ fn typeck_pass1a(cx: mut_view<TypeckCtx>, hir_file: view<HirFile>, thir_ptr: *mu
         }
         top_it = unsafe { (*top_it).next };
     }
-    tc_refresh_adt_instances(mut_view(*cx));
 }
 
 fn typeck_pass1b_and_2(

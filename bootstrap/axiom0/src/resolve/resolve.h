@@ -19,8 +19,9 @@ typedef struct AxResolveMap {
     AxNodeMap node_map;
     AxNodeMap module_access_nodes;
     AxNodeMap extern_nodes;
+    /* T164 (INV-BOOT-005): the single per-compilation SymbolId counter shared by user, std and extern
+     * symbols; after resolution it is the first free id (mono continues from it). */
     uint32_t next_symbol_v;
-    uint32_t next_std_symbol_v;
     void *module_naming_ctx;
 } AxResolveMap;
 
