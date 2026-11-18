@@ -246,6 +246,24 @@ def test_a(a):
     check("board cannot be changed from inside a snapshot worktree", rc == 2 and "linked git worktree" in out, out)
     rc, out = sh([sys.executable, os.path.join(snap, SCRIPTS, "taskctl.py"), "status"], snap)
     check("read-only commands work inside a snapshot", rc == 0 and "total 10" in out, out)
+    # an unlisted dirty file under a task's LOCK only is someone else's work: not copied (2026-11-18, T485/T444)
+    codes = os.path.join(a, "src", "diag", "codes.def")
+    codes_orig = open(codes, encoding="utf-8").read() if os.path.exists(codes) else None
+    write(a, "src/diag/codes.def", "OTHER TASK HALF-WRITTEN\n")
+    write(a, "src/types/t.c", "int t;\n")
+    rc, out = tc(a, "snapshot", "T005")
+    snap5 = os.path.join(a, "build-snap-T005")
+    check("snapshot skips unlisted dirty files under the task's locks only, keeps those under its paths",
+          rc == 0 and os.path.exists(os.path.join(snap5, "src", "types", "t.c"))
+          and not open(os.path.join(snap5, "src", "diag", "codes.def")).read().startswith("OTHER")
+          if os.path.exists(os.path.join(snap5, "src", "diag", "codes.def"))
+          else rc == 0 and os.path.exists(os.path.join(snap5, "src", "types", "t.c")) and "locks only" in out, out)
+    tc(a, "snapshot", "T005", "--remove")
+    if codes_orig is None:
+        os.remove(codes)
+    else:
+        write(a, "src/diag/codes.def", codes_orig)
+    os.remove(os.path.join(a, "src", "types", "t.c"))
 
     # ---- accept T002: entry inside another running task's paths, glob entry, directory entry
     write(a, "_workspaces/reports/T002-qa.md", "# QA\n## Files changed\n- tests/lex/qa_added.ax\n\nVERDICT: PASS round=0\n")

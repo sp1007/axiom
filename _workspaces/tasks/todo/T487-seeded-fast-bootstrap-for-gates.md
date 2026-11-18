@@ -11,7 +11,7 @@ priority: 10
 status: todo
 attempts: 0
 timeout_min: 600
-paths: [tools/bootstrap.py, tools/build_axiomc.py, tools/tests/build_axiomc, tests/selfhost/fixedpoint, tests/selfhost/obj_link_driver/axiomc_e2e_oracle.py]
+paths: [tools/bootstrap.py, tools/build_axiomc.py, tools/tests/build_axiomc, tests/selfhost/fixedpoint, tests/selfhost/obj_link_driver/axiomc_e2e_oracle.py, _workspaces/baseline-failures.txt]
 locks: [tools/taskgate.py, tools/axtest.py]
 spec: [spec/SPEC-20-selfhost.md, spec/SPEC-00-bootstrap.md, spec/decisions/ADR-0043-cyclic-type-graphs-and-symbol-id-space.md]
 covers: [REQ-BLD-028, REQ-TST-072]
@@ -55,6 +55,10 @@ Measured here on 2026-11-18 (same input `tests/selfhost/parse/qa_parse_corpus_a.
 5. **No duplicate bootstraps:** `fixedpoint_oracle.py` and `axiomc_e2e_oracle.py` reuse the stage binaries the gate
    already built when their input manifests match (print `REUSED …`), and rebuild otherwise. Their checks
    (two directories, both opt levels, functional parity) are unchanged.
+6. **Timeouts (T485 gate F-3):** `fixedpoint_oracle.py:179` hard-codes `timeout=1500` for `bootstrap.py
+   --check-both-opt` while stage 2 alone takes 36–45 min on the shared machine, so the test can never pass there.
+   Derive inner timeouts from the test's own budget / `--timeout-scale` (no hard-coded inner limit shorter than the
+   test timeout). Remove `selfhost/fixedpoint/fixedpoint.test` from `_workspaces/baseline-failures.txt` when it passes.
 
 ## Acceptance (quality guards — mandatory, this is a compiler)
 - On at least 3 commits (HEAD and two earlier accepted commits): the seeded `B` is byte-identical to the full-chain
