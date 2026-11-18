@@ -6,7 +6,7 @@ owner: axiom-semantics
 reviewer: axiom-qa
 model: opus
 gate_model: sonnet
-depends: [T164]
+depends: [T164, T166]
 priority: 60
 status: todo
 attempts: 0
@@ -43,3 +43,6 @@ could also affect code axiomc1 runs while building axiomc2; the stage-2/3 fixed 
 
 ## Log
 - 2026-11-17 created by axiom-architect (T444 report "other findings"; ADR-0043 §4)
+- 2026-11-19 architect (unblock T491): now depends on T166 AX0-FIX-11 — the axiomc1 interpreter crash is very likely
+  the same axiom0 branch-fixup overflow (`exec_assign_binop`, 1076 fixups; T491 report). First step: re-run the
+  repro with the T166 axiom0; if the crash is gone, record that as classification (a) with T166 as the fix and close.

@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 13
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tests/mir/intrinsics, tests/selfhost/hir/qa_hir_desugar_and_drop.ax.in, _workspaces/baseline-failures.txt]
 locks: []
 spec: [spec/SPEC-20-selfhost.md]
 covers: [REQ-TST-072]
+started: 2026-11-19 03:55:12
+agent: T490-impl
 ---
 # T490 — Baseline fix: MIR intrinsic goldens and qa_hir_desugar_and_drop
 
@@ -40,3 +42,4 @@ Pre-existing failures found by the T481a and T485 gates (identical with the HEAD
 
 ## Log
 - 2026-11-18 created by orchestrator (T485 gate follow-up F-4, T481a gate observations)
+- 2026-11-19 03:55:12 started (attempt 1) T490-impl

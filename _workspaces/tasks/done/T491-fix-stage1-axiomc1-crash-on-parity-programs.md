@@ -8,12 +8,15 @@ model: opus
 gate_model: opus
 depends: [T164]
 priority: 12
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tests/selfhost/obj_link_driver/axiomc_e2e_oracle.py, tests/run/parity/backend, _workspaces/baseline-failures.txt]
 locks: []
 spec: [spec/SPEC-20-selfhost.md, spec/SPEC-00-bootstrap.md]
 covers: [REQ-BLD-028]
+started: 2026-11-19 03:36:57
+superseded_by: T166
+finished: 2026-11-19 03:57:25
 ---
 # T491 — Stage-1 axiomc1 crashes on two parity programs
 
@@ -38,3 +41,6 @@ miscompiles part of axiomc or axiomc has undefined behaviour that only shows und
 
 ## Log
 - 2026-11-18 created by orchestrator (T485 gate follow-up F-4)
+- 2026-11-19 03:36:57 started (attempt 1) T491-impl
+- 2026-11-19 03:54:46 block: root cause in frozen axiom0: fixed bb_offsets[1024]/fixups[1024] overflow in bootstrap/axiom0/src/driver/build_native/build.c (no bounds check) -> silent miscompile of functions with >1024 jumps (exec_assign_binop: 1076); needs AX0-FIX task; repro in T491-report.md
+- 2026-11-19 03:57:25 superseded by T166 -> done (no code of its own)

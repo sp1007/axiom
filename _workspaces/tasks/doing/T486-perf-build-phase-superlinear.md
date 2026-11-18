@@ -8,13 +8,15 @@ model: opus
 gate_model: opus
 depends: [T164]
 priority: 10
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 900
 paths: [compiler/backend, compiler/target/x64, compiler/objmodel, compiler/obj, compiler/link, tests/perf/build_scaling]
 locks: [compiler/lir/builder.ax, compiler/mir/builder.ax, compiler/abi, compiler/driver/pipeline.ax]
 spec: [spec/SPEC-76-performance-contract.md, spec/SPEC-20-selfhost.md]
 covers: [REQ-OPT-292]
+started: 2026-11-19 03:36:56
+agent: T486-impl
 ---
 # T486 — Perf: make the `build` phase scale linearly
 
@@ -41,3 +43,6 @@ legs of the 179 selfhost ids cost 8 h of the 10.6 h serial suite; nearly all of 
   `.exe` at O0 and O1 before/after (deterministic output, SPEC-76 `INV-DET-004`); script + summary in the report.
 - Normal gate (encode/obj/link/run suites unchanged); self-host fixpoint holds.
 - Report before/after times for at least 3 large bundles; target: build phase ≥ 5× faster on `qa_backend_unit.ax`.
+
+## Log
+- 2026-11-19 03:36:56 started (attempt 1) T486-impl
