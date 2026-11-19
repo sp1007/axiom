@@ -8,15 +8,15 @@ model: opus
 gate_model: opus
 depends: [T164]
 priority: 10
-status: doing
+status: done
 attempts: 1
 timeout_min: 900
-paths: [compiler/backend, compiler/target/x64, compiler/objmodel, compiler/obj, compiler/link, tests/perf/build_scaling]
+paths: [compiler/backend, compiler/target/x64, compiler/objmodel, compiler/obj, compiler/link, tests/perf/build_scaling, tests/selfhost/link/qa_pe_headers_and_imports.ax.in]
 locks: [compiler/lir/builder.ax, compiler/mir/builder.ax, compiler/abi, compiler/driver/pipeline.ax]
 spec: [spec/SPEC-76-performance-contract.md, spec/SPEC-20-selfhost.md]
 covers: [REQ-OPT-292]
 started: 2026-11-19 09:33:02
-agent: T486-impl
+finished: 2026-11-19 18:40:05
 ---
 # T486 — Perf: make the `build` phase scale linearly
 
@@ -50,3 +50,5 @@ legs of the 179 selfhost ids cost 8 h of the 10.6 h serial suite; nearly all of 
 - 2026-11-19 06:56:11 started (attempt 1) T486-impl
 - 2026-11-19 08:46:11 requeue: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 43m6s. (infrastructure failure: attempt refunded)
 - 2026-11-19 09:33:02 started (attempt 1) T486-impl
+- 2026-11-19 13:45 orchestrator: paths += tests/selfhost/link/qa_pe_headers_and_imports.ax.in (new LinkerContext.gindex field breaks its 5 exhaustive struct literals; mechanical fix, no other running task owns the file)
+- 2026-11-19 18:40:05 accepted by QA -> done

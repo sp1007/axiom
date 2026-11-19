@@ -36,12 +36,14 @@ use compiler.obj.coff.bytes_eq
 use compiler.obj.coff.cstr_eq
 use compiler.obj.coff.coff_mul_usize
 use compiler.obj.coff.coff_mul_u32
+use compiler.obj.coff.objsym_hash
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 @intrinsic fn align_of<T>() -> usize { 0 }
 @intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
 @intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
 @intrinsic unsafe fn ptr_write_bytes<T>(dst: *mut T, val: u8, count: usize) {}
+@intrinsic fn wrapping_mul_u64(a: u64, b: u64) -> u64 { 0 }
 
 // --- PE32+ Format Sizes & Constants ---
 
@@ -618,6 +620,13 @@ pub struct PeReloc {
     pub addend: i64,
 }
 
+// T486: open-addressing table of (global index + 1), 0 = empty; globals [0, done) are indexed.
+pub struct LinkerGlobalIndex {
+    pub slots: *mut u32,
+    pub cap: usize,
+    pub done: usize,
+}
+
 pub struct LinkerContext {
     pub sections: *mut *mut MergedSection,
     pub num_sections: usize,
@@ -631,6 +640,151 @@ pub struct LinkerContext {
     pub str_arena: *mut Arena,
     pub tls_dir_rva: u32,
     pub tls_dir_size: u32,
+    // T486: name -> global index for `linker_find_global*` (null: linear search). Global names are
+    // unique (`linker_add_global` dedups) and never change once added.
+    pub gindex: *mut LinkerGlobalIndex,
+}
+
+fn lgi_alloc() -> *mut LinkerGlobalIndex {
+    let ix = unsafe { heap_alloc(size_of<LinkerGlobalIndex>(), align_of<LinkerGlobalIndex>()) as *mut LinkerGlobalIndex };
+    unsafe {
+        (*ix).slots = 0 as *mut u32;
+        (*ix).cap = 0;
+        (*ix).done = 0;
+    }
+    ix
+}
+
+fn lgi_free(ix: *mut LinkerGlobalIndex) {
+    unsafe {
+        if (*ix).cap > 0 && ((*ix).slots as usize) != 0 {
+            heap_free((*ix).slots as *mut u8, coff_mul_usize((*ix).cap, 4), 4);
+        }
+        heap_free(ix as *mut u8, size_of<LinkerGlobalIndex>(), align_of<LinkerGlobalIndex>());
+    }
+}
+
+unsafe fn lgi_slot(ix: *mut LinkerGlobalIndex, k: usize) -> *mut u32 {
+    (((*ix).slots as usize) + k * 4) as *mut u32
+}
+
+// The slot holding the global named `name` (`n` bytes), or the empty slot where it goes.
+fn lgi_probe(ctx: view<LinkerContext>, ix: *mut LinkerGlobalIndex, name: *const u8, n: usize) -> *mut u32 {
+    let mask = (unsafe { (*ix).cap }) - 1;
+    let mut k = (objsym_hash(name, n) as usize) & mask;
+    while true {
+        let slot = unsafe { lgi_slot(ix, k) };
+        let v = unsafe { *slot };
+        if v == 0u32 {
+            return slot;
+        }
+        let g = unsafe { global_sym_slot_ptr(ctx.globals, (v - 1u32) as usize) };
+        let gname = unsafe { (*g).name };
+        if bytes_eq(gname, cstr_len(gname), name, n) {
+            return slot;
+        }
+        k = (k + 1) & mask;
+    }
+    0 as *mut u32
+}
+
+fn lgi_sync(ctx: view<LinkerContext>, ix: *mut LinkerGlobalIndex) {
+    let n = ctx.num_globals;
+    if (unsafe { (*ix).done }) >= n {
+        return;
+    }
+    if (unsafe { (*ix).cap }) < 2 * (n + 1) {
+        let mut cap: usize = 64;
+        while cap < 4 * (n + 1) {
+            cap = cap + cap;
+        }
+        unsafe {
+            if (*ix).cap > 0 && ((*ix).slots as usize) != 0 {
+                heap_free((*ix).slots as *mut u8, coff_mul_usize((*ix).cap, 4), 4);
+            }
+        }
+        let slots = unsafe { heap_alloc(coff_mul_usize(cap, 4), 4) as *mut u32 };
+        let mut z: usize = 0;
+        while z < cap {
+            unsafe { *(((slots as usize) + z * 4) as *mut u32) = 0u32; }
+            z = z + 1;
+        }
+        unsafe {
+            (*ix).slots = slots;
+            (*ix).cap = cap;
+            (*ix).done = 0;
+        }
+    }
+    let mut i: usize = unsafe { (*ix).done };
+    while i < n {
+        let g = unsafe { global_sym_slot_ptr(ctx.globals, i) };
+        let gname = unsafe { (*g).name };
+        if (gname as usize) != 0 {
+            let slot = lgi_probe(ctx, ix, gname, cstr_len(gname));
+            if (unsafe { *slot }) == 0u32 {
+                unsafe { *slot = (i + 1) as u32; }
+            }
+        }
+        i = i + 1;
+    }
+    unsafe { (*ix).done = n; }
+}
+
+// Same result as the linear search over `globals` (first global with that name; names are unique).
+fn lgi_find(ctx: view<LinkerContext>, name: *const u8, n: usize) -> *mut GlobalSymbol {
+    let ix = ctx.gindex;
+    lgi_sync(ctx, ix);
+    if (unsafe { (*ix).cap }) == 0 {
+        return 0 as *mut GlobalSymbol;
+    }
+    let v = unsafe { *lgi_probe(ctx, ix, name, n) };
+    if v == 0u32 {
+        return 0 as *mut GlobalSymbol;
+    }
+    unsafe { global_sym_slot_ptr(ctx.globals, (v - 1u32) as usize) }
+}
+
+// `lgi_find` for a name given as a byte view (same hash, avoids pulling a raw pointer out of `Str`
+// which the MIR interpreter rejects because only the slice tracks the live allocation).
+fn lgi_find_view(ctx: view<LinkerContext>, bytes: view<[u8]>) -> *mut GlobalSymbol {
+    let ix = ctx.gindex;
+    lgi_sync(ctx, ix);
+    if (unsafe { (*ix).cap }) == 0 {
+        return 0 as *mut GlobalSymbol;
+    }
+    let n = len(bytes);
+    let mut h: u64 = 14695981039346656037u64;
+    let mut i: usize = 0;
+    while i < n {
+        h = wrapping_mul_u64(h ^ (bytes[i] as u64), 1099511628211u64);
+        i = i + 1;
+    }
+    let mask = (unsafe { (*ix).cap }) - 1;
+    let mut k = (h as usize) & mask;
+    while true {
+        let v = unsafe { *lgi_slot(ix, k) };
+        if v == 0u32 {
+            return 0 as *mut GlobalSymbol;
+        }
+        let g = unsafe { global_sym_slot_ptr(ctx.globals, (v - 1u32) as usize) };
+        let gname = unsafe { (*g).name };
+        if cstr_len(gname) == n {
+            let mut matched = true;
+            let mut j: usize = 0;
+            while j < n {
+                if (unsafe { *(gname + j) }) != bytes[j] {
+                    matched = false;
+                    break;
+                }
+                j = j + 1;
+            }
+            if matched {
+                return g;
+            }
+        }
+        k = (k + 1) & mask;
+    }
+    0 as *mut GlobalSymbol
 }
 
 fn alloc_linker_arena() -> *mut Arena {
@@ -654,6 +808,7 @@ pub fn linker_context_init(ctx: mut_view<LinkerContext>) {
     ctx.str_arena = alloc_linker_arena();
     ctx.tls_dir_rva = 0u32;
     ctx.tls_dir_size = 0u32;
+    ctx.gindex = lgi_alloc();
 }
 
 pub unsafe fn merged_sec_slot_ptr(base: *mut *mut MergedSection, idx: usize) -> *mut *mut MergedSection {
@@ -710,6 +865,10 @@ pub fn linker_context_free(ctx: mut_view<LinkerContext>) {
     ctx.globals = 0 as *mut GlobalSymbol;
     ctx.num_globals = 0;
     ctx.cap_globals = 0;
+    if (ctx.gindex as usize) != 0 {
+        lgi_free(ctx.gindex);
+        ctx.gindex = 0 as *mut LinkerGlobalIndex;
+    }
 
     if ctx.cap_relocs > 0 && (ctx.relocs as usize) != 0 {
         unsafe {
@@ -965,6 +1124,9 @@ pub fn linker_find_global(ctx: view<LinkerContext>, name: *const u8) -> *mut Glo
     if (name as usize) == 0 || (ctx.globals as usize) == 0 {
         return 0 as *mut GlobalSymbol;
     }
+    if (ctx.gindex as usize) != 0 && (unsafe { *name }) != 0u8 {
+        return lgi_find(ctx, name, cstr_len(name));
+    }
     let stride = size_of<GlobalSymbol>();
     let base = ctx.globals as usize;
     let b0 = unsafe { *name };
@@ -999,6 +1161,9 @@ pub fn linker_find_global(ctx: view<LinkerContext>, name: *const u8) -> *mut Glo
 pub fn linker_find_global_str(ctx: view<LinkerContext>, name: Str) -> *mut GlobalSymbol {
     let bytes: view<[u8]> = unsafe { *(address_of(name) as *const view<[u8]>) };
     let n = len(bytes);
+    if (ctx.gindex as usize) != 0 && n > 0 && (ctx.globals as usize) != 0 {
+        return lgi_find_view(ctx, bytes);
+    }
     let mut i: usize = 0;
     while i < ctx.num_globals {
         let g = linker_global_at(ctx, i);
@@ -1407,6 +1572,16 @@ pub struct LinkV2Context {
     pub searched_libs: *const u8,
     pub current_obj_name: *const u8,
     pub active: bool,
+    // T486: name index over `syms`. `nx_slots` is an open-addressing table of (first meta index + 1)
+    // per symbol name, `nx_tails` the last meta of that name, `nx_next[i]` the next meta (index + 1)
+    // with the same name as meta i. A chain lists the metas of one name in index order, so a lookup
+    // walking it sees the candidates in the order of the linear scan it replaces. Metas with a null
+    // `sym_name` are not indexed (no lookup can match them). `sym_name` never changes once added.
+    pub nx_slots: *mut u32,
+    pub nx_tails: *mut u32,
+    pub nx_cap: usize,
+    pub nx_next: *mut u32,
+    pub nx_next_cap: usize,
 }
 
 pub fn link_v2_context_new() -> LinkV2Context {
@@ -1420,7 +1595,120 @@ pub fn link_v2_context_new() -> LinkV2Context {
         searched_libs: 0 as *const u8,
         current_obj_name: 0 as *const u8,
         active: true,
+        nx_slots: 0 as *mut u32,
+        nx_tails: 0 as *mut u32,
+        nx_cap: 0,
+        nx_next: 0 as *mut u32,
+        nx_next_cap: 0,
     }
+}
+
+unsafe fn v2_u32_at(base: *mut u32, k: usize) -> *mut u32 {
+    ((base as usize) + k * 4) as *mut u32
+}
+
+fn v2_u32_alloc_zeroed(n: usize) -> *mut u32 {
+    let p = unsafe { heap_alloc(coff_mul_usize(n, 4), 4) as *mut u32 };
+    let mut i: usize = 0;
+    while i < n {
+        unsafe { *v2_u32_at(p, i) = 0u32; }
+        i = i + 1;
+    }
+    p
+}
+
+fn v2_nx_free(v2: mut_view<LinkV2Context>) {
+    if v2.nx_cap > 0 {
+        unsafe {
+            heap_free(v2.nx_slots as *mut u8, coff_mul_usize(v2.nx_cap, 4), 4);
+            heap_free(v2.nx_tails as *mut u8, coff_mul_usize(v2.nx_cap, 4), 4);
+        }
+    }
+    if v2.nx_next_cap > 0 {
+        unsafe { heap_free(v2.nx_next as *mut u8, coff_mul_usize(v2.nx_next_cap, 4), 4); }
+    }
+    v2.nx_slots = 0 as *mut u32;
+    v2.nx_tails = 0 as *mut u32;
+    v2.nx_cap = 0;
+    v2.nx_next = 0 as *mut u32;
+    v2.nx_next_cap = 0;
+}
+
+// Table slot of the chain for `name` (`n` bytes): the slot holding it, or the empty slot where it goes.
+fn v2_nx_probe(v2: view<LinkV2Context>, name: *const u8, n: usize) -> usize {
+    let mask = v2.nx_cap - 1;
+    let mut k = (objsym_hash(name, n) as usize) & mask;
+    while true {
+        let h = unsafe { *v2_u32_at(v2.nx_slots, k) };
+        if h == 0u32 {
+            return k;
+        }
+        let m = unsafe { v2_sym_slot_ptr(v2.syms, (h - 1u32) as usize) };
+        let mn = unsafe { (*m).sym_name };
+        if bytes_eq(mn, cstr_len(mn), name, n) {
+            return k;
+        }
+        k = (k + 1) & mask;
+    }
+    0
+}
+
+// Appends meta `i` (the newest) to the chain of its name.
+fn v2_nx_link(v2: mut_view<LinkV2Context>, i: usize) {
+    let m = unsafe { v2_sym_slot_ptr(v2.syms, i) };
+    let mn = unsafe { (*m).sym_name };
+    if (mn as usize) == 0 {
+        return;
+    }
+    unsafe { *v2_u32_at(v2.nx_next, i) = 0u32; }
+    let k = v2_nx_probe(view(*v2), mn, cstr_len(mn));
+    let h = unsafe { *v2_u32_at(v2.nx_slots, k) };
+    if h == 0u32 {
+        unsafe {
+            *v2_u32_at(v2.nx_slots, k) = (i + 1) as u32;
+            *v2_u32_at(v2.nx_tails, k) = (i + 1) as u32;
+        }
+    } else {
+        let t = unsafe { *v2_u32_at(v2.nx_tails, k) };
+        unsafe {
+            *v2_u32_at(v2.nx_next, (t - 1u32) as usize) = (i + 1) as u32;
+            *v2_u32_at(v2.nx_tails, k) = (i + 1) as u32;
+        }
+    }
+}
+
+// Indexes the newest meta (`num_syms - 1`), growing the arrays (and rebuilding every chain in index
+// order) when needed.
+fn v2_nx_add(v2: mut_view<LinkV2Context>) {
+    let n = v2.num_syms;
+    if n > v2.nx_next_cap || 2 * (n + 1) > v2.nx_cap {
+        v2_nx_free(mut_view(*v2));
+        let mut cap: usize = 64;
+        while cap < 4 * (n + 1) {
+            cap = cap + cap;
+        }
+        v2.nx_slots = v2_u32_alloc_zeroed(cap);
+        v2.nx_tails = v2_u32_alloc_zeroed(cap);
+        v2.nx_cap = cap;
+        let ncap = if v2.cap_syms > n { v2.cap_syms } else { n };
+        v2.nx_next = v2_u32_alloc_zeroed(ncap);
+        v2.nx_next_cap = ncap;
+        let mut i: usize = 0;
+        while i < n {
+            v2_nx_link(mut_view(*v2), i);
+            i = i + 1;
+        }
+        return;
+    }
+    v2_nx_link(mut_view(*v2), n - 1);
+}
+
+// First meta (index + 1) in the chain of `name`, 0 when none or no index.
+fn v2_nx_head(v2: view<LinkV2Context>, name: *const u8) -> u32 {
+    if v2.nx_cap == 0 {
+        return 0u32;
+    }
+    unsafe { *v2_u32_at(v2.nx_slots, v2_nx_probe(v2, name, cstr_len(name))) }
 }
 
 pub fn link_v2_context_free(v2: mut_view<LinkV2Context>) {
@@ -1448,6 +1736,7 @@ pub fn link_v2_context_free(v2: mut_view<LinkV2Context>) {
     v2.reloc_metas = 0 as *mut LinkV2RelocMeta;
     v2.num_reloc_metas = 0;
     v2.cap_reloc_metas = 0;
+    v2_nx_free(mut_view(*v2));
 }
 
 unsafe fn v2_sym_slot_ptr(base: *mut LinkV2SymMeta, idx: usize) -> *mut LinkV2SymMeta {
@@ -1456,6 +1745,15 @@ unsafe fn v2_sym_slot_ptr(base: *mut LinkV2SymMeta, idx: usize) -> *mut LinkV2Sy
 
 unsafe fn v2_reloc_slot_ptr(base: *mut LinkV2RelocMeta, idx: usize) -> *mut LinkV2RelocMeta {
     ((base as usize) + coff_mul_usize(idx, size_of<LinkV2RelocMeta>())) as *mut LinkV2RelocMeta
+}
+
+// T486: the meta after `idx` (index + 1, 0 = none) with the same `sym_name`, or `u32::MAX` when the
+// context has no name index.
+pub fn link_v2_next_same_name(v2: view<LinkV2Context>, idx: usize) -> u32 {
+    if v2.nx_cap == 0 || idx >= v2.num_syms {
+        return 0xFFFFFFFFu32;
+    }
+    unsafe { *v2_u32_at(v2.nx_next, idx) }
 }
 
 pub fn link_v2_sym_at(v2: view<LinkV2Context>, idx: usize) -> *mut LinkV2SymMeta {
@@ -1523,11 +1821,23 @@ pub fn link_v2_add_sym_meta(
         };
     }
     v2.num_syms = v2.num_syms + 1;
+    v2_nx_add(mut_view(*v2));
     slot
 }
 
 pub fn link_v2_find_def_meta(v2: view<LinkV2Context>, sym_name: *const u8) -> *mut LinkV2SymMeta {
     if (sym_name as usize) == 0 || (v2.syms as usize) == 0 {
+        return 0 as *mut LinkV2SymMeta;
+    }
+    if v2.nx_cap > 0 {
+        let mut c = v2_nx_head(v2, sym_name);
+        while c != 0u32 {
+            let m = unsafe { v2_sym_slot_ptr(v2.syms, (c - 1u32) as usize) };
+            if (unsafe { (*m).entry_kind }) == AXMETA_ENTRY_DEF {
+                return m;
+            }
+            c = unsafe { *v2_u32_at(v2.nx_next, (c - 1u32) as usize) };
+        }
         return 0 as *mut LinkV2SymMeta;
     }
     let mut i: usize = 0;
@@ -1549,6 +1859,20 @@ pub fn link_v2_find_def_meta_in_obj(
     obj_name: *const u8
 ) -> *mut LinkV2SymMeta {
     if (sym_name as usize) == 0 || (v2.syms as usize) == 0 {
+        return 0 as *mut LinkV2SymMeta;
+    }
+    if v2.nx_cap > 0 {
+        let mut c = v2_nx_head(v2, sym_name);
+        while c != 0u32 {
+            let m = unsafe { v2_sym_slot_ptr(v2.syms, (c - 1u32) as usize) };
+            if (unsafe { (*m).entry_kind }) == AXMETA_ENTRY_DEF {
+                if (obj_name as usize) == 0 ||
+                   ((unsafe { (*m).obj_name as usize }) != 0 && cstr_eq(unsafe { (*m).obj_name }, obj_name)) {
+                    return m;
+                }
+            }
+            c = unsafe { *v2_u32_at(v2.nx_next, (c - 1u32) as usize) };
+        }
         return 0 as *mut LinkV2SymMeta;
     }
     let mut i: usize = 0;
@@ -1576,6 +1900,24 @@ pub fn link_v2_find_ref_meta(
         return 0 as *mut LinkV2SymMeta;
     }
     let mut fallback: *mut LinkV2SymMeta = 0 as *mut LinkV2SymMeta;
+    if v2.nx_cap > 0 {
+        let mut c = v2_nx_head(v2, sym_name);
+        while c != 0u32 {
+            let m = unsafe { v2_sym_slot_ptr(v2.syms, (c - 1u32) as usize) };
+            if (unsafe { (*m).entry_kind }) == AXMETA_ENTRY_REF {
+                if (obj_name as usize) != 0 &&
+                   (unsafe { (*m).obj_name as usize }) != 0 &&
+                   cstr_eq(unsafe { (*m).obj_name }, obj_name) {
+                    return m;
+                }
+                if (fallback as usize) == 0 {
+                    fallback = m;
+                }
+            }
+            c = unsafe { *v2_u32_at(v2.nx_next, (c - 1u32) as usize) };
+        }
+        return fallback;
+    }
     let mut i: usize = 0;
     while i < v2.num_syms {
         let m = unsafe { v2_sym_slot_ptr(v2.syms, i) };

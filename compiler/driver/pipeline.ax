@@ -203,6 +203,7 @@ use compiler.backend.session.backend_populate_hir_const_aggregates
 use compiler.backend.session.backend_promote_const_aggregates
 use compiler.backend.session.backend_emit_const_tables
 use compiler.backend.session.backend_lower_fn_to_mc_checked_opt
+use compiler.backend.session.backend_lower_fn_to_mc_checked_timed
 use compiler.backend.session.backend_emit_fn_strings_rdata
 use compiler.backend.session.backend_format_const_sym_name
 use compiler.backend.session.session_emit_lir_mir_text_opt
@@ -242,6 +243,7 @@ use compiler.obj.coff.objmodel_add_section_bytes
 use compiler.obj.coff.objmodel_get_section_mut
 use compiler.obj.coff.objmodel_add_symbol_bytes
 use compiler.obj.coff.objmodel_find_symbol_bytes
+use compiler.obj.coff.objmodel_symbol_names_changed
 use compiler.obj.coff.section_add_byte
 use compiler.obj.coff.section_add_bytes
 use compiler.obj.coff.section_add_reloc
@@ -549,6 +551,113 @@ pub fn format_pass_time(out: mut_view<DiagBuffer>, stage_idx: u32, elapsed_ns: u
     push_pipe_str(mut_view(*out), 106, 2);
 }
 
+// T486: sub-timers of the `build` phase. Indices into `PipelineCtx.build_ns`; the backend lowering
+// timers (lir .. mverify) are filled by `backend_lower_fn_to_mc_checked_timed` at `BT_LIR + k`.
+const BT_ASYNC: usize = 0;
+const BT_MIR: usize = 1;
+const BT_DROP: usize = 2;
+const BT_OPT: usize = 3;
+const BT_CALLTY: usize = 4;
+const BT_COLLECT: usize = 5;
+const BT_CONSTS: usize = 6;
+const BT_LIR: usize = 7;
+const BT_ENCODE: usize = 12;
+const BT_OBJFIN: usize = 13;
+const BT_COUNT: usize = 14;
+
+// 14 names of 10 bytes: the `time-build:` sub-timer names, in BT_* order.
+const BUILD_SUB_NAMES: [140]u8 = [
+    // "async     "
+    97u8, 115u8, 121u8, 110u8, 99u8, 32u8, 32u8, 32u8, 32u8, 32u8,
+    // "mir_build "
+    109u8, 105u8, 114u8, 95u8, 98u8, 117u8, 105u8, 108u8, 100u8, 32u8,
+    // "mir_drop  "
+    109u8, 105u8, 114u8, 95u8, 100u8, 114u8, 111u8, 112u8, 32u8, 32u8,
+    // "mir_opt   "
+    109u8, 105u8, 114u8, 95u8, 111u8, 112u8, 116u8, 32u8, 32u8, 32u8,
+    // "mir_callty"
+    109u8, 105u8, 114u8, 95u8, 99u8, 97u8, 108u8, 108u8, 116u8, 121u8,
+    // "collect   "
+    99u8, 111u8, 108u8, 108u8, 101u8, 99u8, 116u8, 32u8, 32u8, 32u8,
+    // "consts    "
+    99u8, 111u8, 110u8, 115u8, 116u8, 115u8, 32u8, 32u8, 32u8, 32u8,
+    // "lir       "
+    108u8, 105u8, 114u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8,
+    // "abi       "
+    97u8, 98u8, 105u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8,
+    // "isel      "
+    105u8, 115u8, 101u8, 108u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8,
+    // "frame     "
+    102u8, 114u8, 97u8, 109u8, 101u8, 32u8, 32u8, 32u8, 32u8, 32u8,
+    // "mverify   "
+    109u8, 118u8, 101u8, 114u8, 105u8, 102u8, 121u8, 32u8, 32u8, 32u8,
+    // "encode    "
+    101u8, 110u8, 99u8, 111u8, 100u8, 101u8, 32u8, 32u8, 32u8, 32u8,
+    // "obj_final "
+    111u8, 98u8, 106u8, 95u8, 102u8, 105u8, 110u8, 97u8, 108u8, 32u8,
+];
+
+// "time-build: " (12 bytes), "link_rest " (10 bytes)
+const BUILD_SUB_MISC: [22]u8 = [
+    116u8, 105u8, 109u8, 101u8, 45u8, 98u8, 117u8, 105u8, 108u8, 100u8, 58u8, 32u8,
+    108u8, 105u8, 110u8, 107u8, 95u8, 114u8, 101u8, 115u8, 116u8, 32u8,
+];
+
+// Adds the time since `t0` to sub-timer `k` and returns the current time.
+fn bt_add(ctx: mut_view<PipelineCtx>, k: usize, t0: u64) -> u64 {
+    let t1 = monotonic_ns();
+    if t1 > t0 {
+        ctx.build_ns[k] = ctx.build_ns[k] + (t1 - t0);
+    }
+    t1
+}
+
+// One `time-build: <name> <secs>s` line; the name is 10 bytes of `tbl` at `off`.
+fn format_build_sub_line(out: mut_view<DiagBuffer>, from_misc: bool, off: usize, elapsed_ns: u64) {
+    let mut i: usize = 0;
+    while i < 12 {
+        diag_buf_push_byte(mut_view(*out), BUILD_SUB_MISC[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 10 {
+        let c = if from_misc { BUILD_SUB_MISC[off + i] } else { BUILD_SUB_NAMES[off + i] };
+        diag_buf_push_byte(mut_view(*out), c);
+        i = i + 1;
+    }
+    diag_buf_push_byte(mut_view(*out), 32u8);
+    let elapsed_i64: i64 = if (elapsed_ns as i64) >= 0i64 { elapsed_ns as i64 } else { 0i64 };
+    let tenths_ms: i64 = (elapsed_i64 + 50000i64) / 100000i64;
+    let secs: u32 = (tenths_ms / 10000i64) as u32;
+    let frac: i32 = (tenths_ms % 10000i64) as i32;
+    diag_buf_push_u32(mut_view(*out), secs);
+    diag_buf_push_byte(mut_view(*out), 46u8);
+    diag_buf_push_byte(mut_view(*out), (((frac / 1000) % 10) as u8) + 48u8);
+    diag_buf_push_byte(mut_view(*out), (((frac / 100) % 10) as u8) + 48u8);
+    diag_buf_push_byte(mut_view(*out), (((frac / 10) % 10) as u8) + 48u8);
+    diag_buf_push_byte(mut_view(*out), ((frac % 10) as u8) + 48u8);
+    push_pipe_str(mut_view(*out), 106, 2);
+}
+
+// T486: the split of the `build` phase, after its `time: build` line. `collect` is the MIR collection
+// loop minus the MIR parts timed separately; `link_rest` is the rest of the phase (PE link and write).
+fn format_build_sub_times(out: mut_view<DiagBuffer>, ctx: view<PipelineCtx>, total_ns: u64) {
+    let mir_parts = ctx.build_ns[BT_MIR] + ctx.build_ns[BT_DROP] + ctx.build_ns[BT_OPT] + ctx.build_ns[BT_CALLTY];
+    let mut sum: u64 = 0u64;
+    let mut k: usize = 0;
+    while k < BT_COUNT {
+        let mut v = ctx.build_ns[k];
+        if k == BT_COLLECT {
+            v = if v > mir_parts { v - mir_parts } else { 0u64 };
+        }
+        sum = sum + v;
+        format_build_sub_line(mut_view(*out), false, k * 10, v);
+        k = k + 1;
+    }
+    let rest = if total_ns > sum { total_ns - sum } else { 0u64 };
+    format_build_sub_line(mut_view(*out), true, 12, rest);
+}
+
 // =============================================================================
 // 2. Pipeline Context (`PipelineCtx`) & Stage Execution
 // =============================================================================
@@ -575,6 +684,8 @@ pub struct PipelineCtx {
     pub thir: Thir,
     pub mono: MonoEngine,
     pub time_ns: [10]u64,
+    // T486: sub-timers of the `build` phase (BT_* indices), printed as `time-build:` lines.
+    pub build_ns: [16]u64,
     pub interp_rc: i32,
     pub panic_msg: StrView,
 }
@@ -637,6 +748,11 @@ pub fn pipeline_ctx_init(ctx: mut_view<PipelineCtx>) {
     while i < 10 {
         ctx.time_ns[i] = 0u64;
         i = i + 1;
+    }
+    let mut bi: usize = 0;
+    while bi < 16 {
+        ctx.build_ns[bi] = 0u64;
+        bi = bi + 1;
     }
     ctx.interp_rc = 0;
     sv_clear(mut_view(ctx.panic_msg));
@@ -2614,6 +2730,7 @@ fn pipe_build_item_body(
         }
         return pre;
     }
+    let mut tb = monotonic_ns();
     let body = mir_build_fn(
         mut_view(ctx.mir_arena),
         it,
@@ -2624,9 +2741,11 @@ fn pipe_build_item_body(
         0 as *mut MonoEngine
     );
     if (body as usize) == 0 {
+        let _ = bt_add(mut_view(*ctx), BT_MIR, tb);
         return body;
     }
     backend_promote_const_aggregates(unsafe { mut_view(*body) }, view(ctx.thir));
+    tb = bt_add(mut_view(*ctx), BT_MIR, tb);
     if run_drop_elab {
         mir_drop_elaborate(
             unsafe { mut_view(*body) },
@@ -2644,6 +2763,7 @@ fn pipe_build_item_body(
                 it as *const HirItem
             );
         }
+        tb = bt_add(mut_view(*ctx), BT_DROP, tb);
     }
     if run_opt {
         opt_run_in_arena(
@@ -2654,8 +2774,10 @@ fn pipe_build_item_body(
             false,
             it as *const HirItem
         );
+        tb = bt_add(mut_view(*ctx), BT_OPT, tb);
     }
     backend_resolve_body_call_types(unsafe { mut_view(*body) }, view(ctx.hir), view(ctx.thir));
+    let _ = bt_add(mut_view(*ctx), BT_CALLTY, tb);
     body
 }
 
@@ -2805,6 +2927,27 @@ unsafe fn pipe_obj_symbol_at(base: *mut ObjSymbol, idx: usize) -> *mut ObjSymbol
 // AXS-WLIB-030: `extern "C" fn foo(...)` without `@link` must emit bare `foo` in COFF objects
 // so static libraries and short-import libraries can satisfy it directly.
 fn pipe_strip_unlinked_extern_c_prefixes(ctx: view<PipelineCtx>, obj: mut_view<ObjModel>) {
+    let mut unlinked_fns: [64]*const HirItem = [0 as *const HirItem; 64];
+    let mut unlinked_n: usize = 0;
+    let mut unlinked_overflow: bool = false;
+    let mut it0: *mut HirItem = ctx.hir.items;
+    while (it0 as usize) != 0 {
+        if (unsafe { (*it0).kind }) == HIR_ITEM_FN &&
+           (unsafe { (*it0).abi.v }) != 0u32 &&
+           (unsafe { (*it0).body as usize }) == 0 &&
+           !pipe_item_has_link_attr(it0 as *const HirItem, view(ctx.sess.interner)) {
+            if unlinked_n < 64 {
+                unlinked_fns[unlinked_n] = it0 as *const HirItem;
+                unlinked_n = unlinked_n + 1;
+            } else {
+                unlinked_overflow = true;
+            }
+        }
+        it0 = unsafe { (*it0).next };
+    }
+    if unlinked_n == 0 && !unlinked_overflow {
+        return;
+    }
     let k32_pfx: [13]u8 = [
         75u8, 69u8, 82u8, 78u8, 69u8, 76u8, 51u8, 50u8, 46u8, 100u8, 108u8, 108u8, 36u8,
     ];
@@ -2827,7 +2970,23 @@ fn pipe_strip_unlinked_extern_c_prefixes(ctx: view<PipelineCtx>, obj: mut_view<O
             if is_k32 {
                 let bare_ptr = unsafe { (nptr as *const u8) + 13 };
                 let bare_len = nlen - 13;
-                if pipe_is_unlinked_extern_c_fn(ctx.hir.items, view(ctx.sess.interner), bare_ptr, bare_len) {
+                let mut matched_unlinked: bool = false;
+                if !unlinked_overflow {
+                    let bare_sv = StrView { ptr: bare_ptr, len: bare_len };
+                    let mut ui: usize = 0;
+                    while ui < unlinked_n {
+                        let uit = unlinked_fns[ui];
+                        let fn_sv = interner_get(view(ctx.sess.interner), unsafe { (*uit).name });
+                        if sv_eq(view(fn_sv), view(bare_sv)) {
+                            matched_unlinked = true;
+                            break;
+                        }
+                        ui = ui + 1;
+                    }
+                } else {
+                    matched_unlinked = pipe_is_unlinked_extern_c_fn(ctx.hir.items, view(ctx.sess.interner), bare_ptr, bare_len);
+                }
+                if matched_unlinked {
                     let mut k: usize = 0;
                     while k < bare_len {
                         unsafe { *(nptr + k) = *(nptr + 13 + k); }
@@ -2837,6 +2996,7 @@ fn pipe_strip_unlinked_extern_c_prefixes(ctx: view<PipelineCtx>, obj: mut_view<O
                         *(nptr + bare_len) = 0u8;
                         (*sym).name_len = bare_len;
                     }
+                    objmodel_symbol_names_changed(view(*obj));
                 }
             }
         }
@@ -2868,6 +3028,11 @@ fn pipe_item_has_entry_attr(it: *const HirItem, interner: view<StrInterner>) -> 
 }
 
 fn pipe_is_mono_clone(head: *mut MonoInstance, target: *const HirItem) -> bool {
+    if (target as usize) == 0 ||
+       (unsafe { (*target).generic_params as usize }) != 0 ||
+       ((unsafe { (*target).span.file.v }) != 0xFFFFFFFEu32 && (unsafe { (*target).symbol.v }) < 0x08000000u32) {
+        return false;
+    }
     let mut inst: *mut MonoInstance = head;
     while (inst as usize) != 0 {
         if ((unsafe { (*inst).new_item }) as usize) == (target as usize) &&
@@ -3843,6 +4008,7 @@ fn pipe_lower_dll_imports_for_obj(
                         (*sym_after).size = 6u64;
                         (*sym_after).linkage = SYM_LOCAL;
                     }
+                    objmodel_symbol_names_changed(view(*obj));
                 }
             }
         }
@@ -4192,7 +4358,212 @@ fn pipe_format_fn_abi_sig(
     StrView { ptr: dst as *const u8, len: slen }
 }
 
+fn pipe_ptr_hash(p: usize) -> usize {
+    let v = p as u64;
+    let mut h: u64 = ((v & 0xFFFFFFFFu64) * 0x9E3779B9u64) ^ ((v >> 32u64) * 0x85EBCA6Bu64);
+    h = h ^ (h >> 16u64);
+    h as usize
+}
+
+fn pipe_bytes_hash(ptr: *const u8, n: usize) -> usize {
+    let mut h: u64 = 0xCBF29CE484222325u64;
+    let mut i: usize = 0;
+    while i < n {
+        let b = (unsafe { *(ptr + i) }) as u64;
+        h = h ^ b;
+        h = ((h & 0xFFFFFFFFu64) * 0x9E3779B9u64) ^ ((h >> 32u64) * 0x85EBCA6Bu64) ^ (h << 7u64) ^ (h >> 3u64);
+        i = i + 1;
+    }
+    h as usize
+}
+
+unsafe fn pipe_mono_inst_ptr_at(base: *mut *mut MonoInstance, idx: usize) -> *mut *mut MonoInstance {
+    ((base as usize) + opts_mul_usize(idx, size_of<*mut MonoInstance>())) as *mut *mut MonoInstance
+}
+
+fn pipe_pow2_cap(n: usize) -> usize {
+    let mut cap: usize = 16;
+    while cap < 2 * (n + 1) {
+        cap = cap + cap;
+    }
+    cap
+}
+
+fn pipe_zero_usize_slice(p: *mut usize, n: usize) {
+    let mut i: usize = 0;
+    while i < n {
+        unsafe { *(((p as usize) + opts_mul_usize(i, size_of<usize>())) as *mut usize) = 0; }
+        i = i + 1;
+    }
+}
+
+fn pipe_zero_u32_slice(p: *mut u32, n: usize) {
+    let mut i: usize = 0;
+    while i < n {
+        unsafe { *pipe_u32_at(p, i) = 0u32; }
+        i = i + 1;
+    }
+}
+
+fn pipe_build_mono_clone_tab(
+    arena: mut_view<Arena>,
+    head: *mut MonoInstance,
+    out_keys: mut_view<*mut usize>,
+    out_vals: mut_view<*mut *mut MonoInstance>
+) -> usize {
+    let mut cnt: usize = 0;
+    let mut cur: *mut MonoInstance = head;
+    while (cur as usize) != 0 {
+        let ni = unsafe { (*cur).new_item as usize };
+        let oi = unsafe { (*cur).orig_item as usize };
+        if ni != 0 && ni != oi {
+            cnt = cnt + 1;
+        }
+        cur = unsafe { (*cur).next };
+    }
+    if cnt == 0 {
+        *out_keys = 0 as *mut usize;
+        *out_vals = 0 as *mut *mut MonoInstance;
+        return 0;
+    }
+    let cap = pipe_pow2_cap(cnt);
+    let keys = arena_alloc_raw(mut_view(*arena), opts_mul_usize(cap, size_of<usize>()), align_of<usize>()) as *mut usize;
+    let vals = arena_alloc_raw(mut_view(*arena), opts_mul_usize(cap, size_of<*mut MonoInstance>()), align_of<*mut MonoInstance>()) as *mut *mut MonoInstance;
+    pipe_zero_usize_slice(keys, cap);
+    let mask = cap - 1;
+    cur = head;
+    while (cur as usize) != 0 {
+        let ni = unsafe { (*cur).new_item as usize };
+        let oi = unsafe { (*cur).orig_item as usize };
+        if ni != 0 && ni != oi {
+            let mut slot = pipe_ptr_hash(ni) & mask;
+            while true {
+                let kp = ((keys as usize) + opts_mul_usize(slot, size_of<usize>())) as *mut usize;
+                let k = unsafe { *kp };
+                if k == ni {
+                    break;
+                }
+                if k == 0 {
+                    unsafe {
+                        *kp = ni;
+                        *pipe_mono_inst_ptr_at(vals, slot) = cur;
+                    }
+                    break;
+                }
+                slot = (slot + 1) & mask;
+            }
+        }
+        cur = unsafe { (*cur).next };
+    }
+    *out_keys = keys;
+    *out_vals = vals;
+    cap
+}
+
+fn pipe_find_mono_in_tab(
+    cap: usize,
+    keys: *mut usize,
+    vals: *mut *mut MonoInstance,
+    target: *const HirItem
+) -> *mut MonoInstance {
+    let t = target as usize;
+    if cap == 0 || t == 0 || (keys as usize) == 0 {
+        return 0 as *mut MonoInstance;
+    }
+    let mask = cap - 1;
+    let mut slot = pipe_ptr_hash(t) & mask;
+    while true {
+        let k = unsafe { *(((keys as usize) + opts_mul_usize(slot, size_of<usize>())) as *const usize) };
+        if k == 0 {
+            return 0 as *mut MonoInstance;
+        }
+        if k == t {
+            return unsafe { *pipe_mono_inst_ptr_at(vals, slot) };
+        }
+        slot = (slot + 1) & mask;
+    }
+    0 as *mut MonoInstance
+}
+
+fn pipe_build_trait_member_tab(
+    arena: mut_view<Arena>,
+    items_head: *mut HirItem,
+    out_keys: mut_view<*mut usize>
+) -> usize {
+    let mut cnt: usize = 0;
+    let mut t: *mut HirItem = items_head;
+    while (t as usize) != 0 {
+        if (unsafe { (*t).kind }) == HIR_ITEM_TRAIT {
+            let mut tm: *mut HirItem = unsafe { (*t).members };
+            while (tm as usize) != 0 {
+                cnt = cnt + 1;
+                tm = unsafe { (*tm).next };
+            }
+        }
+        t = unsafe { (*t).next };
+    }
+    if cnt == 0 {
+        *out_keys = 0 as *mut usize;
+        return 0;
+    }
+    let cap = pipe_pow2_cap(cnt);
+    let keys = arena_alloc_raw(mut_view(*arena), opts_mul_usize(cap, size_of<usize>()), align_of<usize>()) as *mut usize;
+    pipe_zero_usize_slice(keys, cap);
+    let mask = cap - 1;
+    t = items_head;
+    while (t as usize) != 0 {
+        if (unsafe { (*t).kind }) == HIR_ITEM_TRAIT {
+            let mut tm: *mut HirItem = unsafe { (*t).members };
+            while (tm as usize) != 0 {
+                let k_val = tm as usize;
+                let mut slot = pipe_ptr_hash(k_val) & mask;
+                while true {
+                    let kp = ((keys as usize) + opts_mul_usize(slot, size_of<usize>())) as *mut usize;
+                    let k = unsafe { *kp };
+                    if k == k_val {
+                        break;
+                    }
+                    if k == 0 {
+                        unsafe { *kp = k_val; }
+                        break;
+                    }
+                    slot = (slot + 1) & mask;
+                }
+                tm = unsafe { (*tm).next };
+            }
+        }
+        t = unsafe { (*t).next };
+    }
+    *out_keys = keys;
+    cap
+}
+
+fn pipe_has_trait_member_in_tab(cap: usize, keys: *mut usize, m: *const HirItem) -> bool {
+    let mv = m as usize;
+    if cap == 0 || mv == 0 || (keys as usize) == 0 {
+        return false;
+    }
+    let mask = cap - 1;
+    let mut slot = pipe_ptr_hash(mv) & mask;
+    while true {
+        let k = unsafe { *(((keys as usize) + opts_mul_usize(slot, size_of<usize>())) as *const usize) };
+        if k == 0 {
+            return false;
+        }
+        if k == mv {
+            return true;
+        }
+        slot = (slot + 1) & mask;
+    }
+    false
+}
+
 fn pipe_find_mono_instance(head: *mut MonoInstance, target: *const HirItem) -> *mut MonoInstance {
+    if (target as usize) == 0 ||
+       (unsafe { (*target).generic_params as usize }) != 0 ||
+       ((unsafe { (*target).span.file.v }) != 0xFFFFFFFEu32 && (unsafe { (*target).symbol.v }) < 0x08000000u32) {
+        return 0 as *mut MonoInstance;
+    }
     let mut inst: *mut MonoInstance = head;
     while (inst as usize) != 0 {
         if ((unsafe { (*inst).new_item }) as usize) == (target as usize) &&
@@ -4204,9 +4575,10 @@ fn pipe_find_mono_instance(head: *mut MonoInstance, target: *const HirItem) -> *
     0 as *mut MonoInstance
 }
 
-fn pipe_format_demangled_sym(
+fn pipe_format_demangled_sym_with_minst(
     ctx: mut_view<PipelineCtx>,
     hir_it: *const HirItem,
+    minst: *mut MonoInstance,
     sym_sv: view<StrView>
 ) -> StrView {
     // 1. If `sym_sv` starts with `_AX1_`, demangle via `pe_demangle_symbol`.
@@ -4229,44 +4601,41 @@ fn pipe_format_demangled_sym(
     }
 
     // 2. If `hir_it` is a monomorphized generic clone, format `<orig_canonical><<type_args>>`.
-    if (hir_it as usize) != 0 {
-        let minst = pipe_find_mono_instance(ctx.mono.instances_head, hir_it);
-        if (minst as usize) != 0 {
-            let orig_it = unsafe { (*minst).orig_item };
-            let acount = unsafe { (*minst).args.count };
-            let aptr = unsafe { (*minst).args.args };
-            if (orig_it as usize) != 0 && acount > 0 && (aptr as usize) != 0 {
-                let mut mbuf = coff_buf_with_capacity(64);
-                let orig_cn = resolve_symbol_canonical_name(view(ctx.rmap), unsafe { (*orig_it).symbol });
-                if orig_cn.len > 0 && (orig_cn.ptr as usize) != 0 {
-                    coff_buf_put_bytes(mut_view(mbuf), orig_cn.ptr, orig_cn.len);
-                } else {
-                    let onm = interner_get(view(ctx.sess.interner), unsafe { (*orig_it).name });
-                    coff_buf_put_bytes(mut_view(mbuf), onm.ptr, onm.len);
-                }
-                coff_buf_put_u8(mut_view(mbuf), 60u8); // '<'
-                let mut ai: usize = 0;
-                while ai < acount {
-                    if ai > 0 {
-                        coff_buf_put_u8(mut_view(mbuf), 44u8);
-                        coff_buf_put_u8(mut_view(mbuf), 32u8);
-                    }
-                    let a_tid = unsafe { *typeid_at(aptr, ai) };
-                    pipe_append_type_sig(mut_view(mbuf), a_tid, view(ctx.thir.interner), view(ctx.sess.interner));
-                    ai = ai + 1;
-                }
-                coff_buf_put_u8(mut_view(mbuf), 62u8); // '>'
-                let mlen = mbuf.len;
-                let mdst = arena_alloc_raw(mut_view(ctx.backend_arena), mlen + 1, 1);
-                let mut mi: usize = 0;
-                while mi < mlen {
-                    unsafe { *(mdst + mi) = *(mbuf.ptr + mi); }
-                    mi = mi + 1;
-                }
-                unsafe { *(mdst + mlen) = 0u8; }
-                coff_buf_free(mut_view(mbuf));
-                return StrView { ptr: mdst as *const u8, len: mlen };
+    if (hir_it as usize) != 0 && (minst as usize) != 0 {
+        let orig_it = unsafe { (*minst).orig_item };
+        let acount = unsafe { (*minst).args.count };
+        let aptr = unsafe { (*minst).args.args };
+        if (orig_it as usize) != 0 && acount > 0 && (aptr as usize) != 0 {
+            let mut mbuf = coff_buf_with_capacity(64);
+            let orig_cn = resolve_symbol_canonical_name(view(ctx.rmap), unsafe { (*orig_it).symbol });
+            if orig_cn.len > 0 && (orig_cn.ptr as usize) != 0 {
+                coff_buf_put_bytes(mut_view(mbuf), orig_cn.ptr, orig_cn.len);
+            } else {
+                let onm = interner_get(view(ctx.sess.interner), unsafe { (*orig_it).name });
+                coff_buf_put_bytes(mut_view(mbuf), onm.ptr, onm.len);
             }
+            coff_buf_put_u8(mut_view(mbuf), 60u8); // '<'
+            let mut ai: usize = 0;
+            while ai < acount {
+                if ai > 0 {
+                    coff_buf_put_u8(mut_view(mbuf), 44u8);
+                    coff_buf_put_u8(mut_view(mbuf), 32u8);
+                }
+                let a_tid = unsafe { *typeid_at(aptr, ai) };
+                pipe_append_type_sig(mut_view(mbuf), a_tid, view(ctx.thir.interner), view(ctx.sess.interner));
+                ai = ai + 1;
+            }
+            coff_buf_put_u8(mut_view(mbuf), 62u8); // '>'
+            let mlen = mbuf.len;
+            let mdst = arena_alloc_raw(mut_view(ctx.backend_arena), mlen + 1, 1);
+            let mut mi: usize = 0;
+            while mi < mlen {
+                unsafe { *(mdst + mi) = *(mbuf.ptr + mi); }
+                mi = mi + 1;
+            }
+            unsafe { *(mdst + mlen) = 0u8; }
+            coff_buf_free(mut_view(mbuf));
+            return StrView { ptr: mdst as *const u8, len: mlen };
         }
     }
 
@@ -4294,6 +4663,19 @@ fn pipe_format_demangled_sym(
     unsafe { *(fdst + flen) = 0u8; }
     coff_buf_free(mut_view(fbuf));
     StrView { ptr: fdst as *const u8, len: flen }
+}
+
+fn pipe_format_demangled_sym(
+    ctx: mut_view<PipelineCtx>,
+    hir_it: *const HirItem,
+    sym_sv: view<StrView>
+) -> StrView {
+    let minst = if (hir_it as usize) != 0 {
+        pipe_find_mono_instance(ctx.mono.instances_head, hir_it)
+    } else {
+        0 as *mut MonoInstance
+    };
+    pipe_format_demangled_sym_with_minst(ctx, hir_it, minst, sym_sv)
 }
 
 fn pipe_find_hir_fn_for_sym(
@@ -4341,6 +4723,20 @@ fn pipe_emit_axmeta_section(
         112u8, 114u8, 101u8, 108u8, 117u8, 100u8, 101u8,
         95u8, 108u8, 111u8, 97u8, 100u8, 101u8, 100u8,
     ];
+    let mut mono_keys: *mut usize = 0 as *mut usize;
+    let mut mono_vals: *mut *mut MonoInstance = 0 as *mut *mut MonoInstance;
+    let mono_cap = pipe_build_mono_clone_tab(
+        mut_view(ctx.backend_arena),
+        ctx.mono.instances_head,
+        mut_view(mono_keys),
+        mut_view(mono_vals)
+    );
+    let mut trait_keys: *mut usize = 0 as *mut usize;
+    let trait_cap = pipe_build_trait_member_tab(
+        mut_view(ctx.backend_arena),
+        ctx.hir.items,
+        mut_view(trait_keys)
+    );
 
     // 1. Emit `AXMETA_ENTRY_DEF` for each defined function in `items_buf[0..fn_count]`.
     let mut fi: usize = 0;
@@ -4390,16 +4786,17 @@ fn pipe_emit_axmeta_section(
                     mut_view(p_cnt),
                     mut_view(r_sz)
                 );
+                let fn_minst = pipe_find_mono_in_tab(mono_cap, mono_keys, mono_vals, fn_item as *const HirItem);
                 let is_weak: bool =
-                    pipe_is_mono_clone(ctx.mono.instances_head, fn_item as *const HirItem) ||
-                    pipe_is_trait_member(ctx.hir.items, fn_item) ||
+                    (fn_minst as usize) != 0 ||
+                    pipe_has_trait_member_in_tab(trait_cap, trait_keys, fn_item as *const HirItem) ||
                     tc_is_default_inst(fn_item as *const HirItem) ||
                     pipe_fid_is_std(ctx.proj.files as *const ProjectFile, ctx.proj.file_count, unsafe { (*fn_item).span.file.v }) ||
                     pipe_sv_eq_ascii(view(fname_sv), unsafe { address_of(prel_b[0]) }, 14) ||
                     pipe_sv_has_dollar(view(fname_sv)) ||
                     pipe_item_has_weak_attr(fn_item as *const HirItem, view(ctx.sess.interner));
                 let bind: u8 = if is_weak { SYM_BIND_WEAK } else { SYM_BIND_STRONG };
-                let dem_sv = pipe_format_demangled_sym(mut_view(*ctx), fn_item as *const HirItem, view(fname_sv));
+                let dem_sv = pipe_format_demangled_sym_with_minst(mut_view(*ctx), fn_item as *const HirItem, fn_minst, view(fname_sv));
                 let sp = unsafe { (*fn_item).span };
                 let fid_out: u32 = if axmeta_keep_file_id { sp.file.v } else { 0u32 };
                 axmeta_put_entry(
@@ -4432,7 +4829,7 @@ fn pipe_emit_axmeta_section(
                         view(ctx.sess.interner),
                         view(exp_fn_sv)
                     ) {
-                        let exp_dem_sv = pipe_format_demangled_sym(mut_view(*ctx), fn_item as *const HirItem, view(exp_fn_sv));
+                        let exp_dem_sv = pipe_format_demangled_sym_with_minst(mut_view(*ctx), fn_item as *const HirItem, fn_minst, view(exp_fn_sv));
                         axmeta_put_entry(
                             mut_view(entries_buf),
                             exp_fn_sv.ptr,
@@ -4518,61 +4915,185 @@ fn pipe_emit_axmeta_section(
     }
 
     // 3. Emit `AXMETA_ENTRY_REF` for undefined external symbols in `obj.symbols`.
-    let mut si: usize = 0;
-    while si < obj.symbols_len {
-        let osym = unsafe { pipe_obj_symbol_at(obj.symbols, si) };
-        if (unsafe { (*osym).linkage }) == SYM_EXTERNAL && (unsafe { (*osym).section_id.v }) == 0u32 {
-            let s_ptr = unsafe { (*osym).name };
-            let s_len = unsafe { (*osym).name_len };
-            if s_len > 0 && (s_ptr as usize) != 0 {
-                let sym_sv = StrView { ptr: s_ptr, len: s_len };
-                let hir_fn = pipe_find_hir_fn_for_sym(ctx.hir.items, view(ctx.sess.interner), view(sym_sv));
-                if (hir_fn as usize) != 0 {
-                    let p_ity = thir_get_item_type(view(ctx.thir), hir_fn as *const HirItem);
-                    let mut fn_ty: *const AxType = 0 as *const AxType;
-                    if (p_ity as usize) != 0 && (unsafe { (*p_ity).v }) != 0u32 {
-                        fn_ty = type_get(view(ctx.thir.interner), TypeId { v: unsafe { (*p_ity).v } }) as *const AxType;
+    let mut hir_fn_cnt: usize = 0;
+    let mut hit0: *mut HirItem = ctx.hir.items;
+    while (hit0 as usize) != 0 {
+        if (unsafe { (*hit0).kind }) == HIR_ITEM_FN && (unsafe { (*hit0).name.v }) != 0u32 {
+            hir_fn_cnt = hir_fn_cnt + 1;
+        }
+        hit0 = unsafe { (*hit0).next };
+    }
+    if hir_fn_cnt > 0 && obj.symbols_len > 0 {
+        let fn_tab_cap = pipe_pow2_cap(hir_fn_cnt);
+        let fn_tab_mask = fn_tab_cap - 1;
+        let fn_tab_items = arena_alloc_raw(
+            mut_view(ctx.backend_arena),
+            opts_mul_usize(fn_tab_cap, size_of<*mut HirItem>()),
+            align_of<*mut HirItem>()
+        ) as *mut *mut HirItem;
+        pipe_zero_usize_slice(fn_tab_items as *mut usize, fn_tab_cap);
+        let fn_ref_ready = arena_alloc_raw(mut_view(ctx.backend_arena), fn_tab_cap, 1);
+        let mut zri: usize = 0;
+        while zri < fn_tab_cap {
+            unsafe { *(fn_ref_ready + zri) = 0u8; }
+            zri = zri + 1;
+        }
+        let fn_ref_sig_ptr = arena_alloc_raw(
+            mut_view(ctx.backend_arena),
+            opts_mul_usize(fn_tab_cap, size_of<usize>()),
+            align_of<usize>()
+        ) as *mut usize;
+        let fn_ref_sig_len = arena_alloc_raw(
+            mut_view(ctx.backend_arena),
+            opts_mul_usize(fn_tab_cap, size_of<usize>()),
+            align_of<usize>()
+        ) as *mut usize;
+        let fn_ref_dem_ptr = arena_alloc_raw(
+            mut_view(ctx.backend_arena),
+            opts_mul_usize(fn_tab_cap, size_of<usize>()),
+            align_of<usize>()
+        ) as *mut usize;
+        let fn_ref_dem_len = arena_alloc_raw(
+            mut_view(ctx.backend_arena),
+            opts_mul_usize(fn_tab_cap, size_of<usize>()),
+            align_of<usize>()
+        ) as *mut usize;
+        let fn_ref_cc = arena_alloc_raw(mut_view(ctx.backend_arena), fn_tab_cap, 1);
+        let fn_ref_pcnt = arena_alloc_raw(
+            mut_view(ctx.backend_arena),
+            opts_mul_usize(fn_tab_cap, size_of<u32>()),
+            align_of<u32>()
+        ) as *mut u32;
+        let fn_ref_rsz = arena_alloc_raw(
+            mut_view(ctx.backend_arena),
+            opts_mul_usize(fn_tab_cap, size_of<u32>()),
+            align_of<u32>()
+        ) as *mut u32;
+
+        let mut hit: *mut HirItem = ctx.hir.items;
+        while (hit as usize) != 0 {
+            if (unsafe { (*hit).kind }) == HIR_ITEM_FN {
+                let fn_name_v = unsafe { (*hit).name.v };
+                if fn_name_v != 0u32 {
+                    let fsv = interner_get(view(ctx.sess.interner), StrId { v: fn_name_v });
+                    if fsv.len > 0 && (fsv.ptr as usize) != 0 {
+                        let mut slot = pipe_bytes_hash(fsv.ptr, fsv.len) & fn_tab_mask;
+                        while true {
+                            let cur_it = unsafe { *pipe_hir_item_ptr_at(fn_tab_items, slot) };
+                            if (cur_it as usize) == 0 {
+                                unsafe { *pipe_hir_item_ptr_at(fn_tab_items, slot) = hit; }
+                                break;
+                            }
+                            let cur_sv = interner_get(view(ctx.sess.interner), unsafe { (*cur_it).name });
+                            if sv_eq(view(cur_sv), view(fsv)) {
+                                if ((unsafe { (*cur_it).body }) as usize) == 0 &&
+                                   ((unsafe { (*hit).body }) as usize) != 0 {
+                                    unsafe { *pipe_hir_item_ptr_at(fn_tab_items, slot) = hit; }
+                                }
+                                break;
+                            }
+                            slot = (slot + 1) & fn_tab_mask;
+                        }
                     }
-                    let cc = pipe_item_get_call_conv(hir_fn as *const HirItem, view(ctx.sess.interner));
-                    let mut p_cnt: u32 = 0xFFFFFFFFu32;
-                    let mut r_sz: u32 = 0xFFFFFFFFu32;
-                    let sig_sv = pipe_format_fn_abi_sig(
-                        mut_view(ctx.backend_arena),
-                        fn_ty,
-                        cc,
-                        view(ctx.thir.interner),
-                        view(ctx.sess.interner),
-                        mut_view(p_cnt),
-                        mut_view(r_sz)
-                    );
-                    let dem_sv = pipe_format_demangled_sym(mut_view(*ctx), hir_fn as *const HirItem, view(sym_sv));
-                    let sp = unsafe { (*hir_fn).span };
-                    let fid_out: u32 = if axmeta_keep_file_id { sp.file.v } else { 0u32 };
-                    axmeta_put_entry(
-                        mut_view(entries_buf),
-                        sym_sv.ptr,
-                        sym_sv.len,
-                        dem_sv.ptr,
-                        dem_sv.len,
-                        sig_sv.ptr,
-                        sig_sv.len,
-                        0 as *const u8,
-                        0,
-                        AXMETA_ENTRY_REF,
-                        SYM_BIND_STRONG,
-                        SYM_ABI_KIND_FUNC,
-                        cc,
-                        p_cnt,
-                        r_sz,
-                        fid_out,
-                        sp.start,
-                        sp.end
-                    );
-                    entry_count = entry_count + 1u32;
                 }
             }
+            hit = unsafe { (*hit).next };
         }
-        si = si + 1;
+
+        let mut si: usize = 0;
+        while si < obj.symbols_len {
+            let osym = unsafe { pipe_obj_symbol_at(obj.symbols, si) };
+            if (unsafe { (*osym).linkage }) == SYM_EXTERNAL && (unsafe { (*osym).section_id.v }) == 0u32 {
+                let s_ptr = unsafe { (*osym).name };
+                let s_len = unsafe { (*osym).name_len };
+                if s_len > 0 && (s_ptr as usize) != 0 {
+                    let sym_sv = StrView { ptr: s_ptr, len: s_len };
+                    let mut slot = pipe_bytes_hash(s_ptr, s_len) & fn_tab_mask;
+                    let mut hir_fn: *mut HirItem = 0 as *mut HirItem;
+                    while true {
+                        let cur_it = unsafe { *pipe_hir_item_ptr_at(fn_tab_items, slot) };
+                        if (cur_it as usize) == 0 {
+                            break;
+                        }
+                        let cur_sv = interner_get(view(ctx.sess.interner), unsafe { (*cur_it).name });
+                        if sv_eq(view(cur_sv), view(sym_sv)) {
+                            hir_fn = cur_it;
+                            break;
+                        }
+                        slot = (slot + 1) & fn_tab_mask;
+                    }
+                    if (hir_fn as usize) != 0 {
+                        if (unsafe { *(fn_ref_ready + slot) }) == 0u8 {
+                            let p_ity = thir_get_item_type(view(ctx.thir), hir_fn as *const HirItem);
+                            let mut fn_ty: *const AxType = 0 as *const AxType;
+                            if (p_ity as usize) != 0 && (unsafe { (*p_ity).v }) != 0u32 {
+                                fn_ty = type_get(view(ctx.thir.interner), TypeId { v: unsafe { (*p_ity).v } }) as *const AxType;
+                            }
+                            let cc0 = pipe_item_get_call_conv(hir_fn as *const HirItem, view(ctx.sess.interner));
+                            let mut p_cnt0: u32 = 0xFFFFFFFFu32;
+                            let mut r_sz0: u32 = 0xFFFFFFFFu32;
+                            let sig_sv0 = pipe_format_fn_abi_sig(
+                                mut_view(ctx.backend_arena),
+                                fn_ty,
+                                cc0,
+                                view(ctx.thir.interner),
+                                view(ctx.sess.interner),
+                                mut_view(p_cnt0),
+                                mut_view(r_sz0)
+                            );
+                            let ref_minst = pipe_find_mono_in_tab(mono_cap, mono_keys, mono_vals, hir_fn as *const HirItem);
+                            let dem_sv0 = pipe_format_demangled_sym_with_minst(
+                                mut_view(*ctx),
+                                hir_fn as *const HirItem,
+                                ref_minst,
+                                view(sym_sv)
+                            );
+                            unsafe {
+                                *pipe_usize_at(fn_ref_sig_ptr, slot) = sig_sv0.ptr as usize;
+                                *pipe_usize_at(fn_ref_sig_len, slot) = sig_sv0.len;
+                                *pipe_usize_at(fn_ref_dem_ptr, slot) = dem_sv0.ptr as usize;
+                                *pipe_usize_at(fn_ref_dem_len, slot) = dem_sv0.len;
+                                *(fn_ref_cc + slot) = cc0;
+                                *pipe_u32_at(fn_ref_pcnt, slot) = p_cnt0;
+                                *pipe_u32_at(fn_ref_rsz, slot) = r_sz0;
+                                *(fn_ref_ready + slot) = 1u8;
+                            }
+                        }
+                        let sig_ptr = (unsafe { *pipe_usize_at(fn_ref_sig_ptr, slot) }) as *const u8;
+                        let sig_len = unsafe { *pipe_usize_at(fn_ref_sig_len, slot) };
+                        let dem_ptr = (unsafe { *pipe_usize_at(fn_ref_dem_ptr, slot) }) as *const u8;
+                        let dem_len = unsafe { *pipe_usize_at(fn_ref_dem_len, slot) };
+                        let cc = unsafe { *(fn_ref_cc + slot) };
+                        let p_cnt = unsafe { *pipe_u32_at(fn_ref_pcnt, slot) };
+                        let r_sz = unsafe { *pipe_u32_at(fn_ref_rsz, slot) };
+                        let sp = unsafe { (*hir_fn).span };
+                        let fid_out: u32 = if axmeta_keep_file_id { sp.file.v } else { 0u32 };
+                        axmeta_put_entry(
+                            mut_view(entries_buf),
+                            sym_sv.ptr,
+                            sym_sv.len,
+                            dem_ptr,
+                            dem_len,
+                            sig_ptr,
+                            sig_len,
+                            0 as *const u8,
+                            0,
+                            AXMETA_ENTRY_REF,
+                            SYM_BIND_STRONG,
+                            SYM_ABI_KIND_FUNC,
+                            cc,
+                            p_cnt,
+                            r_sz,
+                            fid_out,
+                            sp.start,
+                            sp.end
+                        );
+                        entry_count = entry_count + 1u32;
+                    }
+                }
+            }
+            si = si + 1;
+        }
     }
 
     if entry_count > 0u32 {
@@ -4616,11 +5137,11 @@ fn pipe_item_has_own_generics(mono_head: *mut MonoInstance, it: *const HirItem) 
     if (it as usize) == 0 {
         return false;
     }
-    if pipe_is_mono_clone(mono_head, it) {
+    let gp = unsafe { (*it).generic_params };
+    if (gp as usize) == 0 || (unsafe { (*gp).params as usize }) == 0 {
         return false;
     }
-    let gp = unsafe { (*it).generic_params };
-    (gp as usize) != 0 && (unsafe { (*gp).params as usize }) != 0
+    !pipe_is_mono_clone(mono_head, it)
 }
 
 fn pipe_op_refs_sym(op: view<MirOperand>, sym_v: u32) -> bool {
@@ -4694,6 +5215,172 @@ fn pipe_bodies_ref_sym(bodies_buf: *mut *mut MirBody, fn_count: usize, sym_v: u3
     false
 }
 
+fn pipe_items_tab_insert(
+    cap: usize,
+    keys: *mut usize,
+    vals: *mut u32,
+    it: *const HirItem,
+    idx: usize
+) {
+    let k_val = it as usize;
+    if cap == 0 || k_val == 0 || (keys as usize) == 0 {
+        return;
+    }
+    let mask = cap - 1;
+    let mut slot = pipe_ptr_hash(k_val) & mask;
+    while true {
+        let kp = unsafe { pipe_usize_at(keys, slot) };
+        let cur = unsafe { *kp };
+        if cur == k_val {
+            return;
+        }
+        if cur == 0 {
+            unsafe {
+                *kp = k_val;
+                *pipe_u32_at(vals, slot) = (idx + 1) as u32;
+            }
+            return;
+        }
+        slot = (slot + 1) & mask;
+    }
+}
+
+fn pipe_items_tab_find(
+    cap: usize,
+    keys: *mut usize,
+    vals: *mut u32,
+    it: *const HirItem
+) -> u32 {
+    let k_val = it as usize;
+    if cap == 0 || k_val == 0 || (keys as usize) == 0 {
+        return 0u32;
+    }
+    let mask = cap - 1;
+    let mut slot = pipe_ptr_hash(k_val) & mask;
+    while true {
+        let cur = unsafe { *pipe_usize_at(keys, slot) };
+        if cur == 0 {
+            return 0u32;
+        }
+        if cur == k_val {
+            return unsafe { *pipe_u32_at(vals, slot) };
+        }
+        slot = (slot + 1) & mask;
+    }
+    0u32
+}
+
+fn pipe_std_sym_insert(cap: usize, keys: *mut u32, sym_v: u32) {
+    if cap == 0 || sym_v == 0u32 || (keys as usize) == 0 {
+        return;
+    }
+    let mask = cap - 1;
+    let mut slot = pipe_ptr_hash(sym_v as usize) & mask;
+    while true {
+        let kp = unsafe { pipe_u32_at(keys, slot) };
+        let cur = unsafe { *kp };
+        if cur == sym_v {
+            return;
+        }
+        if cur == 0u32 {
+            unsafe { *kp = sym_v; }
+            return;
+        }
+        slot = (slot + 1) & mask;
+    }
+}
+
+fn pipe_std_sym_mark_op(cap: usize, keys: *mut u32, hit: *mut u8, op: view<MirOperand>) {
+    if op.kind != MIR_OP_CONST {
+        return;
+    }
+    let sym_v = op.constant.sym.v;
+    if cap == 0 || sym_v == 0u32 || (keys as usize) == 0 {
+        return;
+    }
+    let mask = cap - 1;
+    let mut slot = pipe_ptr_hash(sym_v as usize) & mask;
+    while true {
+        let cur = unsafe { *pipe_u32_at(keys, slot) };
+        if cur == 0u32 {
+            return;
+        }
+        if cur == sym_v {
+            unsafe { *(hit + slot) = 1u8; }
+            return;
+        }
+        slot = (slot + 1) & mask;
+    }
+}
+
+fn pipe_std_sym_is_hit(cap: usize, keys: *mut u32, hit: *mut u8, sym_v: u32) -> bool {
+    if cap == 0 || sym_v == 0u32 || (keys as usize) == 0 {
+        return false;
+    }
+    let mask = cap - 1;
+    let mut slot = pipe_ptr_hash(sym_v as usize) & mask;
+    while true {
+        let cur = unsafe { *pipe_u32_at(keys, slot) };
+        if cur == 0u32 {
+            return false;
+        }
+        if cur == sym_v {
+            return (unsafe { *(hit + slot) }) != 0u8;
+        }
+        slot = (slot + 1) & mask;
+    }
+    false
+}
+
+fn pipe_mark_body_std_refs(cap: usize, keys: *mut u32, hit: *mut u8, body: *const MirBody) {
+    if (body as usize) == 0 || cap == 0 {
+        return;
+    }
+    let bbs = unsafe { (*body).bbs };
+    let bb_cnt = unsafe { (*body).bb_count };
+    let mut b: usize = 0;
+    while b < bb_cnt && (bbs as usize) != 0 {
+        let bb = unsafe { mir_bb_at(bbs, b) };
+        let stmts = unsafe { (*bb).stmts };
+        let stmt_cnt = unsafe { (*bb).stmt_count };
+        let mut s: usize = 0;
+        while s < stmt_cnt && (stmts as usize) != 0 {
+            let st = unsafe { mir_stmt_at(stmts, s) };
+            if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN {
+                let rvk = unsafe { (*st).rvalue.kind };
+                if rvk == MIR_RVALUE_USE || rvk == MIR_RVALUE_CAST || rvk == MIR_RVALUE_UNARY_OP {
+                    pipe_std_sym_mark_op(cap, keys, hit, unsafe { view((*st).rvalue.use_op) });
+                } else if rvk == MIR_RVALUE_BINARY_OP {
+                    pipe_std_sym_mark_op(cap, keys, hit, unsafe { view((*st).rvalue.lhs) });
+                    pipe_std_sym_mark_op(cap, keys, hit, unsafe { view((*st).rvalue.rhs) });
+                } else if rvk == MIR_RVALUE_AGGREGATE {
+                    let ops = unsafe { (*st).rvalue.operands };
+                    let oc = unsafe { (*st).rvalue.operand_count };
+                    let mut oi: usize = 0;
+                    while oi < oc && (ops as usize) != 0 {
+                        let op = unsafe { mir_op_at(ops, oi) };
+                        pipe_std_sym_mark_op(cap, keys, hit, unsafe { view(*op) });
+                        oi = oi + 1;
+                    }
+                }
+            }
+            s = s + 1;
+        }
+        if (unsafe { (*bb).has_terminator }) && (unsafe { (*bb).terminator.kind }) == MIR_TERM_CALL {
+            pipe_std_sym_mark_op(cap, keys, hit, unsafe { view((*bb).terminator.func) });
+            let args = unsafe { (*bb).terminator.args };
+            let ac = unsafe { (*bb).terminator.arg_count };
+            let mut ai: usize = 0;
+            while ai < ac && (args as usize) != 0 {
+                let aop = unsafe { mir_op_at(args, ai) };
+                pipe_std_sym_mark_op(cap, keys, hit, unsafe { view(*aop) });
+                ai = ai + 1;
+            }
+        }
+        b = b + 1;
+    }
+}
+
 fn driver_emit_objmodel_filtered_ex(
     ctx: mut_view<PipelineCtx>,
     run_drop_elab: bool,
@@ -4710,7 +5397,9 @@ fn driver_emit_objmodel_filtered_ex(
     if session_has_errors(view(ctx.sess)) {
         return false;
     }
+    let mut bt0 = monotonic_ns();
     pipe_lower_all_async_functions(mut_view(*ctx));
+    bt0 = bt_add(mut_view(*ctx), BT_ASYNC, bt0);
     if session_has_errors(view(ctx.sess)) {
         return false;
     }
@@ -4793,6 +5482,18 @@ fn driver_emit_objmodel_filtered_ex(
         opts_mul_usize(alloc_fn_cap, size_of<*mut MirBody>()),
         align_of<*mut MirBody>()
     ) as *mut *mut MirBody;
+    let items_tab_cap = pipe_pow2_cap(alloc_fn_cap);
+    let items_tab_keys = arena_alloc_raw(
+        mut_view(ctx.backend_arena),
+        opts_mul_usize(items_tab_cap, size_of<usize>()),
+        align_of<usize>()
+    ) as *mut usize;
+    let items_tab_vals = arena_alloc_raw(
+        mut_view(ctx.backend_arena),
+        opts_mul_usize(items_tab_cap, size_of<u32>()),
+        align_of<u32>()
+    ) as *mut u32;
+    pipe_zero_usize_slice(items_tab_keys, items_tab_cap);
     let mut fn_count: usize = 0;
 
     backend_populate_hir_const_aggregates(view(ctx.sess), view(ctx.hir), mut_view(ctx.thir));
@@ -4823,6 +5524,7 @@ fn driver_emit_objmodel_filtered_ex(
                         *pipe_hir_item_ptr_at(items_buf, fn_count) = it;
                         *pipe_mir_body_ptr_at(bodies_buf, fn_count) = body;
                     }
+                    pipe_items_tab_insert(items_tab_cap, items_tab_keys, items_tab_vals, it as *const HirItem, fn_count);
                     fn_count = fn_count + 1;
                 }
             }
@@ -4837,13 +5539,19 @@ fn driver_emit_objmodel_filtered_ex(
     // in `hir.items` (impl members and generic clones are). Build those bodies too, so the image defines the
     // default method that the impls without an override call.
     if is_build_mode {
+        let mut trait_keys: *mut usize = 0 as *mut usize;
+        let trait_cap = pipe_build_trait_member_tab(
+            mut_view(ctx.backend_arena),
+            ctx.hir.items,
+            mut_view(trait_keys)
+        );
         let mut ei: *mut MonoInstance = ctx.mono.instances_head;
         while (ei as usize) != 0 {
             let ni: *mut HirItem = unsafe { (*ei).new_item };
             if (unsafe { (*ei).mir_body }) != 0 && (ni as usize) != 0 && (unsafe { (*ni).kind }) == HIR_ITEM_FN &&
                 (filter_fid_v == 0u32 || !for_lib || (unsafe { (*ni).span.file.v }) == filter_fid_v) &&
-                (pipe_is_trait_member(ctx.hir.items, ni) || tc_is_default_inst(ni as *const HirItem)) &&
-                !pipe_item_in_buf(items_buf, fn_count, ni) {
+                (pipe_has_trait_member_in_tab(trait_cap, trait_keys, ni as *const HirItem) || tc_is_default_inst(ni as *const HirItem)) &&
+                pipe_items_tab_find(items_tab_cap, items_tab_keys, items_tab_vals, ni as *const HirItem) == 0u32 {
                 let body = pipe_build_item_body(
                     mut_view(*ctx), run_drop_elab, run_opt, ni, thir_ptr, hir_ptr, str_in_ptr, db_ptr
                 );
@@ -4852,6 +5560,7 @@ fn driver_emit_objmodel_filtered_ex(
                         *pipe_hir_item_ptr_at(items_buf, fn_count) = ni;
                         *pipe_mir_body_ptr_at(bodies_buf, fn_count) = body;
                     }
+                    pipe_items_tab_insert(items_tab_cap, items_tab_keys, items_tab_vals, ni as *const HirItem, fn_count);
                     fn_count = fn_count + 1;
                 }
             }
@@ -4861,18 +5570,62 @@ fn driver_emit_objmodel_filtered_ex(
 
     // Emit non-generic `<std>` helper functions only when reachable from emitted MIR bodies.
     if !for_lib && (filter_fid_v == 0u32 || include_std_weak) {
-        let mut added_std: bool = true;
-        while added_std {
-            added_std = false;
-            let mut sit: *mut HirItem = ctx.hir.items;
-            while (sit as usize) != 0 {
-                if (unsafe { (*sit).kind }) == HIR_ITEM_FN &&
-                   fn_count < fn_cap &&
-                   !pipe_item_in_buf(items_buf, fn_count, sit) &&
-                   !pipe_item_has_own_generics(ctx.mono.instances_head, sit as *const HirItem) {
-                    let sit_fid_v = unsafe { (*sit).span.file.v };
-                    if pipe_fid_is_std(ctx.proj.files as *const ProjectFile, ctx.proj.file_count, sit_fid_v) &&
-                       pipe_bodies_ref_sym(bodies_buf, fn_count, unsafe { (*sit).symbol.v }) {
+        let std_cands = arena_alloc_raw(
+            mut_view(ctx.backend_arena),
+            opts_mul_usize(alloc_fn_cap, size_of<*mut HirItem>()),
+            align_of<*mut HirItem>()
+        ) as *mut *mut HirItem;
+        let mut std_cand_n: usize = 0;
+        let mut sit0: *mut HirItem = ctx.hir.items;
+        while (sit0 as usize) != 0 {
+            if (unsafe { (*sit0).kind }) == HIR_ITEM_FN &&
+               pipe_items_tab_find(items_tab_cap, items_tab_keys, items_tab_vals, sit0 as *const HirItem) == 0u32 &&
+               !pipe_item_has_own_generics(ctx.mono.instances_head, sit0 as *const HirItem) {
+                let sit_fid_v = unsafe { (*sit0).span.file.v };
+                if pipe_fid_is_std(ctx.proj.files as *const ProjectFile, ctx.proj.file_count, sit_fid_v) &&
+                   std_cand_n < alloc_fn_cap {
+                    unsafe { *pipe_hir_item_ptr_at(std_cands, std_cand_n) = sit0; }
+                    std_cand_n = std_cand_n + 1;
+                }
+            }
+            sit0 = unsafe { (*sit0).next };
+        }
+        if std_cand_n > 0 {
+            let std_sym_cap = pipe_pow2_cap(std_cand_n);
+            let std_sym_keys = arena_alloc_raw(
+                mut_view(ctx.backend_arena),
+                opts_mul_usize(std_sym_cap, size_of<u32>()),
+                align_of<u32>()
+            ) as *mut u32;
+            pipe_zero_u32_slice(std_sym_keys, std_sym_cap);
+            let std_sym_hit = arena_alloc_raw(mut_view(ctx.backend_arena), std_sym_cap, 1);
+            let mut zhi: usize = 0;
+            while zhi < std_sym_cap {
+                unsafe { *(std_sym_hit + zhi) = 0u8; }
+                zhi = zhi + 1;
+            }
+            let mut sci: usize = 0;
+            while sci < std_cand_n {
+                let sc_it = unsafe { *pipe_hir_item_ptr_at(std_cands, sci) };
+                pipe_std_sym_insert(std_sym_cap, std_sym_keys, unsafe { (*sc_it).symbol.v });
+                sci = sci + 1;
+            }
+            let mut bi: usize = 0;
+            while bi < fn_count {
+                let b_ptr = unsafe { *pipe_mir_body_ptr_at(bodies_buf, bi) };
+                pipe_mark_body_std_refs(std_sym_cap, std_sym_keys, std_sym_hit, b_ptr as *const MirBody);
+                bi = bi + 1;
+            }
+            let mut added_std: bool = true;
+            while added_std {
+                added_std = false;
+                let mut ci: usize = 0;
+                while ci < std_cand_n {
+                    let sit = unsafe { *pipe_hir_item_ptr_at(std_cands, ci) };
+                    if (sit as usize) != 0 &&
+                       fn_count < fn_cap &&
+                       pipe_items_tab_find(items_tab_cap, items_tab_keys, items_tab_vals, sit as *const HirItem) == 0u32 &&
+                       pipe_std_sym_is_hit(std_sym_cap, std_sym_keys, std_sym_hit, unsafe { (*sit).symbol.v }) {
                         let sbody = pipe_build_item_body(
                             mut_view(*ctx), run_drop_elab, run_opt, sit, thir_ptr, hir_ptr, str_in_ptr, db_ptr
                         );
@@ -4881,12 +5634,14 @@ fn driver_emit_objmodel_filtered_ex(
                                 *pipe_hir_item_ptr_at(items_buf, fn_count) = sit;
                                 *pipe_mir_body_ptr_at(bodies_buf, fn_count) = sbody;
                             }
+                            pipe_items_tab_insert(items_tab_cap, items_tab_keys, items_tab_vals, sit as *const HirItem, fn_count);
+                            pipe_mark_body_std_refs(std_sym_cap, std_sym_keys, std_sym_hit, sbody as *const MirBody);
                             fn_count = fn_count + 1;
                             added_std = true;
                         }
                     }
+                    ci = ci + 1;
                 }
-                sit = unsafe { (*sit).next };
             }
         }
     }
@@ -4910,17 +5665,16 @@ fn driver_emit_objmodel_filtered_ex(
         let mut oinst: *mut MonoInstance = ctx.mono.instances_head;
         while (oinst as usize) != 0 {
             let oni: *mut HirItem = unsafe { (*oinst).new_item };
-            let mut e: usize = 0;
-            while e < fn_count {
-                if (unsafe { *(used_buf + e) }) == 0u8 && (unsafe { *pipe_hir_item_ptr_at(items_buf, e) }) == oni {
+            let found_p1 = pipe_items_tab_find(items_tab_cap, items_tab_keys, items_tab_vals, oni as *const HirItem);
+            if found_p1 != 0u32 {
+                let e = (found_p1 - 1u32) as usize;
+                if e < fn_count && (unsafe { *(used_buf + e) }) == 0u8 {
                     unsafe {
                         *(used_buf + e) = 1u8;
                         *pipe_u32_at(order_buf, order_n) = e as u32;
                     }
                     order_n = order_n + 1;
-                    break;
                 }
-                e = e + 1;
             }
             oinst = unsafe { (*oinst).next };
         }
@@ -4939,6 +5693,7 @@ fn driver_emit_objmodel_filtered_ex(
         }
     }
 
+    bt0 = bt_add(mut_view(*ctx), BT_COLLECT, bt0);
     let mut cstr_counter: u32 = 0u32;
     let mut panic_counter: u32 = 0u32;
     let ctable = backend_emit_const_tables(
@@ -4954,6 +5709,9 @@ fn driver_emit_objmodel_filtered_ex(
     );
 
     pipe_emit_tls_statics(mut_view(*ctx), filter_fid_v, mut_view(*obj));
+    bt0 = bt_add(mut_view(*ctx), BT_CONSTS, bt0);
+    let mut lower_acc: [5]u64 = [0u64, 0u64, 0u64, 0u64, 0u64];
+    let lower_ns = unsafe { address_of_mut(lower_acc[0]) };
 
     let mut drectve_buf = coff_buf_with_capacity(64);
     let mut fi: usize = 0;
@@ -4976,7 +5734,8 @@ fn driver_emit_objmodel_filtered_ex(
         };
         let mut lir_body: *mut LirBody = 0 as *mut LirBody;
         let mut mi_body: *mut X64MIBody = 0 as *mut X64MIBody;
-        let v_err = backend_lower_fn_to_mc_checked_opt(
+        bt0 = bt_add(mut_view(*ctx), BT_ENCODE, bt0);
+        let v_err = backend_lower_fn_to_mc_checked_timed(
             mut_view(ctx.backend_arena),
             mir_body,
             hir_ptr,
@@ -4988,8 +5747,10 @@ fn driver_emit_objmodel_filtered_ex(
             mut_view(lir_body),
             mut_view(mi_body),
             mut_view(layout),
-            run_opt
+            run_opt,
+            lower_ns
         );
+        bt0 = monotonic_ns();
         if v_err != X64_VERIFY_OK {
             coff_buf_free(mut_view(drectve_buf));
             return false;
@@ -5135,6 +5896,12 @@ fn driver_emit_objmodel_filtered_ex(
 
         fi = fi + 1;
     }
+    bt0 = bt_add(mut_view(*ctx), BT_ENCODE, bt0);
+    let mut lk: usize = 0;
+    while lk < 5 {
+        ctx.build_ns[BT_LIR + lk] = ctx.build_ns[BT_LIR + lk] + lower_acc[lk];
+        lk = lk + 1;
+    }
 
     if is_build_mode {
         pipe_strip_unlinked_extern_c_prefixes(view(*ctx), mut_view(*obj));
@@ -5173,6 +5940,7 @@ fn driver_emit_objmodel_filtered_ex(
         // relocatable `.obj` / `.lib` artifacts or per-module objects, and intra-object references to
         // local symbols must bind directly to the local definition.
         if for_lib || for_obj || filter_fid_v != 0u32 {
+            let mut def_cnt: usize = 0;
             let mut li: usize = 0;
             while li < obj.symbols_len {
                 let lsym = unsafe { pipe_obj_symbol_at(obj.symbols, li) };
@@ -5184,33 +5952,79 @@ fn driver_emit_objmodel_filtered_ex(
                         }
                     }
                 }
+                if (unsafe { (*lsym).section_id.v }) != 0u32 &&
+                   (for_lib || (unsafe { (*lsym).linkage }) == SYM_LOCAL) {
+                    def_cnt = def_cnt + 1;
+                }
                 li = li + 1;
             }
-            let mut u: usize = 0;
-            while u < obj.symbols_len {
-                let usym = unsafe { pipe_obj_symbol_at(obj.symbols, u) };
-                if (unsafe { (*usym).linkage }) == SYM_EXTERNAL && (unsafe { (*usym).section_id.v }) == 0u32 {
-                    let u_sv = StrView { ptr: unsafe { (*usym).name }, len: unsafe { (*usym).name_len } };
-                    let mut d: usize = 0;
-                    while d < obj.symbols_len {
-                        let dsym = unsafe { pipe_obj_symbol_at(obj.symbols, d) };
-                        if (unsafe { (*dsym).section_id.v }) != 0u32 &&
-                           (for_lib || (unsafe { (*dsym).linkage }) == SYM_LOCAL) {
-                            let d_sv = StrView { ptr: unsafe { (*dsym).name }, len: unsafe { (*dsym).name_len } };
-                            if sv_eq(view(u_sv), view(d_sv)) {
-                                unsafe {
-                                    (*usym).section_id = (*dsym).section_id;
-                                    (*usym).value = (*dsym).value;
-                                    (*usym).size = (*dsym).size;
-                                    (*usym).linkage = SYM_LOCAL;
+            if def_cnt > 0 {
+                let def_cap = pipe_pow2_cap(def_cnt);
+                let def_mask = def_cap - 1;
+                let def_tab = arena_alloc_raw(
+                    mut_view(ctx.backend_arena),
+                    opts_mul_usize(def_cap, size_of<u32>()),
+                    align_of<u32>()
+                ) as *mut u32;
+                pipe_zero_u32_slice(def_tab, def_cap);
+                let mut d: usize = 0;
+                while d < obj.symbols_len {
+                    let dsym = unsafe { pipe_obj_symbol_at(obj.symbols, d) };
+                    if (unsafe { (*dsym).section_id.v }) != 0u32 &&
+                       (for_lib || (unsafe { (*dsym).linkage }) == SYM_LOCAL) {
+                        let d_ptr = unsafe { (*dsym).name };
+                        let d_len = unsafe { (*dsym).name_len };
+                        if d_len > 0 && (d_ptr as usize) != 0 {
+                            let d_sv = StrView { ptr: d_ptr, len: d_len };
+                            let mut slot = pipe_bytes_hash(d_ptr, d_len) & def_mask;
+                            while true {
+                                let cur_v = unsafe { *pipe_u32_at(def_tab, slot) };
+                                if cur_v == 0u32 {
+                                    unsafe { *pipe_u32_at(def_tab, slot) = (d + 1) as u32; }
+                                    break;
                                 }
-                                break;
+                                let cur_sym = unsafe { pipe_obj_symbol_at(obj.symbols, (cur_v - 1u32) as usize) };
+                                let cur_sv = StrView { ptr: unsafe { (*cur_sym).name }, len: unsafe { (*cur_sym).name_len } };
+                                if sv_eq(view(cur_sv), view(d_sv)) {
+                                    break;
+                                }
+                                slot = (slot + 1) & def_mask;
                             }
                         }
-                        d = d + 1;
                     }
+                    d = d + 1;
                 }
-                u = u + 1;
+                let mut u: usize = 0;
+                while u < obj.symbols_len {
+                    let usym = unsafe { pipe_obj_symbol_at(obj.symbols, u) };
+                    if (unsafe { (*usym).linkage }) == SYM_EXTERNAL && (unsafe { (*usym).section_id.v }) == 0u32 {
+                        let u_ptr = unsafe { (*usym).name };
+                        let u_len = unsafe { (*usym).name_len };
+                        if u_len > 0 && (u_ptr as usize) != 0 {
+                            let u_sv = StrView { ptr: u_ptr, len: u_len };
+                            let mut slot = pipe_bytes_hash(u_ptr, u_len) & def_mask;
+                            while true {
+                                let cur_v = unsafe { *pipe_u32_at(def_tab, slot) };
+                                if cur_v == 0u32 {
+                                    break;
+                                }
+                                let dsym = unsafe { pipe_obj_symbol_at(obj.symbols, (cur_v - 1u32) as usize) };
+                                let d_sv = StrView { ptr: unsafe { (*dsym).name }, len: unsafe { (*dsym).name_len } };
+                                if sv_eq(view(u_sv), view(d_sv)) {
+                                    unsafe {
+                                        (*usym).section_id = (*dsym).section_id;
+                                        (*usym).value = (*dsym).value;
+                                        (*usym).size = (*dsym).size;
+                                        (*usym).linkage = SYM_LOCAL;
+                                    }
+                                    break;
+                                }
+                                slot = (slot + 1) & def_mask;
+                            }
+                        }
+                    }
+                    u = u + 1;
+                }
             }
         }
         if emit_axmeta {
@@ -5238,6 +6052,7 @@ fn driver_emit_objmodel_filtered_ex(
     }
 
     coff_buf_free(mut_view(drectve_buf));
+    let _ = bt_add(mut_view(*ctx), BT_OBJFIN, bt0);
     true
 }
 
@@ -6209,6 +7024,7 @@ fn driver_execute_build_into_ctx(
     if dopts.time_passes {
         let elapsed: u64 = if t1 >= t0 { t1 - t0 } else { 0u64 };
         format_pass_time(mut_view(*out_buf), 9u32, elapsed);
+        format_build_sub_times(mut_view(*out_buf), view(*ctx), elapsed);
     }
 
     driver_flush_diagnostics(mut_view(*ctx), dopts, mut_view(*out_buf), mut_view(*err_buf));

@@ -3482,6 +3482,7 @@ pub use compiler.kernel.id.SymbolId
 @intrinsic fn align_of<T>() -> usize { 0 }
 @intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
 @intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+@intrinsic fn wrapping_mul_u64(a: u64, b: u64) -> u64 { 0 }
 
 pub fn coff_mul_usize(a: usize, b: usize) -> usize {
     ((a as isize) * (b as isize)) as usize
@@ -4127,6 +4128,16 @@ pub struct ObjSymbol {
     pub linkage: u32,
 }
 
+// T486: open-addressing index name -> FIRST symbol (lowest index) carrying that name, so a lookup
+// returns exactly what the linear search over `symbols` returned. Filled lazily: symbols
+// [0, done) are indexed, a lookup first indexes the symbols added since. Code that renames a
+// symbol in place must call `objmodel_symbol_names_changed`, which drops the index.
+pub struct ObjSymIndex {
+    pub slots: *mut u32,
+    pub cap: usize,
+    pub done: usize,
+}
+
 pub struct ObjModel {
     pub sections: *mut Section,
     pub sections_len: usize,
@@ -4135,6 +4146,168 @@ pub struct ObjModel {
     pub symbols_len: usize,
     pub symbols_cap: usize,
     pub str_arena: *mut Arena,
+    // T486: name index for `objmodel_find_symbol*` (null: linear search). Heap-allocated so the
+    // lookups, which take a `view<ObjModel>`, can extend it; see `ObjSymIndex`.
+    pub sym_index: *mut ObjSymIndex,
+}
+
+// --- Symbol name index (T486) ---
+
+fn objsym_index_alloc() -> *mut ObjSymIndex {
+    let ix = unsafe { heap_alloc(size_of<ObjSymIndex>(), align_of<ObjSymIndex>()) as *mut ObjSymIndex };
+    unsafe {
+        (*ix).slots = 0 as *mut u32;
+        (*ix).cap = 0;
+        (*ix).done = 0;
+    }
+    ix
+}
+
+fn objsym_index_clear(ix: *mut ObjSymIndex) {
+    unsafe {
+        if (*ix).cap > 0 && ((*ix).slots as usize) != 0 {
+            heap_free((*ix).slots as *mut u8, coff_mul_usize((*ix).cap, 4), 4);
+        }
+        (*ix).slots = 0 as *mut u32;
+        (*ix).cap = 0;
+        (*ix).done = 0;
+    }
+}
+
+// FNV-1a over `n` bytes (also used by the linker's global-symbol index).
+pub fn objsym_hash(p: *const u8, n: usize) -> u64 {
+    let mut h: u64 = 14695981039346656037u64;
+    let mut i: usize = 0;
+    while i < n {
+        h = wrapping_mul_u64(h ^ (unsafe { *(p + i) } as u64), 1099511628211u64);
+        i = i + 1;
+    }
+    h
+}
+
+unsafe fn objsym_slot(ix: *mut ObjSymIndex, k: usize) -> *mut u32 {
+    (((*ix).slots as usize) + k * 4) as *mut u32
+}
+
+// Probes for `name`: the slot holding the symbol with that name, or the empty slot where it goes.
+fn objsym_probe(model: view<ObjModel>, ix: *mut ObjSymIndex, name: *const u8, name_len: usize) -> *mut u32 {
+    let mask = (unsafe { (*ix).cap }) - 1;
+    let mut k = (objsym_hash(name, name_len) as usize) & mask;
+    while true {
+        let slot = unsafe { objsym_slot(ix, k) };
+        let v = unsafe { *slot };
+        if v == 0u32 {
+            return slot;
+        }
+        let sym = unsafe { symbol_slot_ptr(model.symbols, (v - 1u32) as usize) as *const ObjSymbol };
+        let sn = unsafe { (*sym).name };
+        if bytes_eq(sn, cstr_len(sn), name, name_len) {
+            return slot;
+        }
+        k = (k + 1) & mask;
+    }
+    0 as *mut u32
+}
+
+// Indexes the symbols added since the last lookup, in symbol order (a name already present keeps
+// its first symbol). Grows, rebuilding from symbol 0, before the table is more than half full.
+fn objsym_index_sync(model: view<ObjModel>, ix: *mut ObjSymIndex) {
+    let n = model.symbols_len;
+    if (unsafe { (*ix).done }) >= n {
+        return;
+    }
+    if (unsafe { (*ix).cap }) < 2 * (n + 1) {
+        let mut cap: usize = 64;
+        while cap < 4 * (n + 1) {
+            cap = cap + cap;
+        }
+        objsym_index_clear(ix);
+        let slots = unsafe { heap_alloc(coff_mul_usize(cap, 4), 4) as *mut u32 };
+        let mut z: usize = 0;
+        while z < cap {
+            unsafe { *(((slots as usize) + z * 4) as *mut u32) = 0u32; }
+            z = z + 1;
+        }
+        unsafe {
+            (*ix).slots = slots;
+            (*ix).cap = cap;
+        }
+    }
+    let mut i: usize = unsafe { (*ix).done };
+    while i < n {
+        let sym = unsafe { symbol_slot_ptr(model.symbols, i) as *const ObjSymbol };
+        let sn = unsafe { (*sym).name };
+        let slot = objsym_probe(model, ix, sn, cstr_len(sn));
+        if (unsafe { *slot }) == 0u32 {
+            unsafe { *slot = (i + 1) as u32; }
+        }
+        i = i + 1;
+    }
+    unsafe { (*ix).done = n; }
+}
+
+// Same result as the linear search: the first symbol whose current name equals `name`.
+fn objsym_index_find(model: view<ObjModel>, name: *const u8, name_len: usize) -> SymbolId {
+    let ix = model.sym_index;
+    objsym_index_sync(model, ix);
+    if (unsafe { (*ix).cap }) == 0 {
+        return SymbolId.none();
+    }
+    let v = unsafe { *objsym_probe(model, ix, name, name_len) };
+    if v == 0u32 {
+        return SymbolId.none();
+    }
+    SymbolId { v: v }
+}
+
+// `objsym_index_find` for a name given as a byte view (same hash, same first-symbol result).
+fn objsym_index_find_view(model: view<ObjModel>, bytes: view<[u8]>) -> SymbolId {
+    let ix = model.sym_index;
+    objsym_index_sync(model, ix);
+    if (unsafe { (*ix).cap }) == 0 {
+        return SymbolId.none();
+    }
+    let nlen = len(bytes);
+    let mut h: u64 = 14695981039346656037u64;
+    let mut i: usize = 0;
+    while i < nlen {
+        h = wrapping_mul_u64(h ^ (bytes[i] as u64), 1099511628211u64);
+        i = i + 1;
+    }
+    let mask = (unsafe { (*ix).cap }) - 1;
+    let mut k = (h as usize) & mask;
+    while true {
+        let v = unsafe { *objsym_slot(ix, k) };
+        if v == 0u32 {
+            return SymbolId.none();
+        }
+        let sym = unsafe { symbol_slot_ptr(model.symbols, (v - 1u32) as usize) as *const ObjSymbol };
+        let sn = unsafe { (*sym).name };
+        if cstr_len(sn) == nlen {
+            let mut matched: bool = true;
+            let mut j: usize = 0;
+            while j < nlen {
+                if (unsafe { *(sn + j) }) != bytes[j] {
+                    matched = false;
+                    break;
+                }
+                j = j + 1;
+            }
+            if matched {
+                return SymbolId { v: v };
+            }
+        }
+        k = (k + 1) & mask;
+    }
+    SymbolId.none()
+}
+
+// Call after changing a symbol's name in place (its bytes or `name`/`name_len`): the next lookup
+// rebuilds the index from the current names.
+pub fn objmodel_symbol_names_changed(model: view<ObjModel>) {
+    if (model.sym_index as usize) != 0 {
+        objsym_index_clear(model.sym_index);
+    }
 }
 
 // --- Object Model Lifecycle ---
@@ -4163,6 +4336,7 @@ pub fn objmodel_new() -> ObjModel {
         symbols_len: 0,
         symbols_cap: 0,
         str_arena: alloc_str_arena(),
+        sym_index: objsym_index_alloc(),
     }
 }
 
@@ -4174,6 +4348,7 @@ pub fn objmodel_init(model: mut_view<ObjModel>) {
     model.symbols_len = 0;
     model.symbols_cap = 0;
     model.str_arena = alloc_str_arena();
+    model.sym_index = objsym_index_alloc();
 }
 
 pub fn ax_objmodel_init(model: mut_view<ObjModel>) {
@@ -4238,6 +4413,14 @@ pub fn objmodel_free(model: mut_view<ObjModel>) {
     model.symbols = 0 as *mut ObjSymbol;
     model.symbols_len = 0;
     model.symbols_cap = 0;
+
+    if (model.sym_index as usize) != 0 {
+        objsym_index_clear(model.sym_index);
+        unsafe {
+            heap_free(model.sym_index as *mut u8, size_of<ObjSymIndex>(), align_of<ObjSymIndex>());
+        }
+        model.sym_index = 0 as *mut ObjSymIndex;
+    }
 
     if (model.str_arena as usize) != 0 {
         unsafe {
@@ -4616,6 +4799,9 @@ pub fn ax_objmodel_get_symbol(model: mut_view<ObjModel>, id: SymbolId) -> *mut O
 }
 
 pub fn objmodel_find_symbol_bytes(model: view<ObjModel>, name: *const u8, name_len: usize) -> SymbolId {
+    if (model.sym_index as usize) != 0 {
+        return objsym_index_find(model, name, name_len);
+    }
     let count = model.symbols_len;
     let mut i: usize = 0;
     while i < count {
@@ -4641,6 +4827,11 @@ pub fn ax_objmodel_find_symbol(model: view<ObjModel>, name: *const u8) -> Symbol
 pub fn objmodel_find_symbol_str(model: view<ObjModel>, name: Str) -> SymbolId {
     let bytes: view<[u8]> = unsafe { *(address_of(name) as *const view<[u8]>) };
     let nlen = len(bytes);
+    if (model.sym_index as usize) != 0 && nlen > 0 {
+        // Hash and compare through the `view<[u8]>` (not a raw pointer pulled out of the `Str`):
+        // the interpreter only tracks the slice, so a reinterpreted data pointer is not a live allocation.
+        return objsym_index_find_view(model, bytes);
+    }
     let count = model.symbols_len;
     let mut i: usize = 0;
     while i < count {
@@ -6184,12 +6375,14 @@ use compiler.obj.coff.bytes_eq
 use compiler.obj.coff.cstr_eq
 use compiler.obj.coff.coff_mul_usize
 use compiler.obj.coff.coff_mul_u32
+use compiler.obj.coff.objsym_hash
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 @intrinsic fn align_of<T>() -> usize { 0 }
 @intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
 @intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
 @intrinsic unsafe fn ptr_write_bytes<T>(dst: *mut T, val: u8, count: usize) {}
+@intrinsic fn wrapping_mul_u64(a: u64, b: u64) -> u64 { 0 }
 
 // --- PE32+ Format Sizes & Constants ---
 
@@ -6766,6 +6959,13 @@ pub struct PeReloc {
     pub addend: i64,
 }
 
+// T486: open-addressing table of (global index + 1), 0 = empty; globals [0, done) are indexed.
+pub struct LinkerGlobalIndex {
+    pub slots: *mut u32,
+    pub cap: usize,
+    pub done: usize,
+}
+
 pub struct LinkerContext {
     pub sections: *mut *mut MergedSection,
     pub num_sections: usize,
@@ -6779,6 +6979,151 @@ pub struct LinkerContext {
     pub str_arena: *mut Arena,
     pub tls_dir_rva: u32,
     pub tls_dir_size: u32,
+    // T486: name -> global index for `linker_find_global*` (null: linear search). Global names are
+    // unique (`linker_add_global` dedups) and never change once added.
+    pub gindex: *mut LinkerGlobalIndex,
+}
+
+fn lgi_alloc() -> *mut LinkerGlobalIndex {
+    let ix = unsafe { heap_alloc(size_of<LinkerGlobalIndex>(), align_of<LinkerGlobalIndex>()) as *mut LinkerGlobalIndex };
+    unsafe {
+        (*ix).slots = 0 as *mut u32;
+        (*ix).cap = 0;
+        (*ix).done = 0;
+    }
+    ix
+}
+
+fn lgi_free(ix: *mut LinkerGlobalIndex) {
+    unsafe {
+        if (*ix).cap > 0 && ((*ix).slots as usize) != 0 {
+            heap_free((*ix).slots as *mut u8, coff_mul_usize((*ix).cap, 4), 4);
+        }
+        heap_free(ix as *mut u8, size_of<LinkerGlobalIndex>(), align_of<LinkerGlobalIndex>());
+    }
+}
+
+unsafe fn lgi_slot(ix: *mut LinkerGlobalIndex, k: usize) -> *mut u32 {
+    (((*ix).slots as usize) + k * 4) as *mut u32
+}
+
+// The slot holding the global named `name` (`n` bytes), or the empty slot where it goes.
+fn lgi_probe(ctx: view<LinkerContext>, ix: *mut LinkerGlobalIndex, name: *const u8, n: usize) -> *mut u32 {
+    let mask = (unsafe { (*ix).cap }) - 1;
+    let mut k = (objsym_hash(name, n) as usize) & mask;
+    while true {
+        let slot = unsafe { lgi_slot(ix, k) };
+        let v = unsafe { *slot };
+        if v == 0u32 {
+            return slot;
+        }
+        let g = unsafe { global_sym_slot_ptr(ctx.globals, (v - 1u32) as usize) };
+        let gname = unsafe { (*g).name };
+        if bytes_eq(gname, cstr_len(gname), name, n) {
+            return slot;
+        }
+        k = (k + 1) & mask;
+    }
+    0 as *mut u32
+}
+
+fn lgi_sync(ctx: view<LinkerContext>, ix: *mut LinkerGlobalIndex) {
+    let n = ctx.num_globals;
+    if (unsafe { (*ix).done }) >= n {
+        return;
+    }
+    if (unsafe { (*ix).cap }) < 2 * (n + 1) {
+        let mut cap: usize = 64;
+        while cap < 4 * (n + 1) {
+            cap = cap + cap;
+        }
+        unsafe {
+            if (*ix).cap > 0 && ((*ix).slots as usize) != 0 {
+                heap_free((*ix).slots as *mut u8, coff_mul_usize((*ix).cap, 4), 4);
+            }
+        }
+        let slots = unsafe { heap_alloc(coff_mul_usize(cap, 4), 4) as *mut u32 };
+        let mut z: usize = 0;
+        while z < cap {
+            unsafe { *(((slots as usize) + z * 4) as *mut u32) = 0u32; }
+            z = z + 1;
+        }
+        unsafe {
+            (*ix).slots = slots;
+            (*ix).cap = cap;
+            (*ix).done = 0;
+        }
+    }
+    let mut i: usize = unsafe { (*ix).done };
+    while i < n {
+        let g = unsafe { global_sym_slot_ptr(ctx.globals, i) };
+        let gname = unsafe { (*g).name };
+        if (gname as usize) != 0 {
+            let slot = lgi_probe(ctx, ix, gname, cstr_len(gname));
+            if (unsafe { *slot }) == 0u32 {
+                unsafe { *slot = (i + 1) as u32; }
+            }
+        }
+        i = i + 1;
+    }
+    unsafe { (*ix).done = n; }
+}
+
+// Same result as the linear search over `globals` (first global with that name; names are unique).
+fn lgi_find(ctx: view<LinkerContext>, name: *const u8, n: usize) -> *mut GlobalSymbol {
+    let ix = ctx.gindex;
+    lgi_sync(ctx, ix);
+    if (unsafe { (*ix).cap }) == 0 {
+        return 0 as *mut GlobalSymbol;
+    }
+    let v = unsafe { *lgi_probe(ctx, ix, name, n) };
+    if v == 0u32 {
+        return 0 as *mut GlobalSymbol;
+    }
+    unsafe { global_sym_slot_ptr(ctx.globals, (v - 1u32) as usize) }
+}
+
+// `lgi_find` for a name given as a byte view (same hash, avoids pulling a raw pointer out of `Str`
+// which the MIR interpreter rejects because only the slice tracks the live allocation).
+fn lgi_find_view(ctx: view<LinkerContext>, bytes: view<[u8]>) -> *mut GlobalSymbol {
+    let ix = ctx.gindex;
+    lgi_sync(ctx, ix);
+    if (unsafe { (*ix).cap }) == 0 {
+        return 0 as *mut GlobalSymbol;
+    }
+    let n = len(bytes);
+    let mut h: u64 = 14695981039346656037u64;
+    let mut i: usize = 0;
+    while i < n {
+        h = wrapping_mul_u64(h ^ (bytes[i] as u64), 1099511628211u64);
+        i = i + 1;
+    }
+    let mask = (unsafe { (*ix).cap }) - 1;
+    let mut k = (h as usize) & mask;
+    while true {
+        let v = unsafe { *lgi_slot(ix, k) };
+        if v == 0u32 {
+            return 0 as *mut GlobalSymbol;
+        }
+        let g = unsafe { global_sym_slot_ptr(ctx.globals, (v - 1u32) as usize) };
+        let gname = unsafe { (*g).name };
+        if cstr_len(gname) == n {
+            let mut matched = true;
+            let mut j: usize = 0;
+            while j < n {
+                if (unsafe { *(gname + j) }) != bytes[j] {
+                    matched = false;
+                    break;
+                }
+                j = j + 1;
+            }
+            if matched {
+                return g;
+            }
+        }
+        k = (k + 1) & mask;
+    }
+    0 as *mut GlobalSymbol
 }
 
 fn alloc_linker_arena() -> *mut Arena {
@@ -6802,6 +7147,7 @@ pub fn linker_context_init(ctx: mut_view<LinkerContext>) {
     ctx.str_arena = alloc_linker_arena();
     ctx.tls_dir_rva = 0u32;
     ctx.tls_dir_size = 0u32;
+    ctx.gindex = lgi_alloc();
 }
 
 pub unsafe fn merged_sec_slot_ptr(base: *mut *mut MergedSection, idx: usize) -> *mut *mut MergedSection {
@@ -6858,6 +7204,10 @@ pub fn linker_context_free(ctx: mut_view<LinkerContext>) {
     ctx.globals = 0 as *mut GlobalSymbol;
     ctx.num_globals = 0;
     ctx.cap_globals = 0;
+    if (ctx.gindex as usize) != 0 {
+        lgi_free(ctx.gindex);
+        ctx.gindex = 0 as *mut LinkerGlobalIndex;
+    }
 
     if ctx.cap_relocs > 0 && (ctx.relocs as usize) != 0 {
         unsafe {
@@ -7113,6 +7463,9 @@ pub fn linker_find_global(ctx: view<LinkerContext>, name: *const u8) -> *mut Glo
     if (name as usize) == 0 || (ctx.globals as usize) == 0 {
         return 0 as *mut GlobalSymbol;
     }
+    if (ctx.gindex as usize) != 0 && (unsafe { *name }) != 0u8 {
+        return lgi_find(ctx, name, cstr_len(name));
+    }
     let stride = size_of<GlobalSymbol>();
     let base = ctx.globals as usize;
     let b0 = unsafe { *name };
@@ -7147,6 +7500,9 @@ pub fn linker_find_global(ctx: view<LinkerContext>, name: *const u8) -> *mut Glo
 pub fn linker_find_global_str(ctx: view<LinkerContext>, name: Str) -> *mut GlobalSymbol {
     let bytes: view<[u8]> = unsafe { *(address_of(name) as *const view<[u8]>) };
     let n = len(bytes);
+    if (ctx.gindex as usize) != 0 && n > 0 && (ctx.globals as usize) != 0 {
+        return lgi_find_view(ctx, bytes);
+    }
     let mut i: usize = 0;
     while i < ctx.num_globals {
         let g = linker_global_at(ctx, i);
@@ -7555,6 +7911,16 @@ pub struct LinkV2Context {
     pub searched_libs: *const u8,
     pub current_obj_name: *const u8,
     pub active: bool,
+    // T486: name index over `syms`. `nx_slots` is an open-addressing table of (first meta index + 1)
+    // per symbol name, `nx_tails` the last meta of that name, `nx_next[i]` the next meta (index + 1)
+    // with the same name as meta i. A chain lists the metas of one name in index order, so a lookup
+    // walking it sees the candidates in the order of the linear scan it replaces. Metas with a null
+    // `sym_name` are not indexed (no lookup can match them). `sym_name` never changes once added.
+    pub nx_slots: *mut u32,
+    pub nx_tails: *mut u32,
+    pub nx_cap: usize,
+    pub nx_next: *mut u32,
+    pub nx_next_cap: usize,
 }
 
 pub fn link_v2_context_new() -> LinkV2Context {
@@ -7568,7 +7934,120 @@ pub fn link_v2_context_new() -> LinkV2Context {
         searched_libs: 0 as *const u8,
         current_obj_name: 0 as *const u8,
         active: true,
+        nx_slots: 0 as *mut u32,
+        nx_tails: 0 as *mut u32,
+        nx_cap: 0,
+        nx_next: 0 as *mut u32,
+        nx_next_cap: 0,
     }
+}
+
+unsafe fn v2_u32_at(base: *mut u32, k: usize) -> *mut u32 {
+    ((base as usize) + k * 4) as *mut u32
+}
+
+fn v2_u32_alloc_zeroed(n: usize) -> *mut u32 {
+    let p = unsafe { heap_alloc(coff_mul_usize(n, 4), 4) as *mut u32 };
+    let mut i: usize = 0;
+    while i < n {
+        unsafe { *v2_u32_at(p, i) = 0u32; }
+        i = i + 1;
+    }
+    p
+}
+
+fn v2_nx_free(v2: mut_view<LinkV2Context>) {
+    if v2.nx_cap > 0 {
+        unsafe {
+            heap_free(v2.nx_slots as *mut u8, coff_mul_usize(v2.nx_cap, 4), 4);
+            heap_free(v2.nx_tails as *mut u8, coff_mul_usize(v2.nx_cap, 4), 4);
+        }
+    }
+    if v2.nx_next_cap > 0 {
+        unsafe { heap_free(v2.nx_next as *mut u8, coff_mul_usize(v2.nx_next_cap, 4), 4); }
+    }
+    v2.nx_slots = 0 as *mut u32;
+    v2.nx_tails = 0 as *mut u32;
+    v2.nx_cap = 0;
+    v2.nx_next = 0 as *mut u32;
+    v2.nx_next_cap = 0;
+}
+
+// Table slot of the chain for `name` (`n` bytes): the slot holding it, or the empty slot where it goes.
+fn v2_nx_probe(v2: view<LinkV2Context>, name: *const u8, n: usize) -> usize {
+    let mask = v2.nx_cap - 1;
+    let mut k = (objsym_hash(name, n) as usize) & mask;
+    while true {
+        let h = unsafe { *v2_u32_at(v2.nx_slots, k) };
+        if h == 0u32 {
+            return k;
+        }
+        let m = unsafe { v2_sym_slot_ptr(v2.syms, (h - 1u32) as usize) };
+        let mn = unsafe { (*m).sym_name };
+        if bytes_eq(mn, cstr_len(mn), name, n) {
+            return k;
+        }
+        k = (k + 1) & mask;
+    }
+    0
+}
+
+// Appends meta `i` (the newest) to the chain of its name.
+fn v2_nx_link(v2: mut_view<LinkV2Context>, i: usize) {
+    let m = unsafe { v2_sym_slot_ptr(v2.syms, i) };
+    let mn = unsafe { (*m).sym_name };
+    if (mn as usize) == 0 {
+        return;
+    }
+    unsafe { *v2_u32_at(v2.nx_next, i) = 0u32; }
+    let k = v2_nx_probe(view(*v2), mn, cstr_len(mn));
+    let h = unsafe { *v2_u32_at(v2.nx_slots, k) };
+    if h == 0u32 {
+        unsafe {
+            *v2_u32_at(v2.nx_slots, k) = (i + 1) as u32;
+            *v2_u32_at(v2.nx_tails, k) = (i + 1) as u32;
+        }
+    } else {
+        let t = unsafe { *v2_u32_at(v2.nx_tails, k) };
+        unsafe {
+            *v2_u32_at(v2.nx_next, (t - 1u32) as usize) = (i + 1) as u32;
+            *v2_u32_at(v2.nx_tails, k) = (i + 1) as u32;
+        }
+    }
+}
+
+// Indexes the newest meta (`num_syms - 1`), growing the arrays (and rebuilding every chain in index
+// order) when needed.
+fn v2_nx_add(v2: mut_view<LinkV2Context>) {
+    let n = v2.num_syms;
+    if n > v2.nx_next_cap || 2 * (n + 1) > v2.nx_cap {
+        v2_nx_free(mut_view(*v2));
+        let mut cap: usize = 64;
+        while cap < 4 * (n + 1) {
+            cap = cap + cap;
+        }
+        v2.nx_slots = v2_u32_alloc_zeroed(cap);
+        v2.nx_tails = v2_u32_alloc_zeroed(cap);
+        v2.nx_cap = cap;
+        let ncap = if v2.cap_syms > n { v2.cap_syms } else { n };
+        v2.nx_next = v2_u32_alloc_zeroed(ncap);
+        v2.nx_next_cap = ncap;
+        let mut i: usize = 0;
+        while i < n {
+            v2_nx_link(mut_view(*v2), i);
+            i = i + 1;
+        }
+        return;
+    }
+    v2_nx_link(mut_view(*v2), n - 1);
+}
+
+// First meta (index + 1) in the chain of `name`, 0 when none or no index.
+fn v2_nx_head(v2: view<LinkV2Context>, name: *const u8) -> u32 {
+    if v2.nx_cap == 0 {
+        return 0u32;
+    }
+    unsafe { *v2_u32_at(v2.nx_slots, v2_nx_probe(v2, name, cstr_len(name))) }
 }
 
 pub fn link_v2_context_free(v2: mut_view<LinkV2Context>) {
@@ -7596,6 +8075,7 @@ pub fn link_v2_context_free(v2: mut_view<LinkV2Context>) {
     v2.reloc_metas = 0 as *mut LinkV2RelocMeta;
     v2.num_reloc_metas = 0;
     v2.cap_reloc_metas = 0;
+    v2_nx_free(mut_view(*v2));
 }
 
 unsafe fn v2_sym_slot_ptr(base: *mut LinkV2SymMeta, idx: usize) -> *mut LinkV2SymMeta {
@@ -7604,6 +8084,15 @@ unsafe fn v2_sym_slot_ptr(base: *mut LinkV2SymMeta, idx: usize) -> *mut LinkV2Sy
 
 unsafe fn v2_reloc_slot_ptr(base: *mut LinkV2RelocMeta, idx: usize) -> *mut LinkV2RelocMeta {
     ((base as usize) + coff_mul_usize(idx, size_of<LinkV2RelocMeta>())) as *mut LinkV2RelocMeta
+}
+
+// T486: the meta after `idx` (index + 1, 0 = none) with the same `sym_name`, or `u32::MAX` when the
+// context has no name index.
+pub fn link_v2_next_same_name(v2: view<LinkV2Context>, idx: usize) -> u32 {
+    if v2.nx_cap == 0 || idx >= v2.num_syms {
+        return 0xFFFFFFFFu32;
+    }
+    unsafe { *v2_u32_at(v2.nx_next, idx) }
 }
 
 pub fn link_v2_sym_at(v2: view<LinkV2Context>, idx: usize) -> *mut LinkV2SymMeta {
@@ -7671,11 +8160,23 @@ pub fn link_v2_add_sym_meta(
         };
     }
     v2.num_syms = v2.num_syms + 1;
+    v2_nx_add(mut_view(*v2));
     slot
 }
 
 pub fn link_v2_find_def_meta(v2: view<LinkV2Context>, sym_name: *const u8) -> *mut LinkV2SymMeta {
     if (sym_name as usize) == 0 || (v2.syms as usize) == 0 {
+        return 0 as *mut LinkV2SymMeta;
+    }
+    if v2.nx_cap > 0 {
+        let mut c = v2_nx_head(v2, sym_name);
+        while c != 0u32 {
+            let m = unsafe { v2_sym_slot_ptr(v2.syms, (c - 1u32) as usize) };
+            if (unsafe { (*m).entry_kind }) == AXMETA_ENTRY_DEF {
+                return m;
+            }
+            c = unsafe { *v2_u32_at(v2.nx_next, (c - 1u32) as usize) };
+        }
         return 0 as *mut LinkV2SymMeta;
     }
     let mut i: usize = 0;
@@ -7697,6 +8198,20 @@ pub fn link_v2_find_def_meta_in_obj(
     obj_name: *const u8
 ) -> *mut LinkV2SymMeta {
     if (sym_name as usize) == 0 || (v2.syms as usize) == 0 {
+        return 0 as *mut LinkV2SymMeta;
+    }
+    if v2.nx_cap > 0 {
+        let mut c = v2_nx_head(v2, sym_name);
+        while c != 0u32 {
+            let m = unsafe { v2_sym_slot_ptr(v2.syms, (c - 1u32) as usize) };
+            if (unsafe { (*m).entry_kind }) == AXMETA_ENTRY_DEF {
+                if (obj_name as usize) == 0 ||
+                   ((unsafe { (*m).obj_name as usize }) != 0 && cstr_eq(unsafe { (*m).obj_name }, obj_name)) {
+                    return m;
+                }
+            }
+            c = unsafe { *v2_u32_at(v2.nx_next, (c - 1u32) as usize) };
+        }
         return 0 as *mut LinkV2SymMeta;
     }
     let mut i: usize = 0;
@@ -7724,6 +8239,24 @@ pub fn link_v2_find_ref_meta(
         return 0 as *mut LinkV2SymMeta;
     }
     let mut fallback: *mut LinkV2SymMeta = 0 as *mut LinkV2SymMeta;
+    if v2.nx_cap > 0 {
+        let mut c = v2_nx_head(v2, sym_name);
+        while c != 0u32 {
+            let m = unsafe { v2_sym_slot_ptr(v2.syms, (c - 1u32) as usize) };
+            if (unsafe { (*m).entry_kind }) == AXMETA_ENTRY_REF {
+                if (obj_name as usize) != 0 &&
+                   (unsafe { (*m).obj_name as usize }) != 0 &&
+                   cstr_eq(unsafe { (*m).obj_name }, obj_name) {
+                    return m;
+                }
+                if (fallback as usize) == 0 {
+                    fallback = m;
+                }
+            }
+            c = unsafe { *v2_u32_at(v2.nx_next, (c - 1u32) as usize) };
+        }
+        return fallback;
+    }
     let mut i: usize = 0;
     while i < v2.num_syms {
         let m = unsafe { v2_sym_slot_ptr(v2.syms, i) };
@@ -9691,6 +10224,7 @@ use compiler.obj.coff.coff_decode_symbol_record
 use compiler.obj.coff.cstr_len
 use compiler.obj.coff.bytes_eq
 use compiler.obj.coff.cstr_eq
+use compiler.obj.coff.objsym_hash
 use compiler.obj.coff.coff_mul_usize
 use compiler.obj.coff.coff_mul_u32
 use compiler.obj.writer.coff_encode_bytes
@@ -9795,6 +10329,7 @@ use compiler.link.pe.link_v2_find_def_meta_in_obj
 use compiler.link.pe.link_v2_find_ref_meta
 use compiler.link.pe.link_v2_add_reloc_meta
 use compiler.link.pe.link_v2_find_reloc_meta
+use compiler.link.pe.link_v2_next_same_name
 use compiler.link.pe.pe_demangle_cstr_in_ctx
 
 use compiler.link.import.ImportTable
@@ -10013,6 +10548,147 @@ unsafe fn cstr_slot_ptr(base: *mut *const u8, idx: usize) -> *mut *const u8 {
 
 unsafe fn msec_slot_ptr(base: *mut *mut MergedSection, idx: usize) -> *mut *mut MergedSection {
     ((base as usize) + coff_mul_usize(idx, size_of<*mut MergedSection>())) as *mut *mut MergedSection
+}
+
+// --- T486: per-object symbol tables of `linker_load_coff_object_v2` ---
+
+fn lnk_u32_alloc_zeroed(n: usize) -> *mut u32 {
+    let p = unsafe { heap_alloc(coff_mul_usize(n, 4), 4) as *mut u32 };
+    let mut i: usize = 0;
+    while i < n {
+        unsafe { *u32_slot_ptr(p, i) = 0u32; }
+        i = i + 1;
+    }
+    p
+}
+
+// Slot of `name` in an open-addressing table of (symbol index + 1) over `sym_names`: the slot
+// holding a symbol of that name, or the empty slot where it goes. `cap` is a power of two.
+fn lnk_name_probe(tab: *mut u32, cap: usize, sym_names: *mut *const u8, name: *const u8) -> usize {
+    let n = cstr_len(name);
+    let mask = cap - 1;
+    let mut k = (objsym_hash(name, n) as usize) & mask;
+    while true {
+        let v = unsafe { *u32_slot_ptr(tab, k) };
+        if v == 0u32 {
+            return k;
+        }
+        let sn = unsafe { *cstr_slot_ptr(sym_names, (v - 1u32) as usize) };
+        if bytes_eq(sn, cstr_len(sn), name, n) {
+            return k;
+        }
+        k = (k + 1) & mask;
+    }
+    0
+}
+
+fn lnk_pow2_cap(n: usize) -> usize {
+    let mut cap: usize = 16;
+    while cap < 2 * (n + 1) {
+        cap = cap + cap;
+    }
+    cap
+}
+
+// Order of the enclosing-function candidates: by section, then offset, then symbol index.
+fn lnk_cand_less(a: u32, b: u32, sym_secs: *mut *mut MergedSection, sym_offs: *mut u32) -> bool {
+    let sa = (unsafe { *msec_slot_ptr(sym_secs, a as usize) }) as usize;
+    let sb = (unsafe { *msec_slot_ptr(sym_secs, b as usize) }) as usize;
+    if sa != sb {
+        return sa < sb;
+    }
+    let oa = unsafe { *u32_slot_ptr(sym_offs, a as usize) };
+    let ob = unsafe { *u32_slot_ptr(sym_offs, b as usize) };
+    if oa != ob {
+        return oa < ob;
+    }
+    a < b
+}
+
+// Bottom-up merge sort of `n` candidate symbol indices (stable; keys are distinct anyway).
+fn lnk_sort_cands(idx: *mut u32, n: usize, sym_secs: *mut *mut MergedSection, sym_offs: *mut u32) {
+    if n < 2 {
+        return;
+    }
+    let tmp = lnk_u32_alloc_zeroed(n);
+    let mut src = idx;
+    let mut dst = tmp;
+    let mut width: usize = 1;
+    while width < n {
+        let mut lo: usize = 0;
+        while lo < n {
+            let mid = if lo + width < n { lo + width } else { n };
+            let hi = if lo + 2 * width < n { lo + 2 * width } else { n };
+            let mut i = lo;
+            let mut j = mid;
+            let mut k = lo;
+            while k < hi {
+                let take_left = if i < mid && j < hi {
+                    !lnk_cand_less(unsafe { *u32_slot_ptr(src, j) }, unsafe { *u32_slot_ptr(src, i) }, sym_secs, sym_offs)
+                } else {
+                    i < mid
+                };
+                if take_left {
+                    unsafe { *u32_slot_ptr(dst, k) = *u32_slot_ptr(src, i); }
+                    i = i + 1;
+                } else {
+                    unsafe { *u32_slot_ptr(dst, k) = *u32_slot_ptr(src, j); }
+                    j = j + 1;
+                }
+                k = k + 1;
+            }
+            lo = hi;
+        }
+        let t = src;
+        src = dst;
+        dst = t;
+        width = width + width;
+    }
+    if (src as usize) != (idx as usize) {
+        let mut c: usize = 0;
+        while c < n {
+            unsafe { *u32_slot_ptr(idx, c) = *u32_slot_ptr(src, c); }
+            c = c + 1;
+        }
+    }
+    unsafe { heap_free(tmp as *mut u8, coff_mul_usize(n, 4), 4); }
+}
+
+// The enclosing function of offset `off` in merged section `msec`: the candidate of that section with
+// the greatest offset <= `off` (the greatest symbol index among equal offsets), as the former scan
+// over all symbols chose. `cands` is sorted by `lnk_cand_less`. Null when there is none.
+fn lnk_enclosing_fn(
+    cands: *mut u32,
+    n: usize,
+    sym_names: *mut *const u8,
+    sym_secs: *mut *mut MergedSection,
+    sym_offs: *mut u32,
+    msec: *mut MergedSection,
+    off: u32
+) -> *const u8 {
+    // First position whose key is greater than (msec, off, +inf).
+    let ms = msec as usize;
+    let mut lo: usize = 0;
+    let mut hi: usize = n;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let c = (unsafe { *u32_slot_ptr(cands, mid) }) as usize;
+        let cs = (unsafe { *msec_slot_ptr(sym_secs, c) }) as usize;
+        let co = unsafe { *u32_slot_ptr(sym_offs, c) };
+        if cs < ms || (cs == ms && co <= off) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo == 0 {
+        return 0 as *const u8;
+    }
+    let c = (unsafe { *u32_slot_ptr(cands, lo - 1) }) as usize;
+    if ((unsafe { *msec_slot_ptr(sym_secs, c) }) as usize) != ms {
+        return 0 as *const u8;
+    }
+    unsafe { *cstr_slot_ptr(sym_names, c) }
 }
 
 unsafe fn free_sym_target_arrays(sym_secs: *mut *mut MergedSection, sym_offs: *mut u32, cap: usize) {
@@ -10407,28 +11083,37 @@ pub fn linker_load_coff_object_ex(
     }
 
     // 2b. Resolve intra-object references to defined STATIC/EXTERNAL symbols of the same name
+    let def_cap = lnk_pow2_cap(num_syms);
+    let def_tab = lnk_u32_alloc_zeroed(def_cap);
+    let mut d_idx: usize = 0;
+    while d_idx < num_syms {
+        let d_sec = unsafe { *(msec_slot_ptr(sym_secs, d_idx)) };
+        let d_name = unsafe { *(cstr_slot_ptr(sym_names, d_idx)) };
+        if (d_sec as usize) != 0 && (d_name as usize) != 0 {
+            let k = lnk_name_probe(def_tab, def_cap, sym_names, d_name);
+            if (unsafe { *u32_slot_ptr(def_tab, k) }) == 0u32 {
+                unsafe { *u32_slot_ptr(def_tab, k) = (d_idx + 1) as u32; }
+            }
+        }
+        d_idx = d_idx + 1;
+    }
     let mut u_idx: usize = 0;
     while u_idx < num_syms {
         let u_sec = unsafe { *(msec_slot_ptr(sym_secs, u_idx)) };
         let u_name = unsafe { *(cstr_slot_ptr(sym_names, u_idx)) };
         if (u_sec as usize) == 0 && (u_name as usize) != 0 {
-            let mut d_idx: usize = 0;
-            while d_idx < num_syms {
-                let d_sec = unsafe { *(msec_slot_ptr(sym_secs, d_idx)) };
-                let d_name = unsafe { *(cstr_slot_ptr(sym_names, d_idx)) };
-                if (d_sec as usize) != 0 && (d_name as usize) != 0 && cstr_eq(u_name, d_name) {
-                    let d_off = unsafe { *(u32_slot_ptr(sym_offs, d_idx)) };
-                    unsafe {
-                        *(msec_slot_ptr(sym_secs, u_idx)) = d_sec;
-                        *(u32_slot_ptr(sym_offs, u_idx)) = d_off;
-                    }
-                    break;
+            let dv = unsafe { *u32_slot_ptr(def_tab, lnk_name_probe(def_tab, def_cap, sym_names, u_name)) };
+            if dv != 0u32 {
+                let di = (dv - 1u32) as usize;
+                unsafe {
+                    *(msec_slot_ptr(sym_secs, u_idx)) = *(msec_slot_ptr(sym_secs, di));
+                    *(u32_slot_ptr(sym_offs, u_idx)) = *(u32_slot_ptr(sym_offs, di));
                 }
-                d_idx = d_idx + 1;
             }
         }
         u_idx = u_idx + 1;
     }
+    unsafe { heap_free(def_tab as *mut u8, coff_mul_usize(def_cap, 4), 4); }
 
     // 3. Parse Relocations
     s = 0;
@@ -11830,6 +12515,7 @@ pub fn pe_link_coff_buffers_to_buf(
         str_arena: 0 as *mut compiler.kernel.arena.Arena,
         tls_dir_rva: 0u32,
         tls_dir_size: 0u32,
+        gindex: 0 as *mut compiler.link.pe.LinkerGlobalIndex,
     };
     linker_context_init(mut_view(ctx));
     let mut candidates = archive_cand_list_new();
@@ -13727,6 +14413,23 @@ fn link_v2_check_abi_compat_all(
     while i < v2.num_syms {
         let m1 = link_v2_sym_at(v2, i);
         let s1 = unsafe { (*m1).sym_name };
+        let nx = link_v2_next_same_name(v2, i);
+        if nx != 0xFFFFFFFFu32 {
+            // T486: only the later metas of the same name can match: walk that chain (index order).
+            if (s1 as usize) != 0 && (unsafe { *s1 }) != 0u8 {
+                let mut c = nx;
+                while c != 0u32 {
+                    let m2 = link_v2_sym_at(v2, (c - 1u32) as usize);
+                    if !link_v2_metas_abi_compatible(m1 as *const LinkV2SymMeta, m2 as *const LinkV2SymMeta) {
+                        linker_report_abi_mismatch_v2(mut_view(*ctx), diag, s1, m1 as *const LinkV2SymMeta, m2 as *const LinkV2SymMeta);
+                        return false;
+                    }
+                    c = link_v2_next_same_name(v2, (c - 1u32) as usize);
+                }
+            }
+            i = i + 1;
+            continue;
+        }
         if (s1 as usize) != 0 && (unsafe { *s1 }) != 0u8 {
             let mut j: usize = i + 1;
             while j < v2.num_syms {
@@ -14181,30 +14884,58 @@ pub fn linker_load_coff_object_v2(
         sym_idx = sym_idx + 1 + aux_count;
     }
 
-    // 2b. Resolve intra-object references to defined non-weak symbols of the same name
+    // 2b. Resolve intra-object references to defined non-weak symbols of the same name.
+    // T486: through a name table of the FIRST defined non-weak symbol of each name. The former scan
+    // took the lowest-index match among those and the references resolved before; a resolved
+    // reference carries the values of that first definition, so the result is the same.
+    let def_cap = lnk_pow2_cap(num_syms);
+    let def_tab = lnk_u32_alloc_zeroed(def_cap);
+    let mut d_idx: usize = 0;
+    while d_idx < num_syms {
+        let d_sec = unsafe { *(msec_slot_ptr(sym_secs, d_idx)) };
+        let d_name = unsafe { *(cstr_slot_ptr(sym_names, d_idx)) };
+        let d_weak = unsafe { *(sym_is_weak + d_idx) };
+        if (d_sec as usize) != 0 && d_weak == 0u8 && (d_name as usize) != 0 {
+            let k = lnk_name_probe(def_tab, def_cap, sym_names, d_name);
+            if (unsafe { *u32_slot_ptr(def_tab, k) }) == 0u32 {
+                unsafe { *u32_slot_ptr(def_tab, k) = (d_idx + 1) as u32; }
+            }
+        }
+        d_idx = d_idx + 1;
+    }
     let mut u_idx: usize = 0;
     while u_idx < num_syms {
         let u_sec = unsafe { *(msec_slot_ptr(sym_secs, u_idx)) };
         let u_name = unsafe { *(cstr_slot_ptr(sym_names, u_idx)) };
         if (u_sec as usize) == 0 && (u_name as usize) != 0 {
-            let mut d_idx: usize = 0;
-            while d_idx < num_syms {
-                let d_sec = unsafe { *(msec_slot_ptr(sym_secs, d_idx)) };
-                let d_name = unsafe { *(cstr_slot_ptr(sym_names, d_idx)) };
-                let d_weak = unsafe { *(sym_is_weak + d_idx) };
-                if (d_sec as usize) != 0 && d_weak == 0u8 && (d_name as usize) != 0 && cstr_eq(u_name, d_name) {
-                    let d_off = unsafe { *(u32_slot_ptr(sym_offs, d_idx)) };
-                    unsafe {
-                        *(msec_slot_ptr(sym_secs, u_idx)) = d_sec;
-                        *(u32_slot_ptr(sym_offs, u_idx)) = d_off;
-                    }
-                    break;
+            let dv = unsafe { *u32_slot_ptr(def_tab, lnk_name_probe(def_tab, def_cap, sym_names, u_name)) };
+            if dv != 0u32 {
+                let di = (dv - 1u32) as usize;
+                unsafe {
+                    *(msec_slot_ptr(sym_secs, u_idx)) = *(msec_slot_ptr(sym_secs, di));
+                    *(u32_slot_ptr(sym_offs, u_idx)) = *(u32_slot_ptr(sym_offs, di));
                 }
-                d_idx = d_idx + 1;
             }
         }
         u_idx = u_idx + 1;
     }
+    unsafe { heap_free(def_tab as *mut u8, coff_mul_usize(def_cap, 4), 4); }
+
+    // T486: enclosing-function candidates (named symbols in a merged section, not `.`-prefixed),
+    // sorted once for the per-relocation lookup below.
+    let mut cand_n: usize = 0;
+    let cands = lnk_u32_alloc_zeroed(sym_names_cap);
+    let mut ci: usize = 0;
+    while ci < num_syms {
+        let f_sec = unsafe { *(msec_slot_ptr(sym_secs, ci)) };
+        let f_name = unsafe { *(cstr_slot_ptr(sym_names, ci)) };
+        if (f_sec as usize) != 0 && (f_name as usize) != 0 && (unsafe { *f_name }) != 46u8 {
+            unsafe { *u32_slot_ptr(cands, cand_n) = ci as u32; }
+            cand_n = cand_n + 1;
+        }
+        ci = ci + 1;
+    }
+    lnk_sort_cands(cands, cand_n, sym_secs, sym_offs);
 
     // 3. Parse Relocations & Provenance Metadata
     s = 0;
@@ -14216,6 +14947,7 @@ pub fn linker_load_coff_object_v2(
             let rel_table_end: usize = rel_table_off + coff_mul_usize(num_rels, COFF_RELOC_SIZE);
             if rel_table_end > obj_len {
                 unsafe {
+                    heap_free(cands as *mut u8, coff_mul_usize(sym_names_cap, 4), 4);
                     free_sym_target_arrays(sym_secs, sym_offs, sym_names_cap);
                     heap_free(sym_is_weak, sym_names_cap, 1);
                     heap_free(sym_names as *mut u8, coff_mul_usize(sym_names_cap, size_of<*const u8>()), align_of<*const u8>());
@@ -14279,23 +15011,7 @@ pub fn linker_load_coff_object_v2(
                     linker_add_reloc(mut_view(*ctx), msec, off, rel.reloc_type, target_sym_name, addend);
 
                     // Find enclosing function in this object at `off`
-                    let mut best_fn_name: *const u8 = 0 as *const u8;
-                    let mut best_fn_off: u32 = 0u32;
-                    let mut found_fn: bool = false;
-                    let mut fi: usize = 0;
-                    while fi < num_syms {
-                        let f_sec = unsafe { *(msec_slot_ptr(sym_secs, fi)) };
-                        let f_name = unsafe { *(cstr_slot_ptr(sym_names, fi)) };
-                        if f_sec == msec && (f_name as usize) != 0 && (unsafe { *f_name }) != 46u8 {
-                            let f_off = unsafe { *(u32_slot_ptr(sym_offs, fi)) };
-                            if f_off <= off && (!found_fn || f_off >= best_fn_off) {
-                                best_fn_off = f_off;
-                                best_fn_name = f_name;
-                                found_fn = true;
-                            }
-                        }
-                        fi = fi + 1;
-                    }
+                    let best_fn_name = lnk_enclosing_fn(cands, cand_n, sym_names, sym_secs, sym_offs, msec, off);
                     let dem_fn: *const u8 = if (best_fn_name as usize) != 0 {
                         pe_demangle_cstr_in_ctx(mut_view(*ctx), best_fn_name)
                     } else {
@@ -14330,6 +15046,7 @@ pub fn linker_load_coff_object_v2(
     }
 
     unsafe {
+        heap_free(cands as *mut u8, coff_mul_usize(sym_names_cap, 4), 4);
         free_sym_target_arrays(sym_secs, sym_offs, sym_names_cap);
         heap_free(sym_is_weak, sym_names_cap, 1);
         heap_free(sym_names as *mut u8, coff_mul_usize(sym_names_cap, size_of<*const u8>()), align_of<*const u8>());
@@ -14748,6 +15465,7 @@ pub fn pe_link_multi_objs_and_libs_to_buf(
         str_arena: 0 as *mut compiler.kernel.arena.Arena,
         tls_dir_rva: 0u32,
         tls_dir_size: 0u32,
+        gindex: 0 as *mut compiler.link.pe.LinkerGlobalIndex,
     };
     linker_context_init(mut_view(ctx));
     let mut v2 = link_v2_context_new();
@@ -14949,6 +15667,7 @@ pub fn pe_link_dll_multi_objs_and_libs_to_buf(
         str_arena: 0 as *mut compiler.kernel.arena.Arena,
         tls_dir_rva: 0u32,
         tls_dir_size: 0u32,
+        gindex: 0 as *mut compiler.link.pe.LinkerGlobalIndex,
     };
     linker_context_init(mut_view(ctx));
     let mut v2 = link_v2_context_new();

@@ -8,14 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T164]
 priority: 13
-status: doing
-attempts: 1
+status: todo
+attempts: 0
 paths: [compiler/traits/solver.ax, compiler/hir/lower.ax, compiler/hir/hir.ax, tests/run/trait_use_alias]
 locks: [compiler/resolve]
 spec: [spec/SPEC-20-selfhost.md, spec/decisions/ADR-0043-cyclic-type-graphs-and-symbol-id-space.md]
 covers: [REQ-RES-060]
 started: 2026-11-19 07:30:52
-agent: T492-impl
 ---
 # T492 — Trait bound through a `use … as` alias; sentinel ids
 
@@ -52,3 +51,4 @@ explicit flags/real ids so no code compares a `SymbolId` with a constant (ADR-00
 ## Log
 - 2026-11-19 created by orchestrator (T164 gate round 1 follow-up: alias imports; T164 report Follow-up 2: sentinels)
 - 2026-11-19 07:30:52 started (attempt 1) T492-impl
+- 2026-11-19 11:49:03 requeue: quota 429 on Gemini; max_parallel lowered to 3 (owner) - work kept on disk (not charged: attempt refunded)
