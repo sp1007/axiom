@@ -8,13 +8,15 @@ model: opus
 gate_model: opus
 depends: [T449, T486]
 priority: 10
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 900
 paths: [compiler/own, tests/perf/own_scaling]
 locks: [compiler/driver/pipeline.ax]
 spec: [spec/SPEC-76-performance-contract.md, spec/SPEC-20-selfhost.md, spec/SPEC-03-core-semantics.md]
 covers: [REQ-OPT-292]
+started: 2026-11-20 01:46:46
+agent: T493-impl
 ---
 # T493 — Perf: second-wave optimisation of the `own` pass
 
@@ -56,3 +58,4 @@ and every `taskgate` run without dropping any test coverage.
 
 ## Log
 - 2026-11-19 created by orchestrator (owner request: option 1 — optimise remaining `own` pass after T486)
+- 2026-11-20 01:46:46 started (attempt 1) T493-impl

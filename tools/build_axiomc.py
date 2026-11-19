@@ -113,6 +113,32 @@ def main(argv=None):
     ap.add_argument("--std-root", default=None, help="Optional explicit path to std/ directory")
     ap.add_argument("--stage", type=int, choices=(1, 2, 3), default=2, help="Bootstrap stage to build (default: 2)")
     ap.add_argument("--opt", choices=("O0", "O1", "both"), default="O1", help="Stage-2/3 optimization level (default: O1)")
+    ap.add_argument(
+        "--seed",
+        default=None,
+        help="Seed Stage-2 compiler path for seeded fast bootstrap (A=seed(src), B=A(src), C=B(src), B==C), "
+        "or 'auto' (default when not --force/--full-chain/--trust-root) to resolve from --cache-dir (T487)",
+    )
+    ap.add_argument(
+        "--cache-dir",
+        default=None,
+        help="Content-addressed Stage-2 compiler cache directory (default: <main_checkout>/_workspaces/artifacts/compiler-cache)",
+    )
+    ap.add_argument(
+        "--full-chain",
+        action="store_true",
+        help="Force the full axiom0 -> c1 -> c2 (-> c3) chain, disabling seeded mode",
+    )
+    ap.add_argument(
+        "--trust-root",
+        action="store_true",
+        help="Run the full axiom0 -> c1 -> c2 -> c3 trust-root chain and verify c2 == B byte-identical against the seed",
+    )
+    ap.add_argument(
+        "--no-stage0-smoke",
+        action="store_true",
+        help="Skip the stage-0 smoke-set .exe byte-parity guard between axiomc1 and seeded B",
+    )
     ap.add_argument("--force", action="store_true", help="Rebuild every stage even when the input manifests match")
     ap.add_argument("--time-passes", action="store_true", help="Report per-pass timings")
     args = ap.parse_args(argv)
@@ -143,6 +169,11 @@ def main(argv=None):
     axiomc1 = os.path.join(out_dir, "axiomc1.exe")
     axiomc2 = os.path.join(out_dir, "axiomc2.exe")
     axiomc = os.path.join(out_dir, "axiomc.exe")
+    eff_cache_dir = os.path.abspath(args.cache_dir) if args.cache_dir else bootstrap.default_compiler_cache_dir(effective_root)
+
+    eff_seed = args.seed
+    if eff_seed is None and args.stage >= 2 and not args.force and not args.full_chain and not args.trust_root:
+        eff_seed = "auto"
 
     boot_argv = [
         "--root",
@@ -159,7 +190,17 @@ def main(argv=None):
         str(args.stage),
         "--stage2-opt",
         args.opt,
+        "--cache-dir",
+        eff_cache_dir,
     ]
+    if eff_seed:
+        boot_argv.extend(["--seed", eff_seed])
+    if args.full_chain:
+        boot_argv.append("--full-chain")
+    if args.trust_root:
+        boot_argv.append("--trust-root")
+    if args.no_stage0_smoke:
+        boot_argv.append("--no-stage0-smoke")
     if not args.force:
         boot_argv.append("--reuse-existing")
     if args.time_passes:
@@ -169,13 +210,21 @@ def main(argv=None):
     if rc != 0:
         return rc
 
+    if args.stage >= 2 and not os.path.isfile(axiomc2):
+        axiomc2_o0 = os.path.join(out_dir, "axiomc2_O0.exe")
+        if os.path.isfile(axiomc2_o0):
+            bootstrap.safe_copy_binary(axiomc2_o0, axiomc2)
+            mp_o0 = bootstrap.manifest_path(axiomc2_o0)
+            if os.path.isfile(mp_o0):
+                shutil.copy2(mp_o0, bootstrap.manifest_path(axiomc2))
+
     target_bin = axiomc2 if args.stage >= 2 else axiomc1
     if not os.path.isfile(target_bin):
         print("build_axiomc: error: expected binary not found at %s" % target_bin, file=sys.stderr)
         return 1
 
     if os.path.abspath(target_bin) != os.path.abspath(axiomc):
-        shutil.copy2(target_bin, axiomc)
+        bootstrap.safe_copy_binary(target_bin, axiomc)
         target_mp = bootstrap.manifest_path(target_bin)
         if os.path.isfile(target_mp):
             shutil.copy2(target_mp, bootstrap.manifest_path(axiomc))

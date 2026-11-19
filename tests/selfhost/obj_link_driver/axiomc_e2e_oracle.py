@@ -241,45 +241,93 @@ def write_registry(entries):
             f.write("%s\t%s\t%s\n" % (path, entries[path][0], entries[path][1]))
 
 
-def resolve_prebuilt_axiomc(axiom0, root):
+def resolve_prebuilt_axiomc_with_manifest(axiom0, root, bundle_bytes=None):
+    """Reuse a prebuilt stage binary only when its `<bin>.inputs.json` manifest matches the current
+    `compiler/` + `std/` source hashes and bundle text (T444c, T487 Scope 5); never by mtime.
+
+    Returns `(candidate_path, inputs_hash, None)` on hit, or `(None, None, rebuild_reason)` on miss.
+    """
+    import json
+    tools_dir = os.path.join(root, "tools")
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    import bootstrap as b
+
     cdir = os.path.dirname(os.path.abspath(axiom0))
-    comp_dir = os.path.join(root, "compiler")
-    latest_src = 0.0
-    for dirpath, _dirs, files in os.walk(comp_dir):
-        for name in files:
-            if name.endswith(".ax"):
-                try:
-                    mt = os.path.getmtime(os.path.join(dirpath, name))
-                    if mt > latest_src:
-                        latest_src = mt
-                except OSError:
-                    pass
-    for cand in (
+    std = os.path.join(root, "std")
+    source_files = b.collect_source_hashes(root, std)
+    if bundle_bytes is None:
+        if b.load_bundle_text is not getattr(b, "_REAL_LOAD_BUNDLE_TEXT", b.load_bundle_text):
+            bundle_bytes = b.load_bundle_text(root).encode("utf-8")
+        else:
+            bundle_bytes = gen.axiomc_bundle_text().encode("utf-8")
+    bundle_sha = b.sha256_bytes(bundle_bytes)
+
+    candidates = (
         os.path.join(cdir, "axiomc1.exe"),
         os.path.join(cdir, "axiomc.exe"),
         os.path.join(cdir, "axiomc2.exe"),
+        os.path.join(cdir, "dir_stage2_O1", "axiomc2.exe"),
         os.path.join(root, "build", "axiomc1.exe"),
         os.path.join(root, "build", "axiomc.exe"),
         os.path.join(root, "build", "axiomc2.exe"),
-    ):
-        if os.path.isfile(cand):
-            try:
-                if os.path.getmtime(cand) >= latest_src:
-                    return cand
-            except OSError:
-                pass
-    return None
+        os.path.join(root, "build", "dir_stage2_O1", "axiomc2.exe"),
+    )
+    first_reason = None
+    seen = set()
+    for cand in candidates:
+        cand_abs = os.path.abspath(cand)
+        if cand_abs in seen:
+            continue
+        seen.add(cand_abs)
+        if not os.path.isfile(cand_abs):
+            continue
+        mp = b.manifest_path(cand_abs)
+        if not os.path.isfile(mp):
+            if first_reason is None:
+                first_reason = "no input manifest next to the previous binary"
+            continue
+        try:
+            with open(mp, "r", encoding="utf-8") as f:
+                old = json.load(f)
+        except (OSError, ValueError):
+            if first_reason is None:
+                first_reason = "input manifest unreadable"
+            continue
+        if not isinstance(old, dict) or old.get("schema") != b.MANIFEST_SCHEMA:
+            if first_reason is None:
+                first_reason = "input manifest schema changed"
+            continue
+        kind = old.get("kind") or "stage1"
+        producer_sha = old.get("producer_sha256", "")
+        if kind == "stage1":
+            cand_s0 = os.path.join(os.path.dirname(cand_abs), "axiom0.exe")
+            if os.path.isfile(cand_s0):
+                producer_sha = b.sha256_file(cand_s0)
+        expected = b.make_inputs(kind, source_files, producer_sha, bundle_sha, old.get("flags") or {})
+        why = b.reuse_blocker(cand_abs, expected)
+        if why is None:
+            return cand_abs, expected["inputs_hash"], None
+        if first_reason is None:
+            first_reason = why
+    return None, None, first_reason or "no previous binary"
 
 
-def main():
+def resolve_prebuilt_axiomc(axiom0, root, bundle_bytes=None):
+    cand, _inputs_hash, _why = resolve_prebuilt_axiomc_with_manifest(axiom0, root, bundle_bytes=bundle_bytes)
+    return cand
+
+
+def main(argv=None):
     if os.name == "nt":
         try:
             import ctypes
             ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002)
         except Exception:
             pass
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    update = "--update-registry" in sys.argv
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = [a for a in raw_argv if not a.startswith("--")]
+    update = "--update-registry" in raw_argv
     if len(args) < 3:
         print(__doc__)
         return 2
@@ -289,18 +337,56 @@ def main():
     os.makedirs(tmp, exist_ok=True)
     std = os.path.join(root, "std")
 
+    tools_dir = os.path.join(root, "tools")
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    import bootstrap as b
+
+    if b.run_stage_build is not b._REAL_RUN_STAGE_BUILD:
+        bundle_bytes = b.load_bundle_text(root).encode("utf-8")
+    else:
+        bundle_bytes = gen.axiomc_bundle_text().encode("utf-8")
+
     bundle = os.path.join(tmp, "axiomc_bundle.ax")
     with open(bundle, "wb") as f:
-        f.write(gen.axiomc_bundle_text().encode("utf-8"))
+        f.write(bundle_bytes)
     axiomc = os.path.join(tmp, "axiomc.exe")
-    prebuilt = resolve_prebuilt_axiomc(axiom0, root)
+    prebuilt, inputs_hash, why = resolve_prebuilt_axiomc_with_manifest(axiom0, root, bundle_bytes=bundle_bytes)
     if prebuilt is not None:
         shutil.copy2(prebuilt, axiomc)
+        print("REUSED %s (inputs %s)" % (prebuilt, inputs_hash[:16]))
         code, err = 0, b""
     else:
-        code, _out, err = run(
-            [axiom0, "build", "--stack-reserve=" + AXIOMC_STACK_RESERVE, "-o", axiomc, bundle], root, 1500
+        source_files = b.collect_source_hashes(root, std)
+        exp1 = b.make_inputs(
+            "stage1",
+            source_files,
+            b.sha256_file(axiom0) if os.path.isfile(axiom0) else "",
+            b.sha256_bytes(bundle_bytes),
+            {"opt": "default", "stack_reserve": int(AXIOMC_STACK_RESERVE)},
         )
+        if b.run_stage_build is not b._REAL_RUN_STAGE_BUILD:
+            r1 = b.run_stage_build(
+                "stage1_axiom0_to_axiomc1",
+                axiom0,
+                bundle,
+                axiomc,
+                std,
+                int(AXIOMC_STACK_RESERVE),
+                "default",
+                False,
+                root,
+                b.clean_bootstrap_env(),
+            )
+            code = r1["rc"]
+            err = r1["stderr"].encode("utf-8")
+        else:
+            code, _out, err = run(
+                [axiom0, "build", "--stack-reserve=" + AXIOMC_STACK_RESERVE, "-o", axiomc, bundle], root, 1500
+            )
+        if code == 0 and os.path.isfile(axiomc):
+            b.write_manifest(axiomc, exp1)
+            print("REBUILT %s (%s)" % (axiomc, why))
     if code != 0 or not os.path.isfile(axiomc):
         print("FAIL: axiom0 could not build axiomc (rc=%d): %s" % (code, err[:2000].decode("utf-8", "replace")))
         return 1
