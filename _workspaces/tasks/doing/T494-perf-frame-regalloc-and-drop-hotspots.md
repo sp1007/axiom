@@ -8,13 +8,15 @@ model: opus
 gate_model: opus
 depends: [T486]
 priority: 10
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 900
 paths: [compiler/target/x64/frame.ax, compiler/target/x64/isel.ax, compiler/mir/drop.ax, tests/perf/build_scaling]
 locks: [compiler/backend/session.ax]
 spec: [spec/SPEC-76-performance-contract.md, spec/SPEC-20-selfhost.md]
 covers: [REQ-OPT-292]
+started: 2026-11-20 00:26:13
+agent: T494-impl
 ---
 # T494 — Perf: optimise remaining `frame`, `mir_drop`, and `isel` hotspots in `build`
 
@@ -61,3 +63,4 @@ with zero loss of test coverage.
 
 ## Log
 - 2026-11-19 created by orchestrator (owner request: option 1 — optimise remaining `frame`, `mir_drop`, and `isel` hotspots after T486)
+- 2026-11-20 00:26:13 started (attempt 1) T494-impl
