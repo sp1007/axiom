@@ -8,12 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 11
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tools/build_axiomc.py, tools/bootstrap.py, tools/tests/build_axiomc]
 spec: [spec/decisions/ADR-0043-cyclic-type-graphs-and-symbol-id-space.md, spec/SPEC-20-selfhost.md]
 covers: [REQ-BLD-028, REQ-TST-072]
-started: 2026-11-19 03:36:57
+started: 2026-11-19 06:56:12
+agent: T444c-impl
 ---
 # T444c — build_axiomc reuse by content hash
 
@@ -49,3 +50,4 @@ even after `bootstrap/axiom0` changed (relevant for AX0-FIX tasks such as T164).
 - 2026-11-17 created by axiom-architect (T444 report F3; ADR-0043 §4)
 - 2026-11-19 03:36:57 started (attempt 1) T444c-impl
 - 2026-11-19 04:29:25 requeue: restart (not charged: attempt refunded)
+- 2026-11-19 06:56:12 started (attempt 1) T444c-impl
