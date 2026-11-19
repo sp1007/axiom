@@ -8,14 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T164, T166]
 priority: 60
-status: doing
+status: done
 attempts: 1
 timeout_min: 300
 paths: [_workspaces/investigations/T165]
 spec: [spec/decisions/ADR-0043-cyclic-type-graphs-and-symbol-id-space.md, spec/SPEC-20-selfhost.md]
 covers: [REQ-CORE-146]
 started: 2026-11-19 07:40:38
-agent: T165-impl
+finished: 2026-11-19 09:59:19
 ---
 # T165 — Investigate: axiomc1 `run --interp` segfault
 
@@ -49,3 +49,4 @@ could also affect code axiomc1 runs while building axiomc2; the stage-2/3 fixed 
   the same axiom0 branch-fixup overflow (`exec_assign_binop`, 1076 fixups; T491 report). First step: re-run the
   repro with the T166 axiom0; if the crash is gone, record that as classification (a) with T166 as the fix and close.
 - 2026-11-19 07:40:38 started (attempt 1) T165-impl
+- 2026-11-19 09:59:19 accepted by QA -> done

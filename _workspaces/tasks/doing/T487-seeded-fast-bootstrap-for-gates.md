@@ -8,13 +8,15 @@ model: opus
 gate_model: opus
 depends: [T444c]
 priority: 10
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 600
 paths: [tools/bootstrap.py, tools/build_axiomc.py, tools/tests/build_axiomc, tests/selfhost/fixedpoint, tests/selfhost/obj_link_driver/axiomc_e2e_oracle.py, _workspaces/baseline-failures.txt]
 locks: [tools/taskgate.py, tools/axtest.py]
 spec: [spec/SPEC-20-selfhost.md, spec/SPEC-00-bootstrap.md, spec/decisions/ADR-0043-cyclic-type-graphs-and-symbol-id-space.md]
 covers: [REQ-BLD-028, REQ-TST-072]
+started: 2026-11-19 09:33:03
+agent: T487-impl
 ---
 # T487 — Seeded fast bootstrap for gates
 
@@ -77,3 +79,6 @@ Measured here on 2026-11-18 (same input `tests/selfhost/parse/qa_parse_corpus_a.
 
 ## Log
 - 2026-11-18 created by orchestrator (owner request: apply the fast-gate approach of the earlier Axiom project)
+- 2026-11-19 08:07:25 started (attempt 1) T487-impl
+- 2026-11-19 08:45:35 requeue: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 43m8s. (infrastructure failure: attempt refunded)
+- 2026-11-19 09:33:03 started (attempt 1) T487-impl
