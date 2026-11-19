@@ -14,6 +14,7 @@ paths: [compiler/mir/builder.ax, compiler/traits, tests/run/generic_inherent_fie
 locks: []
 spec: [spec/SPEC-20-selfhost.md]
 covers: [REQ-OPT-292]
+started: 2026-11-19 18:41:41
 ---
 # T489 — Generic inherent impl: field read returns 0
 
@@ -45,3 +46,5 @@ so a member of a generic INHERENT impl is not monomorphized. Confirm by reading,
 
 ## Log
 - 2026-11-18 created by orchestrator (T485 gate follow-up F-2)
+- 2026-11-19 18:41:41 started (attempt 1) T489-impl
+- 2026-11-19 18:43:04 requeue: yield to T492 which already has dirty edits in compiler/traits/solver.ax (not charged: attempt refunded)
