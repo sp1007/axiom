@@ -178,22 +178,184 @@ def files_byte_identical(path_a, path_b):
                 return True
 
 
-def latest_source_mtime(root):
-    latest = 0.0
-    for sub in ("compiler", "std"):
-        base = os.path.join(root, sub)
-        if not os.path.isdir(base):
+def sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Input manifests (T444c, REQ-BLD-028). A stage binary `<bin>` is reused only when `<bin>.inputs.json` records
+# exactly the inputs of the build that is about to run; file mtimes are never consulted.
+#
+# Manifest layout (schema 1, JSON, sorted keys, LF):
+#   schema, kind ("axiom0" | "stage1" | "stage2" | "stage3"),
+#   producer_sha256   sha256 of the compiler binary that produced <bin> ("" for axiom0),
+#   bundle_sha256     sha256 of the bundle text that was compiled ("" for axiom0),
+#   flags             {"opt": ..., "stack_reserve": ...} for stages; {"cc": ..., "build_type": ...} for axiom0,
+#   sources_sha256    sha256 over the sorted lines "<relative path> <sha256>" of every hashed source file,
+#   inputs_hash       sha256 of the canonical JSON of the five fields above (this is the reuse key),
+#   files             {relative path: sha256} behind sources_sha256 (kept to explain a rebuild),
+#   output_sha256 / output_size   of <bin> itself (a binary replaced behind the manifest is never reused).
+# Hashed sources of a stage: compiler/**/*.ax, std/**/*.ax and std/**/*.toml (std is keyed by content under the
+# fixed prefix "std/"; the std root's absolute path is deliberately NOT an input because the output does not
+# depend on it, INV-DET-004). Stage 0: every file under bootstrap/axiom0 except build outputs (see hash_tree).
+# ---------------------------------------------------------------------------------------------------------------
+
+MANIFEST_SCHEMA = 1
+MANIFEST_SUFFIX = ".inputs.json"
+_SKIP_DIR_NAMES = ("cmakefiles", ".cache", ".git", "__pycache__")
+_BUILD_TREE_MARKERS = ("CMakeCache.txt", "build.ninja")
+_SKIP_FILE_SUFFIXES = (".exe", ".obj", ".o", ".pyc", ".pdb", ".ilk", ".lib", ".a", ".log")
+
+
+def manifest_path(binary):
+    return binary + MANIFEST_SUFFIX
+
+
+def hash_tree(base, rel_prefix, suffixes=None):
+    """Return {"<rel_prefix>/<path under base>": sha256} for the files under `base` (sorted walk).
+
+    `suffixes` (tuple) keeps only files with one of those extensions; None keeps every file except build outputs
+    (CMake build trees, i.e. directories holding CMakeCache.txt or build.ninja, plus CMakeFiles/.cache/.git/
+    __pycache__ directories, and *.exe/*.obj/*.o/*.pyc/... files). Source directories named build* are kept.
+    """
+    out = {}
+    if not os.path.isdir(base):
+        return out
+    for dirpath, dirnames, filenames in os.walk(base):
+        if suffixes is None:
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if d.lower() not in _SKIP_DIR_NAMES
+                and not any(os.path.isfile(os.path.join(dirpath, d, m)) for m in _BUILD_TREE_MARKERS)
+            )
+        else:
+            dirnames[:] = sorted(dirnames)
+        for fn in sorted(filenames):
+            if suffixes is not None:
+                if not fn.endswith(suffixes):
+                    continue
+            elif fn.lower().endswith(_SKIP_FILE_SUFFIXES):
+                continue
+            full = os.path.join(dirpath, fn)
+            rel = os.path.relpath(full, base).replace(os.sep, "/")
+            try:
+                out[rel_prefix + "/" + rel] = sha256_file(full)
+            except OSError:
+                pass
+    return out
+
+
+def collect_source_hashes(root, std_root):
+    """Hashes of every compiler/std source a stage build can observe (see the manifest layout above)."""
+    files = {}
+    files.update(hash_tree(os.path.join(root, "compiler"), "compiler", (".ax",)))
+    files.update(hash_tree(std_root, "std", (".ax", ".toml")))
+    return files
+
+
+def files_digest(files):
+    lines = ["%s %s" % (k, files[k]) for k in sorted(files)]
+    return sha256_bytes("\n".join(lines).encode("utf-8"))
+
+
+def _canonical_json(obj):
+    import json
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def make_inputs(kind, files, producer_sha256="", bundle_sha256="", flags=None):
+    """Expected-inputs record of a build (the manifest minus the output fields); `inputs_hash` is the reuse key."""
+    rec = {
+        "schema": MANIFEST_SCHEMA,
+        "kind": kind,
+        "producer_sha256": producer_sha256,
+        "bundle_sha256": bundle_sha256,
+        "flags": dict(flags or {}),
+        "sources_sha256": files_digest(files),
+    }
+    rec["inputs_hash"] = sha256_bytes(_canonical_json(rec).encode("utf-8"))
+    rec["files"] = dict(files)
+    return rec
+
+
+def _explain_difference(old, new):
+    parts = []
+    if old.get("producer_sha256") != new.get("producer_sha256"):
+        parts.append("producing compiler changed")
+    if old.get("bundle_sha256") != new.get("bundle_sha256"):
+        parts.append("bundle text changed")
+    if old.get("flags") != new.get("flags"):
+        parts.append("flags changed (%s -> %s)" % (_canonical_json(old.get("flags")), _canonical_json(new.get("flags"))))
+    if old.get("sources_sha256") != new.get("sources_sha256"):
+        of, nf = old.get("files") or {}, new.get("files") or {}
+        changed = sorted(k for k in set(of) | set(nf) if of.get(k) != nf.get(k))
+        shown = ", ".join(changed[:3]) + (" (+%d more)" % (len(changed) - 3) if len(changed) > 3 else "")
+        parts.append("sources changed: %s" % (shown or "?"))
+    return "; ".join(parts) or "inputs changed"
+
+
+def reuse_blocker(binary, expected):
+    """None when `binary` may be reused for the build described by `expected`; otherwise the reason it may not."""
+    import json
+    if not os.path.isfile(binary):
+        return "no previous binary"
+    try:
+        if os.path.getsize(binary) == 0:
+            return "previous binary is empty"
+    except OSError:
+        return "previous binary unreadable"
+    mp = manifest_path(binary)
+    if not os.path.isfile(mp):
+        return "no input manifest next to the previous binary"
+    try:
+        with open(mp, "r", encoding="utf-8") as f:
+            old = json.load(f)
+    except (OSError, ValueError):
+        return "input manifest unreadable"
+    if not isinstance(old, dict) or old.get("schema") != MANIFEST_SCHEMA:
+        return "input manifest schema changed"
+    if old.get("inputs_hash") != expected["inputs_hash"]:
+        return _explain_difference(old, expected)
+    try:
+        if os.path.getsize(binary) != old.get("output_size") or sha256_file(binary) != old.get("output_sha256"):
+            return "binary does not match its manifest (replaced or damaged)"
+    except OSError:
+        return "previous binary unreadable"
+    return None
+
+
+def write_manifest(binary, expected, output_sha256=None):
+    """Write `<binary>.inputs.json` (atomic replace, LF) for a binary just produced from `expected`."""
+    rec = dict(expected)
+    rec["output_sha256"] = output_sha256 or sha256_file(binary)
+    rec["output_size"] = os.path.getsize(binary)
+    mp = manifest_path(binary)
+    tmp = mp + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(_canonical_json(rec) + "\n")
+    os.replace(tmp, mp)
+
+
+def drop_manifest(binary):
+    try:
+        os.remove(manifest_path(binary))
+    except OSError:
+        pass
+
+
+def find_reusable(candidates, expected):
+    """First candidate binary whose manifest matches `expected`: (path, None); else (None, reason of the first
+    candidate that exists, or "no previous binary")."""
+    first_reason = None
+    for cand in candidates:
+        if not cand:
             continue
-        for dirpath, _dirnames, filenames in os.walk(base):
-            for fn in filenames:
-                if fn.endswith(".ax"):
-                    try:
-                        m = os.path.getmtime(os.path.join(dirpath, fn))
-                        if m > latest:
-                            latest = m
-                    except OSError:
-                        pass
-    return latest
+        why = reuse_blocker(cand, expected)
+        if why is None:
+            return cand, None
+        if first_reason is None and os.path.isfile(cand):
+            first_reason = why
+    return None, first_reason or "no previous binary"
 
 
 def run_stage_build(
@@ -343,9 +505,12 @@ def run_stage2_and_stage3_for_opt(
     time_passes,
     env,
     reuse_existing=False,
-    src_mtime=0.0,
+    source_files=None,
 ):
     """Run Stage-2 in dir_stage2_<opt> and (if max_stage >= 3) Stage-3 in dir_stage3_<opt>.
+
+    With `reuse_existing`, a previous binary is reused only when its `<bin>.inputs.json` manifest matches the
+    inputs of this build exactly (see "Input manifests" above); `source_files` is `collect_source_hashes(...)`.
 
     Stage-2 and Stage-3 always execute in two distinct directories (`dir_stage2 != dir_stage3`)
     with identical flags (INV-DET-004, SPEC-00 MS-P10b, SPEC-20 §6.3).
@@ -373,23 +538,28 @@ def run_stage2_and_stage3_for_opt(
 
     results = []
 
-    # Check if we can reuse an up-to-date Stage-2 binary
+    source_files = source_files if source_files is not None else {}
+    flags = {"opt": opt_level, "stack_reserve": stack_reserve}
+    bundle_sha = sha256_bytes(bundle_bytes)
+    s2_copies = [s2_out_in_dir, top_s2_opt]
+    if opt_level == "O1":
+        s2_copies += [top_s2_default, os.path.join(base_dir, "axiomc.exe")]
+
+    # Stage 2 reuse: only on an exact input-manifest match (producer axiomc1, bundle, sources, flags).
+    exp2 = make_inputs("stage2", source_files, sha256_file(axiomc1), bundle_sha, flags)
     reused_s2 = None
+    why2 = "reuse not requested"
     if reuse_existing:
-        for cand in (s2_out_in_dir, top_s2_opt, top_s2_default if opt_level == "O1" else ""):
-            if cand and os.path.isfile(cand):
-                try:
-                    if os.path.getmtime(cand) >= src_mtime and os.path.getsize(cand) > 0:
-                        reused_s2 = cand
-                        break
-                except OSError:
-                    pass
+        reused_s2, why2 = find_reusable([s2_out_in_dir, top_s2_opt, top_s2_default if opt_level == "O1" else ""], exp2)
 
     if reused_s2 is not None:
         if os.path.abspath(reused_s2) != os.path.abspath(s2_out_in_dir):
             shutil.copy2(reused_s2, s2_out_in_dir)
         r2 = make_cached_result("stage2_axiomc1_to_axiomc2_%s" % opt_level, opt_level, s2_out_in_dir, dir_s2)
+        print("REUSED %s (inputs %s)" % (s2_out_in_dir, exp2["inputs_hash"][:16]))
     else:
+        for c in s2_copies:
+            drop_manifest(c)
         r2 = run_stage_build(
             "stage2_axiomc1_to_axiomc2_%s" % opt_level,
             axiomc1,
@@ -402,6 +572,8 @@ def run_stage2_and_stage3_for_opt(
             dir_s2,
             env,
         )
+        if r2["rc"] == 0 and os.path.isfile(s2_out_in_dir):
+            print("REBUILT %s (%s)" % (s2_out_in_dir, why2))
     results.append(r2)
     if r2["rc"] != 0 or not os.path.isfile(s2_out_in_dir):
         print(
@@ -411,10 +583,10 @@ def run_stage2_and_stage3_for_opt(
         )
         return False, results
 
-    shutil.copy2(s2_out_in_dir, top_s2_opt)
-    if opt_level == "O1":
-        shutil.copy2(s2_out_in_dir, top_s2_default)
-        shutil.copy2(s2_out_in_dir, os.path.join(base_dir, "axiomc.exe"))
+    for c in s2_copies[1:]:
+        shutil.copy2(s2_out_in_dir, c)
+    for c in s2_copies:
+        write_manifest(c, exp2, r2["sha256"])
 
     print(
         "STAGE2 (%s) OK: %s [dir=%s] (%d bytes, sha256=%s, wall=%.2fs, peak_ws=%.1fMB, peak_commit=%.1fMB)"
@@ -431,22 +603,21 @@ def run_stage2_and_stage3_for_opt(
     )
 
     if max_stage >= 3:
+        s3_copies = [s3_out_in_dir, top_s3_opt] + ([top_s3_default] if opt_level == "O1" else [])
+        exp3 = make_inputs("stage3", source_files, r2["sha256"], bundle_sha, flags)
         reused_s3 = None
+        why3 = "reuse not requested"
         if reuse_existing:
-            for cand in (s3_out_in_dir, top_s3_opt, top_s3_default if opt_level == "O1" else ""):
-                if cand and os.path.isfile(cand):
-                    try:
-                        if os.path.getmtime(cand) >= src_mtime and os.path.getsize(cand) > 0:
-                            reused_s3 = cand
-                            break
-                    except OSError:
-                        pass
+            reused_s3, why3 = find_reusable([s3_out_in_dir, top_s3_opt, top_s3_default if opt_level == "O1" else ""], exp3)
 
         if reused_s3 is not None:
             if os.path.abspath(reused_s3) != os.path.abspath(s3_out_in_dir):
                 shutil.copy2(reused_s3, s3_out_in_dir)
             r3 = make_cached_result("stage3_axiomc2_to_axiomc3_%s" % opt_level, opt_level, s3_out_in_dir, dir_s3)
+            print("REUSED %s (inputs %s)" % (s3_out_in_dir, exp3["inputs_hash"][:16]))
         else:
+            for c in s3_copies:
+                drop_manifest(c)
             r3 = run_stage_build(
                 "stage3_axiomc2_to_axiomc3_%s" % opt_level,
                 s2_out_in_dir,
@@ -459,6 +630,8 @@ def run_stage2_and_stage3_for_opt(
                 dir_s3,
                 env,
             )
+            if r3["rc"] == 0 and os.path.isfile(s3_out_in_dir):
+                print("REBUILT %s (%s)" % (s3_out_in_dir, why3))
         results.append(r3)
         if r3["rc"] != 0 or not os.path.isfile(s3_out_in_dir):
             print(
@@ -468,9 +641,10 @@ def run_stage2_and_stage3_for_opt(
             )
             return False, results
 
-        shutil.copy2(s3_out_in_dir, top_s3_opt)
-        if opt_level == "O1":
-            shutil.copy2(s3_out_in_dir, top_s3_default)
+        for c in s3_copies[1:]:
+            shutil.copy2(s3_out_in_dir, c)
+        for c in s3_copies:
+            write_manifest(c, exp3, r3["sha256"])
 
         print(
             "STAGE3 (%s) OK: %s [dir=%s] (%d bytes, sha256=%s, wall=%.2fs, peak_ws=%.1fMB, peak_commit=%.1fMB)"
@@ -533,7 +707,8 @@ def main(argv=None):
     ap.add_argument(
         "--reuse-existing",
         action="store_true",
-        help="Reuse existing stage binaries when they are newer than compiler/ and std/ sources",
+        help="Reuse an existing stage binary when its <bin>.inputs.json manifest matches this build's inputs exactly "
+        "(content hashes of compiler/ and std/ sources, bundle text, producing compiler, flags); never by mtime",
     )
     ap.add_argument("--time-passes", action="store_true", help="Pass --time-passes and report per-pass timings")
     ap.add_argument("--perf-csv", default=None, help="Write self-host timing and memory CSV to this path")
@@ -581,10 +756,12 @@ def main(argv=None):
 
     axiomc1 = os.path.abspath(args.out) if args.out else os.path.join(build_dir, "axiomc1.exe")
     base_dir = os.path.dirname(axiomc1)
-    src_mtime = latest_source_mtime(root)
 
     bundle_text = load_bundle_text(root)
     bundle_bytes = bundle_text.encode("utf-8")
+    t_hash = time.perf_counter()
+    source_files = collect_source_hashes(root, std_root)
+    print("INPUTS: %d source files hashed in %.2fs (sources %s)" % (len(source_files), time.perf_counter() - t_hash, files_digest(source_files)[:16]))
     tmp_ctx = None
     if args.bundle_out:
         bundle_path = os.path.abspath(args.bundle_out)
@@ -599,16 +776,19 @@ def main(argv=None):
 
         stage_results = []
 
-        # Stage 1: axiom0 -> axiomc1
-        can_reuse_s1 = (
-            args.reuse_existing
-            and os.path.isfile(axiomc1)
-            and os.path.getsize(axiomc1) > 0
-            and os.path.getmtime(axiomc1) >= src_mtime
+        # Stage 1: axiom0 -> axiomc1 (reused only on an exact manifest match; the producer is axiom0's content hash)
+        exp1 = make_inputs(
+            "stage1", source_files, sha256_file(stage0), sha256_bytes(bundle_bytes),
+            {"opt": args.opt, "stack_reserve": args.stack_reserve},
         )
-        if can_reuse_s1:
+        reused_s1, why1 = (None, "reuse not requested")
+        if args.reuse_existing:
+            reused_s1, why1 = find_reusable([axiomc1], exp1)
+        if reused_s1 is not None:
             r1 = make_cached_result("stage1_axiom0_to_axiomc1", args.opt, axiomc1, root)
+            print("REUSED %s (inputs %s)" % (axiomc1, exp1["inputs_hash"][:16]))
         else:
+            drop_manifest(axiomc1)
             r1 = run_stage_build(
                 "stage1_axiom0_to_axiomc1",
                 stage0,
@@ -621,6 +801,9 @@ def main(argv=None):
                 root,
                 env,
             )
+            if r1["rc"] == 0 and os.path.isfile(axiomc1):
+                write_manifest(axiomc1, exp1, r1["sha256"])
+                print("REBUILT %s (%s)" % (axiomc1, why1))
         stage_results.append(r1)
         if r1["rc"] != 0 or not os.path.isfile(axiomc1):
             print(
@@ -648,7 +831,7 @@ def main(argv=None):
                     args.time_passes or bool(args.perf_csv),
                     env,
                     reuse_existing=args.reuse_existing,
-                    src_mtime=src_mtime,
+                    source_files=source_files,
                 )
                 stage_results.extend(opt_results)
                 if not ok_opt:

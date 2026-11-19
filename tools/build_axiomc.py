@@ -9,8 +9,11 @@ Python 3 standard library only.
 2. Invokes `tools/bootstrap.py` with host C/linker toolchains stripped from `PATH` and
    `SOURCE_DATE_EPOCH=0` to build Stage-1 (`axiomc1.exe`) and Stage-2 (`axiomc2.exe`, plus
    `axiomc.exe`) inside `<out>`.
-3. Reuses up-to-date Stage-1/Stage-2 binaries when no `compiler/**/*.ax` or `std/**/*.ax` source
-   is newer than `<out>/axiomc2.exe` (pass `--force` to force a full rebuild).
+3. Reuses a Stage-0/1/2 binary only when its input manifest `<bin>.inputs.json` matches exactly (T444c, REQ-BLD-028):
+   sha256 of every `compiler/**/*.ax` and `std/**/*.ax|toml` source (axiom0: of every file under
+   `bootstrap/axiom0`), the bundle text, the producing compiler binary and the stage flags. File mtimes are never
+   consulted (a snapshot keeps main-tree mtimes, so an edited file can be older than the binary). Each binary
+   prints `REUSED <bin> (inputs <hash16>)` or `REBUILT <bin> (reason)`; pass `--force` to rebuild everything.
 """
 
 import argparse
@@ -33,6 +36,13 @@ def find_cmake_and_ninja_env():
     return env
 
 
+def stage0_inputs(src_dir, cc, build_type):
+    """Expected-inputs record of `axiom0.exe`: content of every file under `src_dir` (C sources, headers, CMake
+    files; build output directories and binaries skipped, see bootstrap.hash_tree) plus cc and build type."""
+    files = bootstrap.hash_tree(src_dir, "bootstrap/axiom0")
+    return bootstrap.make_inputs("axiom0", files, flags={"cc": cc, "build_type": build_type})
+
+
 def ensure_stage0(out_dir, root, explicit_stage0=None, cc="clang", build_type="Release"):
     if explicit_stage0:
         p = os.path.abspath(explicit_stage0)
@@ -41,14 +51,22 @@ def ensure_stage0(out_dir, root, explicit_stage0=None, cc="clang", build_type="R
         return p
 
     cand = os.path.join(out_dir, "axiom0.exe" if os.name == "nt" else "axiom0")
-    if os.path.isfile(cand):
-        return cand
 
     # Check if out_dir is inside a snapshot that has its own bootstrap/axiom0
     snap_root = os.path.dirname(out_dir)
     src_dir = os.path.join(snap_root, "bootstrap", "axiom0")
     if not os.path.isfile(os.path.join(src_dir, "CMakeLists.txt")):
         src_dir = os.path.join(root, "bootstrap", "axiom0")
+
+    expected = stage0_inputs(src_dir, cc, build_type)
+    why = bootstrap.reuse_blocker(cand, expected)
+    if why is None:
+        print("REUSED %s (inputs %s)" % (cand, expected["inputs_hash"][:16]))
+        return cand
+    # An existing build tree may consider its outputs up to date by mtime although a source changed with an older
+    # mtime (snapshot copies keep main-tree mtimes): rebuild from clean so the content change is honoured.
+    clean_first = os.path.isfile(cand) or os.path.isfile(os.path.join(out_dir, "build.ninja"))
+    bootstrap.drop_manifest(cand)
 
     env = find_cmake_and_ninja_env()
     os.makedirs(out_dir, exist_ok=True)
@@ -67,13 +85,17 @@ def ensure_stage0(out_dir, root, explicit_stage0=None, cc="clang", build_type="R
     if r.returncode != 0:
         raise RuntimeError("cmake configure failed with exit code %d" % r.returncode)
 
-    bld_cmd = ["cmake", "--build", out_dir, "--config", build_type]
+    bld_cmd = ["cmake", "--build", out_dir, "--config", build_type, "--parallel", "2"]
+    if clean_first:
+        bld_cmd.append("--clean-first")
     r = subprocess.run(bld_cmd, cwd=root, env=env)
     if r.returncode != 0:
         raise RuntimeError("cmake build failed with exit code %d" % r.returncode)
 
     if not os.path.isfile(cand):
         raise RuntimeError("stage0 binary was not produced at %s" % cand)
+    bootstrap.write_manifest(cand, expected)
+    print("REBUILT %s (%s)" % (cand, why))
     return cand
 
 
@@ -91,7 +113,7 @@ def main(argv=None):
     ap.add_argument("--std-root", default=None, help="Optional explicit path to std/ directory")
     ap.add_argument("--stage", type=int, choices=(1, 2, 3), default=2, help="Bootstrap stage to build (default: 2)")
     ap.add_argument("--opt", choices=("O0", "O1", "both"), default="O1", help="Stage-2/3 optimization level (default: O1)")
-    ap.add_argument("--force", action="store_true", help="Force full rebuild even if binaries are newer than sources")
+    ap.add_argument("--force", action="store_true", help="Rebuild every stage even when the input manifests match")
     ap.add_argument("--time-passes", action="store_true", help="Report per-pass timings")
     args = ap.parse_args(argv)
 
@@ -154,6 +176,11 @@ def main(argv=None):
 
     if os.path.abspath(target_bin) != os.path.abspath(axiomc):
         shutil.copy2(target_bin, axiomc)
+        target_mp = bootstrap.manifest_path(target_bin)
+        if os.path.isfile(target_mp):
+            shutil.copy2(target_mp, bootstrap.manifest_path(axiomc))
+        else:
+            bootstrap.drop_manifest(axiomc)
 
     # Smoke-check the built compiler
     smoke = subprocess.run(

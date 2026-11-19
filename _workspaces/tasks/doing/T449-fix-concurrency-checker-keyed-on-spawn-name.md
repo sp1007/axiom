@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T452]
 priority: 24
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 600
 paths: [compiler/own/unsafe.ax, tests/ui/concurrency/spawn_contract]
 locks: [compiler/types/typeck.ax]
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/SPEC-30-concurrency.md, spec/SPEC-34-executors-fibers.md]
 covers: [REQ-TST-072, REQ-TST-035]
+started: 2026-11-19 07:40:37
+agent: T449-impl
 ---
 # T449 — Fix: spawn checks follow the declared contract, not the name
 
@@ -46,3 +48,4 @@ arguments and raw-pointer locals; a method merely named `spawn` is not checked (
 
 ## Log
 - 2026-11-13 created by axiom-architect (ADR-0042 §2; T422 FU-E)
+- 2026-11-19 07:40:37 started (attempt 1) T449-impl
