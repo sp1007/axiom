@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T434]
 priority: 0
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/fmt/cst/mod.ax, tools/affected_map.txt, tests/run/fmt_engine, tests/run/fmt_cli, tests/conformance/p19/e19_2_formatter]
 locks: [compiler/syntax/parse.ax]
 spec: [spec/SPEC-61-reflection-derive.md, spec/SPEC-20-selfhost.md]
 covers: [REQ-TST-072]
+started: 2026-11-20 14:12:57
+finished: 2026-11-20 15:14:36
 ---
 # T820 — Fix regression: formatter emits synthetic `@derive(...)` `ITEM_IMPL` nodes
 
@@ -45,3 +47,5 @@ Culprit commit: `bda3bb63` (`T434`). Before `T434`, `parse_synthetic_item()` in 
 
 ## Log
 - 2026-11-20 created from fullrun-1 bisect (Cluster A, culprit bda3bb63 T434)
+- 2026-11-20 14:12:57 started (attempt 1) T820-impl
+- 2026-11-20 15:14:36 accepted by QA -> done

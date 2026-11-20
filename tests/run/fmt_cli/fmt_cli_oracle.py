@@ -37,6 +37,7 @@ EXPECTED_PROBE_STDOUT = (
     "probe[cli_flags_and_manifest] unknown_opt_exit=2 stdin_with_path_exit=2 bad_manifest_exit=2 exclude_ok=true\n"
     "probe[cli_modes] check_unfmt_exit=1 diff_has_headers=true quiet_only_path=true fmt_inplace_exit=0 check_after_fmt_exit=0 mtime_preserved=true syntax_refusal_exit=1 stdin_ok=true\n"
     "probe[lsp_formatting] fmt_accepted=true options_ignored=true minimal_edit_ok=true canonical_noop_edits=0 range_fmt_ok=true broken_doc_edits=0\n"
+    "probe[derive_and_real_impl] start_ok=true after_ok=true impl0_ok=true\n"
     "FMT-CLI-PROBE-PASS\n"
 )
 
