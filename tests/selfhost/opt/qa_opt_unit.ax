@@ -14264,6 +14264,232 @@ fn drop_variant_field_count(t: *mut AxType, variant: usize) -> usize {
     unsafe { *usize_at((*t).variant_field_counts, variant) }
 }
 
+// Per-compile cache for `mir_type_needs_drop_in`, stored in `thir.interner.scratch[2].fields`
+// (same pattern as `LirSymCache` in `lir/builder.ax` and `BackendSymCache` in `backend/session.ax`).
+// Enabled only when `thir.expr_methods` has the `6usize` drop-indexed sentinel and no synthetic
+// unit-test head impls are present. Invalidated automatically if `hir.items`, `db`, or
+// `thir.expr_methods.len` changes.
+struct DropNeedsCache {
+    hir_head: *mut HirItem,
+    db: *const SourceDatabase,
+    expr_methods_len: usize,
+    cap: usize,
+    states: *mut u8,
+}
+
+fn drop_zero_u8(ptr: *mut u8, n: usize) {
+    let mut i: usize = 0;
+    while i < n {
+        unsafe { *(((ptr as usize) + i) as *mut u8) = 0u8; }
+        i = i + 1;
+    }
+}
+
+fn drop_get_needs_cache(
+    thir: view<Thir>,
+    hir: view<HirFile>,
+    db: *const SourceDatabase
+) -> *mut DropNeedsCache {
+    let thir_ptr = unsafe { address_of(thir.interner.arena.head) as usize };
+    if thir_ptr == 0 || thir.interner.t_u128.v != 0x3FFF0129u32 || (thir.interner.scratch as usize) == 0 {
+        return 0 as *mut DropNeedsCache;
+    }
+    if thir.expr_methods.cap == 0 {
+        return 0 as *mut DropNeedsCache;
+    }
+    let drop_indexed: *mut *const HirItem = ptr_itemmap_get(view(thir.expr_methods), 6usize);
+    if (drop_indexed as usize) == 0 {
+        return 0 as *mut DropNeedsCache;
+    }
+    let hir_ptr: usize = unsafe { address_of(hir.items) as usize };
+    let hir_head: *mut HirItem = if hir_ptr != 0 { hir.items } else { 0 as *mut HirItem };
+    if (hir_head as usize) != 0 && (unsafe { (*hir_head).kind }) == HIR_ITEM_IMPL {
+        let head_m: *mut HirItem = unsafe { (*hir_head).members };
+        if (head_m as usize) != 0 && ((unsafe { (*head_m).symbol.v }) == 999999u32 || (unsafe { (*head_m).symbol.v }) == 7001u32) {
+            return 0 as *mut DropNeedsCache;
+        }
+    }
+    let slot_ty = ((thir.interner.scratch as usize) + mir_mul_usize(2, size_of<AxType>())) as *mut AxType;
+    let mut c = (unsafe { (*slot_ty).fields }) as *mut DropNeedsCache;
+    let arena = unsafe { address_of(thir.interner.arena.head) as *mut Arena };
+    if (c as usize) == 0 {
+        c = unsafe {
+            arena_alloc_raw(mut_view(*arena), size_of<DropNeedsCache>(), align_of<DropNeedsCache>()) as *mut DropNeedsCache
+        };
+        unsafe {
+            (*c).hir_head = hir_head;
+            (*c).db = db;
+            (*c).expr_methods_len = thir.expr_methods.len;
+            (*c).cap = 0;
+            (*c).states = 0 as *mut u8;
+            (*slot_ty).fields = c as *mut TypeId;
+        }
+    } else if (unsafe { (*c).hir_head as usize }) != (hir_head as usize) ||
+              (unsafe { (*c).db as usize }) != (db as usize) ||
+              (unsafe { (*c).expr_methods_len }) != thir.expr_methods.len {
+        unsafe {
+            (*c).hir_head = hir_head;
+            (*c).db = db;
+            (*c).expr_methods_len = thir.expr_methods.len;
+            if (*c).cap > 0 {
+                drop_zero_u8((*c).states, (*c).cap);
+            }
+        }
+    }
+    c
+}
+
+fn drop_cache_ensure(c: *mut DropNeedsCache, thir: view<Thir>, need: usize) {
+    let cur_cap = unsafe { (*c).cap };
+    if need < cur_cap {
+        return;
+    }
+    let mut new_cap = if cur_cap == 0 { 256 } else { cur_cap };
+    while new_cap <= need {
+        new_cap = new_cap + new_cap;
+    }
+    let arena = unsafe { address_of(thir.interner.arena.head) as *mut Arena };
+    let new_states = unsafe { arena_alloc_raw(mut_view(*arena), new_cap, 1) };
+    if cur_cap > 0 {
+        unsafe {
+            ptr_copy_nonoverlapping<u8>((*c).states as *const u8, new_states, cur_cap);
+        }
+    }
+    drop_zero_u8(((new_states as usize) + cur_cap) as *mut u8, new_cap - cur_cap);
+    unsafe {
+        (*c).states = new_states;
+        (*c).cap = new_cap;
+    }
+}
+
+fn mir_type_needs_drop_cached(
+    ty: TypeId,
+    thir: view<Thir>,
+    hir: view<HirFile>,
+    db: *const SourceDatabase,
+    str_in: view<StrInterner>,
+    cache: *mut DropNeedsCache
+) -> bool {
+    let ty_v = ty.v;
+    if ty_v == 0u32 || ty_v == 0x3FFF0128u32 || ty_v == 0x3FFF0129u32 {
+        return false;
+    }
+    if (cache as usize) != 0 {
+        let idx = ty_v as usize;
+        if idx < (unsafe { (*cache).cap }) {
+            let st = unsafe { *(((((*cache).states) as usize) + idx) as *mut u8) };
+            if st == 1u8 {
+                return false;
+            }
+            if st == 2u8 {
+                return true;
+            }
+            if st == 3u8 {
+                return false;
+            }
+        } else {
+            if idx > thir.interner.len {
+                return false;
+            }
+            drop_cache_ensure(cache, thir, idx);
+        }
+        unsafe {
+            *(((((*cache).states) as usize) + idx) as *mut u8) = 3u8;
+        }
+    }
+
+    let t = drop_type_get(thir, TypeId { v: ty_v });
+    let mut res = false;
+    if (t as usize) != 0 {
+        let kind = unsafe { (*t).kind };
+        if kind == TY_CLOSURE {
+            let capture_count = unsafe { (*t).capture_count };
+            let captures = unsafe { (*t).captures };
+            let mut i: usize = 0;
+            while i < capture_count {
+                let capture = unsafe { capture_at(captures, i) };
+                let mode = unsafe { (*capture).mode };
+                let capture_ty = TypeId { v: unsafe { (*capture).ty.v } };
+                if mode == CAP_MOVE && mir_type_needs_drop_cached(capture_ty, thir, hir, db, str_in, cache) {
+                    res = true;
+                    break;
+                }
+                i = i + 1;
+            }
+        } else if kind == TY_COROUTINE {
+            let field_count = unsafe { (*t).field_count };
+            let fields = unsafe { (*t).fields };
+            let mut i: usize = 1;
+            while i < field_count {
+                if mir_type_needs_drop_cached(drop_field_type(fields, i), thir, hir, db, str_in, cache) {
+                    res = true;
+                    break;
+                }
+                i = i + 1;
+            }
+        } else if kind == TY_STRUCT {
+            let def = unsafe { (*t).def };
+            if (def as usize) != 0 && (unsafe { (*def).struct_fields as usize }) == 0 {
+                res = true;
+            } else {
+                let drop_fn = drop_find_impl_fn_with_thir(TypeId { v: ty_v }, thir, hir, def, db, str_in);
+                if (drop_fn as usize) != 0 {
+                    res = true;
+                } else {
+                    let field_count = unsafe { (*t).field_count };
+                    let fields = unsafe { (*t).fields };
+                    let mut i: usize = 0;
+                    while i < field_count {
+                        if mir_type_needs_drop_cached(drop_field_type(fields, i), thir, hir, db, str_in, cache) {
+                            res = true;
+                            break;
+                        }
+                        i = i + 1;
+                    }
+                }
+            }
+        } else if kind == TY_TUPLE {
+            let field_count = unsafe { (*t).field_count };
+            let fields = unsafe { (*t).fields };
+            let mut i: usize = 0;
+            while i < field_count {
+                if mir_type_needs_drop_cached(drop_field_type(fields, i), thir, hir, db, str_in, cache) {
+                    res = true;
+                    break;
+                }
+                i = i + 1;
+            }
+        } else if kind == TY_ENUM {
+            let variant_count = unsafe { (*t).variant_count };
+            let mut variant: usize = 0;
+            while variant < variant_count && !res {
+                let field_count = drop_variant_field_count(t, variant);
+                let mut i: usize = 0;
+                while i < field_count {
+                    let field_ty = drop_variant_field_type(t, variant, i);
+                    if mir_type_needs_drop_cached(field_ty, thir, hir, db, str_in, cache) {
+                        res = true;
+                        break;
+                    }
+                    i = i + 1;
+                }
+                variant = variant + 1;
+            }
+        } else if kind == TY_ARRAY {
+            let alen = unsafe { (*t).array_len };
+            let elem = TypeId { v: unsafe { (*t).elem.v } };
+            res = alen > 0u64 && mir_type_needs_drop_cached(elem, thir, hir, db, str_in, cache);
+        }
+    }
+
+    if (cache as usize) != 0 {
+        unsafe {
+            *(((((*cache).states) as usize) + (ty_v as usize)) as *mut u8) = if res { 2u8 } else { 1u8 };
+        }
+    }
+    res
+}
+
 // Does a value of type `ty` own something that must be dropped?
 //   - closures: a by-move capture that needs drop;
 //   - structs: no field list (unit, empty or tuple struct), a user `impl Drop`, or a field that
@@ -14278,105 +14504,8 @@ pub fn mir_type_needs_drop_in(
     db: *const SourceDatabase,
     str_in: view<StrInterner>
 ) -> bool {
-    let t = drop_type_get(thir, TypeId { v: ty.v });
-    if (t as usize) == 0 {
-        return false;
-    }
-    let kind = unsafe { (*t).kind };
-
-    if kind == TY_CLOSURE {
-        let capture_count = unsafe { (*t).capture_count };
-        let captures = unsafe { (*t).captures };
-        let mut i: usize = 0;
-        while i < capture_count {
-            let capture = unsafe { capture_at(captures, i) };
-            let mode = unsafe { (*capture).mode };
-            let capture_ty = TypeId { v: unsafe { (*capture).ty.v } };
-            if mode == CAP_MOVE && mir_type_needs_drop_in(capture_ty, thir, hir, db, str_in) {
-                return true;
-            }
-            i = i + 1;
-        }
-        return false;
-    }
-
-    if kind == TY_COROUTINE {
-        // A lowered state machine needs drop glue only if some saved field (parameter, live
-        // local or in-flight sub-future) needs drop; field 0 is the `u32` state tag.
-        let field_count = unsafe { (*t).field_count };
-        let fields = unsafe { (*t).fields };
-        let mut i: usize = 1;
-        while i < field_count {
-            if mir_type_needs_drop_in(drop_field_type(fields, i), thir, hir, db, str_in) {
-                return true;
-            }
-            i = i + 1;
-        }
-        return false;
-    }
-
-    if kind == TY_STRUCT {
-        let def = unsafe { (*t).def };
-        if (def as usize) != 0 {
-            let struct_fields = unsafe { (*def).struct_fields };
-            if (struct_fields as usize) == 0 {
-                return true;
-            }
-        }
-        let drop_fn = drop_find_impl_fn_with_thir(TypeId { v: ty.v }, thir, hir, def, db, str_in);
-        if (drop_fn as usize) != 0 {
-            return true;
-        }
-        let field_count = unsafe { (*t).field_count };
-        let fields = unsafe { (*t).fields };
-        let mut i: usize = 0;
-        while i < field_count {
-            if mir_type_needs_drop_in(drop_field_type(fields, i), thir, hir, db, str_in) {
-                return true;
-            }
-            i = i + 1;
-        }
-        return false;
-    }
-
-    if kind == TY_TUPLE {
-        let field_count = unsafe { (*t).field_count };
-        let fields = unsafe { (*t).fields };
-        let mut i: usize = 0;
-        while i < field_count {
-            if mir_type_needs_drop_in(drop_field_type(fields, i), thir, hir, db, str_in) {
-                return true;
-            }
-            i = i + 1;
-        }
-        return false;
-    }
-
-    if kind == TY_ENUM {
-        let variant_count = unsafe { (*t).variant_count };
-        let mut variant: usize = 0;
-        while variant < variant_count {
-            let field_count = drop_variant_field_count(t, variant);
-            let mut i: usize = 0;
-            while i < field_count {
-                let field_ty = drop_variant_field_type(t, variant, i);
-                if mir_type_needs_drop_in(field_ty, thir, hir, db, str_in) {
-                    return true;
-                }
-                i = i + 1;
-            }
-            variant = variant + 1;
-        }
-        return false;
-    }
-
-    if kind == TY_ARRAY {
-        let alen = unsafe { (*t).array_len };
-        let elem = TypeId { v: unsafe { (*t).elem.v } };
-        return alen > 0u64 && mir_type_needs_drop_in(elem, thir, hir, db, str_in);
-    }
-
-    false
+    let cache = drop_get_needs_cache(thir, hir, db);
+    mir_type_needs_drop_cached(TypeId { v: ty.v }, thir, hir, db, str_in, cache)
 }
 
 // `mir_type_needs_drop_in` without a source database (C: `ax_type_needs_drop(..., db = NULL)`).
@@ -14580,6 +14709,7 @@ fn drop_visit_operand(
     hir: view<HirFile>,
     db: *const SourceDatabase,
     str_in: view<StrInterner>,
+    cache: *mut DropNeedsCache,
     df: view<DropFlags>,
     op: view<MirOperand>,
     buf: mut_view<DropStmtBuf>,
@@ -14595,7 +14725,7 @@ fn drop_visit_operand(
                 return;
             }
             let pty = mir_drop_place_type(body, thir, view(op.place));
-            if !mir_type_needs_drop_in(pty, thir, hir, db, str_in) {
+            if !mir_type_needs_drop_cached(pty, thir, hir, db, str_in, cache) {
                 return;
             }
         }
@@ -14609,33 +14739,118 @@ fn drop_visit_rvalue(
     hir: view<HirFile>,
     db: *const SourceDatabase,
     str_in: view<StrInterner>,
+    cache: *mut DropNeedsCache,
     df: view<DropFlags>,
     rv: view<MirRvalue>,
     buf: mut_view<DropStmtBuf>,
     arena: mut_view<Arena>
 ) {
     if rv.kind == MIR_RVALUE_USE || rv.kind == MIR_RVALUE_CAST || rv.kind == MIR_RVALUE_UNARY_OP {
-        drop_visit_operand(body, thir, hir, db, str_in, df, view(rv.use_op), mut_view(*buf), mut_view(*arena));
+        drop_visit_operand(body, thir, hir, db, str_in, cache, df, view(rv.use_op), mut_view(*buf), mut_view(*arena));
     } else if rv.kind == MIR_RVALUE_REPEAT {
-        drop_visit_operand(body, thir, hir, db, str_in, df, view(rv.use_op), mut_view(*buf), mut_view(*arena));
+        drop_visit_operand(body, thir, hir, db, str_in, cache, df, view(rv.use_op), mut_view(*buf), mut_view(*arena));
         if (rv.repeat_count_op as usize) != 0 {
             unsafe {
-                drop_visit_operand(body, thir, hir, db, str_in, df, view(*rv.repeat_count_op), mut_view(*buf), mut_view(*arena));
+                drop_visit_operand(body, thir, hir, db, str_in, cache, df, view(*rv.repeat_count_op), mut_view(*buf), mut_view(*arena));
             }
         }
     } else if rv.kind == MIR_RVALUE_BINARY_OP || rv.kind == MIR_RVALUE_OVERFLOWS_BINARY_OP {
-        drop_visit_operand(body, thir, hir, db, str_in, df, view(rv.lhs), mut_view(*buf), mut_view(*arena));
-        drop_visit_operand(body, thir, hir, db, str_in, df, view(rv.rhs), mut_view(*buf), mut_view(*arena));
+        drop_visit_operand(body, thir, hir, db, str_in, cache, df, view(rv.lhs), mut_view(*buf), mut_view(*arena));
+        drop_visit_operand(body, thir, hir, db, str_in, cache, df, view(rv.rhs), mut_view(*buf), mut_view(*arena));
     } else if rv.kind == MIR_RVALUE_AGGREGATE {
         let mut i: usize = 0;
         while i < rv.operand_count {
             let op = unsafe { mir_op_at(rv.operands, i) };
             unsafe {
-                drop_visit_operand(body, thir, hir, db, str_in, df, view(*op), mut_view(*buf), mut_view(*arena));
+                drop_visit_operand(body, thir, hir, db, str_in, cache, df, view(*op), mut_view(*buf), mut_view(*arena));
             }
             i = i + 1;
         }
     }
+}
+
+fn drop_op_touches_flagged(df: view<DropFlags>, op: view<MirOperand>) -> bool {
+    if op.kind != MIR_OP_MOVE && op.kind != MIR_OP_COPY {
+        return false;
+    }
+    let lv = op.place.local.v as usize;
+    if lv >= df.orig_local_count {
+        return false;
+    }
+    (unsafe { *(((df.flags as usize) + (lv << 2)) as *mut u32) }) != 0u32
+}
+
+fn drop_block_needs_rewrite(body: view<MirBody>, df: view<DropFlags>, bb_idx: usize) -> bool {
+    let bb = unsafe { mir_bb_at(body.bbs, bb_idx) };
+    let old_count = unsafe { (*bb).stmt_count };
+    let stmts_base = unsafe { (*bb).stmts as usize };
+    let stmt_sz = size_of<MirStmt>();
+    let flags_base = df.flags as usize;
+    let orig_lc = df.orig_local_count;
+    let mut j: usize = 0;
+    while j < old_count {
+        let stmt = (stmts_base + mir_mul_usize(j, stmt_sz)) as *mut MirStmt;
+        let stmt_kind = unsafe { (*stmt).kind };
+        if stmt_kind == MIR_STMT_ASSIGN {
+            let dest_v = unsafe { (*stmt).place.local.v as usize };
+            if dest_v < orig_lc && (unsafe { *((flags_base + (dest_v << 2)) as *mut u32) }) != 0u32 {
+                return true;
+            }
+            let rk = unsafe { (*stmt).rvalue.kind };
+            if rk == MIR_RVALUE_USE || rk == MIR_RVALUE_CAST || rk == MIR_RVALUE_UNARY_OP {
+                if unsafe { drop_op_touches_flagged(df, view((*stmt).rvalue.use_op)) } {
+                    return true;
+                }
+            } else if rk == MIR_RVALUE_REPEAT {
+                if unsafe { drop_op_touches_flagged(df, view((*stmt).rvalue.use_op)) } {
+                    return true;
+                }
+                let rco = unsafe { (*stmt).rvalue.repeat_count_op };
+                if (rco as usize) != 0 && (unsafe { drop_op_touches_flagged(df, view(*rco)) }) {
+                    return true;
+                }
+            } else if rk == MIR_RVALUE_BINARY_OP || rk == MIR_RVALUE_OVERFLOWS_BINARY_OP {
+                if unsafe { drop_op_touches_flagged(df, view((*stmt).rvalue.lhs)) } ||
+                   unsafe { drop_op_touches_flagged(df, view((*stmt).rvalue.rhs)) } {
+                    return true;
+                }
+            } else if rk == MIR_RVALUE_AGGREGATE {
+                let oc = unsafe { (*stmt).rvalue.operand_count };
+                let ops = unsafe { (*stmt).rvalue.operands };
+                let mut k: usize = 0;
+                while k < oc {
+                    let op = unsafe { mir_op_at(ops, k) };
+                    if unsafe { drop_op_touches_flagged(df, view(*op)) } {
+                        return true;
+                    }
+                    k = k + 1;
+                }
+            }
+        }
+        j = j + 1;
+    }
+
+    let term_kind = unsafe { (*bb).terminator.kind };
+    if term_kind == MIR_TERM_SWITCH_INT {
+        return unsafe { drop_op_touches_flagged(df, view((*bb).terminator.discr)) };
+    } else if term_kind == MIR_TERM_CALL {
+        if unsafe { drop_op_touches_flagged(df, view((*bb).terminator.func)) } {
+            return true;
+        }
+        let arg_count = unsafe { (*bb).terminator.arg_count };
+        let args = unsafe { (*bb).terminator.args };
+        let mut a: usize = 0;
+        while a < arg_count {
+            let arg = unsafe { mir_op_at(args, a) };
+            if unsafe { drop_op_touches_flagged(df, view(*arg)) } {
+                return true;
+            }
+            a = a + 1;
+        }
+    } else if term_kind == MIR_TERM_ASSERT {
+        return unsafe { drop_op_touches_flagged(df, view((*bb).terminator.cond)) };
+    }
+    false
 }
 
 // Rewrites the statements of one block: flag set in a call's return block, flag clears before
@@ -14646,12 +14861,28 @@ fn drop_rewrite_block(
     hir: view<HirFile>,
     db: *const SourceDatabase,
     str_in: view<StrInterner>,
+    cache: *mut DropNeedsCache,
     df: view<DropFlags>,
     bb_idx: usize,
     call_init_local_v: u32,
     arena: mut_view<Arena>
 ) {
     let bb = unsafe { mir_bb_at(body.bbs, bb_idx) };
+    let term_kind = unsafe { (*bb).terminator.kind };
+
+    if call_init_local_v == 0u32 && !drop_block_needs_rewrite(view(*body), df, bb_idx) {
+        if term_kind == MIR_TERM_DROP {
+            let drop_local_v = unsafe { (*bb).terminator.drop_place.local.v };
+            let flag = drop_flag_of(df, drop_local_v);
+            if flag != 0u32 {
+                unsafe {
+                    (*bb).terminator.drop_flag = flag;
+                }
+            }
+        }
+        return;
+    }
+
     let old_count = unsafe { (*bb).stmt_count };
     let mut buf = drop_stmt_buf_new(mut_view(*arena), old_count + 16);
 
@@ -14666,7 +14897,7 @@ fn drop_rewrite_block(
         let stmt_kind = unsafe { (*stmt).kind };
         if stmt_kind == MIR_STMT_ASSIGN {
             unsafe {
-                drop_visit_rvalue(view(*body), thir, hir, db, str_in, df, view((*stmt).rvalue), mut_view(buf), mut_view(*arena));
+                drop_visit_rvalue(view(*body), thir, hir, db, str_in, cache, df, view((*stmt).rvalue), mut_view(buf), mut_view(*arena));
             }
         }
         unsafe {
@@ -14682,14 +14913,13 @@ fn drop_rewrite_block(
         j = j + 1;
     }
 
-    let term_kind = unsafe { (*bb).terminator.kind };
     if term_kind == MIR_TERM_SWITCH_INT {
         unsafe {
-            drop_visit_operand(view(*body), thir, hir, db, str_in, df, view((*bb).terminator.discr), mut_view(buf), mut_view(*arena));
+            drop_visit_operand(view(*body), thir, hir, db, str_in, cache, df, view((*bb).terminator.discr), mut_view(buf), mut_view(*arena));
         }
     } else if term_kind == MIR_TERM_CALL {
         unsafe {
-            drop_visit_operand(view(*body), thir, hir, db, str_in, df, view((*bb).terminator.func), mut_view(buf), mut_view(*arena));
+            drop_visit_operand(view(*body), thir, hir, db, str_in, cache, df, view((*bb).terminator.func), mut_view(buf), mut_view(*arena));
         }
         let arg_count = unsafe { (*bb).terminator.arg_count };
         let args = unsafe { (*bb).terminator.args };
@@ -14697,13 +14927,13 @@ fn drop_rewrite_block(
         while a < arg_count {
             let arg = unsafe { mir_op_at(args, a) };
             unsafe {
-                drop_visit_operand(view(*body), thir, hir, db, str_in, df, view(*arg), mut_view(buf), mut_view(*arena));
+                drop_visit_operand(view(*body), thir, hir, db, str_in, cache, df, view(*arg), mut_view(buf), mut_view(*arena));
             }
             a = a + 1;
         }
     } else if term_kind == MIR_TERM_ASSERT {
         unsafe {
-            drop_visit_operand(view(*body), thir, hir, db, str_in, df, view((*bb).terminator.cond), mut_view(buf), mut_view(*arena));
+            drop_visit_operand(view(*body), thir, hir, db, str_in, cache, df, view((*bb).terminator.cond), mut_view(buf), mut_view(*arena));
         }
     }
 
@@ -15282,114 +15512,126 @@ pub fn mir_drop_elaborate(
     body.drop_elaborated = true;
     let orig_local_count = body.local_count;
     let bool_ty_v = thir.interner.t_bool.v;
-    let flags_bytes = mir_mul_usize(orig_local_count + 1, size_of<u32>());
-    let flags = arena_alloc_raw(mut_view(*arena), flags_bytes, align_of<u32>()) as *mut u32;
-    let mut i: usize = 0;
-    while i <= orig_local_count {
-        unsafe {
-            *u32_at(flags, i) = 0u32;
-        }
-        i = i + 1;
-    }
+    let cache = drop_get_needs_cache(view(*thir), hir, db);
 
     // 1. One flag local per original local (the return slot excluded) whose type needs drop.
+    //    Allocate `flags` lazily on the first local that needs drop.
+    let mut flags: *mut u32 = 0 as *mut u32;
     let mut flag_count: usize = 0;
-    i = 1;
+    let mut i: usize = 1;
     while i < orig_local_count {
         let decl = unsafe { mir_local_at(body.locals, i) };
         let local_ty = TypeId { v: unsafe { (*decl).ty.v } };
-        if mir_type_needs_drop_in(local_ty, view(*thir), hir, db, str_in) {
+        if mir_type_needs_drop_cached(local_ty, view(*thir), hir, db, str_in, cache) {
+            if (flags as usize) == 0 {
+                let flags_bytes = (orig_local_count + 1) << 2;
+                flags = arena_alloc_raw(mut_view(*arena), flags_bytes, align_of<u32>()) as *mut u32;
+                let mut z: usize = 0;
+                while z <= orig_local_count {
+                    unsafe {
+                        *(((flags as usize) + (z << 2)) as *mut u32) = 0u32;
+                    }
+                    z = z + 1;
+                }
+            }
             let flag_local = drop_new_local(mut_view(*body), mut_view(*arena), bool_ty_v, true);
             unsafe {
-                *u32_at(flags, i) = flag_local.v;
+                *(((flags as usize) + (i << 2)) as *mut u32) = flag_local.v;
             }
             flag_count = flag_count + 1;
         }
         i = i + 1;
     }
     body.drop_flag_count = body.drop_flag_count + flag_count;
-    let df = DropFlags { flags: flags, orig_local_count: orig_local_count, bool_ty_v: bool_ty_v };
 
-    // 2. Flag initialisation at the top of bb0: arguments arrive initialised.
-    if body.bb_count > 0 && flag_count > 0 {
-        let bb0 = unsafe { mir_bb_at(body.bbs, 0) };
-        let old_count = unsafe { (*bb0).stmt_count };
-        let mut buf = drop_stmt_buf_new(mut_view(*arena), old_count + flag_count);
-        i = 1;
-        while i < orig_local_count {
-            let flag = drop_flag_of(view(df), i as u32);
-            if flag != 0u32 {
-                let decl = unsafe { mir_local_at(body.locals, i) };
-                let is_arg = (unsafe { (*decl).kind }) == MIR_LOCAL_ARG;
-                drop_stmt_buf_push_flag(mut_view(buf), mut_view(*arena), flag, bool_ty_v, is_arg);
+    // 2..4. Flag initialisation, call-return arming, and per-block flag maintenance are all
+    //       no-ops when no original local needs a drop flag (`flag_count == 0`).
+    if flag_count > 0 {
+        let df = DropFlags { flags: flags, orig_local_count: orig_local_count, bool_ty_v: bool_ty_v };
+
+        // 2. Flag initialisation at the top of bb0: arguments arrive initialised.
+        if body.bb_count > 0 {
+            let bb0 = unsafe { mir_bb_at(body.bbs, 0) };
+            let old_count = unsafe { (*bb0).stmt_count };
+            let mut buf = drop_stmt_buf_new(mut_view(*arena), old_count + flag_count);
+            i = 1;
+            while i < orig_local_count {
+                let flag = drop_flag_of(view(df), i as u32);
+                if flag != 0u32 {
+                    let decl = unsafe { mir_local_at(body.locals, i) };
+                    let is_arg = (unsafe { (*decl).kind }) == MIR_LOCAL_ARG;
+                    drop_stmt_buf_push_flag(mut_view(buf), mut_view(*arena), flag, bool_ty_v, is_arg);
+                }
+                i = i + 1;
+            }
+            let mut j: usize = 0;
+            while j < old_count {
+                let stmt = unsafe { mir_stmt_at((*bb0).stmts, j) };
+                unsafe {
+                    drop_stmt_buf_push_copy(mut_view(buf), mut_view(*arena), view(*stmt));
+                }
+                j = j + 1;
+            }
+            unsafe {
+                (*bb0).stmts = buf.stmts;
+                (*bb0).stmt_count = buf.count;
+                (*bb0).stmt_cap = buf.cap;
+            }
+        }
+
+        // 3. A call that writes a flagged local arms its flag at the start of its return block.
+        let bb_count = body.bb_count;
+        let call_inits_bytes = mir_mul_usize(bb_count + 1, size_of<MirLocalId>());
+        let call_inits = arena_alloc_raw(mut_view(*arena), call_inits_bytes, align_of<MirLocalId>()) as *mut MirLocalId;
+        i = 0;
+        while i <= bb_count {
+            unsafe {
+                (*mir_local_id_at(call_inits, i)).v = 0u32;
             }
             i = i + 1;
         }
-        let mut j: usize = 0;
-        while j < old_count {
-            let stmt = unsafe { mir_stmt_at((*bb0).stmts, j) };
-            unsafe {
-                drop_stmt_buf_push_copy(mut_view(buf), mut_view(*arena), view(*stmt));
-            }
-            j = j + 1;
-        }
-        unsafe {
-            (*bb0).stmts = buf.stmts;
-            (*bb0).stmt_count = buf.count;
-            (*bb0).stmt_cap = buf.cap;
-        }
-    }
-
-    // 3. A call that writes a flagged local arms its flag at the start of its return block.
-    let bb_count = body.bb_count;
-    let call_inits_bytes = mir_mul_usize(bb_count + 1, size_of<MirLocalId>());
-    let call_inits = arena_alloc_raw(mut_view(*arena), call_inits_bytes, align_of<MirLocalId>()) as *mut MirLocalId;
-    i = 0;
-    while i <= bb_count {
-        unsafe {
-            (*mir_local_id_at(call_inits, i)).v = 0u32;
-        }
-        i = i + 1;
-    }
-    i = 0;
-    while i < bb_count {
-        let bb = unsafe { mir_bb_at(body.bbs, i) };
-        let term_kind = unsafe { (*bb).terminator.kind };
-        if term_kind == MIR_TERM_CALL {
-            let dest_v = unsafe { (*bb).terminator.destination.local.v };
-            if drop_flag_of(view(df), dest_v) != 0u32 {
-                let call_target = (unsafe { (*bb).terminator.call_target.v }) as usize;
-                if call_target < bb_count {
-                    unsafe {
-                        (*mir_local_id_at(call_inits, call_target)).v = dest_v;
+        i = 0;
+        while i < bb_count {
+            let bb = unsafe { mir_bb_at(body.bbs, i) };
+            let term_kind = unsafe { (*bb).terminator.kind };
+            if term_kind == MIR_TERM_CALL {
+                let dest_v = unsafe { (*bb).terminator.destination.local.v };
+                if drop_flag_of(view(df), dest_v) != 0u32 {
+                    let call_target = (unsafe { (*bb).terminator.call_target.v }) as usize;
+                    if call_target < bb_count {
+                        unsafe {
+                            (*mir_local_id_at(call_inits, call_target)).v = dest_v;
+                        }
                     }
                 }
             }
+            i = i + 1;
         }
-        i = i + 1;
+
+        // 4. Flag maintenance inside every original block.
+        i = 0;
+        while i < bb_count {
+            let call_init_v = unsafe { (*mir_local_id_at(call_inits, i)).v };
+            drop_rewrite_block(mut_view(*body), view(*thir), hir, db, str_in, cache, view(df), i, call_init_v, mut_view(*arena));
+            i = i + 1;
+        }
     }
 
-    // 4. Flag maintenance inside every original block.
-    i = 0;
-    while i < bb_count {
-        let call_init_v = unsafe { (*mir_local_id_at(call_inits, i)).v };
-        drop_rewrite_block(mut_view(*body), view(*thir), hir, db, str_in, view(df), i, call_init_v, mut_view(*arena));
-        i = i + 1;
-    }
-
-    // 5. Expand drop terminators until none with a known type remains; blocks created by one pass
-    //    are expanded by the next one.
+    // 5. Expand drop terminators until none with a known type remains; only blocks created by
+    //    pass k (`start_bb .. current_count`) can contain newly-introduced `drop` terminators.
+    let mut start_bb: usize = 0;
     let mut changed = true;
     while changed {
         changed = false;
         let current_count = body.bb_count;
-        i = 0;
+        i = start_bb;
         while i < current_count {
             if drop_expand_block(mut_view(*body), mut_view(*thir), hir, db, str_in, mut_view(*arena), i) {
                 changed = true;
             }
             i = i + 1;
         }
+        start_bb = current_count;
     }
 }
 

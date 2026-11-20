@@ -95,6 +95,7 @@ def gen_program(units):
 
 
 PASS_RE = re.compile(r"^time:\s+(\w+)\s+([0-9.]+)\s*s", re.M)
+SUB_RE = re.compile(r"^time-build:\s+(\w+)\s+([0-9.]+)\s*s", re.M)
 
 
 def build_time(compiler, path, exe, opt, timeout):
@@ -107,12 +108,13 @@ def build_time(compiler, path, exe, opt, timeout):
     if p.returncode != 0:
         raise RuntimeError("compiler exit %d on %s:\n%s" % (p.returncode, path, text[-2000:]))
     times = {m.group(1): float(m.group(2)) for m in PASS_RE.finditer(text)}
+    subs = {m.group(1): float(m.group(2)) for m in SUB_RE.finditer(text)}
     if "build" not in times:
         raise RuntimeError("no `build` line in --time-passes output:\n" + text[-2000:])
     r = subprocess.run([exe], capture_output=True, timeout=60)
     if r.returncode != 0:
         raise RuntimeError("%s exited %d" % (exe, r.returncode))
-    return times["build"], time.time() - t0
+    return times["build"], subs, time.time() - t0
 
 
 def main():
@@ -121,6 +123,14 @@ def main():
     ap.add_argument("--tmp", required=True)
     ap.add_argument("--units", type=int, default=150)
     ap.add_argument("--limit", type=float, default=5.0)
+    ap.add_argument("--frame-limit", type=float, default=None,
+                    help="max frame(4N) / max(frame(N), 0.05) ratio when time-build sub-timers are present")
+    ap.add_argument("--frame-to-ir-limit", type=float, default=None,
+                    help="max frame(4N) / max(mir_build(4N)+lir(4N), 0.05) ratio (CPU-speed-independent budget)")
+    ap.add_argument("--hot-to-ir-limit", type=float, default=None,
+                    help="max (frame(4N)+isel(4N)) / max(mir_build(4N)+lir(4N), 0.05) ratio")
+    ap.add_argument("--build-budget", type=float, default=None,
+                    help="optional absolute upper bound on build(4N) in seconds")
     ap.add_argument("--opt", default="O0", choices=["O0", "O1"])
     ap.add_argument("--timeout", type=float, default=300.0)
     ap.add_argument("--print", action="store_true", help="print the timings")
@@ -133,20 +143,49 @@ def main():
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(gen_program(n))
         try:
-            bt, wall = build_time(a.compiler, path, exe, a.opt, a.timeout)
+            bt, subs, wall = build_time(a.compiler, path, exe, a.opt, a.timeout)
         except subprocess.TimeoutExpired:
             print("SKIP build scaling: compile of %d units exceeded %ss" % (n, a.timeout))
             return 0
-        res.append((n, bt, wall))
+        res.append((n, bt, subs, wall))
         if a.print:
-            sys.stderr.write("units=%d build=%.3fs wall=%.3fs\n" % (n, bt, wall))
-    (n1, b1, _), (n4, b4, _) = res
+            sys.stderr.write(
+                "units=%d build=%.3fs frame=%.3fs isel=%.3fs mir_drop=%.3fs wall=%.3fs\n"
+                % (n, bt, subs.get("frame", -1.0), subs.get("isel", -1.0), subs.get("mir_drop", -1.0), wall)
+            )
+    (n1, b1, s1, _), (n4, b4, s4, _) = res
     # Sub-0.05 s timings are noise: compare against a floor so a tiny N cannot fail the ratio.
     ratio = b4 / max(b1, 0.05)
     sys.stderr.write("build(%d)=%.3fs build(%d)=%.3fs ratio %.2f limit %.2f\n" % (n1, b1, n4, b4, ratio, a.limit))
     if ratio > a.limit:
         print("FAIL build scaling: build(%d)=%.3fs build(%d)=%.3fs ratio %.2f > %.2f" % (n1, b1, n4, b4, ratio, a.limit))
         return 1
+    if a.build_budget is not None and b4 > a.build_budget:
+        print("FAIL build scaling: build(%d)=%.3fs > budget %.3fs" % (n4, b4, a.build_budget))
+        return 1
+    if "frame" in s1 and "frame" in s4:
+        f1, f4 = s1["frame"], s4["frame"]
+        fratio = f4 / max(f1, 0.05)
+        ir4 = s4.get("mir_build", 0.0) + s4.get("lir", 0.0)
+        f_to_ir = f4 / max(ir4, 0.05)
+        hot4 = f4 + s4.get("isel", 0.0)
+        hot_to_ir = hot4 / max(ir4, 0.05)
+        sys.stderr.write(
+            "frame(%d)=%.3fs frame(%d)=%.3fs ratio %.2f frame/ir=%.2f (frame+isel)/ir=%.2f\n"
+            % (n1, f1, n4, f4, fratio, f_to_ir, hot_to_ir)
+        )
+        if a.frame_limit is not None and fratio > a.frame_limit:
+            print("FAIL build scaling: frame(%d)=%.3fs frame(%d)=%.3fs ratio %.2f > %.2f"
+                  % (n1, f1, n4, f4, fratio, a.frame_limit))
+            return 1
+        if a.frame_to_ir_limit is not None and f_to_ir > a.frame_to_ir_limit:
+            print("FAIL build scaling: frame(%d)=%.3fs / (mir_build+lir)=%.3fs = %.2f > %.2f"
+                  % (n4, f4, ir4, f_to_ir, a.frame_to_ir_limit))
+            return 1
+        if a.hot_to_ir_limit is not None and hot_to_ir > a.hot_to_ir_limit:
+            print("FAIL build scaling: (frame+isel)(%d)=%.3fs / (mir_build+lir)=%.3fs = %.2f > %.2f"
+                  % (n4, hot4, ir4, hot_to_ir, a.hot_to_ir_limit))
+            return 1
     print("OK build scaling")
     return 0
 

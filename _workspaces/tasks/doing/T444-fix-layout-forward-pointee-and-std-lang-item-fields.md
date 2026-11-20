@@ -8,15 +8,16 @@ model: opus
 gate_model: sonnet
 depends: [T452, T164]
 priority: 21
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 900
 paths: [compiler/types/layout.ax, tests/run/layout_fwd_pointee]
 locks: [compiler/types/types.ax, compiler/types/typeck.ax, compiler/traits/mono.ax, compiler/resolve, compiler/lir/builder.ax]
 spec: [spec/decisions/ADR-0043-cyclic-type-graphs-and-symbol-id-space.md, spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/SPEC-03-core-semantics.md, spec/SPEC-33-async.md]
 covers: [REQ-TST-072, REQ-TST-084]
-started: 2026-11-17 17:12:06
+started: 2026-11-20 08:53:58
 unblocks: 1
+agent: T444-impl
 ---
 # T444 — Fix: layout through forward-referenced pointees and lang-item fields in std modules
 
@@ -67,3 +68,4 @@ natively (T421 FU-1, FU-3; ADR-0042 §2).
 - 2026-11-17 19:45:46 block: needs compiler/traits/mono.ax in locks: subst_ty_self loops on now-correct cyclic struct types; also axiom0 extern symbol-id collision (30000) bootstrap hazard
 - 2026-11-17 unblock by axiom-architect: + locks compiler/traits/mono.ax (B1), depends T164 (B2, AX0-FIX-10), tests/selfhost lock dropped (harness regenerates bundles); ADR-0043
 - 2026-11-17 19:52:54 unblocked (cycle 1) 
+- 2026-11-20 08:53:58 started (attempt 1) T444-impl
