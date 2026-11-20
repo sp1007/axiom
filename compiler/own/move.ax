@@ -8,12 +8,15 @@ use compiler.kernel.id.FileId
 use compiler.kernel.id.TypeId
 use compiler.kernel.interner.StrInterner
 use compiler.source.span.Span
+use compiler.types.types.AxType
+use compiler.types.types.TY_ENUM
 use compiler.types.types.TY_STRUCT
 use compiler.types.types.TY_TUPLE
 use compiler.types.types.Thir
 use compiler.types.types.mul_usize
 use compiler.types.types.type_get
 use compiler.types.types.type_is_copy
+use compiler.mir.mir.MIR_PROJ_DOWNCAST
 use compiler.mir.mir.MIR_PROJ_FIELD
 use compiler.mir.mir.MirBody
 use compiler.mir.mir.MirPlace
@@ -41,6 +44,8 @@ pub struct PathNode {
     pub first_child: u32,
     pub num_children: u32,
     pub is_copy: bool,
+    // T444b: children are the enum's variant nodes (DOWNCAST), not fields.
+    pub is_enum: bool,
 }
 
 pub struct PathCtx {
@@ -129,6 +134,14 @@ pub fn populate_path_tree(
         fields = unsafe { (*ty).fields };
     }
 
+    // T444b (REQ-OWN-051): an enum node has one child per variant (reached by DOWNCAST), and each
+    // variant node has one child per payload field (reached by FIELD). Binding several payload
+    // fields by value then moves each field place once, leaving the scrutinee PARTIAL.
+    if tk == TY_ENUM {
+        populate_enum_variants(mut_view(*ctx), node_idx, ty, thir, str_in);
+        return;
+    }
+
     if field_count > 0 && (fields as usize) != 0 {
         let first_child = ctx.count as u32;
         let new_count = ctx.count + field_count;
@@ -152,6 +165,7 @@ pub fn populate_path_tree(
                 (*child_np).first_child = 0u32;
                 (*child_np).num_children = 0u32;
                 (*child_np).is_copy = is_cp;
+                (*child_np).is_enum = false;
             }
             i = i + 1;
         }
@@ -163,6 +177,94 @@ pub fn populate_path_tree(
             populate_path_tree(mut_view(*ctx), first_child + (i as u32), TypeId { v: fty_v }, thir, str_in);
             i = i + 1;
         }
+    }
+}
+
+unsafe fn own_typeid_ptr_at(base: *const *mut TypeId, idx: usize) -> *const *mut TypeId {
+    ((base as usize) + mul_usize(idx, size_of<*mut TypeId>())) as *const *mut TypeId
+}
+
+unsafe fn own_usize_at(base: *const usize, idx: usize) -> *const usize {
+    ((base as usize) + mul_usize(idx, size_of<usize>())) as *const usize
+}
+
+fn populate_enum_variants(
+    ctx: mut_view<PathCtx>,
+    node_idx: u32,
+    ty: *mut AxType,
+    thir: view<Thir>,
+    str_in: view<StrInterner>
+) {
+    let variant_count = unsafe { (*ty).variant_count };
+    let vfields = unsafe { (*ty).variant_fields };
+    let vcounts = unsafe { (*ty).variant_field_counts };
+    if variant_count == 0 || (vfields as usize) == 0 || (vcounts as usize) == 0 {
+        return;
+    }
+    let enum_np = unsafe { path_node_at(ctx.nodes as *const PathNode, node_idx as usize) };
+    let enum_copy = unsafe { (*enum_np).is_copy };
+
+    let first_variant = ctx.count as u32;
+    let new_count = ctx.count + variant_count;
+    path_ctx_ensure_cap(mut_view(*ctx), new_count);
+    ctx.count = new_count;
+    let parent_np = unsafe { path_node_at_mut(ctx.nodes, node_idx as usize) };
+    unsafe {
+        (*parent_np).first_child = first_variant;
+        (*parent_np).num_children = variant_count as u32;
+        (*parent_np).is_enum = true;
+    }
+
+    let mut v: usize = 0;
+    while (v < variant_count) {
+        let vnp = unsafe { path_node_at_mut(ctx.nodes, (first_variant as usize) + v) };
+        unsafe {
+            (*vnp).parent = node_idx;
+            (*vnp).first_child = 0u32;
+            (*vnp).num_children = 0u32;
+            (*vnp).is_copy = enum_copy;
+            (*vnp).is_enum = false;
+        }
+        v = v + 1;
+    }
+
+    v = 0;
+    while (v < variant_count) {
+        let vnode = first_variant + (v as u32);
+        let fcount = unsafe { *own_usize_at(vcounts as *const usize, v) };
+        let flist = unsafe { *own_typeid_ptr_at(vfields as *const *mut TypeId, v) };
+        if fcount > 0 && (flist as usize) != 0 {
+            let first_field = ctx.count as u32;
+            let nc = ctx.count + fcount;
+            path_ctx_ensure_cap(mut_view(*ctx), nc);
+            ctx.count = nc;
+            let vnp = unsafe { path_node_at_mut(ctx.nodes, vnode as usize) };
+            unsafe {
+                (*vnp).first_child = first_field;
+                (*vnp).num_children = fcount as u32;
+            }
+            let mut i: usize = 0;
+            while (i < fcount) {
+                let fty_v = unsafe { (*own_type_id_at(flist as *const TypeId, i)).v };
+                let is_cp = type_is_copy(TypeId { v: fty_v }, thir, str_in);
+                let cnp = unsafe { path_node_at_mut(ctx.nodes, (first_field as usize) + i) };
+                unsafe {
+                    (*cnp).parent = vnode;
+                    (*cnp).first_child = 0u32;
+                    (*cnp).num_children = 0u32;
+                    (*cnp).is_copy = is_cp;
+                    (*cnp).is_enum = false;
+                }
+                i = i + 1;
+            }
+            i = 0;
+            while (i < fcount) {
+                let fty_v = unsafe { (*own_type_id_at(flist as *const TypeId, i)).v };
+                populate_path_tree(mut_view(*ctx), first_field + (i as u32), TypeId { v: fty_v }, thir, str_in);
+                i = i + 1;
+            }
+        }
+        v = v + 1;
     }
 }
 
@@ -204,6 +306,7 @@ pub fn path_ctx_init(
             (*np).first_child = 0u32;
             (*np).num_children = 0u32;
             (*np).is_copy = is_cp;
+            (*np).is_enum = false;
         }
         i = i + 1;
     }
@@ -249,16 +352,28 @@ pub fn resolve_place(ctx: view<PathCtx>, place: view<MirPlace>) -> u32 {
     while (i < place.proj_count) {
         let pr = unsafe { mir_proj_at(place.projs, i) };
         let pk = unsafe { (*pr).kind };
-        if pk == MIR_PROJ_FIELD {
-            let f = unsafe { (*pr).field_idx };
-            let np = unsafe { path_node_at(ctx.nodes as *const PathNode, node as usize) };
-            let nchild = unsafe { (*np).num_children };
-            let fchild = unsafe { (*np).first_child };
-            if f < nchild {
-                node = fchild + f;
-            }
+        if pk == MIR_PROJ_FIELD || pk == MIR_PROJ_DOWNCAST {
+            let f = if pk == MIR_PROJ_DOWNCAST { unsafe { (*pr).variant_idx } } else { unsafe { (*pr).field_idx } };
+            node = path_child(ctx, node, pk, f);
         }
         i = i + 1;
+    }
+    node
+}
+
+// The path node one FIELD or DOWNCAST projection below `node` (T444b: DOWNCAST selects the variant
+// node of an enum); `node` itself when the tree has no such child.
+// `pk` is the projection kind, `f` its variant index (DOWNCAST) or field index (FIELD).
+pub fn path_child(ctx: view<PathCtx>, node: u32, pk: u8, f: u32) -> u32 {
+    let np = unsafe { path_node_at(ctx.nodes as *const PathNode, node as usize) };
+    let is_enum = unsafe { (*np).is_enum };
+    if is_enum != (pk == MIR_PROJ_DOWNCAST) {
+        return node;
+    }
+    let nchild = unsafe { (*np).num_children };
+    let fchild = unsafe { (*np).first_child };
+    if f < nchild {
+        return fchild + f;
     }
     node
 }
