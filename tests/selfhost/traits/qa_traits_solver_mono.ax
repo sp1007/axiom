@@ -12687,6 +12687,10 @@ fn resolve_path_seg(
                     AX_NAME_UNRESOLVED, view(seg_span));
                 break;
             }
+        } else if hkind == SYM_GENERIC_PARAM && (unsafe { (*seg).next as usize }) == 0 {
+            // T447 (FU-B, ADR-0042 §2): `P.Assoc` on a generic parameter is an associated-type projection. Typeck
+            // resolves it from P's bounds (`F: Future<Output = T>` makes `F.Output` = `T`); the segment stays unbound.
+            break;
         } else {
             emit_diag(mut_view(*env), mut_view(*arena), mut_view(*sink), mut_view(*interner), mut_view(*rmap),
                 AX_NAME_UNRESOLVED, view(seg_span));
@@ -23402,6 +23406,7 @@ use compiler.hir.hir.HIR_ITEM_FN
 use compiler.hir.hir.HIR_ITEM_IMPL
 use compiler.hir.hir.HIR_ITEM_TRAIT
 use compiler.hir.hir.HIR_ITEM_TYPE_ALIAS
+use compiler.hir.hir.HIR_TYPE_ARRAY
 use compiler.hir.hir.HIR_TYPE_PATH
 use compiler.hir.hir.HIR_TYPE_PTR
 use compiler.hir.hir.HIR_TYPE_SLICE
@@ -23409,6 +23414,8 @@ use compiler.hir.hir.HIR_TYPE_TUPLE
 use compiler.hir.hir.HIR_TYPE_VIEW
 use compiler.hir.hir.HirFieldDecl
 use compiler.hir.hir.HirFile
+use compiler.hir.hir.HirGenericArg
+use compiler.hir.hir.HirGenericArgs
 use compiler.hir.hir.HirGenericParam
 use compiler.hir.hir.HirGenericParams
 use compiler.hir.hir.HirItem
@@ -23838,7 +23845,280 @@ pub fn hir_types_overlap_target(t1: *const HirType, t2: *const HirType) -> bool 
     false
 }
 
+// T447 (FU-C, ADR-0042 §2): coherence unifies the two impl headers before reporting AX_TRAIT_OVERLAP. Each impl's
+// generic parameters are fresh variables (side 1 = the earlier impl, side 2 = the later one, so equal names never
+// alias); concrete types must match structurally, including their type arguments. Bindings live in two parallel
+// slot arrays (`b_ty`: bound HirType address, `b_side`: the side whose parameters that type mentions), slot =
+// (side - 1) * cap + parameter index. The occurs check rejects a cyclic binding (`X := *const X`: no finite type
+// satisfies both headers); the depth guard only bounds pathological nesting and then answers "overlap" — the
+// conservative direction for coherence. The cheap head comparison (`hir_types_overlap_target`) still filters pairs
+// first, so blanket `impl<T> Tr for T` headers keep their pre-T447 treatment.
+struct OvUnify {
+    gp1: *mut HirGenericParams,
+    gp2: *mut HirGenericParams,
+    b_ty: usize,
+    b_side: usize,
+    cap: usize,
+}
+
+const OV_MAX_DEPTH: usize = 64;
+
+fn ov_generic_count(gps: *mut HirGenericParams) -> usize {
+    if (gps as usize) == 0 {
+        return 0;
+    }
+    let mut n: usize = 0;
+    let mut gp: *mut HirGenericParam = unsafe { (*gps).params };
+    while (gp as usize) != 0 {
+        n = n + 1;
+        gp = unsafe { (*gp).next };
+    }
+    n
+}
+
+// Index of the impl generic parameter `t` names (a bare path without type arguments), or -1.
+fn ov_param_index(gps: *mut HirGenericParams, t: *const HirType) -> isize {
+    if (gps as usize) == 0 || (t as usize) == 0 {
+        return -1;
+    }
+    if (unsafe { (*t).kind }) != HIR_TYPE_PATH || (unsafe { (*t).path.generic_args as usize }) != 0 {
+        return -1;
+    }
+    let sym = unsafe { (*t).path.symbol.v };
+    let name = unsafe { (*t).path.name.v };
+    let mut idx: isize = 0;
+    let mut gp: *mut HirGenericParam = unsafe { (*gps).params };
+    while (gp as usize) != 0 {
+        let gsym = unsafe { (*gp).symbol.v };
+        if sym != 0u32 && gsym != 0u32 {
+            if sym == gsym {
+                return idx;
+            }
+        } else if name != 0u32 && (unsafe { (*gp).name.v }) == name {
+            return idx;
+        }
+        idx = idx + 1;
+        gp = unsafe { (*gp).next };
+    }
+    -1
+}
+
+fn ov_slot_addr(base: usize, slot: usize) -> *mut usize {
+    (base + slot * size_of<usize>()) as *mut usize
+}
+
+fn ov_slot_of(u: view<OvUnify>, side: usize, t: *const HirType) -> isize {
+    let gps = if side == 1 { u.gp1 } else { u.gp2 };
+    let idx = ov_param_index(gps, t);
+    if idx < 0 {
+        return -1;
+    }
+    ((side - 1) * u.cap + (idx as usize)) as isize
+}
+
+fn ov_unify_list(u: mut_view<OvUnify>, a: *const HirType, sa: usize, b: *const HirType, sb: usize, depth: usize) -> bool {
+    let mut x: *const HirType = a;
+    let mut y: *const HirType = b;
+    while (x as usize) != 0 && (y as usize) != 0 {
+        if !ov_unify(mut_view(*u), x, sa, y, sb, depth + 1) {
+            return false;
+        }
+        x = unsafe { (*x).next } as *const HirType;
+        y = unsafe { (*y).next } as *const HirType;
+    }
+    (x as usize) == 0 && (y as usize) == 0
+}
+
+// Occurs check: does `t` (mentioning side `ts` parameters) contain the variable `slot`, through bindings?
+fn ov_occurs(u: view<OvUnify>, slot: isize, t: *const HirType, ts: usize, depth: usize) -> bool {
+    if depth > OV_MAX_DEPTH || (t as usize) == 0 {
+        return false;
+    }
+    let s = ov_slot_of(u, ts, t);
+    if s >= 0 {
+        if s == slot {
+            return true;
+        }
+        let bt = unsafe { *ov_slot_addr(u.b_ty, s as usize) };
+        if bt == 0 {
+            return false;
+        }
+        let bs = unsafe { *ov_slot_addr(u.b_side, s as usize) };
+        return ov_occurs(u, slot, bt as *const HirType, bs, depth + 1);
+    }
+    let k = unsafe { (*t).kind };
+    if k == HIR_TYPE_PATH {
+        let g: *mut HirGenericArgs = unsafe { (*t).path.generic_args };
+        if (g as usize) == 0 {
+            return false;
+        }
+        let mut a: *mut HirGenericArg = unsafe { (*g).args };
+        while (a as usize) != 0 {
+            if ov_occurs(u, slot, unsafe { (*a).ty } as *const HirType, ts, depth + 1) {
+                return true;
+            }
+            a = unsafe { (*a).next };
+        }
+        return false;
+    }
+    if k == HIR_TYPE_TUPLE {
+        let mut e: *const HirType = unsafe { (*t).elem_types } as *const HirType;
+        while (e as usize) != 0 {
+            if ov_occurs(u, slot, e, ts, depth + 1) {
+                return true;
+            }
+            e = unsafe { (*e).next } as *const HirType;
+        }
+        return false;
+    }
+    if k == HIR_TYPE_SLICE || k == HIR_TYPE_ARRAY || k == HIR_TYPE_VIEW || k == HIR_TYPE_PTR {
+        return ov_occurs(u, slot, unsafe { (*t).elem } as *const HirType, ts, depth + 1);
+    }
+    false
+}
+
+fn ov_unify(u: mut_view<OvUnify>, a: *const HirType, sa: usize, b: *const HirType, sb: usize, depth: usize) -> bool {
+    if depth > OV_MAX_DEPTH {
+        return true;
+    }
+    if (a as usize) == 0 || (b as usize) == 0 {
+        return false;
+    }
+    // Walk bound variables to their current binding.
+    let mut x: *const HirType = a;
+    let mut xs: usize = sa;
+    let mut xslot = ov_slot_of(view(*u), xs, x);
+    let mut steps: usize = 0;
+    while xslot >= 0 && steps <= OV_MAX_DEPTH {
+        let bt = unsafe { *ov_slot_addr(u.b_ty, xslot as usize) };
+        if bt == 0 {
+            break;
+        }
+        xs = unsafe { *ov_slot_addr(u.b_side, xslot as usize) };
+        x = bt as *const HirType;
+        xslot = ov_slot_of(view(*u), xs, x);
+        steps = steps + 1;
+    }
+    let mut y: *const HirType = b;
+    let mut ys: usize = sb;
+    let mut yslot = ov_slot_of(view(*u), ys, y);
+    steps = 0;
+    while yslot >= 0 && steps <= OV_MAX_DEPTH {
+        let bt = unsafe { *ov_slot_addr(u.b_ty, yslot as usize) };
+        if bt == 0 {
+            break;
+        }
+        ys = unsafe { *ov_slot_addr(u.b_side, yslot as usize) };
+        y = bt as *const HirType;
+        yslot = ov_slot_of(view(*u), ys, y);
+        steps = steps + 1;
+    }
+    if xslot >= 0 {
+        if yslot == xslot {
+            return true;
+        }
+        if ov_occurs(view(*u), xslot, y, ys, 0) {
+            return false;
+        }
+        unsafe {
+            *ov_slot_addr(u.b_ty, xslot as usize) = y as usize;
+            *ov_slot_addr(u.b_side, xslot as usize) = ys;
+        }
+        return true;
+    }
+    if yslot >= 0 {
+        if ov_occurs(view(*u), yslot, x, xs, 0) {
+            return false;
+        }
+        unsafe {
+            *ov_slot_addr(u.b_ty, yslot as usize) = x as usize;
+            *ov_slot_addr(u.b_side, yslot as usize) = xs;
+        }
+        return true;
+    }
+    let k1 = unsafe { (*x).kind };
+    let k2 = unsafe { (*y).kind };
+    if k1 != k2 {
+        return false;
+    }
+    if k1 == HIR_TYPE_PATH {
+        // Same head (the pre-T447 comparison), then the type arguments position by position. An elided argument
+        // list on one side cannot be told apart, so it unifies.
+        if !hir_types_overlap_target(x, y) {
+            return false;
+        }
+        let g1: *mut HirGenericArgs = unsafe { (*x).path.generic_args };
+        let g2: *mut HirGenericArgs = unsafe { (*y).path.generic_args };
+        if (g1 as usize) == 0 || (g2 as usize) == 0 {
+            return true;
+        }
+        let mut a1: *mut HirGenericArg = unsafe { (*g1).args };
+        let mut a2: *mut HirGenericArg = unsafe { (*g2).args };
+        while (a1 as usize) != 0 && (a2 as usize) != 0 {
+            if !ov_unify(mut_view(*u), unsafe { (*a1).ty } as *const HirType, xs, unsafe { (*a2).ty } as *const HirType, ys, depth + 1) {
+                return false;
+            }
+            a1 = unsafe { (*a1).next };
+            a2 = unsafe { (*a2).next };
+        }
+        return (a1 as usize) == 0 && (a2 as usize) == 0;
+    }
+    if k1 == HIR_TYPE_TUPLE {
+        return ov_unify_list(mut_view(*u), unsafe { (*x).elem_types } as *const HirType, xs,
+            unsafe { (*y).elem_types } as *const HirType, ys, depth);
+    }
+    if k1 == HIR_TYPE_SLICE || k1 == HIR_TYPE_ARRAY {
+        // Array lengths are not compared (conservative: equal-element arrays overlap).
+        return ov_unify(mut_view(*u), unsafe { (*x).elem } as *const HirType, xs, unsafe { (*y).elem } as *const HirType, ys, depth + 1);
+    }
+    if k1 == HIR_TYPE_VIEW || k1 == HIR_TYPE_PTR {
+        if (unsafe { (*x).is_mut }) != (unsafe { (*y).is_mut }) {
+            return false;
+        }
+        return ov_unify(mut_view(*u), unsafe { (*x).elem } as *const HirType, xs, unsafe { (*y).elem } as *const HirType, ys, depth + 1);
+    }
+    false
+}
+
+// Do the headers `impl<gp1> t1 for s1` and `impl<gp2> t2 for s2` unify?
+fn ov_impl_headers_unify(u: mut_view<OvUnify>, i1: *mut HirItem, i2: *mut HirItem) -> bool {
+    u.gp1 = unsafe { (*i1).generic_params };
+    u.gp2 = unsafe { (*i2).generic_params };
+    let mut j: usize = 0;
+    while j < 2 * u.cap {
+        unsafe {
+            *ov_slot_addr(u.b_ty, j) = 0;
+            *ov_slot_addr(u.b_side, j) = 0;
+        }
+        j = j + 1;
+    }
+    let t1 = unsafe { (*i1).trait_path } as *const HirType;
+    let t2 = unsafe { (*i2).trait_path } as *const HirType;
+    let s1 = unsafe { (*i1).self_type } as *const HirType;
+    let s2 = unsafe { (*i2).self_type } as *const HirType;
+    ov_unify(mut_view(*u), t1, 1, t2, 2, 0) && ov_unify(mut_view(*u), s1, 1, s2, 2, 0)
+}
+
 pub fn traits_check_overlap(hir: view<HirFile>, sink: mut_view<DiagSink>) {
+    let mut cap: usize = 1;
+    let mut ic: *mut HirItem = hir.items;
+    while ((ic as usize) != 0) {
+        if (unsafe { (*ic).kind }) == HIR_ITEM_IMPL {
+            let n = ov_generic_count(unsafe { (*ic).generic_params });
+            if n > cap {
+                cap = n;
+            }
+        }
+        ic = unsafe { (*ic).next };
+    }
+    let bytes = 2 * cap * size_of<usize>();
+    let mut u = OvUnify {
+        gp1: 0 as *mut HirGenericParams,
+        gp2: 0 as *mut HirGenericParams,
+        b_ty: arena_alloc_raw(mut_view(sink.arena), bytes, 8) as usize,
+        b_side: arena_alloc_raw(mut_view(sink.arena), bytes, 8) as usize,
+        cap: cap,
+    };
     let mut i1: *mut HirItem = hir.items;
     while ((i1 as usize) != 0) {
         let k1 = unsafe { (*i1).kind };
@@ -23851,7 +24131,8 @@ pub fn traits_check_overlap(hir: view<HirFile>, sink: mut_view<DiagSink>) {
                 let t2 = unsafe { (*i2).trait_path };
                 let s2 = unsafe { (*i2).self_type };
                 if k2 == HIR_ITEM_IMPL && (t2 as usize) != 0 && (s2 as usize) != 0 {
-                    if hir_types_overlap_target(t1, t2) && hir_types_overlap_target(s1, s2) {
+                    if hir_types_overlap_target(t1, t2) && hir_types_overlap_target(s1, s2) &&
+                       ov_impl_headers_unify(mut_view(u), i1, i2) {
                         let sp2_f = unsafe { (*i2).span.file.v };
                         let sp2_s = unsafe { (*i2).span.start };
                         let sp2_e = unsafe { (*i2).span.end };
@@ -31466,7 +31747,213 @@ fn tc_resolve_generic_param_sym(cx: mut_view<TypeckCtx>, it: *const HirItem, sym
     (TypeId { v: 0u32 })
 }
 
+// T447 (FU-B, ADR-0042 §2): the impl whose associated type `it` is. HIR post-processing appends a shallow clone of
+// every impl member to the top-level item list (compiler/hir/lower.ax `clone_hir_item_shallow`, which shares the
+// `ty` node), so the clone is recognised by its shared type node. Null for a free type alias.
+fn tc_alias_enclosing_impl(hir: *const HirFile, it: *const HirItem) -> *const HirItem {
+    if (hir as usize) == 0 || (it as usize) == 0 {
+        return 0 as *const HirItem;
+    }
+    let ty_p = unsafe { (*it).ty as usize };
+    let mut im: *mut HirItem = unsafe { (*hir).items };
+    while (im as usize) != 0 {
+        if (unsafe { (*im).kind }) == HIR_ITEM_IMPL {
+            let mut m: *mut HirItem = unsafe { (*im).members };
+            while (m as usize) != 0 {
+                if (unsafe { (*m).kind }) == HIR_ITEM_TYPE_ALIAS &&
+                   ((m as usize) == (it as usize) || (ty_p != 0 && (unsafe { (*m).ty as usize }) == ty_p)) {
+                    return im as *const HirItem;
+                }
+                m = unsafe { (*m).next };
+            }
+        }
+        im = unsafe { (*im).next };
+    }
+    0 as *const HirItem
+}
+
+// T447 (FU-B): for the top-level clone of an impl's associated type, the impl member it was cloned from; else null.
+fn tc_alias_orig_member(hir: *const HirFile, it: *const HirItem) -> *const HirItem {
+    if (hir as usize) == 0 || (it as usize) == 0 {
+        return 0 as *const HirItem;
+    }
+    let ty_p = unsafe { (*it).ty as usize };
+    if ty_p == 0 {
+        return 0 as *const HirItem;
+    }
+    let mut im: *mut HirItem = unsafe { (*hir).items };
+    while (im as usize) != 0 {
+        if (unsafe { (*im).kind }) == HIR_ITEM_IMPL {
+            let mut m: *mut HirItem = unsafe { (*im).members };
+            while (m as usize) != 0 {
+                if (unsafe { (*m).kind }) == HIR_ITEM_TYPE_ALIAS && (m as usize) != (it as usize) &&
+                   (unsafe { (*m).ty as usize }) == ty_p {
+                    return m as *const HirItem;
+                }
+                m = unsafe { (*m).next };
+            }
+        }
+        im = unsafe { (*im).next };
+    }
+    0 as *const HirItem
+}
+
+// T447 (FU-B): the type of a type alias, computed with the alias as the current item and — for an impl's associated
+// type, or its top-level clone — the impl's generic scope (and `Self`) in force, so `type Output = Result<T, E>`
+// resolves the impl parameter `T`.
+fn tc_alias_type_in_scope(cx: mut_view<TypeckCtx>, it: *mut HirItem, aty_node: *mut HirType) -> TypeId {
+    let old_fn = cx.current_fn;
+    let old_impl = cx.current_impl;
+    let old_self = cx.self_ty.v;
+    cx.current_fn = it;
+    let enc = tc_alias_enclosing_impl(cx.hir as *const HirFile, it as *const HirItem);
+    if (enc as usize) != 0 {
+        cx.current_impl = enc;
+        let st = unsafe { thir_get_item_type(view(*cx.thir), enc) };
+        if st.v != 0u32 {
+            cx.self_ty.v = st.v;
+        }
+    }
+    let t = hir_type_to_typeid(mut_view(*cx), aty_node);
+    cx.current_fn = old_fn;
+    cx.current_impl = old_impl;
+    cx.self_ty.v = old_self;
+    t
+}
+
+// T447 (FU-B): the binding `Name = X` for `assoc` in a bound list (`F: Future<Output = X> + ...`), or null.
+fn tc_bound_list_assoc_binding(cx: view<TypeckCtx>, bounds: *mut HirType, assoc: view<StrView>) -> *mut HirType {
+    let mut b: *mut HirType = bounds;
+    while (b as usize) != 0 {
+        if (unsafe { (*b).kind }) == HIR_TYPE_PATH {
+            let hga: *mut HirGenericArgs = unsafe { (*b).path.generic_args };
+            if (hga as usize) != 0 {
+                let mut a: *mut HirGenericArg = unsafe { (*hga).args };
+                while (a as usize) != 0 {
+                    let an = unsafe { (*a).name.v };
+                    if an != 0u32 {
+                        let asv = unsafe { interner_get(view(*cx.str_in), (StrId { v: an })) };
+                        if sv_eq(view(asv), assoc) {
+                            return unsafe { (*a).ty };
+                        }
+                    }
+                    a = unsafe { (*a).next };
+                }
+            }
+        }
+        b = unsafe { (*b).next };
+    }
+    0 as *mut HirType
+}
+
+// T447 (FU-B): the binding for `pname.assoc` from the bounds of generic parameter `pname` of item `it` (inline bounds
+// and `where` predicates). `found` is set when `it` declares `pname` at all (an inner declaration shadows outer ones).
+fn tc_item_param_assoc_binding(
+    cx: view<TypeckCtx>,
+    it: *const HirItem,
+    pname: view<StrView>,
+    assoc: view<StrView>,
+    found: mut_view<bool>
+) -> *mut HirType {
+    if (it as usize) == 0 {
+        return 0 as *mut HirType;
+    }
+    let gps: *mut HirGenericParams = unsafe { (*it).generic_params };
+    if (gps as usize) == 0 {
+        return 0 as *mut HirType;
+    }
+    let mut gp: *mut HirGenericParam = unsafe { (*gps).params };
+    while (gp as usize) != 0 {
+        let gsv = unsafe { interner_get(view(*cx.str_in), (StrId { v: (*gp).name.v })) };
+        if sv_eq(view(gsv), pname) {
+            *found = true;
+            let r = tc_bound_list_assoc_binding(cx, unsafe { (*gp).bounds }, assoc);
+            if (r as usize) != 0 {
+                return r;
+            }
+        }
+        gp = unsafe { (*gp).next };
+    }
+    if !*found {
+        return 0 as *mut HirType;
+    }
+    let wc: *mut HirWhereClause = unsafe { (*it).where_clause };
+    if (wc as usize) != 0 {
+        let mut pred: *mut HirWherePred = unsafe { (*wc).preds };
+        while (pred as usize) != 0 {
+            let pty: *mut HirType = unsafe { (*pred).ty };
+            if (pty as usize) != 0 && (unsafe { (*pty).kind }) == HIR_TYPE_PATH &&
+               (unsafe { (*pty).path.generic_args as usize }) == 0 {
+                let psv = unsafe { tc_path_name_sv(cx, view((*pty).path)) };
+                if sv_eq(view(psv), pname) {
+                    let r = tc_bound_list_assoc_binding(cx, unsafe { (*pred).bounds }, assoc);
+                    if (r as usize) != 0 {
+                        return r;
+                    }
+                }
+            }
+            pred = unsafe { (*pred).next };
+        }
+    }
+    0 as *mut HirType
+}
+
+// T447 (FU-B): `P.Assoc` where `P` is a generic parameter of the current item or impl whose bounds bind `Assoc`
+// (`impl<F: Future<Output = T>, T>` → `F.Output` is `T`). Returns 0 when the path is not such a projection.
+fn tc_param_assoc_projection(cx: mut_view<TypeckCtx>, path: view<HirPath>) -> TypeId {
+    if (cx.str_in as usize) == 0 || (path.generic_args as usize) != 0 {
+        return (TypeId { v: 0u32 });
+    }
+    let name = tc_path_name_sv(view(*cx), path);
+    if 3 > name.len || (name.ptr as usize) == 0 {
+        return (TypeId { v: 0u32 });
+    }
+    let mut dot: usize = 0;
+    let mut k: usize = 0;
+    while k < name.len {
+        let ch = unsafe { *(name.ptr + k) };
+        if ch == 46u8 {
+            if dot != 0 {
+                return (TypeId { v: 0u32 });
+            }
+            dot = k;
+        } else if ch == 60u8 || ch == 32u8 || ch == 40u8 || ch == 91u8 {
+            return (TypeId { v: 0u32 });
+        }
+        k = k + 1;
+    }
+    if dot == 0 || dot + 1 >= name.len {
+        return (TypeId { v: 0u32 });
+    }
+    let pname = StrView { ptr: name.ptr, len: dot };
+    let assoc = StrView { ptr: unsafe { name.ptr + dot + 1 }, len: name.len - dot - 1 };
+    if tc_sv_is_4(view(pname), 83u8, 101u8, 108u8, 102u8) { // Self
+        return (TypeId { v: 0u32 });
+    }
+    let mut found_fn = false;
+    let mut bt = tc_item_param_assoc_binding(view(*cx), cx.current_fn, view(pname), view(assoc), mut_view(found_fn));
+    if (bt as usize) == 0 && !found_fn && (cx.current_impl as usize) != (cx.current_fn as usize) {
+        let mut found_im = false;
+        bt = tc_item_param_assoc_binding(view(*cx), cx.current_impl, view(pname), view(assoc), mut_view(found_im));
+    }
+    if (bt as usize) == 0 {
+        return (TypeId { v: 0u32 });
+    }
+    // A binding that names the projection itself (`F: Tr<A = F.A>`) has no meaning; leave it to the name lookup.
+    if (unsafe { (*bt).kind }) == HIR_TYPE_PATH {
+        let bsv = unsafe { tc_path_name_sv(view(*cx), view((*bt).path)) };
+        if sv_eq(view(bsv), view(name)) {
+            return (TypeId { v: 0u32 });
+        }
+    }
+    hir_type_to_typeid(mut_view(*cx), bt)
+}
+
 pub fn lookup_path_type(cx: mut_view<TypeckCtx>, path: view<HirPath>, out_args: mut_view<GenericArgsSlice>) -> TypeId {
+    let proj = tc_param_assoc_projection(mut_view(*cx), path);
+    if proj.v != 0u32 {
+        return proj;
+    }
     if path.symbol.v != 0u32 {
         let in_active = tc_sym_in_active_scope(view(*cx), path.symbol.v);
         if in_active {
@@ -31525,10 +32012,7 @@ pub fn lookup_path_type(cx: mut_view<TypeckCtx>, path: view<HirPath>, out_args: 
                         if ik == HIR_ITEM_TYPE_ALIAS {
                             let aty_node: *mut HirType = unsafe { (*it).ty };
                             if (aty_node as usize) != 0 {
-                                let old_fn = cx.current_fn;
-                                cx.current_fn = it;
-                                let computed = hir_type_to_typeid(mut_view(*cx), aty_node);
-                                cx.current_fn = old_fn;
+                                let computed = tc_alias_type_in_scope(mut_view(*cx), it, aty_node);
                                 if !is_error(mut_view(*cx), (TypeId { v: computed.v })) && computed.v != 0u32 {
                                     unsafe { thir_set_item_type(mut_view(*cx.thir), it, (TypeId { v: computed.v })); }
                                 }
@@ -31591,10 +32075,7 @@ pub fn lookup_path_type(cx: mut_view<TypeckCtx>, path: view<HirPath>, out_args: 
                         if ik == HIR_ITEM_TYPE_ALIAS {
                             let aty_node: *mut HirType = unsafe { (*it).ty };
                             if (aty_node as usize) != 0 {
-                                let old_fn = cx.current_fn;
-                                cx.current_fn = it;
-                                let computed = hir_type_to_typeid(mut_view(*cx), aty_node);
-                                cx.current_fn = old_fn;
+                                let computed = tc_alias_type_in_scope(mut_view(*cx), it, aty_node);
                                 if !is_error(mut_view(*cx), (TypeId { v: computed.v })) && computed.v != 0u32 {
                                     unsafe { thir_set_item_type(mut_view(*cx.thir), it, (TypeId { v: computed.v })); }
                                 }
@@ -31853,10 +32334,7 @@ fn lookup_path_type_by_name(
                     if t.v == 0u32 {
                         let aty_node: *mut HirType = unsafe { (*it).ty };
                         if (aty_node as usize) != 0 {
-                            let old_fn = cx.current_fn;
-                            cx.current_fn = it;
-                            t = hir_type_to_typeid(mut_view(*cx), aty_node);
-                            cx.current_fn = old_fn;
+                            t = tc_alias_type_in_scope(mut_view(*cx), it, aty_node);
                             if !is_error(mut_view(*cx), (TypeId { v: t.v })) && t.v != 0u32 {
                                 unsafe { thir_set_item_type(mut_view(*cx.thir), it, (TypeId { v: t.v })); }
                             }
@@ -39543,7 +40021,19 @@ fn register_item_sig(cx: mut_view<TypeckCtx>, it: *mut HirItem, parent_impl: *co
         cx.current_fn = it;
         let aty_node: *mut HirType = unsafe { (*it).ty };
         let ty = if (aty_node as usize) != 0 {
-            hir_type_to_typeid(mut_view(*cx), aty_node)
+            // T447: the top-level clone of an impl's associated type takes the type already computed for the impl
+            // member (no second evaluation, so no duplicated diagnostic).
+            let orig = tc_alias_orig_member(cx.hir as *const HirFile, it as *const HirItem);
+            let orig_t = if (orig as usize) != 0 {
+                unsafe { thir_get_item_type(view(*cx.thir), orig) }
+            } else {
+                (TypeId { v: 0u32 })
+            };
+            if orig_t.v != 0u32 {
+                orig_t
+            } else {
+                tc_alias_type_in_scope(mut_view(*cx), it, aty_node)
+            }
         } else {
             let aname = unsafe { (*it).name };
             unsafe { intern_param_ty(mut_view((*cx.thir).interner), (StrId { v: aname.v }), 0u32) }
@@ -40274,10 +40764,7 @@ fn tc_resolve_type_alias(
 ) {
     let aty_node: *mut HirType = unsafe { (*top_it).ty };
     if (aty_node as usize) != 0 {
-        let old_fn = cx.current_fn;
-        cx.current_fn = top_it;
-        let computed = hir_type_to_typeid(mut_view(*cx), aty_node);
-        cx.current_fn = old_fn;
+        let computed = tc_alias_type_in_scope(mut_view(*cx), top_it, aty_node);
         if !is_error(mut_view(*cx), (TypeId { v: computed.v })) && computed.v != 0u32 {
             unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: computed.v })); }
         }

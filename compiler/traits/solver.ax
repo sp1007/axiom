@@ -35,6 +35,7 @@ use compiler.hir.hir.HIR_ITEM_FN
 use compiler.hir.hir.HIR_ITEM_IMPL
 use compiler.hir.hir.HIR_ITEM_TRAIT
 use compiler.hir.hir.HIR_ITEM_TYPE_ALIAS
+use compiler.hir.hir.HIR_TYPE_ARRAY
 use compiler.hir.hir.HIR_TYPE_PATH
 use compiler.hir.hir.HIR_TYPE_PTR
 use compiler.hir.hir.HIR_TYPE_SLICE
@@ -42,6 +43,8 @@ use compiler.hir.hir.HIR_TYPE_TUPLE
 use compiler.hir.hir.HIR_TYPE_VIEW
 use compiler.hir.hir.HirFieldDecl
 use compiler.hir.hir.HirFile
+use compiler.hir.hir.HirGenericArg
+use compiler.hir.hir.HirGenericArgs
 use compiler.hir.hir.HirGenericParam
 use compiler.hir.hir.HirGenericParams
 use compiler.hir.hir.HirItem
@@ -471,7 +474,280 @@ pub fn hir_types_overlap_target(t1: *const HirType, t2: *const HirType) -> bool 
     false
 }
 
+// T447 (FU-C, ADR-0042 §2): coherence unifies the two impl headers before reporting AX_TRAIT_OVERLAP. Each impl's
+// generic parameters are fresh variables (side 1 = the earlier impl, side 2 = the later one, so equal names never
+// alias); concrete types must match structurally, including their type arguments. Bindings live in two parallel
+// slot arrays (`b_ty`: bound HirType address, `b_side`: the side whose parameters that type mentions), slot =
+// (side - 1) * cap + parameter index. The occurs check rejects a cyclic binding (`X := *const X`: no finite type
+// satisfies both headers); the depth guard only bounds pathological nesting and then answers "overlap" — the
+// conservative direction for coherence. The cheap head comparison (`hir_types_overlap_target`) still filters pairs
+// first, so blanket `impl<T> Tr for T` headers keep their pre-T447 treatment.
+struct OvUnify {
+    gp1: *mut HirGenericParams,
+    gp2: *mut HirGenericParams,
+    b_ty: usize,
+    b_side: usize,
+    cap: usize,
+}
+
+const OV_MAX_DEPTH: usize = 64;
+
+fn ov_generic_count(gps: *mut HirGenericParams) -> usize {
+    if (gps as usize) == 0 {
+        return 0;
+    }
+    let mut n: usize = 0;
+    let mut gp: *mut HirGenericParam = unsafe { (*gps).params };
+    while (gp as usize) != 0 {
+        n = n + 1;
+        gp = unsafe { (*gp).next };
+    }
+    n
+}
+
+// Index of the impl generic parameter `t` names (a bare path without type arguments), or -1.
+fn ov_param_index(gps: *mut HirGenericParams, t: *const HirType) -> isize {
+    if (gps as usize) == 0 || (t as usize) == 0 {
+        return -1;
+    }
+    if (unsafe { (*t).kind }) != HIR_TYPE_PATH || (unsafe { (*t).path.generic_args as usize }) != 0 {
+        return -1;
+    }
+    let sym = unsafe { (*t).path.symbol.v };
+    let name = unsafe { (*t).path.name.v };
+    let mut idx: isize = 0;
+    let mut gp: *mut HirGenericParam = unsafe { (*gps).params };
+    while (gp as usize) != 0 {
+        let gsym = unsafe { (*gp).symbol.v };
+        if sym != 0u32 && gsym != 0u32 {
+            if sym == gsym {
+                return idx;
+            }
+        } else if name != 0u32 && (unsafe { (*gp).name.v }) == name {
+            return idx;
+        }
+        idx = idx + 1;
+        gp = unsafe { (*gp).next };
+    }
+    -1
+}
+
+fn ov_slot_addr(base: usize, slot: usize) -> *mut usize {
+    (base + slot * size_of<usize>()) as *mut usize
+}
+
+fn ov_slot_of(u: view<OvUnify>, side: usize, t: *const HirType) -> isize {
+    let gps = if side == 1 { u.gp1 } else { u.gp2 };
+    let idx = ov_param_index(gps, t);
+    if idx < 0 {
+        return -1;
+    }
+    ((side - 1) * u.cap + (idx as usize)) as isize
+}
+
+fn ov_unify_list(u: mut_view<OvUnify>, a: *const HirType, sa: usize, b: *const HirType, sb: usize, depth: usize) -> bool {
+    let mut x: *const HirType = a;
+    let mut y: *const HirType = b;
+    while (x as usize) != 0 && (y as usize) != 0 {
+        if !ov_unify(mut_view(*u), x, sa, y, sb, depth + 1) {
+            return false;
+        }
+        x = unsafe { (*x).next } as *const HirType;
+        y = unsafe { (*y).next } as *const HirType;
+    }
+    (x as usize) == 0 && (y as usize) == 0
+}
+
+// Occurs check: does `t` (mentioning side `ts` parameters) contain the variable `slot`, through bindings?
+fn ov_occurs(u: view<OvUnify>, slot: isize, t: *const HirType, ts: usize, depth: usize) -> bool {
+    if depth > OV_MAX_DEPTH || (t as usize) == 0 {
+        return false;
+    }
+    let s = ov_slot_of(u, ts, t);
+    if s >= 0 {
+        if s == slot {
+            return true;
+        }
+        let bt = unsafe { *ov_slot_addr(u.b_ty, s as usize) };
+        if bt == 0 {
+            return false;
+        }
+        let bs = unsafe { *ov_slot_addr(u.b_side, s as usize) };
+        return ov_occurs(u, slot, bt as *const HirType, bs, depth + 1);
+    }
+    let k = unsafe { (*t).kind };
+    if k == HIR_TYPE_PATH {
+        let g: *mut HirGenericArgs = unsafe { (*t).path.generic_args };
+        if (g as usize) == 0 {
+            return false;
+        }
+        let mut a: *mut HirGenericArg = unsafe { (*g).args };
+        while (a as usize) != 0 {
+            if ov_occurs(u, slot, unsafe { (*a).ty } as *const HirType, ts, depth + 1) {
+                return true;
+            }
+            a = unsafe { (*a).next };
+        }
+        return false;
+    }
+    if k == HIR_TYPE_TUPLE {
+        let mut e: *const HirType = unsafe { (*t).elem_types } as *const HirType;
+        while (e as usize) != 0 {
+            if ov_occurs(u, slot, e, ts, depth + 1) {
+                return true;
+            }
+            e = unsafe { (*e).next } as *const HirType;
+        }
+        return false;
+    }
+    if k == HIR_TYPE_SLICE || k == HIR_TYPE_ARRAY || k == HIR_TYPE_VIEW || k == HIR_TYPE_PTR {
+        return ov_occurs(u, slot, unsafe { (*t).elem } as *const HirType, ts, depth + 1);
+    }
+    false
+}
+
+fn ov_unify(u: mut_view<OvUnify>, a: *const HirType, sa: usize, b: *const HirType, sb: usize, depth: usize) -> bool {
+    if depth > OV_MAX_DEPTH {
+        return true;
+    }
+    if (a as usize) == 0 || (b as usize) == 0 {
+        return false;
+    }
+    // Walk bound variables to their current binding.
+    let mut x: *const HirType = a;
+    let mut xs: usize = sa;
+    let mut xslot = ov_slot_of(view(*u), xs, x);
+    let mut steps: usize = 0;
+    while xslot >= 0 && steps <= OV_MAX_DEPTH {
+        let bt = unsafe { *ov_slot_addr(u.b_ty, xslot as usize) };
+        if bt == 0 {
+            break;
+        }
+        xs = unsafe { *ov_slot_addr(u.b_side, xslot as usize) };
+        x = bt as *const HirType;
+        xslot = ov_slot_of(view(*u), xs, x);
+        steps = steps + 1;
+    }
+    let mut y: *const HirType = b;
+    let mut ys: usize = sb;
+    let mut yslot = ov_slot_of(view(*u), ys, y);
+    steps = 0;
+    while yslot >= 0 && steps <= OV_MAX_DEPTH {
+        let bt = unsafe { *ov_slot_addr(u.b_ty, yslot as usize) };
+        if bt == 0 {
+            break;
+        }
+        ys = unsafe { *ov_slot_addr(u.b_side, yslot as usize) };
+        y = bt as *const HirType;
+        yslot = ov_slot_of(view(*u), ys, y);
+        steps = steps + 1;
+    }
+    if xslot >= 0 {
+        if yslot == xslot {
+            return true;
+        }
+        if ov_occurs(view(*u), xslot, y, ys, 0) {
+            return false;
+        }
+        unsafe {
+            *ov_slot_addr(u.b_ty, xslot as usize) = y as usize;
+            *ov_slot_addr(u.b_side, xslot as usize) = ys;
+        }
+        return true;
+    }
+    if yslot >= 0 {
+        if ov_occurs(view(*u), yslot, x, xs, 0) {
+            return false;
+        }
+        unsafe {
+            *ov_slot_addr(u.b_ty, yslot as usize) = x as usize;
+            *ov_slot_addr(u.b_side, yslot as usize) = xs;
+        }
+        return true;
+    }
+    let k1 = unsafe { (*x).kind };
+    let k2 = unsafe { (*y).kind };
+    if k1 != k2 {
+        return false;
+    }
+    if k1 == HIR_TYPE_PATH {
+        // Same head (the pre-T447 comparison), then the type arguments position by position. An elided argument
+        // list on one side cannot be told apart, so it unifies.
+        if !hir_types_overlap_target(x, y) {
+            return false;
+        }
+        let g1: *mut HirGenericArgs = unsafe { (*x).path.generic_args };
+        let g2: *mut HirGenericArgs = unsafe { (*y).path.generic_args };
+        if (g1 as usize) == 0 || (g2 as usize) == 0 {
+            return true;
+        }
+        let mut a1: *mut HirGenericArg = unsafe { (*g1).args };
+        let mut a2: *mut HirGenericArg = unsafe { (*g2).args };
+        while (a1 as usize) != 0 && (a2 as usize) != 0 {
+            if !ov_unify(mut_view(*u), unsafe { (*a1).ty } as *const HirType, xs, unsafe { (*a2).ty } as *const HirType, ys, depth + 1) {
+                return false;
+            }
+            a1 = unsafe { (*a1).next };
+            a2 = unsafe { (*a2).next };
+        }
+        return (a1 as usize) == 0 && (a2 as usize) == 0;
+    }
+    if k1 == HIR_TYPE_TUPLE {
+        return ov_unify_list(mut_view(*u), unsafe { (*x).elem_types } as *const HirType, xs,
+            unsafe { (*y).elem_types } as *const HirType, ys, depth);
+    }
+    if k1 == HIR_TYPE_SLICE || k1 == HIR_TYPE_ARRAY {
+        // Array lengths are not compared (conservative: equal-element arrays overlap).
+        return ov_unify(mut_view(*u), unsafe { (*x).elem } as *const HirType, xs, unsafe { (*y).elem } as *const HirType, ys, depth + 1);
+    }
+    if k1 == HIR_TYPE_VIEW || k1 == HIR_TYPE_PTR {
+        if (unsafe { (*x).is_mut }) != (unsafe { (*y).is_mut }) {
+            return false;
+        }
+        return ov_unify(mut_view(*u), unsafe { (*x).elem } as *const HirType, xs, unsafe { (*y).elem } as *const HirType, ys, depth + 1);
+    }
+    false
+}
+
+// Do the headers `impl<gp1> t1 for s1` and `impl<gp2> t2 for s2` unify?
+fn ov_impl_headers_unify(u: mut_view<OvUnify>, i1: *mut HirItem, i2: *mut HirItem) -> bool {
+    u.gp1 = unsafe { (*i1).generic_params };
+    u.gp2 = unsafe { (*i2).generic_params };
+    let mut j: usize = 0;
+    while j < 2 * u.cap {
+        unsafe {
+            *ov_slot_addr(u.b_ty, j) = 0;
+            *ov_slot_addr(u.b_side, j) = 0;
+        }
+        j = j + 1;
+    }
+    let t1 = unsafe { (*i1).trait_path } as *const HirType;
+    let t2 = unsafe { (*i2).trait_path } as *const HirType;
+    let s1 = unsafe { (*i1).self_type } as *const HirType;
+    let s2 = unsafe { (*i2).self_type } as *const HirType;
+    ov_unify(mut_view(*u), t1, 1, t2, 2, 0) && ov_unify(mut_view(*u), s1, 1, s2, 2, 0)
+}
+
 pub fn traits_check_overlap(hir: view<HirFile>, sink: mut_view<DiagSink>) {
+    let mut cap: usize = 1;
+    let mut ic: *mut HirItem = hir.items;
+    while ((ic as usize) != 0) {
+        if (unsafe { (*ic).kind }) == HIR_ITEM_IMPL {
+            let n = ov_generic_count(unsafe { (*ic).generic_params });
+            if n > cap {
+                cap = n;
+            }
+        }
+        ic = unsafe { (*ic).next };
+    }
+    let bytes = 2 * cap * size_of<usize>();
+    let mut u = OvUnify {
+        gp1: 0 as *mut HirGenericParams,
+        gp2: 0 as *mut HirGenericParams,
+        b_ty: arena_alloc_raw(mut_view(sink.arena), bytes, 8) as usize,
+        b_side: arena_alloc_raw(mut_view(sink.arena), bytes, 8) as usize,
+        cap: cap,
+    };
     let mut i1: *mut HirItem = hir.items;
     while ((i1 as usize) != 0) {
         let k1 = unsafe { (*i1).kind };
@@ -484,7 +760,8 @@ pub fn traits_check_overlap(hir: view<HirFile>, sink: mut_view<DiagSink>) {
                 let t2 = unsafe { (*i2).trait_path };
                 let s2 = unsafe { (*i2).self_type };
                 if k2 == HIR_ITEM_IMPL && (t2 as usize) != 0 && (s2 as usize) != 0 {
-                    if hir_types_overlap_target(t1, t2) && hir_types_overlap_target(s1, s2) {
+                    if hir_types_overlap_target(t1, t2) && hir_types_overlap_target(s1, s2) &&
+                       ov_impl_headers_unify(mut_view(u), i1, i2) {
                         let sp2_f = unsafe { (*i2).span.file.v };
                         let sp2_s = unsafe { (*i2).span.start };
                         let sp2_e = unsafe { (*i2).span.end };

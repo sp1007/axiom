@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T452]
 priority: 23
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 900
 paths: [tests/typeck/impl_generics_assoc, tests/ui/trait_overlap_concrete]
 locks: [compiler/resolve, compiler/traits/solver.ax, compiler/types/typeck.ax]
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/SPEC-03-core-semantics.md]
 covers: [REQ-TST-072, REQ-TST-051]
+started: 2026-11-20 17:50:14
+finished: 2026-11-20 21:38:34
 ---
 # T447 — Fix: associated types with impl generics; overlap check with concrete arguments
 
@@ -45,3 +47,5 @@ ADR-0042 §2).
 
 ## Log
 - 2026-11-13 created by axiom-architect (ADR-0042 §2; T422 FU-B, FU-C)
+- 2026-11-20 17:50:14 started (attempt 1) t447-impl
+- 2026-11-20 21:38:34 accepted by QA -> done
