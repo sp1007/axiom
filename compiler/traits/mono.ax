@@ -48,6 +48,7 @@ use compiler.types.types.intern_tuple_ty
 use compiler.types.types.intern_type
 use compiler.types.types.intern_view_ty
 use compiler.types.types.type_get
+use compiler.types.types.typemap_get
 use compiler.types.types.typeid_at
 use compiler.types.types.typeid_ptr_at
 use compiler.types.types.usize_at
@@ -376,51 +377,33 @@ fn subst_ty_adt(
     args: view<GenericArgsSlice>,
     self_v: u32
 ) -> TypeId {
+    // T444 (ADR-0043 §1, INV-SEM-008): struct identity is def + args (key_eq_type). Non-generic ADTs or ADTs
+    // whose generic arguments do not change are returned as is. When arguments change, check for an existing
+    // instance by def + new args and intern a field-less shell first before substituting fields so cyclic
+    // graphs (e.g. `Node<T> -> *mut Node<T>`) terminate cleanly.
     if tk == TY_STRUCT {
         let gcount = unsafe { (*t).arg_count };
         let orig_gargs = unsafe { (*t).args };
-        let fcount = unsafe { (*t).field_count };
-        let orig_fields = unsafe { (*t).fields };
-        let mut changed: bool = false;
-        let mut new_gargs: *mut TypeId = orig_gargs;
-        if gcount > 0 && (orig_gargs as usize) != 0 {
-            new_gargs = arena_alloc_raw(
-                mut_view(ti.arena),
-                (((gcount as isize) * (size_of<TypeId>() as isize)) as usize),
-                align_of<TypeId>()
-            ) as *mut TypeId;
-            let mut i: usize = 0;
-            while (i < gcount) {
-                let orig_gv = unsafe { (*typeid_at(orig_gargs, i)).v };
-                let sub_g = subst_ty_self(mut_view(*ti), TypeId { v: orig_gv }, args, self_v);
-                if sub_g.v != orig_gv {
-                    changed = true;
-                }
-                unsafe {
-                    (*typeid_at(new_gargs, i)).v = sub_g.v;
-                }
-                i = i + 1;
-            }
+        if gcount == 0 || (orig_gargs as usize) == 0 {
+            return TypeId { v: ty_v };
         }
-        let mut new_fields: *mut TypeId = orig_fields;
-        if fcount > 0 && (orig_fields as usize) != 0 {
-            new_fields = arena_alloc_raw(
-                mut_view(ti.arena),
-                (((fcount as isize) * (size_of<TypeId>() as isize)) as usize),
-                align_of<TypeId>()
-            ) as *mut TypeId;
-            let mut i: usize = 0;
-            while (i < fcount) {
-                let orig_fv = unsafe { (*typeid_at(orig_fields, i)).v };
-                let sub_f = subst_ty_self(mut_view(*ti), TypeId { v: orig_fv }, args, self_v);
-                if sub_f.v != orig_fv {
-                    changed = true;
-                }
-                unsafe {
-                    (*typeid_at(new_fields, i)).v = sub_f.v;
-                }
-                i = i + 1;
+        let mut changed: bool = false;
+        let new_gargs = arena_alloc_raw(
+            mut_view(ti.arena),
+            (((gcount as isize) * (size_of<TypeId>() as isize)) as usize),
+            align_of<TypeId>()
+        ) as *mut TypeId;
+        let mut i: usize = 0;
+        while (i < gcount) {
+            let orig_gv = unsafe { (*typeid_at(orig_gargs, i)).v };
+            let sub_g = subst_ty_self(mut_view(*ti), TypeId { v: orig_gv }, args, self_v);
+            if sub_g.v != orig_gv {
+                changed = true;
             }
+            unsafe {
+                (*typeid_at(new_gargs, i)).v = sub_g.v;
+            }
+            i = i + 1;
         }
         if !changed {
             return TypeId { v: ty_v };
@@ -431,10 +414,43 @@ fn subst_ty_adt(
             copy_ax_type_into(mut_view(*sp), view(*t_latest));
             (*sp).args = new_gargs;
             (*sp).arg_count = gcount;
-            (*sp).fields = new_fields;
-            (*sp).field_count = fcount;
+            (*sp).fields = 0 as *mut TypeId;
+            (*sp).field_count = 0;
+            (*sp).variant_fields = 0 as *mut *mut TypeId;
+            (*sp).variant_field_counts = 0 as *mut usize;
+            (*sp).variant_count = 0;
         }
-        return intern_type(mut_view(*ti), unsafe { view(*sp) });
+        let existing = typemap_get(view(ti.map), unsafe { view(*sp) });
+        if (existing as usize) != 0 {
+            let ex_v = unsafe { (*existing).v };
+            return TypeId { v: ex_v };
+        }
+        let inst = intern_type(mut_view(*ti), unsafe { view(*sp) });
+        let fcount = unsafe { (*t_latest).field_count };
+        let orig_fields = unsafe { (*t_latest).fields };
+        let mut new_fields: *mut TypeId = 0 as *mut TypeId;
+        if fcount > 0 && (orig_fields as usize) != 0 {
+            new_fields = arena_alloc_raw(
+                mut_view(ti.arena),
+                (((fcount as isize) * (size_of<TypeId>() as isize)) as usize),
+                align_of<TypeId>()
+            ) as *mut TypeId;
+            let mut f: usize = 0;
+            while (f < fcount) {
+                let orig_fv = unsafe { (*typeid_at(orig_fields, f)).v };
+                let sub_f = subst_ty_self(mut_view(*ti), TypeId { v: orig_fv }, args, self_v);
+                unsafe {
+                    (*typeid_at(new_fields, f)).v = sub_f.v;
+                }
+                f = f + 1;
+            }
+        }
+        let it = type_get(view(*ti), TypeId { v: inst.v });
+        unsafe {
+            (*it).fields = new_fields;
+            (*it).field_count = fcount;
+        }
+        return inst;
     }
 
     subst_ty_enum_or_closure(mut_view(*ti), ty_v, t, tk, args, self_v)
@@ -451,31 +467,52 @@ fn subst_ty_enum_or_closure(
     if tk == TY_ENUM {
         let gcount = unsafe { (*t).arg_count };
         let orig_gargs = unsafe { (*t).args };
-        let vcount = unsafe { (*t).variant_count };
-        let orig_vfields = unsafe { (*t).variant_fields };
-        let orig_vcounts = unsafe { (*t).variant_field_counts };
-        let mut changed: bool = false;
-        let mut new_gargs: *mut TypeId = orig_gargs;
-        if gcount > 0 && (orig_gargs as usize) != 0 {
-            new_gargs = arena_alloc_raw(
-                mut_view(ti.arena),
-                (((gcount as isize) * (size_of<TypeId>() as isize)) as usize),
-                align_of<TypeId>()
-            ) as *mut TypeId;
-            let mut i: usize = 0;
-            while (i < gcount) {
-                let orig_gv = unsafe { (*typeid_at(orig_gargs, i)).v };
-                let sub_g = subst_ty_self(mut_view(*ti), TypeId { v: orig_gv }, args, self_v);
-                if sub_g.v != orig_gv {
-                    changed = true;
-                }
-                unsafe {
-                    (*typeid_at(new_gargs, i)).v = sub_g.v;
-                }
-                i = i + 1;
-            }
+        if gcount == 0 || (orig_gargs as usize) == 0 {
+            return TypeId { v: ty_v };
         }
-        let mut new_vfields: *mut *mut TypeId = orig_vfields;
+        let mut changed: bool = false;
+        let new_gargs = arena_alloc_raw(
+            mut_view(ti.arena),
+            (((gcount as isize) * (size_of<TypeId>() as isize)) as usize),
+            align_of<TypeId>()
+        ) as *mut TypeId;
+        let mut i: usize = 0;
+        while (i < gcount) {
+            let orig_gv = unsafe { (*typeid_at(orig_gargs, i)).v };
+            let sub_g = subst_ty_self(mut_view(*ti), TypeId { v: orig_gv }, args, self_v);
+            if sub_g.v != orig_gv {
+                changed = true;
+            }
+            unsafe {
+                (*typeid_at(new_gargs, i)).v = sub_g.v;
+            }
+            i = i + 1;
+        }
+        if !changed {
+            return TypeId { v: ty_v };
+        }
+        let t_latest = type_get(view(*ti), TypeId { v: ty_v });
+        let sp = ti.scratch;
+        unsafe {
+            copy_ax_type_into(mut_view(*sp), view(*t_latest));
+            (*sp).args = new_gargs;
+            (*sp).arg_count = gcount;
+            (*sp).fields = 0 as *mut TypeId;
+            (*sp).field_count = 0;
+            (*sp).variant_fields = 0 as *mut *mut TypeId;
+            (*sp).variant_field_counts = 0 as *mut usize;
+            (*sp).variant_count = 0;
+        }
+        let existing = typemap_get(view(ti.map), unsafe { view(*sp) });
+        if (existing as usize) != 0 {
+            let ex_v = unsafe { (*existing).v };
+            return TypeId { v: ex_v };
+        }
+        let inst = intern_type(mut_view(*ti), unsafe { view(*sp) });
+        let vcount = unsafe { (*t_latest).variant_count };
+        let orig_vfields = unsafe { (*t_latest).variant_fields };
+        let orig_vcounts = unsafe { (*t_latest).variant_field_counts };
+        let mut new_vfields: *mut *mut TypeId = 0 as *mut *mut TypeId;
         if vcount > 0 && (orig_vfields as usize) != 0 && (orig_vcounts as usize) != 0 {
             new_vfields = arena_alloc_raw(
                 mut_view(ti.arena),
@@ -496,9 +533,6 @@ fn subst_ty_enum_or_closure(
                     while (f < fcount) {
                         let orig_fv = unsafe { (*typeid_at(src_vf, f)).v };
                         let sub_f = subst_ty_self(mut_view(*ti), TypeId { v: orig_fv }, args, self_v);
-                        if sub_f.v != orig_fv {
-                            changed = true;
-                        }
                         unsafe {
                             (*typeid_at(dst_vf, f)).v = sub_f.v;
                         }
@@ -515,18 +549,13 @@ fn subst_ty_enum_or_closure(
                 v = v + 1;
             }
         }
-        if !changed {
-            return TypeId { v: ty_v };
-        }
-        let t_latest = type_get(view(*ti), TypeId { v: ty_v });
-        let sp = ti.scratch;
+        let et = type_get(view(*ti), TypeId { v: inst.v });
         unsafe {
-            copy_ax_type_into(mut_view(*sp), view(*t_latest));
-            (*sp).args = new_gargs;
-            (*sp).arg_count = gcount;
-            (*sp).variant_fields = new_vfields;
+            (*et).variant_fields = new_vfields;
+            (*et).variant_field_counts = orig_vcounts;
+            (*et).variant_count = vcount;
         }
-        return intern_type(mut_view(*ti), unsafe { view(*sp) });
+        return inst;
     }
 
     if tk == TY_CLOSURE {

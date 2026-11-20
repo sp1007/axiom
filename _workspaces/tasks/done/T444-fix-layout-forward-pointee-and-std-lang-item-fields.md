@@ -8,7 +8,7 @@ model: opus
 gate_model: sonnet
 depends: [T452, T164]
 priority: 21
-status: doing
+status: done
 attempts: 1
 timeout_min: 900
 paths: [compiler/types/layout.ax, tests/run/layout_fwd_pointee]
@@ -17,7 +17,7 @@ spec: [spec/decisions/ADR-0043-cyclic-type-graphs-and-symbol-id-space.md, spec/d
 covers: [REQ-TST-072, REQ-TST-084]
 started: 2026-11-20 08:53:58
 unblocks: 1
-agent: T444-impl
+finished: 2026-11-20 12:28:41
 ---
 # T444 — Fix: layout through forward-referenced pointees and lang-item fields in std modules
 
@@ -69,3 +69,4 @@ natively (T421 FU-1, FU-3; ADR-0042 §2).
 - 2026-11-17 unblock by axiom-architect: + locks compiler/traits/mono.ax (B1), depends T164 (B2, AX0-FIX-10), tests/selfhost lock dropped (harness regenerates bundles); ADR-0043
 - 2026-11-17 19:52:54 unblocked (cycle 1) 
 - 2026-11-20 08:53:58 started (attempt 1) T444-impl
+- 2026-11-20 12:28:41 accepted by QA -> done
