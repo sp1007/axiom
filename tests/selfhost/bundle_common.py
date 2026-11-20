@@ -1143,16 +1143,42 @@ def extract_const_block(bundle_text, const_name):
     return m.group(1)
 
 
-def extract_blobs_from_bundle(bundle_path, data_const_name, off_const_name, len_const_name=None):
-    """Parses `const <data_const_name>: [N]u8` and offsets/lengths from a committed `.ax` bundle."""
-    text = read_bytes(bundle_path).decode("utf-8").replace("\r\n", "\n")
-    data_block = extract_const_block(text, data_const_name)
+def extract_module_slice(bundle_text, mod_name):
+    """Returns the source slice starting at `module <mod_name>` up to the next top-level `module ` (or EOF)."""
+    pat = re.compile(r"^module\s+" + re.escape(mod_name) + r"\b[^\n]*\n", re.M)
+    m = pat.search(bundle_text)
+    if not m:
+        raise ValueError("could not find module %s in bundle" % mod_name)
+    start = m.start()
+    nxt = re.search(r"^module\s+", bundle_text[m.end():], re.M)
+    end = m.end() + nxt.start() if nxt else len(bundle_text)
+    return bundle_text[start:end]
+
+
+def extract_const_block_from_member(bundle_path, member_name, const_name, fallback_path=None):
+    """Extracts `const <const_name>` from `module __case_<stem>` in `bundle_path`, falling back to `fallback_path`."""
+    stem = member_name[:-3] if member_name.endswith(".ax") else member_name
+    mod_name = "__case_" + stem
+    if bundle_path and os.path.isfile(bundle_path):
+        text = read_bytes(bundle_path).decode("utf-8").replace("\r\n", "\n")
+        try:
+            slice_text = extract_module_slice(text, mod_name)
+            return extract_const_block(slice_text, const_name)
+        except ValueError:
+            pass
+    if fallback_path and os.path.isfile(fallback_path):
+        text = read_bytes(fallback_path).decode("utf-8").replace("\r\n", "\n")
+        return extract_const_block(text, const_name)
+    raise FileNotFoundError(
+        "could not locate const %s for %s in %s or %s" % (const_name, member_name, bundle_path, fallback_path)
+    )
+
+
+def _blobs_from_blocks(data_block, off_block, len_block=None):
     raw_bytes = bytes(int(x) for x in re.findall(r"(\d+)u8", data_block))
-    off_block = extract_const_block(text, off_const_name)
     offs = [int(x) for x in re.findall(r"(\d+)(?:u32|usize)?", off_block.split("=", 1)[1])]
     blobs = []
-    if len_const_name is not None:
-        len_block = extract_const_block(text, len_const_name)
+    if len_block is not None:
         lens = [int(x) for x in re.findall(r"(\d+)(?:u32|usize)?", len_block.split("=", 1)[1])]
         for off, ln in zip(offs, lens):
             blobs.append(raw_bytes[off:off + ln])
@@ -1160,6 +1186,35 @@ def extract_blobs_from_bundle(bundle_path, data_const_name, off_const_name, len_
         for i in range(len(offs) - 1):
             blobs.append(raw_bytes[offs[i]:offs[i + 1]])
     return blobs
+
+
+def extract_blobs_from_bundle(bundle_path, data_const_name, off_const_name, len_const_name=None):
+    """Parses `const <data_const_name>: [N]u8` and offsets/lengths from a committed `.ax` bundle."""
+    text = read_bytes(bundle_path).decode("utf-8").replace("\r\n", "\n")
+    data_block = extract_const_block(text, data_const_name)
+    off_block = extract_const_block(text, off_const_name)
+    len_block = extract_const_block(text, len_const_name) if len_const_name is not None else None
+    return _blobs_from_blocks(data_block, off_block, len_block)
+
+
+def extract_blobs_from_member(bundle_path, member_name, data_const_name, off_const_name,
+                              len_const_name=None, fallback_path=None):
+    """Extracts packed byte blobs from `module __case_<stem>` in a merged bundle, or `fallback_path`."""
+    data_block = extract_const_block_from_member(bundle_path, member_name, data_const_name, fallback_path)
+    off_block = extract_const_block_from_member(bundle_path, member_name, off_const_name, fallback_path)
+    len_block = (
+        extract_const_block_from_member(bundle_path, member_name, len_const_name, fallback_path)
+        if len_const_name is not None
+        else None
+    )
+    return _blobs_from_blocks(data_block, off_block, len_block)
+
+
+def extract_ints_from_member(bundle_path, member_name, const_name, fallback_path=None):
+    """Extracts integer elements from `const <const_name>: [N]<int> = [...]` in a merged bundle or fallback."""
+    block = extract_const_block_from_member(bundle_path, member_name, const_name, fallback_path)
+    rhs = block.split("=", 1)[1]
+    return [int(x) for x in re.findall(r"(-?\d+)(?:i32|u32|i64|u64|usize|isize)?", rhs)]
 
 
 def first_diff_line(a_bytes, b_bytes):
@@ -1359,10 +1414,9 @@ def get_pub_exports(mod_list, root=ROOT):
     return exports
 
 
-def assemble_template_bundle(template_path, seed_mods, include_std_sys=True, root=ROOT):
-    """Assembles a complete `.ax` bundle from `<bundle>.ax.in` (header + `module main`) and `compiler/` modules."""
-    raw = read_bytes(template_path).decode("utf-8").replace("\r\n", "\n")
-    lines = raw.split("\n")
+def split_header_and_body(text):
+    """Splits leading `//` directive/comment lines from the Axiom source body."""
+    lines = text.replace("\r\n", "\n").split("\n")
     header_lines = []
     idx = 0
     while idx < len(lines) and (lines[idx].startswith("//") or lines[idx].strip() == ""):
@@ -1370,6 +1424,167 @@ def assemble_template_bundle(template_path, seed_mods, include_std_sys=True, roo
             header_lines.append(lines[idx])
         idx += 1
     body = "\n".join(lines[idx:]).strip() + "\n"
+    return header_lines, body
+
+
+def _merge_member_module(orig_name, member_body):
+    """Rewrites one member's `module <m>` + `[pub] fn main(` into `module __case_<stem>` + `pub fn __t488_run(`."""
+    stem = orig_name[:-3] if orig_name.endswith(".ax") else orig_name
+    mod_name = "__case_" + stem
+    body = member_body.replace("\r\n", "\n").strip() + "\n"
+    if re.search(r"^module\s+\S+", body, re.M):
+        body = re.sub(r"^module\s+\S+", "module " + mod_name, body, count=1, flags=re.M)
+    else:
+        body = "module " + mod_name + "\n\n" + body
+    new_body, nsubs = re.subn(
+        r"^(?:pub\s+)?fn\s+main\s*\(",
+        "pub fn __t488_run(",
+        body,
+        count=1,
+        flags=re.M,
+    )
+    if nsubs != 1:
+        raise ValueError("could not find `fn main(` in merged member %s" % orig_name)
+    return stem, mod_name, new_body
+
+
+class MergeGroup:
+    """Declares a merged selfhost bundle combining multiple `.ax.in` templates under one closure (T488)."""
+
+    def __init__(self, out_name, members, seed_mods, include_std_sys=True,
+                 timeout=None, modes=None, reason=None):
+        self.out_name = out_name
+        self.members = list(members)
+        self.seed_mods = list(seed_mods)
+        self.include_std_sys = include_std_sys
+        self.timeout = timeout
+        self.modes = modes
+        self.reason = reason
+
+
+def assemble_merged_group(prelude_text, modules_text, members, modes=None, timeout=None,
+                          extra_headers=None, reason=None):
+    """Assembles a merged selfhost bundle sharing one prelude and one compiler module closure (T488).
+
+    `members` is a sequence of `(orig_name, full_member_text)` or `(orig_name, header_lines, body_text)`.
+    Each member's body is placed in its own isolated `module __case_<stem>` with `main` renamed to
+    `pub fn __t488_run() -> i32`. The generated `module main` calls each member in order, prints
+    `OK <stem>\\n` (or `FAIL <stem>\\n` on non-zero return) after each member, continues after a
+    failure, and exits with 0 iff all members returned 0.
+    """
+    if len(members) < 2:
+        raise ValueError("merge group requires at least 2 members")
+
+    norm_members = []
+    seen_stems = set()
+    for item in members:
+        if len(item) == 2:
+            orig_name, raw_text = item
+            if isinstance(raw_text, bytes):
+                raw_text = raw_text.decode("utf-8")
+            hdrs, body = split_header_and_body(raw_text)
+        else:
+            orig_name, hdrs, body = item
+            if isinstance(body, bytes):
+                body = body.decode("utf-8")
+        stem = orig_name[:-3] if orig_name.endswith(".ax") else orig_name
+        if stem in seen_stems:
+            raise ValueError("duplicate member %s in merge group" % stem)
+        seen_stems.add(stem)
+        norm_members.append((orig_name, list(hdrs), body))
+
+    inferred_modes = None
+    explicit_interp_native = False
+    inferred_flags = []
+    max_timeout = 0
+    stdout_lines = []
+    case_modules = []
+    uses = []
+    calls = []
+
+    for idx, (orig_name, hdrs, body) in enumerate(norm_members):
+        stem, mod_name, wrapped = _merge_member_module(orig_name, body)
+        case_modules.append(wrapped)
+        uses.append("use %s.__t488_run as __run_%d" % (mod_name, idx))
+        calls.append(
+            "    let __r%d = __run_%d();\n"
+            "    if __r%d == 0 {\n"
+            "        print(\"OK %s\\n\");\n"
+            "    } else {\n"
+            "        print(\"FAIL %s\\n\");\n"
+            "        __failed = 1;\n"
+            "    }" % (idx, idx, idx, stem, stem)
+        )
+        m_modes = "interp native"
+        for h in hdrs:
+            if h.startswith("// modes:"):
+                m_modes = h.split(":", 1)[1].strip()
+                if m_modes == "interp native":
+                    explicit_interp_native = True
+            elif h.startswith("// timeout:"):
+                try:
+                    tval = int(h.split(":", 1)[1].strip())
+                    if tval > max_timeout:
+                        max_timeout = tval
+                except ValueError:
+                    pass
+            elif h.startswith("// flags:"):
+                fl = h.split(":", 1)[1].strip()
+                if fl and fl not in inferred_flags:
+                    inferred_flags.append(fl)
+            elif h.startswith("// stdout:"):
+                stdout_lines.append(h)
+        if inferred_modes is None:
+            inferred_modes = m_modes
+        elif modes is None and m_modes != inferred_modes:
+            raise ValueError(
+                "mixed modes in merge group (%s has %r vs %r)" % (orig_name, m_modes, inferred_modes)
+            )
+        stdout_lines.append("// stdout: OK %s\\n" % stem)
+
+    use_modes = modes if modes is not None else inferred_modes
+    use_timeout = timeout if timeout is not None else (max_timeout if max_timeout > 0 else 600)
+
+    header = ["// test: run"]
+    if use_modes and use_modes != "interp native":
+        header.append("// modes: " + use_modes)
+    elif use_modes == "interp native" and explicit_interp_native:
+        header.append("// modes: interp native")
+    if reason:
+        header.append("// Reason: " + reason)
+    for fl in inferred_flags:
+        header.append("// flags: " + fl)
+    header.append("// timeout: %d" % use_timeout)
+    if extra_headers:
+        header.extend(extra_headers)
+    header.extend(stdout_lines)
+
+    driver = (
+        "module main\n\n"
+        + "\n".join(uses)
+        + "\n\npub fn main() -> i32 {\n"
+        + "    let mut __failed: i32 = 0;\n"
+        + "\n".join(calls)
+        + "\n    __failed\n}\n"
+    )
+
+    return (
+        "\n".join(header)
+        + "\n\n"
+        + prelude_text.rstrip("\n")
+        + "\n\n"
+        + modules_text.rstrip("\n")
+        + "\n\n"
+        + "\n\n".join(m.rstrip("\n") for m in case_modules)
+        + "\n\n"
+        + driver
+    )
+
+
+def assemble_template_bundle(template_path, seed_mods, include_std_sys=True, root=ROOT):
+    """Assembles a complete `.ax` bundle from `<bundle>.ax.in` (header + `module main`) and `compiler/` modules."""
+    raw = read_bytes(template_path).decode("utf-8").replace("\r\n", "\n")
+    header_lines, body = split_header_and_body(raw)
     header = "\n".join(header_lines) + "\n" if header_lines else ""
     prelude = build_prelude_text(
         include_sym_pad=True,
@@ -1382,6 +1597,31 @@ def assemble_template_bundle(template_path, seed_mods, include_std_sys=True, roo
     return header + "\n" + prelude + "\n" + mods_txt + "\n\n" + body
 
 
+def assemble_merged_template_bundle(here_dir, group, root=ROOT):
+    """Assembles a `MergeGroup` of `.ax.in` templates under one prelude and one module closure."""
+    prelude = build_prelude_text(
+        include_sym_pad=True,
+        sym_pad_count=800,
+        include_std_sys=group.include_std_sys,
+        root=root,
+    )
+    mods = resolve_compiler_module_deps(group.seed_mods, root=root)
+    mods_txt = assemble_compiler_modules(mods, root=root)
+    members = []
+    for mname in group.members:
+        tpl_path = os.path.join(here_dir, mname + ".in")
+        raw = read_bytes(tpl_path).decode("utf-8").replace("\r\n", "\n")
+        members.append((mname, raw))
+    return assemble_merged_group(
+        prelude,
+        mods_txt,
+        members,
+        modes=group.modes,
+        timeout=group.timeout,
+        reason=group.reason,
+    )
+
+
 def run_template_generator(here_dir, bundle_specs, argv=None, root=ROOT):
     """Standard CLI entrypoint for template-based `gen_<area>_tests.py` generators."""
     if argv is None:
@@ -1389,6 +1629,11 @@ def run_template_generator(here_dir, bundle_specs, argv=None, root=ROOT):
     check_mode = "--check" in argv or "check" in argv
     outputs = []
     for spec in bundle_specs:
+        if isinstance(spec, MergeGroup):
+            out_path = os.path.join(here_dir, spec.out_name)
+            text = assemble_merged_template_bundle(here_dir, spec, root=root)
+            outputs.append((out_path, text))
+            continue
         if len(spec) == 2:
             bundle_name, seed_mods = spec
             include_std_sys = True

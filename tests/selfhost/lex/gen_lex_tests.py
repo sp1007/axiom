@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bundle generator and freshness check for tests/selfhost/lex (T144)."""
+"""Bundle generator and freshness check for tests/selfhost/lex (T144, T488)."""
 
 import os
 import sys
@@ -11,8 +11,11 @@ sys.path.insert(0, os.path.join(ROOT, "tests", "selfhost"))
 import bundle_common as bc  # noqa: E402
 
 BUNDLES = [
-    ('qa_lex_differential.ax', ['compiler.lex.scanner', 'compiler.diag.format']),
-    ('qa_lex_tokens.ax', ['compiler.lex.scanner', 'compiler.diag.emitter']),
+    bc.MergeGroup(
+        'qa_lex_all.ax',
+        ['qa_lex_differential.ax', 'qa_lex_tokens.ax'],
+        ['compiler.lex.scanner', 'compiler.diag.format', 'compiler.diag.emitter'],
+    ),
     ('u64_max_literal.ax', ['compiler.lex.scanner', 'compiler.lexer.session']),
 ]
 

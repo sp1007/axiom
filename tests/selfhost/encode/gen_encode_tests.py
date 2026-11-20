@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bundle generator and freshness check for tests/selfhost/encode (T144)."""
+"""Bundle generator and freshness check for tests/selfhost/encode (T144, T488)."""
 
 import os
 import sys
@@ -10,7 +10,14 @@ sys.path.insert(0, os.path.join(ROOT, "tests", "selfhost"))
 
 import bundle_common as bc  # noqa: E402
 
-BUNDLES = [('qa_encode_edge_cases.ax', ['compiler.kernel.id', 'compiler.kernel.arena', 'compiler.obj.coff', 'compiler.target.x64.encode']), ('qa_encode_instructions.ax', ['compiler.kernel.id', 'compiler.kernel.arena', 'compiler.obj.coff', 'compiler.target.x64.encode']), ('qa_encode_relocs_and_frames.ax', ['compiler.kernel.id', 'compiler.kernel.arena', 'compiler.obj.coff', 'compiler.obj.writer', 'compiler.target.x64.encode'])]
+BUNDLES = [
+    bc.MergeGroup(
+        'qa_encode_instructions_and_edges.ax',
+        ['qa_encode_edge_cases.ax', 'qa_encode_instructions.ax'],
+        ['compiler.kernel.id', 'compiler.kernel.arena', 'compiler.obj.coff', 'compiler.target.x64.encode'],
+    ),
+    ('qa_encode_relocs_and_frames.ax', ['compiler.kernel.id', 'compiler.kernel.arena', 'compiler.obj.coff', 'compiler.obj.writer', 'compiler.target.x64.encode']),
+]
 
 
 def main(argv=None):

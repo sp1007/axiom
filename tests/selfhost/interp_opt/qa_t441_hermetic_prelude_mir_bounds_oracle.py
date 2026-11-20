@@ -80,27 +80,27 @@ def check_bundles_and_embedded_blobs(root):
 
     interp_bundles = sorted(glob.glob(os.path.join(root, "tests", "selfhost", "interp_opt", "*.ax")))
     own_bundles = sorted(glob.glob(os.path.join(root, "tests", "selfhost", "own_mir_verify", "*.ax")))
-    assert len(interp_bundles) == 7, "expected 7 interp_opt bundles, got %d" % len(interp_bundles)
-    assert len(own_bundles) == 9, "expected 9 own_mir_verify bundles, got %d" % len(own_bundles)
+    assert len(interp_bundles) == 2, "expected 2 merged interp_opt bundles, got %d" % len(interp_bundles)
+    assert len(own_bundles) == 2, "expected 2 merged own_mir_verify bundles, got %d" % len(own_bundles)
 
     for bpath in interp_bundles + own_bundles:
         raw = read_no_cr(bpath)
-        head = raw[:1024].decode("utf-8")
+        head = raw[:2048].decode("utf-8")
         assert "// test: run\n" in head, "missing // test: run in %s" % bpath
         has_stdout = "// stdout: OK " in head
         has_nonzero_exit = ("// exit:" in head) and ("// exit: 0\n" not in head)
         assert has_stdout or has_nonzero_exit, "weak native evidence in %s" % bpath
 
-    mir_b = os.path.join(root, "tests", "selfhost", "interp_opt", "qa_interp_opt_diff_mir_b.ax")
-    mir_b_blobs = bc.extract_blobs_from_bundle(mir_b, "CASE_DATA", "CASE_OFF")
+    mir_b = os.path.join(root, "tests", "selfhost", "interp_opt", "qa_interp_opt_native.ax")
+    mir_b_blobs = bc.extract_blobs_from_member(mir_b, "qa_interp_opt_diff_mir_b", "CASE_DATA", "CASE_OFF")
     # Case 12 is tests/selfhost/drop/fixtures/d01_scope_exit.ax (3 blobs per case: path, src, exp_mir_opt)
     assert mir_b_blobs[12 * 3] == b"tests/selfhost/drop/fixtures/d01_scope_exit.ax"
     d01_exp_opt = mir_b_blobs[12 * 3 + 2]
     assert b"    let _1: type#17;\n    let _2: type#17;\n" in d01_exp_opt
     assert b"    let _1: type#21;\n" not in d01_exp_opt
 
-    drop_b = os.path.join(root, "tests", "selfhost", "own_mir_verify", "qa_own_mir_diff_drop_b.ax")
-    drop_b_blobs = bc.extract_blobs_from_bundle(drop_b, "CASE_DATA", "CASE_OFF")
+    drop_b = os.path.join(root, "tests", "selfhost", "own_mir_verify", "qa_own_mir_diff_native.ax")
+    drop_b_blobs = bc.extract_blobs_from_member(drop_b, "qa_own_mir_diff_drop_b", "CASE_DATA", "CASE_OFF")
     # Case 1 is tests/selfhost/drop/fixtures/d03_struct_fields.ax (5 blobs per case: path, src, pre, drop, synth)
     assert drop_b_blobs[1 * 5] == b"tests/selfhost/drop/fixtures/d03_struct_fields.ax"
     d03_exp_pre = drop_b_blobs[1 * 5 + 2]

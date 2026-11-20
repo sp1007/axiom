@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bundle generator and freshness check for tests/selfhost/lexer (T144)."""
+"""Bundle generator and freshness check for tests/selfhost/lexer (T144, T488)."""
 
 import os
 import sys
@@ -10,7 +10,13 @@ sys.path.insert(0, os.path.join(ROOT, "tests", "selfhost"))
 
 import bundle_common as bc  # noqa: E402
 
-BUNDLES = [('qa_lexer_corpus_neg_a.ax', ['compiler.lexer.session']), ('qa_lexer_corpus_neg_b.ax', ['compiler.lexer.session']), ('qa_lexer_corpus_pos_a.ax', ['compiler.lexer.session']), ('qa_lexer_corpus_pos_b.ax', ['compiler.lexer.session']), ('qa_lexer_session_integration.ax', ['compiler.lexer.session'])]
+BUNDLES = [
+    bc.MergeGroup(
+        'qa_lexer_all.ax',
+        ['qa_lexer_corpus_neg_a.ax', 'qa_lexer_corpus_neg_b.ax', 'qa_lexer_corpus_pos_a.ax', 'qa_lexer_corpus_pos_b.ax', 'qa_lexer_session_integration.ax'],
+        ['compiler.lexer.session'],
+    ),
+]
 
 
 def main(argv=None):

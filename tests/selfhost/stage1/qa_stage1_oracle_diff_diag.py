@@ -120,8 +120,8 @@ def test_driver_generator_and_lf(root):
 
     for rel in (
         "tests/selfhost/driver/gen_driver_tests.py",
-        "tests/selfhost/driver/qa_driver_commands_b.ax",
-        "tests/selfhost/driver/qa_driver_inspect_diff_b.ax",
+        "tests/selfhost/driver/qa_driver_full_interp.ax",
+        "tests/selfhost/driver/qa_driver_full_native.ax",
         "tests/selfhost/stage1/stage1_oracle.py",
     ):
         p = os.path.join(root, *rel.split("/"))

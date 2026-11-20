@@ -270,11 +270,14 @@ def run_inspect(axiom0, emit_kind, rel_path):
     return res.stdout.replace(b"\r\n", b"\n")
 
 
-def gen_unit_test(modules_text, axiom0):
-    out_path = os.path.join(HERE, "qa_backend_unit.ax")
+def gen_unit_member(axiom0, merged_path):
+    orig_name = "qa_backend_unit.ax"
+    fallback_path = os.path.join(HERE, orig_name)
     cached_blobs = None
     if not axiom0:
-        cached_blobs = bc.extract_blobs_from_bundle(out_path, "UNIT_DATA", "UNIT_OFFS")
+        cached_blobs = bc.extract_blobs_from_member(
+            merged_path, orig_name, "UNIT_DATA", "UNIT_OFFS", fallback_path=fallback_path
+        )
     blobs = []
     for idx, (rel_mir, do_mi_mc) in enumerate(UNIT_MIR_FILES):
         mir_bytes = read_bytes(os.path.join(ROOT, *rel_mir.split("/"))).replace(b"\r\n", b"\n")
@@ -302,23 +305,24 @@ def gen_unit_test(modules_text, axiom0):
     tmpl = read_bytes(os.path.join(HERE, "harness_backend_unit.ax.in")).decode("utf-8").replace("\r\n", "\n")
     main_mod = tmpl.replace("// __BLOB_TABLES__", tables)
 
-    header = "\n".join([
+    hdrs = [
         "// test: run",
         "// timeout: 1200",
         "// stdout: 18446744073709551615\\n",
         "// stdout: 18446744073709551615\\n",
         "// stdout: OK Backend Unit & ObjModel\\n",
-        "",
-    ])
-    full_text = header + PRELUDE + "\n" + modules_text + "\n" + main_mod
-    return out_path, full_text.encode("utf-8")
+    ]
+    return orig_name, hdrs, main_mod
 
 
-def gen_lir_diff_test(modules_text, axiom0, suffix, label, ax_items, mir_files, native_only):
-    out_path = os.path.join(HERE, "qa_backend_diff_lir_%s.ax" % suffix)
+def gen_lir_diff_member(axiom0, suffix, label, ax_items, mir_files, native_only, merged_path):
+    orig_name = "qa_backend_diff_lir_%s.ax" % suffix
+    fallback_path = os.path.join(HERE, orig_name)
     cached_blobs = None
     if not axiom0:
-        cached_blobs = bc.extract_blobs_from_bundle(out_path, "LIR_DATA", "LIR_OFFS")
+        cached_blobs = bc.extract_blobs_from_member(
+            merged_path, orig_name, "LIR_DATA", "LIR_OFFS", fallback_path=fallback_path
+        )
     blobs = []
     prelude_flags = []
     for idx, (rel_ax, needs_prelude) in enumerate(ax_items):
@@ -353,27 +357,21 @@ def gen_lir_diff_test(modules_text, axiom0, suffix, label, ax_items, mir_files, 
         "// __OK_PRINT__", 'print("%s\\n");' % ok_msg
     )
 
-    header_lines = ["// test: run"]
+    hdrs = ["// test: run", "// timeout: 1200"]
     if native_only:
-        header_lines.append("// modes: native")
-        header_lines.append(
-            "// Reason: heavy LIR differential corpus across MIR build, opt, mc, and native run fixtures; "
-            "small interp twin is qa_backend_diff_lir_a.ax"
-        )
-    header_lines.extend([
-        "// timeout: 1200",
-        "// stdout: %s\\n" % ok_msg,
-        "",
-    ])
-    full_text = "\n".join(header_lines) + PRELUDE + "\n" + modules_text + "\n" + main_mod
-    return out_path, full_text.encode("utf-8")
+        hdrs.append("// modes: native")
+    hdrs.append("// stdout: %s\\n" % ok_msg)
+    return orig_name, hdrs, main_mod
 
 
-def gen_mimc_diff_test(modules_text, axiom0, suffix, label, ax_items, mir_files, native_only):
-    out_path = os.path.join(HERE, "qa_backend_diff_mi_mc_%s.ax" % suffix)
+def gen_mimc_diff_member(axiom0, suffix, label, ax_items, mir_files, native_only, merged_path):
+    orig_name = "qa_backend_diff_mi_mc_%s.ax" % suffix
+    fallback_path = os.path.join(HERE, orig_name)
     cached_blobs = None
     if not axiom0:
-        cached_blobs = bc.extract_blobs_from_bundle(out_path, "MIMC_DATA", "MIMC_OFFS")
+        cached_blobs = bc.extract_blobs_from_member(
+            merged_path, orig_name, "MIMC_DATA", "MIMC_OFFS", fallback_path=fallback_path
+        )
     blobs = []
     prelude_flags = []
     for idx, (rel_ax, needs_prelude) in enumerate(ax_items):
@@ -415,20 +413,11 @@ def gen_mimc_diff_test(modules_text, axiom0, suffix, label, ax_items, mir_files,
         "// __OK_PRINT__", 'print("%s\\n");' % ok_msg
     )
 
-    header_lines = ["// test: run"]
+    hdrs = ["// test: run", "// timeout: 1200"]
     if native_only:
-        header_lines.append("// modes: native")
-        header_lines.append(
-            "// Reason: heavy Machine IR, Machine Code, and ObjModel differential corpus; "
-            "small interp twin is qa_backend_diff_mi_mc_a.ax"
-        )
-    header_lines.extend([
-        "// timeout: 1200",
-        "// stdout: %s\\n" % ok_msg,
-        "",
-    ])
-    full_text = "\n".join(header_lines) + PRELUDE + "\n" + modules_text + "\n" + main_mod
-    return out_path, full_text.encode("utf-8")
+        hdrs.append("// modes: native")
+    hdrs.append("// stdout: %s\\n" % ok_msg)
+    return orig_name, hdrs, main_mod
 
 
 EDGE_CONST_AX_SRC = b"""\
@@ -491,7 +480,7 @@ mir_body {
 """
 
 
-def gen_edge_test(modules_text):
+def gen_edge_member():
     blobs = [
         b"fn broken_mir {\n",
         b"tests/selfhost/backend/bad_resolve.ax",
@@ -523,15 +512,12 @@ def gen_edge_test(modules_text):
     tmpl = read_bytes(os.path.join(HERE, "harness_backend_edge.ax.in")).decode("utf-8").replace("\r\n", "\n")
     main_mod = tmpl.replace("// __BLOB_TABLES__", tables)
 
-    header = "\n".join([
+    hdrs = [
         "// test: run",
         "// timeout: 1200",
         "// stdout: OK Backend QA Edge & Seam Tests\\n",
-        "",
-    ])
-    full_text = header + PRELUDE + "\n" + modules_text + "\n" + main_mod
-    out_path = os.path.join(HERE, "qa_backend_edge.ax")
-    return out_path, full_text.encode("utf-8")
+    ]
+    return "qa_backend_edge.ax", hdrs, main_mod
 
 
 def main():
@@ -564,13 +550,34 @@ def main():
     )
     mimc_mir = [m for m in all_lir_mir if m not in MIR_ONLY_LIR]
 
+    interp_out = os.path.join(HERE, "qa_backend_interp.ax")
+    native_out = os.path.join(HERE, "qa_backend_native.ax")
+    interp_members = [
+        gen_unit_member(axiom0, interp_out),
+        gen_edge_member(),
+        gen_lir_diff_member(axiom0, "a", "A", AX_CORPUS_SMALL_LIR, ["tests/lir/add.mir"], False, interp_out),
+        gen_mimc_diff_member(axiom0, "a", "A", AX_CORPUS_SMALL_MIMC, ["tests/lir/add.mir"], False, interp_out),
+    ]
+    native_members = [
+        gen_lir_diff_member(axiom0, "b", "B", AX_CORPUS_HEAVY, all_lir_mir, True, native_out),
+        gen_mimc_diff_member(axiom0, "b", "B", AX_CORPUS_HEAVY, mimc_mir, True, native_out),
+    ]
     outputs = [
-        gen_unit_test(modules_text, axiom0),
-        gen_edge_test(modules_text),
-        gen_lir_diff_test(modules_text, axiom0, "a", "A", AX_CORPUS_SMALL_LIR, ["tests/lir/add.mir"], False),
-        gen_lir_diff_test(modules_text, axiom0, "b", "B", AX_CORPUS_HEAVY, all_lir_mir, True),
-        gen_mimc_diff_test(modules_text, axiom0, "a", "A", AX_CORPUS_SMALL_MIMC, ["tests/lir/add.mir"], False),
-        gen_mimc_diff_test(modules_text, axiom0, "b", "B", AX_CORPUS_HEAVY, mimc_mir, True),
+        (
+            interp_out,
+            bc.assemble_merged_group(PRELUDE, modules_text, interp_members, timeout=1800),
+        ),
+        (
+            native_out,
+            bc.assemble_merged_group(
+                PRELUDE,
+                modules_text,
+                native_members,
+                modes="native",
+                timeout=1200,
+                reason="heavy LIR/MI/MC/ObjModel differential corpus; small interp twin is qa_backend_interp.ax",
+            ),
+        ),
     ]
     return bc.write_or_check_bundles(outputs, check_mode, root=ROOT)
 

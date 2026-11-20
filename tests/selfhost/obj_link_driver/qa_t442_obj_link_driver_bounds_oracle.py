@@ -27,13 +27,10 @@ sys.path.insert(0, HERE)
 
 import gen_obj_link_driver_tests as gen  # noqa: E402
 
-DRIVER_BUNDLES = [
-    "tests/selfhost/driver/qa_driver_cli_and_project.ax",
-    "tests/selfhost/driver/qa_driver_boundary_edges.ax",
-    "tests/selfhost/driver/qa_driver_inspect_diff_a.ax",
-    "tests/selfhost/driver/qa_driver_inspect_diff_b.ax",
-    "tests/selfhost/driver/qa_driver_commands_a.ax",
-    "tests/selfhost/driver/qa_driver_commands_b.ax",
+DRIVER_MERGED_BUNDLES = [
+    ("tests/selfhost/driver/qa_driver_light.ax", ["qa_driver_cli_and_project", "qa_driver_boundary_edges"]),
+    ("tests/selfhost/driver/qa_driver_full_interp.ax", ["qa_driver_inspect_diff_a", "qa_driver_commands_a"]),
+    ("tests/selfhost/driver/qa_driver_full_native.ax", ["qa_driver_inspect_diff_b", "qa_driver_commands_b"]),
 ]
 
 OBJ_LINK_DRIVER_BUNDLES = [
@@ -70,8 +67,30 @@ def check_generators(root):
 
 
 def check_bundle_headers_and_stdout(root):
-    all_bundles = DRIVER_BUNDLES + OBJ_LINK_DRIVER_BUNDLES
-    for rel in all_bundles:
+    for rel, members in DRIVER_MERGED_BUNDLES:
+        path = os.path.join(root, rel)
+        if not os.path.isfile(path):
+            fail("missing merged driver bundle: %s" % rel)
+        with open(path, "rb") as f:
+            raw = f.read()
+        if b"\r" in raw:
+            fail("CR byte found in %s" % rel)
+        head_lines = raw[:2048].decode("utf-8", "replace").split("\n")
+        leading_comments = []
+        for ln in head_lines:
+            if not ln.startswith("//"):
+                break
+            leading_comments.append(ln)
+        if "// test: run" not in leading_comments:
+            fail("%s missing '// test: run' in header" % rel)
+        tail_text = raw[-4096:].decode("utf-8", "replace")
+        for member in members:
+            if ("// stdout: OK %s\\n" % member) not in leading_comments:
+                fail("%s missing '// stdout: OK %s\\n' in header (got %r)" % (rel, member, leading_comments))
+            if ('print("OK %s\\n");' % member) not in tail_text:
+                fail("%s missing print(\"OK %s\\n\"); in merged main()" % (rel, member))
+
+    for rel in OBJ_LINK_DRIVER_BUNDLES:
         path = os.path.join(root, rel)
         if not os.path.isfile(path):
             fail("missing bundle: %s" % rel)

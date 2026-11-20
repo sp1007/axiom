@@ -211,10 +211,13 @@ def pack_blobs(blobs):
     return bytes(all_bytes), offs, lens
 
 
-def gen_cli_and_project_bundle(prelude, light_mods, axiom0):
-    out_path = os.path.join(HERE, "qa_driver_cli_and_project.ax")
+def gen_cli_and_project_member(axiom0, merged_path):
+    orig_name = "qa_driver_cli_and_project.ax"
+    fallback_path = os.path.join(HERE, orig_name)
     if axiom0 is None:
-        blobs = bc.extract_blobs_from_bundle(out_path, "BLOBS", "BLOB_OFFS", "BLOB_LENS")
+        blobs = bc.extract_blobs_from_member(
+            merged_path, orig_name, "BLOBS", "BLOB_OFFS", "BLOB_LENS", fallback_path=fallback_path
+        )
         blob_bytes, offs, lens = pack_blobs(blobs)
     else:
         _, exp_help, _ = run_axiom0(axiom0, ["help"], expect_rc=0)
@@ -905,16 +908,22 @@ pub fn main() -> i32 {
         "lens": ", ".join(str(x) for x in lens),
     }
 
-    header = "// test: run\n// timeout: 1200\n// modes: interp native\n// stdout: OK driver_cli_and_project\\n\n\n"
-    full_text = header + prelude + "\n" + light_mods + "\n" + main_src
-    return out_path, full_text.encode("utf-8")
+    hdrs = [
+        "// test: run",
+        "// timeout: 1200",
+        "// modes: interp native",
+        "// stdout: OK driver_cli_and_project\\n",
+    ]
+    return orig_name, hdrs, main_src
 
 
-def gen_inspect_diff_bundle(filename, modes, prelude, full_mods, axiom0, cases, fast_std=False):
-    out_path = os.path.join(HERE, filename)
+def gen_inspect_diff_member(filename, modes, axiom0, cases, merged_path, fast_std=False):
+    fallback_path = os.path.join(HERE, filename)
     case_meta = []
     if axiom0 is None:
-        blobs = bc.extract_blobs_from_bundle(out_path, "BLOBS", "BLOB_OFFS", "BLOB_LENS")
+        blobs = bc.extract_blobs_from_member(
+            merged_path, filename, "BLOBS", "BLOB_OFFS", "BLOB_LENS", fallback_path=fallback_path
+        )
         blob_bytes, offs, lens = pack_blobs(blobs)
         for idx, (_emit_flag, opt_o1, _input_path) in enumerate(cases):
             base = 4 + 4 * idx
@@ -1077,15 +1086,22 @@ pub fn main() -> i32 {
         "tag": os.path.splitext(filename)[0],
     }
 
-    header = "// test: run\n// timeout: 1800\n// modes: %s\n// stdout: OK %s\\n\n\n" % (modes, os.path.splitext(filename)[0])
-    full_text = header + prelude + "\n" + full_mods + "\n" + main_src
-    return out_path, full_text.encode("utf-8")
+    hdrs = [
+        "// test: run",
+        "// timeout: 1800",
+        "// modes: %s" % modes,
+        "// stdout: OK %s\\n" % os.path.splitext(filename)[0],
+    ]
+    return filename, hdrs, main_src
 
 
-def gen_commands_a_bundle(prelude, full_mods, axiom0):
-    out_path = os.path.join(HERE, "qa_driver_commands_a.ax")
+def gen_commands_a_member(axiom0, merged_path):
+    orig_name = "qa_driver_commands_a.ax"
+    fallback_path = os.path.join(HERE, orig_name)
     if axiom0 is None:
-        blobs = bc.extract_blobs_from_bundle(out_path, "BLOBS", "BLOB_OFFS", "BLOB_LENS")
+        blobs = bc.extract_blobs_from_member(
+            merged_path, orig_name, "BLOBS", "BLOB_OFFS", "BLOB_LENS", fallback_path=fallback_path
+        )
         blob_bytes, offs, lens = pack_blobs(blobs)
     else:
         _, exp_version, _ = run_axiom0(axiom0, ["version"], expect_rc=0)
@@ -1314,15 +1330,22 @@ pub fn main() -> i32 {
         "lens": ", ".join(str(x) for x in lens),
     }
 
-    header = "// test: run\n// timeout: 1800\n// modes: interp native\n// stdout: OK driver_commands_a\\n\n\n"
-    full_text = header + prelude + "\n" + full_mods + "\n" + main_src
-    return out_path, full_text.encode("utf-8")
+    hdrs = [
+        "// test: run",
+        "// timeout: 1800",
+        "// modes: interp native",
+        "// stdout: OK driver_commands_a\\n",
+    ]
+    return orig_name, hdrs, main_src
 
 
-def gen_commands_b_bundle(prelude, full_mods, axiom0):
-    out_path = os.path.join(HERE, "qa_driver_commands_b.ax")
+def gen_commands_b_member(axiom0, merged_path):
+    orig_name = "qa_driver_commands_b.ax"
+    fallback_path = os.path.join(HERE, orig_name)
     if axiom0 is None:
-        blobs = bc.extract_blobs_from_bundle(out_path, "BLOBS", "BLOB_OFFS", "BLOB_LENS")
+        blobs = bc.extract_blobs_from_member(
+            merged_path, orig_name, "BLOBS", "BLOB_OFFS", "BLOB_LENS", fallback_path=fallback_path
+        )
         blob_bytes, offs, lens = pack_blobs(blobs)
     else:
         # Precompute reference COFF .obj and PE32+ .exe outputs from axiom0 build
@@ -1679,15 +1702,22 @@ pub fn main() -> i32 {
         "lens": ", ".join(str(x) for x in lens),
     }
 
-    header = "// test: run\n// timeout: 1800\n// modes: native\n// stdout: OK driver_commands_b\\n\n\n"
-    full_text = header + prelude + "\n" + full_mods + "\n" + main_src
-    return out_path, full_text.encode("utf-8")
+    hdrs = [
+        "// test: run",
+        "// timeout: 1800",
+        "// modes: native",
+        "// stdout: OK driver_commands_b\\n",
+    ]
+    return orig_name, hdrs, main_src
 
 
-def gen_boundary_edges_bundle(prelude, light_mods, axiom0):
-    out_path = os.path.join(HERE, "qa_driver_boundary_edges.ax")
+def gen_boundary_edges_member(axiom0, merged_path):
+    orig_name = "qa_driver_boundary_edges.ax"
+    fallback_path = os.path.join(HERE, orig_name)
     if axiom0 is None:
-        blobs = bc.extract_blobs_from_bundle(out_path, "BLOBS", "BLOB_OFFS", "BLOB_LENS")
+        blobs = bc.extract_blobs_from_member(
+            merged_path, orig_name, "BLOBS", "BLOB_OFFS", "BLOB_LENS", fallback_path=fallback_path
+        )
         blob_bytes, offs, lens = pack_blobs(blobs)
     else:
         _, _, exp_ver_extra = run_axiom0(axiom0, ["version", "extra_arg"], expect_rc=2)
@@ -2031,9 +2061,13 @@ pub fn main() -> i32 {
         "lens": ", ".join(str(x) for x in lens),
     }
 
-    header = "// test: run\n// timeout: 1200\n// modes: interp native\n// stdout: OK driver_boundary_edges\\n\n\n"
-    full_text = header + prelude + "\n" + light_mods + "\n" + main_src
-    return out_path, full_text.encode("utf-8")
+    hdrs = [
+        "// test: run",
+        "// timeout: 1200",
+        "// modes: interp native",
+        "// stdout: OK driver_boundary_edges\\n",
+    ]
+    return orig_name, hdrs, main_src
 
 
 def main():
@@ -2052,9 +2086,14 @@ def main():
     light_mods = assemble_modules(LIGHT_MODULES)
     full_mods = assemble_modules(FULL_MODULES)
 
-    outputs = []
-    outputs.append(gen_cli_and_project_bundle(prelude, light_mods, axiom0))
-    outputs.append(gen_boundary_edges_bundle(prelude, light_mods, axiom0))
+    light_out = os.path.join(HERE, "qa_driver_light.ax")
+    full_interp_out = os.path.join(HERE, "qa_driver_full_interp.ax")
+    full_native_out = os.path.join(HERE, "qa_driver_full_native.ax")
+
+    light_members = [
+        gen_cli_and_project_member(axiom0, light_out),
+        gen_boundary_edges_member(axiom0, light_out),
+    ]
 
     inspect_cases_a = [
         ("--emit=tokens", False, "tests/driver/test.ax"),
@@ -2066,15 +2105,17 @@ def main():
         ("--emit=mir-opt", True, "tests/driver/test.ax"),
         ("--emit=mir", False, "tests/lir/const.mir"),
     ]
-    outputs.append(gen_inspect_diff_bundle(
-        "qa_driver_inspect_diff_a.ax",
-        "interp native",
-        prelude,
-        full_mods,
-        axiom0,
-        inspect_cases_a,
-        fast_std=True,
-    ))
+    full_interp_members = [
+        gen_inspect_diff_member(
+            "qa_driver_inspect_diff_a.ax",
+            "interp native",
+            axiom0,
+            inspect_cases_a,
+            full_interp_out,
+            fast_std=True,
+        ),
+        gen_commands_a_member(axiom0, full_interp_out),
+    ]
 
     inspect_cases_b = [
         ("--emit=tokens", False, "tests/mc/frame/main_42.ax"),
@@ -2092,21 +2133,36 @@ def main():
         ("--emit=mc", False, "tests/lir/const.mir"),
         ("--emit=hir", False, "tests/modules/hello/src/main.ax"),
     ]
-    outputs.append(gen_inspect_diff_bundle(
-        "qa_driver_inspect_diff_b.ax",
-        "native",
-        prelude,
-        full_mods,
-        axiom0,
-        inspect_cases_b,
-        fast_std=False,
-    ))
+    full_native_members = [
+        gen_inspect_diff_member(
+            "qa_driver_inspect_diff_b.ax",
+            "native",
+            axiom0,
+            inspect_cases_b,
+            full_native_out,
+            fast_std=False,
+        ),
+        gen_commands_b_member(axiom0, full_native_out),
+    ]
 
-    outputs.append(gen_commands_a_bundle(prelude, full_mods, axiom0))
-    outputs.append(gen_commands_b_bundle(prelude, full_mods, axiom0))
-    bc.write_or_check_bundles(outputs, check_mode, root=ROOT)
+    outputs = [
+        (light_out, bc.assemble_merged_group(prelude, light_mods, light_members, timeout=1200)),
+        (full_interp_out, bc.assemble_merged_group(prelude, full_mods, full_interp_members, timeout=1800)),
+        (
+            full_native_out,
+            bc.assemble_merged_group(
+                prelude,
+                full_mods,
+                full_native_members,
+                modes="native",
+                timeout=1800,
+                reason="heavy selfhost driver inspect/commands batch; interp twin is qa_driver_full_interp.ax",
+            ),
+        ),
+    ]
+    return bc.write_or_check_bundles(outputs, check_mode, root=ROOT)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 

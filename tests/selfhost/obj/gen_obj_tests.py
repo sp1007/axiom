@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bundle generator and freshness check for tests/selfhost/obj (T144)."""
+"""Bundle generator and freshness check for tests/selfhost/obj (T144, T488)."""
 
 import os
 import sys
@@ -10,7 +10,13 @@ sys.path.insert(0, os.path.join(ROOT, "tests", "selfhost"))
 
 import bundle_common as bc  # noqa: E402
 
-BUNDLES = [('qa_coff_edge_cases.ax', ['compiler.kernel.id', 'compiler.kernel.arena', 'compiler.obj.coff', 'compiler.obj.writer', 'compiler.obj']), ('qa_coff_writer_diff.ax', ['compiler.kernel.id', 'compiler.kernel.arena', 'compiler.obj.coff', 'compiler.obj.writer', 'compiler.obj']), ('qa_obj_model.ax', ['compiler.kernel.id', 'compiler.kernel.arena', 'compiler.obj.coff', 'compiler.obj.writer', 'compiler.obj'])]
+BUNDLES = [
+    bc.MergeGroup(
+        'qa_obj_all.ax',
+        ['qa_coff_edge_cases.ax', 'qa_coff_writer_diff.ax', 'qa_obj_model.ax'],
+        ['compiler.kernel.id', 'compiler.kernel.arena', 'compiler.obj.coff', 'compiler.obj.writer', 'compiler.obj'],
+    ),
+]
 
 
 def main(argv=None):
