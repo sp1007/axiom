@@ -1281,6 +1281,573 @@ fn copy_cap_array(dst: *mut MirCap, src: *const MirCap, local_count: usize) {
     }
 }
 
+const CAP_SLOT_NONE: u32 = 0xFFFFFFFFu32;
+
+fn cap_ctz_u64(x: u64) -> usize {
+    if x == 0u64 {
+        return 64;
+    }
+    let mut v = x;
+    let mut n: usize = 0;
+    if (v & 0xFFFFFFFFu64) == 0u64 { n = n + 32; v = v >> 32u64; }
+    if (v & 0xFFFFu64) == 0u64 { n = n + 16; v = v >> 16u64; }
+    if (v & 0xFFu64) == 0u64 { n = n + 8; v = v >> 8u64; }
+    if (v & 0xFu64) == 0u64 { n = n + 4; v = v >> 4u64; }
+    if (v & 0x3u64) == 0u64 { n = n + 2; v = v >> 2u64; }
+    if (v & 0x1u64) == 0u64 { n = n + 1; }
+    n
+}
+
+unsafe fn cap_u32_at(base: *const u32, idx: usize) -> *const u32 {
+    ((base as usize) + (idx << 2usize)) as *const u32
+}
+
+unsafe fn cap_u32_at_mut(base: *mut u32, idx: usize) -> *mut u32 {
+    ((base as usize) + (idx << 2usize)) as *mut u32
+}
+
+unsafe fn cap_u64_at(base: *const u64, idx: usize) -> *const u64 {
+    ((base as usize) + (idx << 3usize)) as *const u64
+}
+
+unsafe fn cap_u64_at_mut(base: *mut u64, idx: usize) -> *mut u64 {
+    ((base as usize) + (idx << 3usize)) as *mut u64
+}
+
+struct FastCapCtx {
+    local_count: usize,
+    slot_count: usize,
+    words: usize,
+    local_to_slot: *mut u32,
+    slot_to_local: *mut u32,
+    dropped_ready: bool,
+    dropped_words: usize,
+    dropped_bits: *mut u64,
+}
+
+fn cap_bit_test(bits: *const u64, slot: usize) -> bool {
+    let w = unsafe { *cap_u64_at(bits, slot >> 6usize) };
+    (w & (1u64 << ((slot & 63usize) as u64))) != 0u64
+}
+
+fn cap_bit_set(bits: *mut u64, slot: usize) {
+    let wp = unsafe { cap_u64_at_mut(bits, slot >> 6usize) };
+    unsafe { *wp = (*wp) | (1u64 << ((slot & 63usize) as u64)); }
+}
+
+fn cap_bit_clear(bits: *mut u64, slot: usize) {
+    let wp = unsafe { cap_u64_at_mut(bits, slot >> 6usize) };
+    unsafe { *wp = (*wp) & (~(1u64 << ((slot & 63usize) as u64))); }
+}
+
+fn cap_fast_local_is_dropped(body: view<MirBody>, fctx: mut_view<FastCapCtx>, l: u32) -> bool {
+    let lu = l as usize;
+    if lu >= fctx.local_count {
+        return false;
+    }
+    if !fctx.dropped_ready {
+        let dw = (fctx.local_count + 63) >> 6usize;
+        let dbytes = dw << 3usize;
+        let dbits = unsafe { heap_alloc(dbytes, 8) } as *mut u64;
+        let mut wi: usize = 0;
+        while wi < dw {
+            unsafe { *cap_u64_at_mut(dbits, wi) = 0u64; }
+            wi = wi + 1;
+        }
+        let mut b: usize = 0;
+        while b < body.bb_count {
+            let bb = unsafe { mir_bb_at(body.bbs, b) };
+            let sc = unsafe { (*bb).stmt_count };
+            let mut s: usize = 0;
+            while s < sc {
+                let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+                if (unsafe { (*st).kind }) == MIR_STMT_DROP && (unsafe { (*st).place.proj_count }) == 0 {
+                    let pl = (unsafe { (*st).place.local.v }) as usize;
+                    if pl < fctx.local_count {
+                        cap_bit_set(dbits, pl);
+                    }
+                }
+                s = s + 1;
+            }
+            if (unsafe { (*bb).has_terminator }) && (unsafe { (*bb).terminator.kind }) == MIR_TERM_DROP && (unsafe { (*bb).terminator.drop_place.proj_count }) == 0 {
+                let tpl = (unsafe { (*bb).terminator.drop_place.local.v }) as usize;
+                if tpl < fctx.local_count {
+                    cap_bit_set(dbits, tpl);
+                }
+            }
+            b = b + 1;
+        }
+        fctx.dropped_bits = dbits;
+        fctx.dropped_words = dw;
+        fctx.dropped_ready = true;
+    }
+    cap_bit_test(fctx.dropped_bits as *const u64, lu)
+}
+
+fn cap_fast_copy(dst_bits: *mut u64, dst_caps: *mut MirCap, src_bits: *const u64, src_caps: *const MirCap, words: usize) {
+    let mut w: usize = 0;
+    while w < words {
+        let mut mask = unsafe { *cap_u64_at(src_bits, w) };
+        unsafe { *cap_u64_at_mut(dst_bits, w) = mask; }
+        let base = w << 6usize;
+        while mask != 0u64 {
+            let bit = cap_ctz_u64(mask);
+            let s = base + bit;
+            let sc = unsafe { mir_cap_at(src_caps, s) };
+            let dc = unsafe { mir_cap_at_mut(dst_caps, s) };
+            unsafe { mir_copy_cap(mut_view(*dc), view(*sc)); }
+            mask = mask & (mask - 1u64);
+        }
+        w = w + 1;
+    }
+}
+
+fn cap_fast_merge(dst_bits: *mut u64, dst_caps: *mut MirCap, src_bits: *const u64, src_caps: *const MirCap, words: usize) -> bool {
+    let mut changed = false;
+    let mut w: usize = 0;
+    while w < words {
+        let sw = unsafe { *cap_u64_at(src_bits, w) };
+        let dw = unsafe { *cap_u64_at(dst_bits as *const u64, w) };
+        let mut diff = sw & (~dw);
+        if diff != 0u64 {
+            unsafe { *cap_u64_at_mut(dst_bits, w) = dw | diff; }
+            changed = true;
+            let base = w << 6usize;
+            while diff != 0u64 {
+                let bit = cap_ctz_u64(diff);
+                let s = base + bit;
+                let sc = unsafe { mir_cap_at(src_caps, s) };
+                let dc = unsafe { mir_cap_at_mut(dst_caps, s) };
+                unsafe { mir_copy_cap(mut_view(*dc), view(*sc)); }
+                diff = diff & (diff - 1u64);
+            }
+        }
+        w = w + 1;
+    }
+    changed
+}
+
+fn cap_fast_check_conflict(
+    bits: *const u64,
+    caps: *const MirCap,
+    words: usize,
+    place: view<MirPlace>,
+    view_kind: u8,
+    loc: Span,
+    body: view<MirBody>,
+    sink: mut_view<DiagSink>
+) {
+    let target_l = place.local.v;
+    let mut w: usize = 0;
+    while w < words {
+        let mut mask = unsafe { *cap_u64_at(bits, w) };
+        let base = w << 6usize;
+        while mask != 0u64 {
+            let bit = cap_ctz_u64(mask);
+            let s = base + bit;
+            let ci = unsafe { mir_cap_at(caps, s) };
+            if (unsafe { (*ci).place.local.v }) == target_l {
+                let rel = unsafe { own_region_relate_in_body(body, view((*ci).place), place) };
+                if rel != MIR_REGION_DISJOINT {
+                    let cv = unsafe { (*ci).view_kind };
+                    if view_kind == MIR_VIEW_MUT || cv == MIR_VIEW_MUT {
+                        if view_kind == MIR_VIEW_MUT {
+                            emit_cap_diag(sink, AX_CAP_CONFLICT_MUT, loc);
+                        } else {
+                            emit_cap_diag(sink, AX_CAP_CONFLICT_READ, loc);
+                        }
+                        return;
+                    }
+                }
+            }
+            mask = mask & (mask - 1u64);
+        }
+        w = w + 1;
+    }
+}
+
+fn cap_fast_check_invalidate(
+    bits: *const u64,
+    caps: *const MirCap,
+    fctx: mut_view<FastCapCtx>,
+    place: view<MirPlace>,
+    by_copy: bool,
+    loc: Span,
+    body: view<MirBody>,
+    bb_idx: usize,
+    stmt_idx: usize,
+    sink: mut_view<DiagSink>
+) {
+    let target_l = place.local.v;
+    let words = fctx.words;
+    let mut w: usize = 0;
+    while w < words {
+        let mut mask = unsafe { *cap_u64_at(bits, w) };
+        let base = w << 6usize;
+        while mask != 0u64 {
+            let bit = cap_ctz_u64(mask);
+            let s = base + bit;
+            let ci = unsafe { mir_cap_at(caps, s) };
+            if (unsafe { (*ci).place.local.v }) == target_l {
+                let rel = unsafe { own_region_relate_in_body(body, view((*ci).place), place) };
+                if rel != MIR_REGION_DISJOINT {
+                    if by_copy && !cap_fast_local_is_dropped(body, mut_view(*fctx), target_l) {
+                        return;
+                    }
+                    let holder_v = unsafe { *cap_u32_at(fctx.slot_to_local as *const u32, s) };
+                    if holder_v >= target_l {
+                        if cap_local_used_from(body, bb_idx, stmt_idx, holder_v) {
+                            emit_cap_diag(sink, AX_CAP_OUTLIVES_OWNER, loc);
+                            return;
+                        }
+                    }
+                }
+            }
+            mask = mask & (mask - 1u64);
+        }
+        w = w + 1;
+    }
+}
+
+fn cap_fast_visit_operand(
+    bits: *const u64,
+    caps: *const MirCap,
+    fctx: mut_view<FastCapCtx>,
+    op: view<MirOperand>,
+    loc: Span,
+    body: view<MirBody>,
+    bb_idx: usize,
+    stmt_idx: usize,
+    sink: mut_view<DiagSink>
+) {
+    if op.kind == MIR_OP_MOVE {
+        cap_fast_check_invalidate(bits, caps, fctx, view(op.place), false, loc, body, bb_idx, stmt_idx, sink);
+    } else if op.kind == MIR_OP_COPY && op.place.proj_count == 0 {
+        cap_fast_check_invalidate(bits, caps, fctx, view(op.place), true, loc, body, bb_idx, stmt_idx, sink);
+    }
+}
+
+fn cap_fast_visit_rvalue(
+    bits: *const u64,
+    caps: *const MirCap,
+    fctx: mut_view<FastCapCtx>,
+    rv: view<MirRvalue>,
+    loc: Span,
+    body: view<MirBody>,
+    bb_idx: usize,
+    stmt_idx: usize,
+    sink: mut_view<DiagSink>
+) {
+    let k = rv.kind;
+    if k == MIR_RVALUE_USE || k == MIR_RVALUE_REPEAT || k == MIR_RVALUE_CAST || k == MIR_RVALUE_UNARY_OP {
+        cap_fast_visit_operand(bits, caps, fctx, view(rv.use_op), loc, body, bb_idx, stmt_idx, sink);
+    } else if k == MIR_RVALUE_REF {
+        let v = if rv.borrow_kind == MIR_BORROW_MUT { MIR_VIEW_MUT } else { MIR_VIEW_READ };
+        cap_fast_check_conflict(bits, caps, fctx.words, view(rv.place), v, loc, body, sink);
+    } else if k == MIR_RVALUE_BINARY_OP || k == MIR_RVALUE_OVERFLOWS_BINARY_OP {
+        cap_fast_visit_operand(bits, caps, mut_view(*fctx), view(rv.lhs), cap_span_copy(view(loc)), view(*body), bb_idx, stmt_idx, mut_view(*sink));
+        cap_fast_visit_operand(bits, caps, fctx, view(rv.rhs), loc, body, bb_idx, stmt_idx, sink);
+    } else if k == MIR_RVALUE_AGGREGATE {
+        let mut i: usize = 0;
+        while i < rv.operand_count {
+            let op = unsafe { mir_op_at(rv.operands, i) };
+            unsafe {
+                cap_fast_visit_operand(bits, caps, mut_view(*fctx), view(*op), cap_span_copy(view(loc)), view(*body), bb_idx, stmt_idx, mut_view(*sink));
+            }
+            i = i + 1;
+        }
+    }
+}
+
+fn cap_fast_visit_stmt(
+    bits: *mut u64,
+    caps: *mut MirCap,
+    fctx: mut_view<FastCapCtx>,
+    stmt: view<MirStmt>,
+    body: view<MirBody>,
+    bb_idx: usize,
+    stmt_idx: usize,
+    sink: mut_view<DiagSink>,
+    report: bool
+) {
+    let sk = stmt.kind;
+    let local_count = fctx.local_count;
+    if sk == MIR_STMT_ASSIGN {
+        let loc = Span { file: FileId { v: stmt.location.file.v }, start: stmt.location.start, end: stmt.location.end };
+        if report {
+            cap_fast_visit_rvalue(bits as *const u64, caps as *const MirCap, mut_view(*fctx), view(stmt.rvalue), cap_span_copy(view(loc)), view(*body), bb_idx, stmt_idx, mut_view(*sink));
+        }
+        let rvk = stmt.rvalue.kind;
+        let dest_idx = stmt.place.local.v as usize;
+        if rvk == MIR_RVALUE_REF {
+            if stmt.place.proj_count == 0 && dest_idx < local_count {
+                let ds = unsafe { *cap_u32_at(fctx.local_to_slot as *const u32, dest_idx) };
+                if ds != CAP_SLOT_NONE {
+                    let v = if stmt.rvalue.borrow_kind == MIR_BORROW_MUT { MIR_VIEW_MUT } else { MIR_VIEW_READ };
+                    let dst_cap = unsafe { mir_cap_at_mut(caps, ds as usize) };
+                    unsafe {
+                        mir_copy_place(mut_view((*dst_cap).place), view(stmt.rvalue.place));
+                        (*dst_cap).view_kind = v;
+                    }
+                    cap_bit_set(bits, ds as usize);
+                }
+                if report {
+                    let dest_v = stmt.place.local.v;
+                    let src_v = stmt.rvalue.place.local.v;
+                    if dest_v < src_v {
+                        emit_cap_diag(mut_view(*sink), AX_CAP_OUTLIVES_OWNER, cap_span_copy(view(loc)));
+                    }
+                }
+            }
+        } else if rvk == MIR_RVALUE_USE && (stmt.rvalue.use_op.kind == MIR_OP_COPY || stmt.rvalue.use_op.kind == MIR_OP_MOVE) {
+            let src_idx = stmt.rvalue.use_op.place.local.v as usize;
+            if stmt.place.proj_count == 0 && stmt.rvalue.use_op.place.proj_count == 0 && dest_idx < local_count && src_idx < local_count {
+                let ds = unsafe { *cap_u32_at(fctx.local_to_slot as *const u32, dest_idx) };
+                if ds != CAP_SLOT_NONE {
+                    let ss = unsafe { *cap_u32_at(fctx.local_to_slot as *const u32, src_idx) };
+                    if ss != CAP_SLOT_NONE && cap_bit_test(bits as *const u64, ss as usize) {
+                        let src_cap = unsafe { mir_cap_at(caps as *const MirCap, ss as usize) };
+                        let dst_cap = unsafe { mir_cap_at_mut(caps, ds as usize) };
+                        unsafe { mir_copy_cap(mut_view(*dst_cap), view(*src_cap)); }
+                        cap_bit_set(bits, ds as usize);
+                        if report {
+                            let dest_v = stmt.place.local.v;
+                            let owner_v = unsafe { (*dst_cap).place.local.v };
+                            if dest_v < owner_v {
+                                emit_cap_diag(mut_view(*sink), AX_CAP_OUTLIVES_OWNER, cap_span_copy(view(loc)));
+                            }
+                        }
+                    } else {
+                        cap_bit_clear(bits, ds as usize);
+                    }
+                }
+            }
+        } else if rvk == MIR_RVALUE_AGGREGATE {
+            if stmt.place.proj_count == 0 && dest_idx < local_count {
+                let ds = unsafe { *cap_u32_at(fctx.local_to_slot as *const u32, dest_idx) };
+                if ds != CAP_SLOT_NONE {
+                    let mut any_active = false;
+                    let mut ai: usize = 0;
+                    while ai < stmt.rvalue.operand_count {
+                        let op = unsafe { mir_op_at(stmt.rvalue.operands, ai) };
+                        let opk = unsafe { (*op).kind };
+                        if (opk == MIR_OP_COPY || opk == MIR_OP_MOVE) && (unsafe { (*op).place.proj_count }) == 0 {
+                            let ol = (unsafe { (*op).place.local.v }) as usize;
+                            if ol < local_count {
+                                let os = unsafe { *cap_u32_at(fctx.local_to_slot as *const u32, ol) };
+                                if os != CAP_SLOT_NONE && cap_bit_test(bits as *const u64, os as usize) {
+                                    any_active = true;
+                                    break;
+                                }
+                            }
+                        }
+                        ai = ai + 1;
+                    }
+                    if any_active && !cap_is_inline_call_arg_closure(view(*body), bb_idx, stmt_idx, stmt.place.local.v, view(stmt.rvalue)) {
+                        let mut i: usize = 0;
+                        while i < stmt.rvalue.operand_count {
+                            let op = unsafe { mir_op_at(stmt.rvalue.operands, i) };
+                            let opk = unsafe { (*op).kind };
+                            if (opk == MIR_OP_COPY || opk == MIR_OP_MOVE) && (unsafe { (*op).place.proj_count }) == 0 {
+                                let op_lidx = (unsafe { (*op).place.local.v }) as usize;
+                                if op_lidx < local_count {
+                                    let os = unsafe { *cap_u32_at(fctx.local_to_slot as *const u32, op_lidx) };
+                                    if os != CAP_SLOT_NONE && cap_bit_test(bits as *const u64, os as usize) {
+                                        let src_cap = unsafe { mir_cap_at(caps as *const MirCap, os as usize) };
+                                        let dst_cap = unsafe { mir_cap_at_mut(caps, ds as usize) };
+                                        unsafe { mir_copy_cap(mut_view(*dst_cap), view(*src_cap)); }
+                                        cap_bit_set(bits, ds as usize);
+                                        if report {
+                                            let dest_v = stmt.place.local.v;
+                                            let owner_v = unsafe { (*dst_cap).place.local.v };
+                                            if dest_v < owner_v {
+                                                emit_cap_diag(mut_view(*sink), AX_CAP_OUTLIVES_OWNER, cap_span_copy(view(loc)));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            i = i + 1;
+                        }
+                    }
+                }
+            }
+        } else if rvk == MIR_RVALUE_CAST {
+            let cop = stmt.rvalue.use_op.kind;
+            let c_pcount = stmt.rvalue.use_op.place.proj_count;
+            let c_lidx = stmt.rvalue.use_op.place.local.v as usize;
+            if (cop == MIR_OP_COPY || cop == MIR_OP_MOVE) && c_pcount == 0 && c_lidx < local_count {
+                let cs = unsafe { *cap_u32_at(fctx.local_to_slot as *const u32, c_lidx) };
+                if cs != CAP_SLOT_NONE && cap_bit_test(bits as *const u64, cs as usize) {
+                    if !cap_local_used_from(view(*body), bb_idx, stmt_idx + 1, c_lidx as u32) {
+                        cap_bit_clear(bits, cs as usize);
+                    }
+                }
+            }
+        }
+
+        if rvk == MIR_RVALUE_USE && stmt.rvalue.use_op.kind == MIR_OP_MOVE {
+            let src_idx = stmt.rvalue.use_op.place.local.v as usize;
+            if stmt.rvalue.use_op.place.proj_count == 0 && src_idx < local_count && src_idx != dest_idx {
+                let ss = unsafe { *cap_u32_at(fctx.local_to_slot as *const u32, src_idx) };
+                if ss != CAP_SLOT_NONE {
+                    cap_bit_clear(bits, ss as usize);
+                }
+            }
+        } else if rvk == MIR_RVALUE_AGGREGATE {
+            let mut i: usize = 0;
+            while i < stmt.rvalue.operand_count {
+                let op = unsafe { mir_op_at(stmt.rvalue.operands, i) };
+                let opk = unsafe { (*op).kind };
+                let op_pcount = unsafe { (*op).place.proj_count };
+                let op_lidx = (unsafe { (*op).place.local.v }) as usize;
+                if opk == MIR_OP_MOVE && op_pcount == 0 && op_lidx < local_count && op_lidx != dest_idx {
+                    let os = unsafe { *cap_u32_at(fctx.local_to_slot as *const u32, op_lidx) };
+                    if os != CAP_SLOT_NONE {
+                        cap_bit_clear(bits, os as usize);
+                    }
+                }
+                i = i + 1;
+            }
+        }
+    } else if sk == MIR_STMT_STORAGE_LIVE || sk == MIR_STMT_STORAGE_DEAD {
+        let lidx = stmt.storage_local.v as usize;
+        if lidx < local_count {
+            let ls = unsafe { *cap_u32_at(fctx.local_to_slot as *const u32, lidx) };
+            if ls != CAP_SLOT_NONE {
+                cap_bit_clear(bits, ls as usize);
+            }
+        }
+    } else if sk == MIR_STMT_DROP {
+        if report {
+            let loc = Span { file: FileId { v: stmt.location.file.v }, start: stmt.location.start, end: stmt.location.end };
+            cap_fast_check_invalidate(bits as *const u64, caps as *const MirCap, fctx, view(stmt.place), false, loc, body, bb_idx, stmt_idx, sink);
+        }
+    }
+}
+
+fn cap_fast_visit_bb(
+    bits: *mut u64,
+    caps: *mut MirCap,
+    fctx: mut_view<FastCapCtx>,
+    bb: view<MirBb>,
+    body: view<MirBody>,
+    bb_idx: usize,
+    sink: mut_view<DiagSink>,
+    report: bool
+) {
+    let mut i: usize = 0;
+    while i < bb.stmt_count {
+        let st = unsafe { mir_stmt_at(bb.stmts, i) };
+        unsafe {
+            cap_fast_visit_stmt(bits, caps, mut_view(*fctx), view(*st), view(*body), bb_idx, i, mut_view(*sink), report);
+        }
+        i = i + 1;
+    }
+    if !bb.has_terminator {
+        return;
+    }
+    let tk = bb.terminator.kind;
+    if tk == MIR_TERM_DROP {
+        if report {
+            let loc = Span {
+                file: FileId { v: bb.terminator.location.file.v },
+                start: bb.terminator.location.start,
+                end: bb.terminator.location.end,
+            };
+            cap_fast_check_invalidate(bits as *const u64, caps as *const MirCap, fctx, view(bb.terminator.drop_place), false, loc, body, bb_idx, bb.stmt_count, sink);
+        }
+    } else if tk == MIR_TERM_CALL {
+        let local_count = fctx.local_count;
+        let loc = Span {
+            file: FileId { v: bb.terminator.location.file.v },
+            start: bb.terminator.location.start,
+            end: bb.terminator.location.end,
+        };
+        let mut a: usize = 0;
+        while a < bb.terminator.arg_count {
+            let op = unsafe { mir_op_at(bb.terminator.args, a) };
+            if report {
+                unsafe {
+                    cap_fast_visit_operand(bits as *const u64, caps as *const MirCap, mut_view(*fctx), view(*op), cap_span_copy(view(loc)), view(*body), bb_idx, bb.stmt_count, mut_view(*sink));
+                }
+            }
+            let opk = unsafe { (*op).kind };
+            let op_pcount = unsafe { (*op).place.proj_count };
+            let op_lidx = (unsafe { (*op).place.local.v }) as usize;
+            if opk == MIR_OP_MOVE && op_pcount == 0 && op_lidx < local_count {
+                let os = unsafe { *cap_u32_at(fctx.local_to_slot as *const u32, op_lidx) };
+                if os != CAP_SLOT_NONE {
+                    cap_bit_clear(bits, os as usize);
+                }
+            }
+            a = a + 1;
+        }
+    }
+}
+
+fn cap_compute_rpo(body: view<MirBody>, rpo_post: *mut u32, rpo_pos: *mut u32) -> usize {
+    let bb_count = body.bb_count;
+    let vis = unsafe { heap_alloc(bb_count, 1) };
+    let stack_bb = unsafe { heap_alloc(bb_count << 2usize, 4) } as *mut u32;
+    let stack_ei = unsafe { heap_alloc(bb_count << 2usize, 4) } as *mut u32;
+    let mut k: usize = 0;
+    while k < bb_count {
+        unsafe {
+            *(vis + k) = 0u8;
+            *cap_u32_at_mut(rpo_pos, k) = CAP_SLOT_NONE;
+        }
+        k = k + 1;
+    }
+    unsafe {
+        *vis = 1u8;
+        *cap_u32_at_mut(stack_bb, 0) = 0u32;
+        *cap_u32_at_mut(stack_ei, 0) = 0u32;
+    }
+    let mut sp: usize = 1;
+    let mut post_len: usize = 0;
+    let mut targets: [16]u32 = [0u32; 16];
+    while sp > 0 {
+        let top = sp - 1;
+        let u = (unsafe { *cap_u32_at(stack_bb as *const u32, top) }) as usize;
+        let ei = (unsafe { *cap_u32_at(stack_ei as *const u32, top) }) as usize;
+        let bb_p = unsafe { mir_bb_at(body.bbs, u) };
+        let tcnt = if unsafe { (*bb_p).has_terminator } {
+            unsafe { cap_term_successors(view((*bb_p).terminator), mut_view(targets)) }
+        } else {
+            0
+        };
+        if ei < tcnt {
+            unsafe { *cap_u32_at_mut(stack_ei, top) = (ei + 1) as u32; }
+            let v = targets[ei] as usize;
+            if v < bb_count && (unsafe { *(vis + v) }) == 0u8 {
+                unsafe {
+                    *(vis + v) = 1u8;
+                    *cap_u32_at_mut(stack_bb, sp) = v as u32;
+                    *cap_u32_at_mut(stack_ei, sp) = 0u32;
+                }
+                sp = sp + 1;
+            }
+        } else {
+            sp = sp - 1;
+            unsafe { *cap_u32_at_mut(rpo_post, post_len) = u as u32; }
+            post_len = post_len + 1;
+        }
+    }
+    k = 0;
+    while k < post_len {
+        let u = (unsafe { *cap_u32_at(rpo_post as *const u32, post_len - 1 - k) }) as usize;
+        unsafe { *cap_u32_at_mut(rpo_pos, u) = k as u32; }
+        k = k + 1;
+    }
+    unsafe {
+        heap_free(vis, bb_count, 1);
+        heap_free(stack_bb as *mut u8, bb_count << 2usize, 4);
+        heap_free(stack_ei as *mut u8, bb_count << 2usize, 4);
+    }
+    post_len
+}
+
 pub fn own_cap_check(body: view<MirBody>, sink: mut_view<DiagSink>) {
     if body.bb_count == 0 || body.local_count == 0 {
         return;
@@ -1288,106 +1855,251 @@ pub fn own_cap_check(body: view<MirBody>, sink: mut_view<DiagSink>) {
     let local_count = body.local_count;
     let bb_count = body.bb_count;
 
-    let bb_in_bytes = mul_usize(bb_count, size_of<CapState>());
-    let bb_in = unsafe { heap_alloc(bb_in_bytes, align_of<CapState>()) } as *mut CapState;
-    let cap_arr_bytes = mul_usize(local_count, size_of<MirCap>());
-
-    let mut i: usize = 0;
-    while (i < bb_count) {
-        let st_p = unsafe { cap_state_at_mut(bb_in, i) };
-        let caps_raw = unsafe { heap_alloc(cap_arr_bytes, align_of<MirCap>()) };
-        let caps_ptr = caps_raw as *mut MirCap;
-        let mut j: usize = 0;
-        while (j < local_count) {
-            let c = unsafe { mir_cap_at_mut(caps_ptr, j) };
-            unsafe {
-                mir_cap_reset(mut_view(*c));
+    // Fast-path: if no whole-local `MIR_RVALUE_REF` exists in this body, no capability can ever
+    // become active, so no borrow conflict or outlives-owner diagnostic can ever be emitted.
+    let mut ref_count: usize = 0;
+    let mut edge_cap: usize = 0;
+    let mut bi: usize = 0;
+    while bi < bb_count {
+        let bb_p = unsafe { mir_bb_at(body.bbs, bi) };
+        let sc = unsafe { (*bb_p).stmt_count };
+        let mut si: usize = 0;
+        while si < sc {
+            let st = unsafe { mir_stmt_at((*bb_p).stmts, si) };
+            if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN && (unsafe { (*st).place.proj_count }) == 0 && ((unsafe { (*st).place.local.v }) as usize) < local_count {
+                let rvk = unsafe { (*st).rvalue.kind };
+                if rvk == MIR_RVALUE_REF {
+                    ref_count = ref_count + 1;
+                } else if rvk == MIR_RVALUE_USE {
+                    let opk = unsafe { (*st).rvalue.use_op.kind };
+                    if (opk == MIR_OP_COPY || opk == MIR_OP_MOVE) && (unsafe { (*st).rvalue.use_op.place.proj_count }) == 0 {
+                        edge_cap = edge_cap + 1;
+                    }
+                } else if rvk == MIR_RVALUE_AGGREGATE {
+                    edge_cap = edge_cap + (unsafe { (*st).rvalue.operand_count });
+                }
             }
-            j = j + 1;
+            si = si + 1;
         }
+        bi = bi + 1;
+    }
+    if ref_count == 0 {
+        return;
+    }
+
+    // Compute the exact transitive closure of locals that can ever hold a capability.
+    let can_cap = unsafe { heap_alloc(local_count, 1) };
+    let lc4 = local_count << 2usize;
+    let edge_head = unsafe { heap_alloc(lc4, 4) } as *mut u32;
+    let bfs_q = unsafe { heap_alloc(lc4, 4) } as *mut u32;
+    let e_alloc = if edge_cap > 0 { edge_cap } else { 1 };
+    let e4 = e_alloc << 2usize;
+    let edge_to = unsafe { heap_alloc(e4, 4) } as *mut u32;
+    let edge_next = unsafe { heap_alloc(e4, 4) } as *mut u32;
+
+    let mut li: usize = 0;
+    while li < local_count {
         unsafe {
-            (*st_p).caps = caps_ptr;
+            *(can_cap + li) = 0u8;
+            *cap_u32_at_mut(edge_head, li) = CAP_SLOT_NONE;
         }
-        i = i + 1;
+        li = li + 1;
+    }
+
+    let mut q_tail: usize = 0;
+    let mut e_len: usize = 0;
+    bi = 0;
+    while bi < bb_count {
+        let bb_p = unsafe { mir_bb_at(body.bbs, bi) };
+        let sc = unsafe { (*bb_p).stmt_count };
+        let mut si: usize = 0;
+        while si < sc {
+            let st = unsafe { mir_stmt_at((*bb_p).stmts, si) };
+            if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN && (unsafe { (*st).place.proj_count }) == 0 {
+                let dst = (unsafe { (*st).place.local.v }) as usize;
+                if dst < local_count {
+                    let rvk = unsafe { (*st).rvalue.kind };
+                    if rvk == MIR_RVALUE_REF {
+                        if (unsafe { *(can_cap + dst) }) == 0u8 {
+                            unsafe {
+                                *(can_cap + dst) = 1u8;
+                                *cap_u32_at_mut(bfs_q, q_tail) = dst as u32;
+                            }
+                            q_tail = q_tail + 1;
+                        }
+                    } else if rvk == MIR_RVALUE_USE {
+                        let opk = unsafe { (*st).rvalue.use_op.kind };
+                        if (opk == MIR_OP_COPY || opk == MIR_OP_MOVE) && (unsafe { (*st).rvalue.use_op.place.proj_count }) == 0 {
+                            let src = (unsafe { (*st).rvalue.use_op.place.local.v }) as usize;
+                            if src < local_count && src != dst && e_len < e_alloc {
+                                unsafe {
+                                    *cap_u32_at_mut(edge_to, e_len) = dst as u32;
+                                    *cap_u32_at_mut(edge_next, e_len) = *cap_u32_at(edge_head as *const u32, src);
+                                    *cap_u32_at_mut(edge_head, src) = e_len as u32;
+                                }
+                                e_len = e_len + 1;
+                            }
+                        }
+                    } else if rvk == MIR_RVALUE_AGGREGATE {
+                        let oc = unsafe { (*st).rvalue.operand_count };
+                        let mut oi: usize = 0;
+                        while oi < oc {
+                            let op = unsafe { mir_op_at((*st).rvalue.operands, oi) };
+                            let opk = unsafe { (*op).kind };
+                            if (opk == MIR_OP_COPY || opk == MIR_OP_MOVE) && (unsafe { (*op).place.proj_count }) == 0 {
+                                let src = (unsafe { (*op).place.local.v }) as usize;
+                                if src < local_count && src != dst && e_len < e_alloc {
+                                    unsafe {
+                                        *cap_u32_at_mut(edge_to, e_len) = dst as u32;
+                                        *cap_u32_at_mut(edge_next, e_len) = *cap_u32_at(edge_head as *const u32, src);
+                                        *cap_u32_at_mut(edge_head, src) = e_len as u32;
+                                    }
+                                    e_len = e_len + 1;
+                                }
+                            }
+                            oi = oi + 1;
+                        }
+                    }
+                }
+            }
+            si = si + 1;
+        }
+        bi = bi + 1;
+    }
+
+    let mut q_head: usize = 0;
+    while q_head < q_tail {
+        let u = (unsafe { *cap_u32_at(bfs_q as *const u32, q_head) }) as usize;
+        q_head = q_head + 1;
+        let mut e = unsafe { *cap_u32_at(edge_head as *const u32, u) };
+        while e != CAP_SLOT_NONE {
+            let v = (unsafe { *cap_u32_at(edge_to as *const u32, e as usize) }) as usize;
+            if (unsafe { *(can_cap + v) }) == 0u8 {
+                unsafe {
+                    *(can_cap + v) = 1u8;
+                    *cap_u32_at_mut(bfs_q, q_tail) = v as u32;
+                }
+                q_tail = q_tail + 1;
+            }
+            e = unsafe { *cap_u32_at(edge_next as *const u32, e as usize) };
+        }
+    }
+
+    unsafe {
+        heap_free(edge_head as *mut u8, lc4, 4);
+        heap_free(bfs_q as *mut u8, lc4, 4);
+        heap_free(edge_to as *mut u8, e4, 4);
+        heap_free(edge_next as *mut u8, e4, 4);
+    }
+
+    let slot_count = q_tail;
+    if slot_count == 0 {
+        unsafe { heap_free(can_cap, local_count, 1); }
+        return;
+    }
+
+    let local_to_slot = unsafe { heap_alloc(lc4, 4) } as *mut u32;
+    let sc4 = slot_count << 2usize;
+    let slot_to_local = unsafe { heap_alloc(sc4, 4) } as *mut u32;
+    let mut s_next: usize = 0;
+    li = 0;
+    while li < local_count {
+        if (unsafe { *(can_cap + li) }) != 0u8 {
+            unsafe {
+                *cap_u32_at_mut(local_to_slot, li) = s_next as u32;
+                *cap_u32_at_mut(slot_to_local, s_next) = li as u32;
+            }
+            s_next = s_next + 1;
+        } else {
+            unsafe { *cap_u32_at_mut(local_to_slot, li) = CAP_SLOT_NONE; }
+        }
+        li = li + 1;
+    }
+    unsafe { heap_free(can_cap, local_count, 1); }
+
+    let words = (slot_count + 63) >> 6usize;
+    let mut fctx = FastCapCtx {
+        local_count: local_count,
+        slot_count: slot_count,
+        words: words,
+        local_to_slot: local_to_slot,
+        slot_to_local: slot_to_local,
+        dropped_ready: false,
+        dropped_words: 0,
+        dropped_bits: 0 as *mut u64,
+    };
+
+    // Single flat allocations for all blocks + temp scratch slot (row `bb_count`).
+    let total_words = mul_usize(bb_count + 1, words);
+    let bits_bytes = total_words << 3usize;
+    let all_bits = unsafe { heap_alloc(bits_bytes, 8) } as *mut u64;
+
+    let total_caps = mul_usize(bb_count + 1, slot_count);
+    let caps_bytes = mul_usize(total_caps, size_of<MirCap>());
+    let all_caps = unsafe { heap_alloc(caps_bytes, align_of<MirCap>()) } as *mut MirCap;
+
+    // Zero only BB0's active bitset; unvisited blocks are overwritten on first discovery.
+    let mut wi: usize = 0;
+    while wi < words {
+        unsafe { *cap_u64_at_mut(all_bits, wi) = 0u64; }
+        wi = wi + 1;
     }
 
     let visited = unsafe { heap_alloc(bb_count, 1) };
-    i = 0;
-    while (i < bb_count) {
-        unsafe { *(visited + i) = 0u8; }
-        i = i + 1;
+    let mut vi: usize = 0;
+    while vi < bb_count {
+        unsafe { *(visited + vi) = 0u8; }
+        vi = vi + 1;
     }
     unsafe { *visited = 1u8; }
 
-    let mut temp = CapState { caps: unsafe { heap_alloc(cap_arr_bytes, align_of<MirCap>()) } as *mut MirCap };
+    let bb4 = bb_count << 2usize;
+    let rpo_post = unsafe { heap_alloc(bb4, 4) } as *mut u32;
+    let rpo_pos = unsafe { heap_alloc(bb4, 4) } as *mut u32;
+    let rpo_len = cap_compute_rpo(view(*body), rpo_post, rpo_pos);
 
-    let mut changed = true;
-    while changed {
-        changed = false;
-        i = 0;
-        while (i < bb_count) {
-            if (unsafe { *(visited + i) }) != 0u8 {
-                let in_st = unsafe { cap_state_at_mut(bb_in, i) };
-                let in_caps = unsafe { (*in_st).caps };
-                copy_cap_array(temp.caps, in_caps as *const MirCap, local_count);
-                let bb_p = unsafe { mir_bb_at(body.bbs, i) };
+    let temp_bits = unsafe { cap_u64_at_mut(all_bits, mul_usize(bb_count, words)) };
+    let temp_caps = unsafe { mir_cap_at_mut(all_caps, mul_usize(bb_count, slot_count)) };
+    let mut targets: [16]u32 = [0u32; 16];
+
+    let mut work_pending = true;
+    while work_pending {
+        work_pending = false;
+        let mut rpo_k: usize = 0;
+        while rpo_k < rpo_len {
+            let b = (unsafe { *cap_u32_at(rpo_post as *const u32, rpo_len - 1 - rpo_k) }) as usize;
+            if (unsafe { *(visited + b) }) == 1u8 {
+                unsafe { *(visited + b) = 2u8; }
+                let in_bits = unsafe { cap_u64_at(all_bits as *const u64, mul_usize(b, words)) };
+                let in_caps = unsafe { mir_cap_at(all_caps as *const MirCap, mul_usize(b, slot_count)) };
+                cap_fast_copy(temp_bits, temp_caps, in_bits, in_caps, words);
+                let bb_p = unsafe { mir_bb_at(body.bbs, b) };
                 unsafe {
-                    cap_visit_bb(mut_view(temp), local_count, view(*bb_p), view(*body), i, mut_view(*sink), false);
+                    cap_fast_visit_bb(temp_bits, temp_caps, mut_view(fctx), view(*bb_p), view(*body), b, mut_view(*sink), false);
                 }
 
-                let has_term = unsafe { (*bb_p).has_terminator };
-                if has_term {
-                    let tk = unsafe { (*bb_p).terminator.kind };
-                    let mut targets: [16]u32 = [0u32; 16];
-                    let mut target_count: usize = 0;
-
-                    if tk == MIR_TERM_GOTO {
-                        targets[target_count] = unsafe { (*bb_p).terminator.goto_target.v };
-                        target_count = target_count + 1;
-                    } else if tk == MIR_TERM_SWITCH_INT {
-                        let sc = unsafe { (*bb_p).terminator.switch_count };
-                        let tgts = unsafe { (*bb_p).terminator.targets };
-                        let mut sj: usize = 0;
-                        while (sj < sc && target_count < 15) {
-                            let tid = unsafe { (*mir_bb_id_at(tgts, sj)).v };
-                            targets[target_count] = tid;
-                            target_count = target_count + 1;
-                            sj = sj + 1;
-                        }
-                        if target_count < 16 {
-                            targets[target_count] = unsafe { (*bb_p).terminator.otherwise.v };
-                            target_count = target_count + 1;
-                        }
-                    } else if tk == MIR_TERM_DROP {
-                        targets[target_count] = unsafe { (*bb_p).terminator.drop_target.v };
-                        target_count = target_count + 1;
-                    } else if tk == MIR_TERM_CALL {
-                        targets[target_count] = unsafe { (*bb_p).terminator.call_target.v };
-                        target_count = target_count + 1;
-                    } else if tk == MIR_TERM_ASSERT {
-                        targets[target_count] = unsafe { (*bb_p).terminator.assert_target.v };
-                        target_count = target_count + 1;
-                    } else if tk == MIR_TERM_SUSPEND {
-                        targets[target_count] = unsafe { (*bb_p).terminator.call_target.v };
-                        target_count = target_count + 1;
-                        targets[target_count] = unsafe { (*bb_p).terminator.call_unwind.v };
-                        target_count = target_count + 1;
-                    }
-
+                if unsafe { (*bb_p).has_terminator } {
+                    let target_count = unsafe { cap_term_successors(view((*bb_p).terminator), mut_view(targets)) };
                     let mut tj: usize = 0;
-                    while (tj < target_count) {
+                    while tj < target_count {
                         let tgt_v = targets[tj] as usize;
                         if tgt_v < bb_count {
-                            let tgt_st = unsafe { cap_state_at_mut(bb_in, tgt_v) };
+                            let tgt_bits = unsafe { cap_u64_at_mut(all_bits, mul_usize(tgt_v, words)) };
+                            let tgt_caps = unsafe { mir_cap_at_mut(all_caps, mul_usize(tgt_v, slot_count)) };
+                            let tgt_pos = (unsafe { *cap_u32_at(rpo_pos as *const u32, tgt_v) }) as usize;
                             if (unsafe { *(visited + tgt_v) }) == 0u8 {
-                                let tgt_caps = unsafe { (*tgt_st).caps };
-                                copy_cap_array(tgt_caps, temp.caps as *const MirCap, local_count);
+                                cap_fast_copy(tgt_bits, tgt_caps, temp_bits as *const u64, temp_caps as *const MirCap, words);
                                 unsafe { *(visited + tgt_v) = 1u8; }
-                                changed = true;
+                                if tgt_pos <= rpo_k {
+                                    work_pending = true;
+                                }
                             } else {
-                                let merged = unsafe { merge_cap_states(mut_view(*tgt_st), view(temp), local_count) };
-                                if merged {
-                                    changed = true;
+                                let did_merge = cap_fast_merge(tgt_bits, tgt_caps, temp_bits as *const u64, temp_caps as *const MirCap, words);
+                                if did_merge {
+                                    unsafe { *(visited + tgt_v) = 1u8; }
+                                    if tgt_pos <= rpo_k {
+                                        work_pending = true;
+                                    }
                                 }
                             }
                         }
@@ -1395,36 +2107,35 @@ pub fn own_cap_check(body: view<MirBody>, sink: mut_view<DiagSink>) {
                     }
                 }
             }
-            i = i + 1;
+            rpo_k = rpo_k + 1;
         }
     }
 
-    i = 0;
-    while (i < bb_count) {
-        if (unsafe { *(visited + i) }) != 0u8 {
-            let in_st = unsafe { cap_state_at_mut(bb_in, i) };
-            let in_caps = unsafe { (*in_st).caps };
-            copy_cap_array(temp.caps, in_caps as *const MirCap, local_count);
-            let bb_p = unsafe { mir_bb_at(body.bbs, i) };
+    // Reporting pass in canonical block order `0..bb_count` (exact diagnostic order).
+    let mut rb: usize = 0;
+    while rb < bb_count {
+        if (unsafe { *(visited + rb) }) != 0u8 {
+            let in_bits = unsafe { cap_u64_at(all_bits as *const u64, mul_usize(rb, words)) };
+            let in_caps = unsafe { mir_cap_at(all_caps as *const MirCap, mul_usize(rb, slot_count)) };
+            cap_fast_copy(temp_bits, temp_caps, in_bits, in_caps, words);
+            let bb_p = unsafe { mir_bb_at(body.bbs, rb) };
             unsafe {
-                cap_visit_bb(mut_view(temp), local_count, view(*bb_p), view(*body), i, mut_view(*sink), true);
+                cap_fast_visit_bb(temp_bits, temp_caps, mut_view(fctx), view(*bb_p), view(*body), rb, mut_view(*sink), true);
             }
         }
-        i = i + 1;
+        rb = rb + 1;
     }
 
-    i = 0;
-    while (i < bb_count) {
-        let st_p = unsafe { cap_state_at_mut(bb_in, i) };
-        let caps_p = unsafe { (*st_p).caps };
-        unsafe {
-            heap_free(caps_p as *mut u8, cap_arr_bytes, align_of<MirCap>());
-        }
-        i = i + 1;
-    }
     unsafe {
-        heap_free(bb_in as *mut u8, bb_in_bytes, align_of<CapState>());
-        heap_free(temp.caps as *mut u8, cap_arr_bytes, align_of<MirCap>());
+        if fctx.dropped_ready {
+            heap_free(fctx.dropped_bits as *mut u8, fctx.dropped_words << 3usize, 8);
+        }
+        heap_free(rpo_post as *mut u8, bb4, 4);
+        heap_free(rpo_pos as *mut u8, bb4, 4);
         heap_free(visited, bb_count, 1);
+        heap_free(all_caps as *mut u8, caps_bytes, align_of<MirCap>());
+        heap_free(all_bits as *mut u8, bits_bytes, 8);
+        heap_free(local_to_slot as *mut u8, lc4, 4);
+        heap_free(slot_to_local as *mut u8, sc4, 4);
     }
 }

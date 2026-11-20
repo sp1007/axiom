@@ -39,6 +39,7 @@ use compiler.mir.mir.MIR_LOCAL_CONST
 use compiler.mir.mir.MIR_OP_COPY
 use compiler.mir.mir.MIR_OP_MOVE
 use compiler.mir.mir.MIR_PROJ_DEREF
+use compiler.mir.mir.MIR_PROJ_FIELD
 use compiler.mir.mir.MIR_RVALUE_AGGREGATE
 use compiler.mir.mir.MIR_RVALUE_BINARY_OP
 use compiler.mir.mir.MIR_RVALUE_CAST
@@ -69,6 +70,7 @@ use compiler.mir.mir.MirOperand
 use compiler.mir.mir.MirPlace
 use compiler.mir.mir.MirRvalue
 use compiler.mir.mir.MirStmt
+use compiler.mir.mir.MirTerminator
 use compiler.mir.mir.mir_bb_at
 use compiler.mir.mir.mir_bb_id_at
 use compiler.mir.mir.mir_copy_place
@@ -81,6 +83,7 @@ use compiler.own.cap.MirCapTracker
 use compiler.own.cap.mir_cap_tracker_add
 use compiler.own.cap.own_cap_check
 use compiler.own.move.OWN_MOVED
+use compiler.own.move.OWN_NODE_NONE
 use compiler.own.move.OWN_OWNED
 use compiler.own.move.OWN_PARTIAL
 use compiler.own.move.OWN_UNINIT
@@ -92,6 +95,7 @@ use compiler.own.move.merge_states
 use compiler.own.move.own_state_at
 use compiler.own.move.own_state_at_mut
 use compiler.own.move.own_u32_at
+use compiler.own.move.own_u32_at_mut
 use compiler.own.move.path_ctx_free
 use compiler.own.move.path_ctx_init
 use compiler.own.move.path_node_at
@@ -443,15 +447,572 @@ fn copy_own_states(dst: *mut OwnStateInfo, src: *const OwnStateInfo, count: usiz
     }
 }
 
-pub fn own_check(
+unsafe fn own_u64_at(base: *const u64, idx: usize) -> *const u64 {
+    ((base as usize) + (idx << 3usize)) as *const u64
+}
+
+unsafe fn own_u64_at_mut(base: *mut u64, idx: usize) -> *mut u64 {
+    ((base as usize) + (idx << 3usize)) as *mut u64
+}
+
+fn own_bit_test(bits: *const u64, node: usize) -> bool {
+    let w = unsafe { *own_u64_at(bits, node >> 6usize) };
+    (w & (1u64 << ((node & 63usize) as u64))) != 0u64
+}
+
+fn own_bit_set(bits: *mut u64, node: usize) {
+    let wp = unsafe { own_u64_at_mut(bits, node >> 6usize) };
+    unsafe { *wp = (*wp) | (1u64 << ((node & 63usize) as u64)); }
+}
+
+fn own_bit_clear(bits: *mut u64, node: usize) {
+    let wp = unsafe { own_u64_at_mut(bits, node >> 6usize) };
+    unsafe { *wp = (*wp) & (~(1u64 << ((node & 63usize) as u64))); }
+}
+
+fn own_bits_copy(dst: *mut u64, src: *const u64, words: usize) {
+    let mut w: usize = 0;
+    while w < words {
+        unsafe { *own_u64_at_mut(dst, w) = *own_u64_at(src, w); }
+        w = w + 1;
+    }
+}
+
+fn own_bits_merge(dst: *mut u64, src: *const u64, words: usize) -> bool {
+    let mut changed = false;
+    let mut w: usize = 0;
+    while w < words {
+        let dw = unsafe { *own_u64_at(dst as *const u64, w) };
+        let sw = unsafe { *own_u64_at(src, w) };
+        let nw = dw & sw;
+        if nw != dw {
+            unsafe { *own_u64_at_mut(dst, w) = nw; }
+            changed = true;
+        }
+        w = w + 1;
+    }
+    changed
+}
+
+fn own_bits_mark(bits: *mut u64, ctx: view<PathCtx>, node: u32, is_owned: bool) {
+    if is_owned {
+        own_bit_set(bits, node as usize);
+    } else {
+        own_bit_clear(bits, node as usize);
+    }
+    let np = unsafe { path_node_at(ctx.nodes as *const PathNode, node as usize) };
+    let nchild = unsafe { (*np).num_children };
+    if nchild > 0u32 {
+        let fchild = unsafe { (*np).first_child };
+        let mut i: u32 = 0u32;
+        while i < nchild {
+            own_bits_mark(bits, ctx, fchild + i, is_owned);
+            i = i + 1u32;
+        }
+    }
+}
+
+fn own_bits_update_parent(bits: *mut u64, ctx: view<PathCtx>, node: u32) {
+    let mut cur = node;
+    while true {
+        let np = unsafe { path_node_at(ctx.nodes as *const PathNode, cur as usize) };
+        let p = unsafe { (*np).parent };
+        if p == OWN_NODE_NONE {
+            return;
+        }
+        let pnp = unsafe { path_node_at(ctx.nodes as *const PathNode, p as usize) };
+        let nchild = unsafe { (*pnp).num_children };
+        let fchild = unsafe { (*pnp).first_child };
+        let mut all_init = true;
+        let mut i: u32 = 0u32;
+        while i < nchild {
+            if !own_bit_test(bits as *const u64, (fchild + i) as usize) {
+                all_init = false;
+                break;
+            }
+            i = i + 1u32;
+        }
+        if all_init {
+            own_bit_set(bits, p as usize);
+        } else {
+            own_bit_clear(bits, p as usize);
+        }
+        cur = p;
+    }
+}
+
+fn own_bits_resolve(ctx: view<PathCtx>, place: view<MirPlace>, out_had_deref: mut_view<bool>) -> u32 {
+    *out_had_deref = false;
+    let lv = place.local.v as usize;
+    if lv >= ctx.local_count {
+        return 0u32;
+    }
+    let mut node = unsafe { *own_u32_at(ctx.local_roots as *const u32, lv) };
+    if place.proj_count == 0 {
+        return node;
+    }
+    let mut i: usize = 0;
+    while i < place.proj_count {
+        let pr = unsafe { mir_proj_at(place.projs, i) };
+        let pk = unsafe { (*pr).kind };
+        if pk == MIR_PROJ_DEREF {
+            *out_had_deref = true;
+            return node;
+        }
+        if pk == MIR_PROJ_FIELD {
+            let f = unsafe { (*pr).field_idx };
+            let np = unsafe { path_node_at(ctx.nodes as *const PathNode, node as usize) };
+            let nchild = unsafe { (*np).num_children };
+            if f < nchild {
+                node = (unsafe { (*np).first_child }) + f;
+            }
+        }
+        i = i + 1;
+    }
+    node
+}
+
+fn own_bits_check_use(bits: *const u64, ctx: view<PathCtx>, place: view<MirPlace>, check_errors: bool, found_error: mut_view<bool>) {
+    if !check_errors || (*found_error) {
+        return;
+    }
+    let mut had_deref = false;
+    let node = own_bits_resolve(ctx, place, mut_view(had_deref));
+    if !own_bit_test(bits, node as usize) {
+        *found_error = true;
+    }
+}
+
+fn own_bits_do_move(bits: *mut u64, ctx: view<PathCtx>, place: view<MirPlace>, check_errors: bool, found_error: mut_view<bool>) {
+    let mut had_deref = false;
+    let node = own_bits_resolve(ctx, place, mut_view(had_deref));
+    if had_deref {
+        if check_errors && !(*found_error) && !own_bit_test(bits as *const u64, node as usize) {
+            *found_error = true;
+        }
+        return;
+    }
+    let np = unsafe { path_node_at(ctx.nodes as *const PathNode, node as usize) };
+    if !(unsafe { (*np).is_copy }) {
+        own_bits_mark(bits, ctx, node, false);
+        if (unsafe { (*np).parent }) != OWN_NODE_NONE {
+            own_bits_update_parent(bits, ctx, node);
+        }
+    }
+}
+
+fn own_bits_do_assign(bits: *mut u64, ctx: view<PathCtx>, place: view<MirPlace>, check_errors: bool, found_error: mut_view<bool>) {
+    let mut had_deref = false;
+    let node = own_bits_resolve(ctx, place, mut_view(had_deref));
+    if had_deref {
+        if check_errors && !(*found_error) && !own_bit_test(bits as *const u64, node as usize) {
+            *found_error = true;
+        }
+        return;
+    }
+    let np = unsafe { path_node_at(ctx.nodes as *const PathNode, node as usize) };
+    if (unsafe { (*np).num_children }) == 0u32 && (unsafe { (*np).parent }) == OWN_NODE_NONE {
+        own_bit_set(bits, node as usize);
+        return;
+    }
+    own_bits_mark(bits, ctx, node, true);
+    if (unsafe { (*np).parent }) != OWN_NODE_NONE {
+        own_bits_update_parent(bits, ctx, node);
+    }
+}
+
+fn own_bits_use_and_move(bits: *mut u64, ctx: view<PathCtx>, place: view<MirPlace>, check_errors: bool, found_error: mut_view<bool>) {
+    let mut had_deref = false;
+    let node = own_bits_resolve(ctx, place, mut_view(had_deref));
+    if check_errors && !(*found_error) && !own_bit_test(bits as *const u64, node as usize) {
+        *found_error = true;
+    }
+    if had_deref {
+        return;
+    }
+    let np = unsafe { path_node_at(ctx.nodes as *const PathNode, node as usize) };
+    if !(unsafe { (*np).is_copy }) {
+        own_bits_mark(bits, ctx, node, false);
+        if (unsafe { (*np).parent }) != OWN_NODE_NONE {
+            own_bits_update_parent(bits, ctx, node);
+        }
+    }
+}
+
+fn own_bits_visit_operand(bits: *mut u64, ctx: view<PathCtx>, op: view<MirOperand>, check_errors: bool, found_error: mut_view<bool>) {
+    if op.kind == MIR_OP_COPY || op.kind == MIR_OP_MOVE {
+        own_bits_use_and_move(bits, ctx, view(op.place), check_errors, found_error);
+    }
+}
+
+fn own_bits_visit_rvalue(bits: *mut u64, ctx: view<PathCtx>, rv: view<MirRvalue>, check_errors: bool, found_error: mut_view<bool>) {
+    let k = rv.kind;
+    if k == MIR_RVALUE_USE || k == MIR_RVALUE_REPEAT || k == MIR_RVALUE_CAST || k == MIR_RVALUE_UNARY_OP {
+        own_bits_visit_operand(bits, ctx, view(rv.use_op), check_errors, found_error);
+    } else if k == MIR_RVALUE_REF || k == MIR_RVALUE_LEN || k == MIR_RVALUE_DISCRIMINANT {
+        if check_errors {
+            own_bits_check_use(bits as *const u64, ctx, view(rv.place), true, found_error);
+        }
+    } else if k == MIR_RVALUE_BINARY_OP || k == MIR_RVALUE_OVERFLOWS_BINARY_OP {
+        own_bits_visit_operand(bits, ctx, view(rv.lhs), check_errors, mut_view(*found_error));
+        own_bits_visit_operand(bits, ctx, view(rv.rhs), check_errors, found_error);
+    } else if k == MIR_RVALUE_AGGREGATE {
+        let mut i: usize = 0;
+        while i < rv.operand_count {
+            let op = unsafe { mir_op_at(rv.operands, i) };
+            unsafe {
+                own_bits_visit_operand(bits, ctx, view(*op), check_errors, mut_view(*found_error));
+            }
+            i = i + 1;
+        }
+    }
+}
+
+fn own_bits_visit_bb(
+    bits: *mut u64,
+    ctx: view<PathCtx>,
+    body: view<MirBody>,
+    thir: view<Thir>,
+    bb: view<MirBb>,
+    ret_needs_check: bool,
+    check_errors: bool,
+    found_error: mut_view<bool>
+) {
+    let mut i: usize = 0;
+    while i < bb.stmt_count {
+        let st = unsafe { mir_stmt_at(bb.stmts, i) };
+        let sk = unsafe { (*st).kind };
+        if sk == MIR_STMT_ASSIGN {
+            unsafe {
+                own_bits_visit_rvalue(bits, ctx, view((*st).rvalue), check_errors, mut_view(*found_error));
+                own_bits_do_assign(bits, ctx, view((*st).place), check_errors, mut_view(*found_error));
+            }
+        } else if sk == MIR_STMT_DROP {
+            unsafe {
+                own_bits_use_and_move(bits, ctx, view((*st).place), check_errors, mut_view(*found_error));
+            }
+        }
+        i = i + 1;
+    }
+    if !bb.has_terminator {
+        return;
+    }
+    let tk = bb.terminator.kind;
+    if tk == MIR_TERM_SWITCH_INT {
+        own_bits_visit_operand(bits, ctx, view(bb.terminator.discr), check_errors, found_error);
+    } else if tk == MIR_TERM_DROP {
+        if bb.terminator.expected {
+            own_bits_use_and_move(bits, ctx, view(bb.terminator.drop_place), check_errors, found_error);
+        } else {
+            own_bits_do_move(bits, ctx, view(bb.terminator.drop_place), check_errors, found_error);
+        }
+    } else if tk == MIR_TERM_CALL {
+        let mut moves_callee = true;
+        let fk = bb.terminator.func.kind;
+        if fk == MIR_OP_COPY || fk == MIR_OP_MOVE {
+            let flocal = bb.terminator.func.place.local.v as usize;
+            if flocal < body.local_count {
+                let ldecl = unsafe { mir_local_at(body.locals, flocal) };
+                let cty_v = unsafe { (*ldecl).ty.v };
+                let t = type_get(view(thir.interner), TypeId { v: cty_v });
+                if (t as usize) != 0 {
+                    let t_kind = unsafe { (*t).kind };
+                    if t_kind == TY_CLOSURE {
+                        let mut has_move = false;
+                        let cap_cnt = unsafe { (*t).capture_count };
+                        let caps = unsafe { (*t).captures };
+                        let mut ci: usize = 0;
+                        while ci < cap_cnt {
+                            let cp = unsafe { closure_cap_at(caps as *const ClosureCapture, ci) };
+                            if (unsafe { (*cp).mode }) == CAP_MOVE {
+                                has_move = true;
+                                break;
+                            }
+                            ci = ci + 1;
+                        }
+                        if !has_move {
+                            moves_callee = false;
+                        }
+                    } else if t_kind == TY_PARAM {
+                        moves_callee = false;
+                    }
+                }
+            }
+        }
+        if moves_callee {
+            own_bits_visit_operand(bits, ctx, view(bb.terminator.func), check_errors, mut_view(*found_error));
+        } else {
+            own_bits_check_use(bits as *const u64, ctx, view(bb.terminator.func.place), check_errors, mut_view(*found_error));
+        }
+        let mut a: usize = 0;
+        while a < bb.terminator.arg_count {
+            let arg_op = unsafe { mir_op_at(bb.terminator.args, a) };
+            unsafe {
+                own_bits_visit_operand(bits, ctx, view(*arg_op), check_errors, mut_view(*found_error));
+            }
+            a = a + 1;
+        }
+        own_bits_do_assign(bits, ctx, view(bb.terminator.destination), check_errors, found_error);
+    } else if tk == MIR_TERM_SUSPEND {
+        own_bits_use_and_move(bits, ctx, view(bb.terminator.drop_place), check_errors, mut_view(*found_error));
+        own_bits_do_assign(bits, ctx, view(bb.terminator.destination), check_errors, found_error);
+    } else if tk == MIR_TERM_ASSERT {
+        own_bits_visit_operand(bits, ctx, view(bb.terminator.cond), check_errors, found_error);
+    } else if tk == MIR_TERM_RETURN {
+        if ret_needs_check && check_errors && !(*found_error) {
+            let rnode = if ctx.local_count > 0 {
+                unsafe { *own_u32_at(ctx.local_roots as *const u32, 0) }
+            } else {
+                0u32
+            };
+            if !own_bit_test(bits as *const u64, rnode as usize) {
+                *found_error = true;
+            }
+        }
+    }
+}
+
+fn own_term_successors(t: view<MirTerminator>, out: mut_view<[16]u32>) -> usize {
+    let tk = t.kind;
+    let mut n: usize = 0;
+    if tk == MIR_TERM_GOTO {
+        (*out)[n] = t.goto_target.v;
+        n = n + 1;
+    } else if tk == MIR_TERM_SWITCH_INT {
+        let mut sj: usize = 0;
+        while sj < t.switch_count && n < 15 {
+            let tid = unsafe { (*mir_bb_id_at(t.targets, sj)).v };
+            (*out)[n] = tid;
+            n = n + 1;
+            sj = sj + 1;
+        }
+        if n < 16 {
+            (*out)[n] = t.otherwise.v;
+            n = n + 1;
+        }
+    } else if tk == MIR_TERM_DROP {
+        (*out)[n] = t.drop_target.v;
+        n = n + 1;
+    } else if tk == MIR_TERM_CALL {
+        (*out)[n] = t.call_target.v;
+        n = n + 1;
+    } else if tk == MIR_TERM_SUSPEND {
+        (*out)[n] = t.call_target.v;
+        n = n + 1;
+    } else if tk == MIR_TERM_ASSERT {
+        (*out)[n] = t.assert_target.v;
+        n = n + 1;
+    }
+    n
+}
+
+fn own_compute_rpo(body: view<MirBody>, rpo_post: *mut u32, rpo_pos: *mut u32) -> usize {
+    let bb_count = body.bb_count;
+    let vis = unsafe { heap_alloc(bb_count, 1) };
+    let bb4 = bb_count << 2usize;
+    let stack_bb = unsafe { heap_alloc(bb4, 4) } as *mut u32;
+    let stack_ei = unsafe { heap_alloc(bb4, 4) } as *mut u32;
+    let mut k: usize = 0;
+    while k < bb_count {
+        unsafe {
+            *(vis + k) = 0u8;
+            *own_u32_at_mut(rpo_pos, k) = OWN_NODE_NONE;
+        }
+        k = k + 1;
+    }
+    unsafe {
+        *vis = 1u8;
+        *own_u32_at_mut(stack_bb, 0) = 0u32;
+        *own_u32_at_mut(stack_ei, 0) = 0u32;
+    }
+    let mut sp: usize = 1;
+    let mut post_len: usize = 0;
+    let mut targets: [16]u32 = [0u32; 16];
+    while sp > 0 {
+        let top = sp - 1;
+        let u = (unsafe { *own_u32_at(stack_bb as *const u32, top) }) as usize;
+        let ei = (unsafe { *own_u32_at(stack_ei as *const u32, top) }) as usize;
+        let bb_p = unsafe { mir_bb_at(body.bbs, u) };
+        let tcnt = if unsafe { (*bb_p).has_terminator } {
+            unsafe { own_term_successors(view((*bb_p).terminator), mut_view(targets)) }
+        } else {
+            0
+        };
+        if ei < tcnt {
+            unsafe { *own_u32_at_mut(stack_ei, top) = (ei + 1) as u32; }
+            let v = targets[ei] as usize;
+            if v < bb_count && (unsafe { *(vis + v) }) == 0u8 {
+                unsafe {
+                    *(vis + v) = 1u8;
+                    *own_u32_at_mut(stack_bb, sp) = v as u32;
+                    *own_u32_at_mut(stack_ei, sp) = 0u32;
+                }
+                sp = sp + 1;
+            }
+        } else {
+            sp = sp - 1;
+            unsafe { *own_u32_at_mut(rpo_post, post_len) = u as u32; }
+            post_len = post_len + 1;
+        }
+    }
+    k = 0;
+    while k < post_len {
+        let u = (unsafe { *own_u32_at(rpo_post as *const u32, post_len - 1 - k) }) as usize;
+        unsafe { *own_u32_at_mut(rpo_pos, u) = k as u32; }
+        k = k + 1;
+    }
+    unsafe {
+        heap_free(vis, bb_count, 1);
+        heap_free(stack_bb as *mut u8, bb4, 4);
+        heap_free(stack_ei as *mut u8, bb4, 4);
+    }
+    post_len
+}
+
+// Exact full 4-state OwnStateInfo solver (with `move_loc` span tracking), invoked ONLY when the
+// 1-bit fast path proves an ownership or definite-init violation exists in `body`.
+fn own_check_exact_fallback(
+    body: mut_view<MirBody>,
+    thir: view<Thir>,
+    sink: mut_view<DiagSink>,
+    ctx: *const PathCtx,
+    arg_count: usize,
+    rpo_post: *const u32,
+    rpo_pos: *const u32,
+    rpo_len: usize
+) {
+    let bb_count = body.bb_count;
+    let ctx_cnt = unsafe { (*ctx).count };
+    let node_count = if ctx_cnt > 0 { ctx_cnt } else { 1 };
+    let total_cells = mul_usize(bb_count + 1, node_count);
+    let all_bytes = mul_usize(total_cells, size_of<OwnStateInfo>());
+    let all_rows = unsafe { heap_alloc(all_bytes, align_of<OwnStateInfo>()) } as *mut OwnStateInfo;
+
+    let mut j: usize = 0;
+    while j < ctx_cnt {
+        let cell = unsafe { own_state_at_mut(all_rows, j) };
+        unsafe {
+            (*cell).state = OWN_UNINIT;
+            (*cell).move_loc.file.v = 0u32;
+            (*cell).move_loc.start = 0u32;
+            (*cell).move_loc.end = 0u32;
+        }
+        j = j + 1;
+    }
+
+    let zero_loc = Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 };
+    let lroots = unsafe { (*ctx).local_roots as *const u32 };
+    let mut ai: usize = 0;
+    while ai < arg_count {
+        if ai + 1 < body.local_count {
+            let root_idx = unsafe { *own_u32_at(lroots, ai + 1) };
+            unsafe { mark_state(all_rows, view(*ctx), root_idx, OWN_OWNED, own_span_copy(view(zero_loc))); }
+        }
+        ai = ai + 1;
+    }
+    ai = 0;
+    while ai < body.local_count {
+        let ldecl = unsafe { mir_local_at(body.locals, ai) };
+        let lk = unsafe { (*ldecl).kind };
+        if lk == MIR_LOCAL_ARG || lk == MIR_LOCAL_CONST {
+            let root_idx = unsafe { *own_u32_at(lroots, ai) };
+            unsafe { mark_state(all_rows, view(*ctx), root_idx, OWN_OWNED, own_span_copy(view(zero_loc))); }
+        }
+        ai = ai + 1;
+    }
+
+    let visited = unsafe { heap_alloc(bb_count, 1) };
+    let mut vi: usize = 0;
+    while vi < bb_count {
+        unsafe { *(visited + vi) = 0u8; }
+        vi = vi + 1;
+    }
+    unsafe { *visited = 1u8; }
+
+    let temp = unsafe { own_state_at_mut(all_rows, mul_usize(bb_count, node_count)) };
+    let mut v = OwnVisitor {
+        state: temp,
+        ctx: ctx,
+        sink: unsafe { address_of_mut(*sink) },
+        report: false,
+        body: unsafe { address_of(*body) },
+        thir: unsafe { address_of(*thir) },
+        cap_tracker: 0 as *mut MirCapTracker,
+        cap_arena: 0 as *mut Arena,
+    };
+    let mut targets: [16]u32 = [0u32; 16];
+
+    let mut work_pending = true;
+    while work_pending {
+        work_pending = false;
+        let mut rpo_k: usize = 0;
+        while rpo_k < rpo_len {
+            let b = (unsafe { *own_u32_at(rpo_post, rpo_len - 1 - rpo_k) }) as usize;
+            if (unsafe { *(visited + b) }) == 1u8 {
+                unsafe { *(visited + b) = 2u8; }
+                let row_b = unsafe { own_state_at(all_rows as *const OwnStateInfo, mul_usize(b, node_count)) };
+                copy_own_states(temp, row_b, ctx_cnt);
+                let bb_p = unsafe { mir_bb_at(body.bbs, b) };
+                unsafe { own_visit_bb(mut_view(v), view(*bb_p)); }
+
+                if unsafe { (*bb_p).has_terminator } {
+                    let target_count = unsafe { own_term_successors(view((*bb_p).terminator), mut_view(targets)) };
+                    let mut tj: usize = 0;
+                    while tj < target_count {
+                        let tgt_v = targets[tj] as usize;
+                        if tgt_v < bb_count {
+                            let tgt_row = unsafe { own_state_at_mut(all_rows, mul_usize(tgt_v, node_count)) };
+                            let tgt_pos = (unsafe { *own_u32_at(rpo_pos, tgt_v) }) as usize;
+                            if (unsafe { *(visited + tgt_v) }) == 0u8 {
+                                copy_own_states(tgt_row, temp as *const OwnStateInfo, ctx_cnt);
+                                unsafe { *(visited + tgt_v) = 1u8; }
+                                if tgt_pos <= rpo_k {
+                                    work_pending = true;
+                                }
+                            } else {
+                                let did_merge = merge_states(tgt_row, temp as *const OwnStateInfo, ctx_cnt);
+                                if did_merge {
+                                    unsafe { *(visited + tgt_v) = 1u8; }
+                                    if tgt_pos <= rpo_k {
+                                        work_pending = true;
+                                    }
+                                }
+                            }
+                        }
+                        tj = tj + 1;
+                    }
+                }
+            }
+            rpo_k = rpo_k + 1;
+        }
+    }
+
+    v.report = true;
+    let mut rb: usize = 0;
+    while rb < bb_count {
+        if (unsafe { *(visited + rb) }) != 0u8 {
+            let row_b = unsafe { own_state_at(all_rows as *const OwnStateInfo, mul_usize(rb, node_count)) };
+            copy_own_states(temp, row_b, ctx_cnt);
+            let bb_p = unsafe { mir_bb_at(body.bbs, rb) };
+            unsafe { own_visit_bb(mut_view(v), view(*bb_p)); }
+        }
+        rb = rb + 1;
+    }
+
+    unsafe {
+        heap_free(visited, bb_count, 1);
+        heap_free(all_rows as *mut u8, all_bytes, align_of<OwnStateInfo>());
+    }
+}
+
+pub fn own_check_init_only(
     it: *const HirItem,
     body: mut_view<MirBody>,
     thir: view<Thir>,
     sink: mut_view<DiagSink>,
     str_in: view<StrInterner>
 ) {
-    own_cap_check(view(*body), mut_view(*sink));
-    if body.bb_count == 0 {
+    if body.bb_count == 0 || sink.errors > 0 {
         return;
     }
 
@@ -468,37 +1029,13 @@ pub fn own_check(
     let bb_count = body.bb_count;
     let ctx_cnt = unsafe { (*ctx).count };
     let node_count = if ctx_cnt > 0 { ctx_cnt } else { 1 };
-    let state_arr_bytes = mul_usize(node_count, size_of<OwnStateInfo>());
-    let bb_in_bytes = mul_usize(bb_count, size_of<*mut OwnStateInfo>());
-    let bb_in = unsafe { heap_alloc(bb_in_bytes, align_of<*mut OwnStateInfo>()) } as *mut *mut OwnStateInfo;
-
-    let mut i: usize = 0;
-    while (i < bb_count) {
-        let row = unsafe { heap_alloc(state_arr_bytes, align_of<OwnStateInfo>()) } as *mut OwnStateInfo;
-        if i == 0 {
-            let mut j: usize = 0;
-            while (j < ctx_cnt) {
-                let cell = unsafe { own_state_at_mut(row, j) };
-                unsafe {
-                    (*cell).state = OWN_UNINIT;
-                    (*cell).move_loc.file.v = 0u32;
-                    (*cell).move_loc.start = 0u32;
-                    (*cell).move_loc.end = 0u32;
-                }
-                j = j + 1;
-            }
-        } else {
-            copy_own_states(row, unsafe { *own_state_ptr_at_mut(bb_in, 0) } as *const OwnStateInfo, ctx_cnt);
-        }
-        unsafe { *own_state_ptr_at_mut(bb_in, i) = row; }
-        i = i + 1;
-    }
+    let words = (node_count + 63) >> 6usize;
 
     let mut arg_count: usize = body.arg_count;
     if (it as usize) != 0 && (unsafe { (*it).kind }) == HIR_ITEM_FN {
         let mut p_cnt: usize = 0;
         let mut p = unsafe { (*it).params as *const HirParam };
-        while ((p as usize) != 0) {
+        while (p as usize) != 0 {
             p_cnt = p_cnt + 1;
             p = unsafe { (*p).next as *const HirParam };
         }
@@ -507,120 +1044,121 @@ pub fn own_check(
         }
     }
 
-    let zero_loc = Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 };
-    let bb0_row = unsafe { *own_state_ptr_at_mut(bb_in, 0) };
-    let lroots = unsafe { (*ctx).local_roots as *const u32 };
-    i = 0;
-    while (i < arg_count) {
-        if i + 1 < body.local_count {
-            let root_p = unsafe { own_u32_at(lroots, i + 1) };
-            let root_idx = unsafe { *root_p };
-            unsafe {
-                mark_state(bb0_row, view(*ctx), root_idx, OWN_OWNED, own_span_copy(view(zero_loc)));
+    let mut ret_needs_check = true;
+    if body.local_count > 0 {
+        let ldecl0 = unsafe { mir_local_at(body.locals, 0) };
+        let rty_v = unsafe { (*ldecl0).ty.v };
+        let rty = type_get(view(thir.interner), TypeId { v: rty_v });
+        if (rty as usize) != 0 {
+            let rtk = unsafe { (*rty).kind };
+            if rtk == TY_UNIT || rtk == TY_NEVER {
+                ret_needs_check = false;
             }
         }
-        i = i + 1;
     }
-    i = 0;
-    while (i < body.local_count) {
-        let ldecl = unsafe { mir_local_at(body.locals, i) };
+
+    // 1-bit definite-ownership fast path: 64 path nodes per u64 (128x smaller than OwnStateInfo).
+    // Exact homomorphism of the 4-state lattice for `state == OWN_OWNED`; falls back to
+    // `own_check_exact_fallback` only if a violation is found so diagnostics/spans are identical.
+    let total_words = mul_usize(bb_count + 1, words);
+    let bits_bytes = total_words << 3usize;
+    let all_bits = unsafe { heap_alloc(bits_bytes, 8) } as *mut u64;
+
+    let mut wi: usize = 0;
+    while wi < words {
+        unsafe { *own_u64_at_mut(all_bits, wi) = 0u64; }
+        wi = wi + 1;
+    }
+
+    let lroots = unsafe { (*ctx).local_roots as *const u32 };
+    let mut ai: usize = 0;
+    while ai < arg_count {
+        if ai + 1 < body.local_count {
+            let root_idx = unsafe { *own_u32_at(lroots, ai + 1) };
+            unsafe { own_bits_mark(all_bits, view(*ctx), root_idx, true); }
+        }
+        ai = ai + 1;
+    }
+    ai = 0;
+    while ai < body.local_count {
+        let ldecl = unsafe { mir_local_at(body.locals, ai) };
         let lk = unsafe { (*ldecl).kind };
         if lk == MIR_LOCAL_ARG || lk == MIR_LOCAL_CONST {
-            let root_p = unsafe { own_u32_at(lroots, i) };
-            let root_idx = unsafe { *root_p };
-            unsafe {
-                mark_state(bb0_row, view(*ctx), root_idx, OWN_OWNED, own_span_copy(view(zero_loc)));
-            }
+            let root_idx = unsafe { *own_u32_at(lroots, ai) };
+            unsafe { own_bits_mark(all_bits, view(*ctx), root_idx, true); }
         }
-        i = i + 1;
+        ai = ai + 1;
     }
 
     let visited = unsafe { heap_alloc(bb_count, 1) };
-    i = 0;
-    while (i < bb_count) {
-        unsafe { *(visited + i) = 0u8; }
-        i = i + 1;
+    let mut vi: usize = 0;
+    while vi < bb_count {
+        unsafe { *(visited + vi) = 0u8; }
+        vi = vi + 1;
     }
     unsafe { *visited = 1u8; }
 
-    // T485: the capability tracker that used to be filled here was never read (own_cap_check is
-    // the capability analysis); a null tracker makes own_visit_rvalue skip it.
-    let temp = unsafe { heap_alloc(state_arr_bytes, align_of<OwnStateInfo>()) } as *mut OwnStateInfo;
+    let bb4 = bb_count << 2usize;
+    let rpo_post = unsafe { heap_alloc(bb4, 4) } as *mut u32;
+    let rpo_pos = unsafe { heap_alloc(bb4, 4) } as *mut u32;
+    let rpo_len = own_compute_rpo(view(*body), rpo_post, rpo_pos);
 
-    let mut v = OwnVisitor {
-        state: temp,
-        ctx: ctx as *const PathCtx,
-        sink: unsafe { address_of_mut(*sink) },
-        report: false,
-        body: unsafe { address_of(*body) },
-        thir: unsafe { address_of(*thir) },
-        cap_tracker: 0 as *mut MirCapTracker,
-        cap_arena: 0 as *mut Arena,
-    };
+    let temp_bits = unsafe { own_u64_at_mut(all_bits, mul_usize(bb_count, words)) };
+    let mut targets: [16]u32 = [0u32; 16];
+    let mut found_error = false;
+    let mut need_recheck = false;
+    let mut is_first_pass = true;
 
-    let mut changed = true;
-    while changed {
-        changed = false;
-        i = 0;
-        while (i < bb_count) {
-            if (unsafe { *(visited + i) }) != 0u8 {
-                let row_i = unsafe { *own_state_ptr_at_mut(bb_in, i) };
-                copy_own_states(temp, row_i as *const OwnStateInfo, ctx_cnt);
-                let bb_p = unsafe { mir_bb_at(body.bbs, i) };
+    let mut work_pending = true;
+    while work_pending && !found_error {
+        work_pending = false;
+        let check_now = is_first_pass;
+        let mut rpo_k: usize = 0;
+        while rpo_k < rpo_len && !found_error {
+            let b = (unsafe { *own_u32_at(rpo_post as *const u32, rpo_len - 1 - rpo_k) }) as usize;
+            if (unsafe { *(visited + b) }) == 1u8 {
+                unsafe { *(visited + b) = 2u8; }
+                let row_b = unsafe { own_u64_at(all_bits as *const u64, mul_usize(b, words)) };
+                own_bits_copy(temp_bits, row_b, words);
+                let bb_p = unsafe { mir_bb_at(body.bbs, b) };
                 unsafe {
-                    own_visit_bb(mut_view(v), view(*bb_p));
+                    own_bits_visit_bb(
+                        temp_bits,
+                        view(*ctx),
+                        view(*body),
+                        thir,
+                        view(*bb_p),
+                        ret_needs_check,
+                        check_now,
+                        mut_view(found_error)
+                    );
                 }
-
-                let has_term = unsafe { (*bb_p).has_terminator };
-                if has_term {
-                    let tk = unsafe { (*bb_p).terminator.kind };
-                    let mut targets: [16]u32 = [0u32; 16];
-                    let mut target_count: usize = 0;
-
-                    if tk == MIR_TERM_GOTO {
-                        targets[target_count] = unsafe { (*bb_p).terminator.goto_target.v };
-                        target_count = target_count + 1;
-                    } else if tk == MIR_TERM_SWITCH_INT {
-                        let sc = unsafe { (*bb_p).terminator.switch_count };
-                        let tgts = unsafe { (*bb_p).terminator.targets };
-                        let mut sj: usize = 0;
-                        while (sj < sc && target_count < 15) {
-                            let tid = unsafe { (*mir_bb_id_at(tgts, sj)).v };
-                            targets[target_count] = tid;
-                            target_count = target_count + 1;
-                            sj = sj + 1;
-                        }
-                        if target_count < 16 {
-                            targets[target_count] = unsafe { (*bb_p).terminator.otherwise.v };
-                            target_count = target_count + 1;
-                        }
-                    } else if tk == MIR_TERM_DROP {
-                        targets[target_count] = unsafe { (*bb_p).terminator.drop_target.v };
-                        target_count = target_count + 1;
-                    } else if tk == MIR_TERM_CALL {
-                        targets[target_count] = unsafe { (*bb_p).terminator.call_target.v };
-                        target_count = target_count + 1;
-                    } else if tk == MIR_TERM_SUSPEND {
-                        targets[target_count] = unsafe { (*bb_p).terminator.call_target.v };
-                        target_count = target_count + 1;
-                    } else if tk == MIR_TERM_ASSERT {
-                        targets[target_count] = unsafe { (*bb_p).terminator.assert_target.v };
-                        target_count = target_count + 1;
-                    }
-
+                if found_error {
+                    break;
+                }
+                if unsafe { (*bb_p).has_terminator } {
+                    let target_count = unsafe { own_term_successors(view((*bb_p).terminator), mut_view(targets)) };
                     let mut tj: usize = 0;
-                    while (tj < target_count) {
+                    while tj < target_count {
                         let tgt_v = targets[tj] as usize;
                         if tgt_v < bb_count {
-                            let tgt_row = unsafe { *own_state_ptr_at_mut(bb_in, tgt_v) };
+                            let tgt_row = unsafe { own_u64_at_mut(all_bits, mul_usize(tgt_v, words)) };
+                            let tgt_pos = (unsafe { *own_u32_at(rpo_pos as *const u32, tgt_v) }) as usize;
                             if (unsafe { *(visited + tgt_v) }) == 0u8 {
-                                copy_own_states(tgt_row, temp as *const OwnStateInfo, ctx_cnt);
+                                own_bits_copy(tgt_row, temp_bits as *const u64, words);
                                 unsafe { *(visited + tgt_v) = 1u8; }
-                                changed = true;
+                                if tgt_pos <= rpo_k {
+                                    work_pending = true;
+                                    need_recheck = true;
+                                }
                             } else {
-                                let merged = merge_states(tgt_row, temp as *const OwnStateInfo, ctx_cnt);
-                                if merged {
-                                    changed = true;
+                                let did_merge = own_bits_merge(tgt_row, temp_bits as *const u64, words);
+                                if did_merge {
+                                    unsafe { *(visited + tgt_v) = 1u8; }
+                                    if tgt_pos <= rpo_k {
+                                        work_pending = true;
+                                        need_recheck = true;
+                                    }
                                 }
                             }
                         }
@@ -628,37 +1166,69 @@ pub fn own_check(
                     }
                 }
             }
-            i = i + 1;
+            rpo_k = rpo_k + 1;
         }
+        is_first_pass = false;
     }
 
-    v.report = true;
-    i = 0;
-    while (i < bb_count) {
-        if (unsafe { *(visited + i) }) != 0u8 {
-            let row_i = unsafe { *own_state_ptr_at_mut(bb_in, i) };
-            copy_own_states(temp, row_i as *const OwnStateInfo, ctx_cnt);
-            let bb_p = unsafe { mir_bb_at(body.bbs, i) };
-            unsafe {
-                own_visit_bb(mut_view(v), view(*bb_p));
+    if !found_error && need_recheck {
+        let mut rpo_k: usize = 0;
+        while rpo_k < rpo_len && !found_error {
+            let b = (unsafe { *own_u32_at(rpo_post as *const u32, rpo_len - 1 - rpo_k) }) as usize;
+            if (unsafe { *(visited + b) }) != 0u8 {
+                let row_b = unsafe { own_u64_at(all_bits as *const u64, mul_usize(b, words)) };
+                own_bits_copy(temp_bits, row_b, words);
+                let bb_p = unsafe { mir_bb_at(body.bbs, b) };
+                unsafe {
+                    own_bits_visit_bb(
+                        temp_bits,
+                        view(*ctx),
+                        view(*body),
+                        thir,
+                        view(*bb_p),
+                        ret_needs_check,
+                        true,
+                        mut_view(found_error)
+                    );
+                }
             }
+            rpo_k = rpo_k + 1;
         }
-        i = i + 1;
     }
 
-    i = 0;
-    while (i < bb_count) {
-        let row_i = unsafe { *own_state_ptr_at_mut(bb_in, i) };
-        unsafe {
-            heap_free(row_i as *mut u8, state_arr_bytes, align_of<OwnStateInfo>());
-        }
-        i = i + 1;
-    }
     unsafe {
-        heap_free(bb_in as *mut u8, bb_in_bytes, align_of<*mut OwnStateInfo>());
-        heap_free(temp as *mut u8, state_arr_bytes, align_of<OwnStateInfo>());
         heap_free(visited, bb_count, 1);
+        heap_free(all_bits as *mut u8, bits_bytes, 8);
+    }
+
+    if found_error {
+        own_check_exact_fallback(
+            body,
+            thir,
+            sink,
+            ctx as *const PathCtx,
+            arg_count,
+            rpo_post as *const u32,
+            rpo_pos as *const u32,
+            rpo_len
+        );
+    }
+
+    unsafe {
+        heap_free(rpo_post as *mut u8, bb4, 4);
+        heap_free(rpo_pos as *mut u8, bb4, 4);
         path_ctx_free(mut_view(*ctx));
         heap_free(ctx as *mut u8, size_of<PathCtx>(), align_of<PathCtx>());
     }
+}
+
+pub fn own_check(
+    it: *const HirItem,
+    body: mut_view<MirBody>,
+    thir: view<Thir>,
+    sink: mut_view<DiagSink>,
+    str_in: view<StrInterner>
+) {
+    own_cap_check(view(*body), mut_view(*sink));
+    own_check_init_only(it, body, thir, sink, str_in);
 }

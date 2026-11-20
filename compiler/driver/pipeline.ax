@@ -177,11 +177,17 @@ use compiler.opt.optir.optir_reconstruct_mir
 use compiler.opt.optir.optir_print
 use compiler.opt.optir.memssa_print
 use compiler.opt.optir.optir_inspect_mir_text
+use compiler.own.cap.own_cap_check
+use compiler.own.init.own_check_init_only
 use compiler.verify.verifier.verify_mir
 use compiler.verify.verifier.verify_mir_own
+use compiler.verify.verifier.verify_mir_cap
+use compiler.verify.verifier.verify_mir_drop_flags
 use compiler.verify.verifier.verify_parse_mir
 use compiler.own_mir_verify.session.session_unsafe_check
 use compiler.own_mir_verify.session.session_lower_all_async
+use compiler.own_mir_verify.session.session_mark_body_copy_locals
+use compiler.own_mir_verify.session.session_drop_elaborate_body
 use compiler.own_mir_verify.session.session_own_mir_verify_fn
 use compiler.own_mir_verify.session.session_own_mir_verify_file
 use compiler.own_mir_verify.session.session_emit_mir
@@ -658,6 +664,90 @@ fn format_build_sub_times(out: mut_view<DiagBuffer>, ctx: view<PipelineCtx>, tot
     format_build_sub_line(mut_view(*out), true, 12, rest);
 }
 
+// T493: sub-timers of the `own` phase. Indices into `PipelineCtx.own_ns`, printed as `time-own:` lines.
+const OT_UNSAFE: usize = 0;
+const OT_ASYNC: usize = 1;
+const OT_MIR_BUILD: usize = 2;
+const OT_VERIFY_MIR: usize = 3;
+const OT_OWN_CAP: usize = 4;
+const OT_OWN_INIT: usize = 5;
+const OT_VERIFY_OWN: usize = 6;
+const OT_MIR_DROP: usize = 7;
+const OT_COUNT: usize = 8;
+
+// 8 names of 10 bytes: the `time-own:` sub-timer names, in OT_* order.
+const OWN_SUB_NAMES: [80]u8 = [
+    // "unsafe    "
+    117u8, 110u8, 115u8, 97u8, 102u8, 101u8, 32u8, 32u8, 32u8, 32u8,
+    // "async     "
+    97u8, 115u8, 121u8, 110u8, 99u8, 32u8, 32u8, 32u8, 32u8, 32u8,
+    // "mir_build "
+    109u8, 105u8, 114u8, 95u8, 98u8, 117u8, 105u8, 108u8, 100u8, 32u8,
+    // "verify_mir"
+    118u8, 101u8, 114u8, 105u8, 102u8, 121u8, 95u8, 109u8, 105u8, 114u8,
+    // "own_cap   "
+    111u8, 119u8, 110u8, 95u8, 99u8, 97u8, 112u8, 32u8, 32u8, 32u8,
+    // "own_init  "
+    111u8, 119u8, 110u8, 95u8, 105u8, 110u8, 105u8, 116u8, 32u8, 32u8,
+    // "verify_own"
+    118u8, 101u8, 114u8, 105u8, 102u8, 121u8, 95u8, 111u8, 119u8, 110u8,
+    // "mir_drop  "
+    109u8, 105u8, 114u8, 95u8, 100u8, 114u8, 111u8, 112u8, 32u8, 32u8,
+];
+
+// "time-own: " (10 bytes), "own_rest  " (10 bytes)
+const OWN_SUB_MISC: [20]u8 = [
+    116u8, 105u8, 109u8, 101u8, 45u8, 111u8, 119u8, 110u8, 58u8, 32u8,
+    111u8, 119u8, 110u8, 95u8, 114u8, 101u8, 115u8, 116u8, 32u8, 32u8,
+];
+
+fn ot_add(ctx: mut_view<PipelineCtx>, k: usize, t0: u64) -> u64 {
+    let t1 = monotonic_ns();
+    if t1 > t0 {
+        ctx.own_ns[k] = ctx.own_ns[k] + (t1 - t0);
+    }
+    t1
+}
+
+fn format_own_sub_line(out: mut_view<DiagBuffer>, from_misc: bool, off: usize, elapsed_ns: u64) {
+    let mut i: usize = 0;
+    while i < 10 {
+        diag_buf_push_byte(mut_view(*out), OWN_SUB_MISC[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 10 {
+        let c = if from_misc { OWN_SUB_MISC[off + i] } else { OWN_SUB_NAMES[off + i] };
+        diag_buf_push_byte(mut_view(*out), c);
+        i = i + 1;
+    }
+    diag_buf_push_byte(mut_view(*out), 32u8);
+    let elapsed_i64: i64 = if (elapsed_ns as i64) >= 0i64 { elapsed_ns as i64 } else { 0i64 };
+    let tenths_ms: i64 = (elapsed_i64 + 50000i64) / 100000i64;
+    let secs: u32 = (tenths_ms / 10000i64) as u32;
+    let frac: i32 = (tenths_ms % 10000i64) as i32;
+    diag_buf_push_u32(mut_view(*out), secs);
+    diag_buf_push_byte(mut_view(*out), 46u8);
+    diag_buf_push_byte(mut_view(*out), (((frac / 1000) % 10) as u8) + 48u8);
+    diag_buf_push_byte(mut_view(*out), (((frac / 100) % 10) as u8) + 48u8);
+    diag_buf_push_byte(mut_view(*out), (((frac / 10) % 10) as u8) + 48u8);
+    diag_buf_push_byte(mut_view(*out), ((frac % 10) as u8) + 48u8);
+    push_pipe_str(mut_view(*out), 106, 2);
+}
+
+fn format_own_sub_times(out: mut_view<DiagBuffer>, ctx: view<PipelineCtx>, total_ns: u64) {
+    let mut sum: u64 = 0u64;
+    let mut k: usize = 0;
+    while k < OT_COUNT {
+        let v = ctx.own_ns[k];
+        sum = sum + v;
+        format_own_sub_line(mut_view(*out), false, k * 10, v);
+        k = k + 1;
+    }
+    let rest = if total_ns > sum { total_ns - sum } else { 0u64 };
+    format_own_sub_line(mut_view(*out), true, 10, rest);
+}
+
 // =============================================================================
 // 2. Pipeline Context (`PipelineCtx`) & Stage Execution
 // =============================================================================
@@ -686,6 +776,8 @@ pub struct PipelineCtx {
     pub time_ns: [10]u64,
     // T486: sub-timers of the `build` phase (BT_* indices), printed as `time-build:` lines.
     pub build_ns: [16]u64,
+    // T493: sub-timers of the `own` phase (OT_* indices), printed as `time-own:` lines.
+    pub own_ns: [8]u64,
     pub interp_rc: i32,
     pub panic_msg: StrView,
 }
@@ -753,6 +845,11 @@ pub fn pipeline_ctx_init(ctx: mut_view<PipelineCtx>) {
     while bi < 16 {
         ctx.build_ns[bi] = 0u64;
         bi = bi + 1;
+    }
+    let mut oi: usize = 0;
+    while oi < 8 {
+        ctx.own_ns[oi] = 0u64;
+        oi = oi + 1;
     }
     ctx.interp_rc = 0;
     sv_clear(mut_view(ctx.panic_msg));
@@ -1452,6 +1549,11 @@ pub fn pipeline_stage_typeck(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptio
 }
 
 pub fn pipeline_stage_own(ctx: mut_view<PipelineCtx>) {
+    let mut oi: usize = 0;
+    while oi < 8 {
+        ctx.own_ns[oi] = 0u64;
+        oi = oi + 1;
+    }
     if session_has_errors(view(ctx.sess)) {
         return;
     }
@@ -1467,17 +1569,126 @@ pub fn pipeline_stage_own(ctx: mut_view<PipelineCtx>) {
     let mono_ptr = unsafe { ptr_from_mut(mut_view(ctx.mono)) };
     let filter_fid_v: u32 = if ctx.proj.is_package { 0u32 } else { ctx.main_fid.v };
     let filter_fid = FileId { v: filter_fid_v };
-    let _ = session_own_mir_verify_file(
+
+    let mut t = monotonic_ns();
+    let ok_unsafe = session_unsafe_check(mut_view(ctx.sess), view(ctx.hir), view(ctx.thir));
+    t = ot_add(mut_view(*ctx), OT_UNSAFE, t);
+    if !ok_unsafe {
+        return;
+    }
+
+    session_lower_all_async(
         mut_view(ctx.sess),
         mut_view(ctx.mir_arena),
         view(ctx.hir),
         mut_view(ctx.thir),
-        filter_fid,
-        mono_ptr,
-        true,
-        0 as *mut DiagBuffer,
-        0 as *mut DiagBuffer
+        mono_ptr
     );
+    t = ot_add(mut_view(*ctx), OT_ASYNC, t);
+
+    let thir_ptr = unsafe { ptr_from_mut(mut_view(ctx.thir)) };
+    let hir_ptr = unsafe { address_of(ctx.hir.items) as *const HirFile };
+    let str_in_ptr = unsafe { ptr_from_mut(mut_view(ctx.sess.interner)) };
+    let db_ptr = unsafe { ptr_from_mut(mut_view(ctx.sess.source_db)) as *const SourceDatabase };
+
+    let mut it: *mut HirItem = ctx.hir.items;
+    while (it as usize) != 0 {
+        let it_file = unsafe { (*it).span.file.v };
+        let is_fn = (unsafe { (*it).kind }) == HIR_ITEM_FN;
+        if is_fn && (filter_fid.v == 0u32 || it_file == 0u32 || it_file == filter_fid.v) {
+            if unsafe { (*it).is_async } {
+                let _ = session_own_mir_verify_fn(
+                    mut_view(ctx.sess),
+                    mut_view(ctx.mir_arena),
+                    it,
+                    view(ctx.hir),
+                    mut_view(ctx.thir),
+                    mono_ptr,
+                    true,
+                    0 as *mut DiagBuffer,
+                    0 as *mut DiagBuffer
+                );
+            } else {
+                let pre = mir_prebuilt_get(it as *const HirItem);
+                let mut body = pre;
+                if (body as usize) == 0 {
+                    t = monotonic_ns();
+                    body = mir_build_fn(
+                        mut_view(ctx.mir_arena),
+                        it,
+                        thir_ptr,
+                        hir_ptr,
+                        str_in_ptr,
+                        db_ptr,
+                        mono_ptr
+                    );
+                    t = ot_add(mut_view(*ctx), OT_MIR_BUILD, t);
+                }
+                if (body as usize) != 0 {
+                    t = monotonic_ns();
+                    verify_mir(
+                        unsafe { view(*body) },
+                        thir_ptr as *const Thir,
+                        mut_view(ctx.sess.diag_sink),
+                        it as *const HirItem
+                    );
+                    t = ot_add(mut_view(*ctx), OT_VERIFY_MIR, t);
+
+                    if (pre as usize) == 0 && !(unsafe { (*body).async_lowered }) {
+                        session_mark_body_copy_locals(view(ctx.sess), unsafe { mut_view(*body) }, view(ctx.thir));
+                        t = monotonic_ns();
+                        own_cap_check(unsafe { view(*body) }, mut_view(ctx.sess.diag_sink));
+                        t = ot_add(mut_view(*ctx), OT_OWN_CAP, t);
+
+                        own_check_init_only(
+                            it as *const HirItem,
+                            unsafe { mut_view(*body) },
+                            view(ctx.thir),
+                            mut_view(ctx.sess.diag_sink),
+                            view(ctx.sess.interner)
+                        );
+                        t = ot_add(mut_view(*ctx), OT_OWN_INIT, t);
+
+                        if !session_has_errors(view(ctx.sess)) {
+                            verify_mir_own(
+                                unsafe { view(*body) },
+                                thir_ptr as *const Thir,
+                                mut_view(ctx.sess.diag_sink),
+                                it as *const HirItem
+                            );
+                            verify_mir_cap(
+                                unsafe { view(*body) },
+                                thir_ptr as *const Thir,
+                                mut_view(ctx.sess.diag_sink)
+                            );
+                            t = ot_add(mut_view(*ctx), OT_VERIFY_OWN, t);
+                        }
+                    }
+
+                    if (pre as usize) == 0 && !session_has_errors(view(ctx.sess)) {
+                        t = monotonic_ns();
+                        session_drop_elaborate_body(
+                            mut_view(ctx.sess),
+                            mut_view(ctx.mir_arena),
+                            unsafe { mut_view(*body) },
+                            mut_view(ctx.thir),
+                            view(ctx.hir)
+                        );
+                        if !session_has_errors(view(ctx.sess)) {
+                            verify_mir_drop_flags(
+                                unsafe { view(*body) },
+                                thir_ptr as *const Thir,
+                                mut_view(ctx.sess.diag_sink),
+                                it as *const HirItem
+                            );
+                        }
+                        t = ot_add(mut_view(*ctx), OT_MIR_DROP, t);
+                    }
+                }
+            }
+        }
+        it = unsafe { (*it).next };
+    }
     if !session_has_errors(view(ctx.sess)) {
         pipe_check_spawn_send(ctx);
     }
@@ -1768,6 +1979,9 @@ pub fn pipeline_run_stages(
         ctx.time_ns[s as usize] = elapsed;
         if dopts.time_passes {
             format_pass_time(mut_view(*out_buf), s, elapsed);
+            if s == STAGE_OWN {
+                format_own_sub_times(mut_view(*out_buf), view(*ctx), elapsed);
+            }
         }
         if session_has_errors(view(ctx.sess)) {
             return false;
@@ -2019,6 +2233,7 @@ fn driver_execute_inspect_ctx(
             ctx.time_ns[STAGE_OWN as usize] = elapsed;
             if dopts.time_passes {
                 format_pass_time(mut_view(*out_buf), STAGE_OWN, elapsed);
+                format_own_sub_times(mut_view(*out_buf), view(*ctx), elapsed);
             }
             if session_has_errors(view(ctx.sess)) {
                 ok = false;
