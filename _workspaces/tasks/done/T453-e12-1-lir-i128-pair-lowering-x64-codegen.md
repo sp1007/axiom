@@ -8,14 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T451, T452, T481]
 priority: 143
-status: doing
+status: done
 attempts: 1
-paths: [compiler/lir, compiler/abi, compiler/target/x64, tests/lir/int128, tests/encode/int128, tests/run/int128_native, tests/ui/backend_ice/sat_u128_emit_lir.test, tests/ui/backend_ice/sat_u128_emit_mi.test, tests/ui/backend_ice/sat_u128_emit_mc.test, tests/ui/backend_ice/sat_u128_unsupported.mir]
+paths: [compiler/lir, compiler/abi, compiler/target/x64, tests/lir/int128, tests/encode/int128, tests/run/int128_native, tests/ui/backend_ice/sat_u128_emit_lir.test, tests/ui/backend_ice/sat_u128_emit_mi.test, tests/ui/backend_ice/sat_u128_emit_mc.test, tests/ui/backend_ice/sat_u128_unsupported.mir, tests/ui/backend_ice/sat_u128_lowered.mir]
 locks: [compiler/backend/session.ax, tests/run/int128_interp, tests/opt/int128, tests/encode/axiom/gnu_as_vectors.ax, tests/run/saturating_native]
 spec: [spec/SPEC-40-integers.md, spec/SPEC-04-core-extensibility.md, 0162, 0179, 0181, tasks/0327]
 covers: [REQ-SIMD-027, REQ-SIMD-266, REQ-SIMD-267]
 started: 2026-11-20 22:55:27
-agent: T453-impl
+finished: 2026-11-21 04:34:59
 ---
 # T453 — E12.1 — LIR i128 register-pair lowering & x86-64 native codegen (ADC/SBB/MULX/SHLD/SHRD)
 
@@ -51,3 +51,4 @@ Lower `i128`/`u128` and saturating integer operations through LIR (`AXS-EXT-050`
 - 2026-11-20 22:23:25 locks widened by orchestrator: + tests/encode/axiom/gnu_as_vectors.ax (gen_encode_tests.py check), + tests/run/saturating_native (128-bit row per Acceptance)
 - 2026-11-20 22:55:17 requeue: dead agent from previous session (not charged: attempt refunded)
 - 2026-11-20 22:55:27 started (attempt 1) T453-impl
+- 2026-11-21 04:34:59 accepted by QA -> done

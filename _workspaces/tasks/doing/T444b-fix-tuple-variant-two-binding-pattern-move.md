@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T445]
 priority: 23
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 600
 paths: [tests/run/pattern_multi_binding, tests/ui/pattern_multi_binding]
 locks: [compiler/own/move.ax, compiler/own/init.ax, compiler/mir/builder.ax]
 spec: [spec/decisions/ADR-0043-cyclic-type-graphs-and-symbol-id-space.md, spec/SPEC-10-ownership.md]
 covers: [REQ-OWN-051, REQ-TST-072]
+started: 2026-11-21 01:48:13
+agent: T444b-impl
 ---
 # T444b — Fix: two bindings in one tuple-variant pattern
 
@@ -47,3 +49,4 @@ REQ-OWN-051 requires; the second binding is never reported as a use after move (
 
 ## Log
 - 2026-11-17 created by axiom-architect (T444 report F1; ADR-0043 §4)
+- 2026-11-21 01:48:13 started (attempt 1) T444b-impl
