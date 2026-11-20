@@ -8,14 +8,14 @@ model: opus
 gate_model: opus
 depends: [T164]
 priority: 11
-status: doing
+status: done
 attempts: 1
 paths: [compiler/mir/builder.ax, compiler/traits, tests/run/generic_inherent_field]
 locks: []
 spec: [spec/SPEC-20-selfhost.md]
 covers: [REQ-OPT-292]
 started: 2026-11-20 02:28:33
-agent: T489-impl
+finished: 2026-11-20 08:50:55
 ---
 # T489 — Generic inherent impl: field read returns 0
 
@@ -50,3 +50,4 @@ so a member of a generic INHERENT impl is not monomorphized. Confirm by reading,
 - 2026-11-19 18:41:41 started (attempt 1) T489-impl
 - 2026-11-19 18:43:04 requeue: yield to T492 which already has dirty edits in compiler/traits/solver.ax (not charged: attempt refunded)
 - 2026-11-20 02:28:33 started (attempt 1) T489-impl
+- 2026-11-20 08:50:55 accepted by QA -> done

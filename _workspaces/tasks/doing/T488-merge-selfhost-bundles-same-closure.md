@@ -8,13 +8,15 @@ model: sonnet
 gate_model: opus
 depends: [T486]
 priority: 12
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 600
-paths: [tests/selfhost/bundle_common.py, tools/affected_map.txt, tests/smoke.list, _workspaces/baseline-failures.txt]
+paths: [tests/selfhost/bundle_common.py, tests/selfhost/bundle_common_selftest.py, tests/selfhost/abi, tests/selfhost/ast, tests/selfhost/backend, tests/selfhost/driver, tests/selfhost/drop, tests/selfhost/encode, tests/selfhost/hir, tests/selfhost/interp, tests/selfhost/interp_opt, tests/selfhost/isel, tests/selfhost/kernel_source_diag, tests/selfhost/lex, tests/selfhost/lexer, tests/selfhost/link, tests/selfhost/lir, tests/selfhost/mir, tests/selfhost/obj, tests/selfhost/obj_link_driver, tests/selfhost/own_mir_verify, tests/selfhost/parse, tests/selfhost/parser, tests/selfhost/resolve, tests/selfhost/resolve_hir, tests/selfhost/stage1, tests/selfhost/typeck, tests/selfhost/typeck_traits, tools/affected_map.txt, tests/smoke.list, _workspaces/baseline-failures.txt]
 locks: []
 spec: [spec/SPEC-20-selfhost.md]
 covers: [REQ-TST-072]
+started: 2026-11-20 07:42:55
+agent: T488-impl
 ---
 # T488 — Merge selfhost bundles with identical module closures
 
@@ -45,3 +47,5 @@ self-build) rather than once per test file. A 5-way merge compiles about 1.06× 
 
 ## Log
 - 2026-11-18 created by orchestrator (proposal in `_workspaces/reports/harness-selfhost-unlock.md`, owner request)
+- 2026-11-20 orchestrator: Step 1 measurement passed (`lir` 5-way merge ratio 0.213 at -O0 / 0.217 at -O1, 4.6–4.7× faster); extended `paths:` with the 26 specific `tests/selfhost/<area>` directories + `bundle_common_selftest.py` (no overlap with `T489`/`T494`) and updated `bundles.py`/`taskctl.py` to retire removed generated bundles cleanly in snapshot and accept.
+- 2026-11-20 07:42:55 started (attempt 1) T488-impl

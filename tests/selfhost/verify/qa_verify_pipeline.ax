@@ -49847,9 +49847,8 @@ fn mb_dotted_is_std_sync_atomic(str_in: *const StrInterner, d: view<AstDottedNam
 // from `thir.expr_methods`, so the key schemes of that table do not apply here)
 //   0 -> list head at build time;
 //   member | 1, (member symbol << 3) | 5 -> member of an impl in module std.sync.atomic;
-//   member | 2, (FN member symbol << 3) | 6 -> FIRST impl (list order) with a trait path and generic
-//     params that has this member / an FN member with this symbol;
-//   impl | 4 -> 1 + list index of such an impl (orders the two candidates above);
+//   member | 2, (FN member symbol << 3) | 6 -> FIRST impl (list order) with generic
+//     params (inherent or trait) that has this member / an FN member with this symbol;
 //   member | 3 -> member of a trait item.
 // Items added after the first MIR build cannot change these facts: mono instances are appended as
 // top-level FN items, async lowering inserts `impl Future` items without generic params whose
@@ -49874,16 +49873,12 @@ fn mb_item_cache(thir: *const Thir, hir: *const HirFile, str_in: *const StrInter
         ptr_itemmap_insert(mut_view(*c), 0, (*hir).items as *const HirItem);
         ptr_itemmap_insert(mut_view((*thir_m).expr_methods), hir as usize, c as *const HirItem);
     }
-    let mut n: usize = 1;
     let mut it: *mut HirItem = unsafe { (*hir).items };
     while (it as usize) != 0 {
         let ik = unsafe { (*it).kind };
         let ia = ik == HIR_ITEM_IMPL && mb_dotted_is_std_sync_atomic(str_in, unsafe { view((*it).module_path) });
-        let ig = ik == HIR_ITEM_IMPL && (unsafe { (*it).trait_path as usize }) != 0 &&
+        let ig = ik == HIR_ITEM_IMPL &&
             (unsafe { (*it).generic_params as usize }) != 0 && (unsafe { (*(*it).generic_params).params as usize }) != 0;
-        if ig {
-            unsafe { ptr_itemmap_insert(mut_view(*c), (it as usize) | 4, n as *const HirItem); }
-        }
         let mut m: *mut HirItem = if ik == HIR_ITEM_IMPL || ik == HIR_ITEM_TRAIT { unsafe { (*it).members } } else { 0 as *mut HirItem };
         while (m as usize) != 0 {
             unsafe {
@@ -49905,7 +49900,6 @@ fn mb_item_cache(thir: *const Thir, hir: *const HirFile, str_in: *const StrInter
                 m = (*m).next;
             }
         }
-        n = n + 1;
         it = unsafe { (*it).next };
     }
     c
@@ -56945,6 +56939,7 @@ fn mb_build_control_or_call_expr(
         let mut fn_ty_id = TypeId {
             v: 0u32
         };
+        let mut method_is_generic = false;
         if (method_item as usize) != 0 {
             let msym = SymbolId {
                 v: unsafe {
@@ -56953,7 +56948,26 @@ fn mb_build_control_or_call_expr(
             };
             callee_op.constant.sym.v = msym.v;
             callee_op.constant.val = msym.v as u64;
-            fn_ty_id = mb_item_ty(mut_view(*b), method_item);
+            method_is_generic = mb_count_generic_params_in_hir(
+                b.thir as *const Thir,
+                b.hir,
+                b.str_in as *const StrInterner,
+                method_item as *const HirItem
+            ) > 0;
+            if method_is_generic {
+                let raw_ptr = unsafe {
+                    thir_get_item_type(view(*b.thir), method_item as *const HirItem)
+                };
+                if (raw_ptr as usize) != 0 {
+                    fn_ty_id = TypeId {
+                        v: unsafe {
+                            (*raw_ptr).v
+                        }
+                    };
+                }
+            } else {
+                fn_ty_id = mb_item_ty(mut_view(*b), method_item);
+            }
             callee_op.constant.ty.v = fn_ty_id.v;
         }
         let fn_ax = unsafe {
@@ -57007,11 +57021,16 @@ fn mb_build_control_or_call_expr(
                     let p0_ptr = unsafe {
                         typeid_at((*fn_ax).param_types, 0)
                     };
-                    self_ty = mb_resolve_ty(mut_view(*b), TypeId {
+                    let raw_p0 = TypeId {
                         v: unsafe {
                             (*p0_ptr).v
                         }
-                    });
+                    };
+                    self_ty = if method_is_generic {
+                        raw_p0
+                    } else {
+                        mb_resolve_ty(mut_view(*b), raw_p0)
+                    };
                     let self_ax = unsafe {
                         type_get(view((*b.thir).interner), (TypeId {
                             v: self_ty.v
@@ -57023,6 +57042,10 @@ fn mb_build_control_or_call_expr(
                             is_mut_ref = (unsafe {
                                 (*self_ax).kind
                             }) == TY_MUT_VIEW;
+                            if method_is_generic && recv_ty.v != 0u32 &&
+                               (unsafe { type_contains_param(view((*b.thir).interner), TypeId { v: self_ty.v }) }) {
+                                self_ty = unsafe { intern_view_ty(mut_view((*b.thir).interner), TypeId { v: recv_ty.v }, is_mut_ref) };
+                            }
                         }
                     }
                 }
@@ -59243,9 +59266,24 @@ fn mb_count_generic_params_in_hir(thir: *const Thir, hir: *const HirFile, str_in
         let pa = unsafe { ptr_itemmap_get(view(*ic), (it as usize) | 2) };
         let pb = unsafe { ptr_itemmap_get(view(*ic), ((sym_v as usize) << 3) | 6) };
         cur = if (pa as usize) != 0 { (unsafe { *pa }) as *mut HirItem } else { 0 as *mut HirItem };
-        if (pb as usize) != 0 && ((cur as usize) == 0 ||
-            (unsafe { *ptr_itemmap_get(view(*ic), (*pb as usize) | 4) as usize }) < (unsafe { *ptr_itemmap_get(view(*ic), (cur as usize) | 4) as usize })) {
-            cur = (unsafe { *pb }) as *mut HirItem;
+        if (pb as usize) != 0 {
+            let cand = (unsafe { *pb }) as *mut HirItem;
+            if (cur as usize) == 0 {
+                cur = cand;
+            } else if (cand as usize) != (cur as usize) {
+                let mut scan: *mut HirItem = cur;
+                let mut cand_after = false;
+                while (scan as usize) != 0 {
+                    if (scan as usize) == (cand as usize) {
+                        cand_after = true;
+                        break;
+                    }
+                    scan = unsafe { (*scan).next };
+                }
+                if !cand_after {
+                    cur = cand;
+                }
+            }
         }
         if (cur as usize) == 0 {
             return 0;
@@ -59256,7 +59294,7 @@ fn mb_count_generic_params_in_hir(thir: *const Thir, hir: *const HirFile, str_in
         return mb_count_generic_params(cur as *const HirItem);
     }
     while ((cur as usize) != 0) {
-        if (unsafe { (*cur).kind }) == HIR_ITEM_IMPL && (unsafe { (*cur).trait_path as usize }) != 0 {
+        if (unsafe { (*cur).kind }) == HIR_ITEM_IMPL {
             let igps = unsafe { (*cur).generic_params };
             if (igps as usize) != 0 && (unsafe { (*igps).params as usize }) != 0 {
                 let mut m: *mut HirItem = unsafe { (*cur).members };
