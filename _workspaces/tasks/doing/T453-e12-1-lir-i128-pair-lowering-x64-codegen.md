@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T451, T452, T481]
 priority: 143
-status: todo
-attempts: 0
-paths: [compiler/lir, compiler/abi, compiler/target/x64, tests/lir/int128, tests/encode/int128, tests/run/int128_native]
-locks: [compiler/backend/session.ax, tests/run/int128_interp, tests/opt/int128]
+status: doing
+attempts: 1
+paths: [compiler/lir, compiler/abi, compiler/target/x64, tests/lir/int128, tests/encode/int128, tests/run/int128_native, tests/ui/backend_ice/sat_u128_emit_lir.test, tests/ui/backend_ice/sat_u128_emit_mi.test, tests/ui/backend_ice/sat_u128_emit_mc.test, tests/ui/backend_ice/sat_u128_unsupported.mir]
+locks: [compiler/backend/session.ax, tests/run/int128_interp, tests/opt/int128, tests/encode/axiom/gnu_as_vectors.ax, tests/run/saturating_native]
 spec: [spec/SPEC-40-integers.md, spec/SPEC-04-core-extensibility.md, 0162, 0179, 0181, tasks/0327]
 covers: [REQ-SIMD-027, REQ-SIMD-266, REQ-SIMD-267]
+started: 2026-11-20 22:55:27
+agent: T453-impl
 ---
 # T453 — E12.1 — LIR i128 register-pair lowering & x86-64 native codegen (ADC/SBB/MULX/SHLD/SHRD)
 
@@ -45,3 +47,7 @@ Lower `i128`/`u128` and saturating integer operations through LIR (`AXS-EXT-050`
 ## Log
 - 2026-11-03 00:30:00 created by T212 (P12 phase planning)
 - 2026-11-13 axiom-architect (ADR-0042 §3): depends on T452 and T481 (narrow-width native saturation fixed first); removes `native-after: T453` from T452's tests
+- 2026-11-20 22:16:24 started (attempt 1) t453-impl
+- 2026-11-20 22:23:25 locks widened by orchestrator: + tests/encode/axiom/gnu_as_vectors.ax (gen_encode_tests.py check), + tests/run/saturating_native (128-bit row per Acceptance)
+- 2026-11-20 22:55:17 requeue: dead agent from previous session (not charged: attempt refunded)
+- 2026-11-20 22:55:27 started (attempt 1) T453-impl

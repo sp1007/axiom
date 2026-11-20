@@ -8,13 +8,15 @@ model: opus
 gate_model: opus
 depends: [T452]
 priority: 22
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 900
 paths: [compiler/own/move.ax, compiler/own/init.ax, compiler/mir/drop.ax, tests/run/own_mut_view_fields, tests/ui/own_mut_view_receiver]
 locks: [compiler/own/cap.ax, compiler/types/typeck.ax, compiler/mir/builder.ax]
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/SPEC-10-ownership.md, spec/SPEC-11-capability.md, spec/SPEC-12-drop.md]
 covers: [REQ-TST-072, REQ-TST-032, REQ-TST-034]
+started: 2026-11-20 22:55:26
+finished: 2026-11-21 01:47:34
 ---
 # T445 — Fix: moves and drops through `mut_view` fields and receivers
 
@@ -46,3 +48,7 @@ parameter (T421 FU-4, FU-6; ADR-0042 §2).
 
 ## Log
 - 2026-11-13 created by axiom-architect (ADR-0042 §2; T421 FU-4, FU-6)
+- 2026-11-20 22:16:24 started (attempt 1) t445-impl
+- 2026-11-20 22:55:16 requeue: dead agent from previous session (not charged: attempt refunded)
+- 2026-11-20 22:55:26 started (attempt 1) T445-impl
+- 2026-11-21 01:47:34 accepted by QA -> done
