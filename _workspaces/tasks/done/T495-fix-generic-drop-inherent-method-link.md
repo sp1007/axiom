@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T489]
 priority: 0
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/mir/builder.ax, tests/run/generic_drop_inherent_method]
 locks: [compiler/traits/mono.ax, compiler/mir/drop.ax, tests/std/async/executor]
 spec: [spec/SPEC-20-selfhost.md, spec/SPEC-03-core-semantics.md]
 covers: [REQ-OPT-292, REQ-TST-072]
+started: 2026-11-20 12:30:06
+finished: 2026-11-20 14:11:54
 ---
 # T495 — Fix regression: `impl<T> Drop` calling a generic inherent method fails native link (`AX_LINK_UNDEFINED_SYMBOL`)
 
@@ -51,3 +53,5 @@ Culprit commit: `f0f98f33` (`T489`). `T489` updated `mb_count_generic_params_in_
 
 ## Log
 - 2026-11-20 created from fullrun-1 bisect (Cluster B, culprit f0f98f33 T489) & T444 follow-up F4
+- 2026-11-20 12:30:06 started (attempt 1) T495-impl
+- 2026-11-20 14:11:54 accepted by QA -> done
