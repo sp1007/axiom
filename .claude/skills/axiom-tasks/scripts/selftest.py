@@ -789,6 +789,7 @@ def test_d():
     write(d, T + "T014-legacy.md", task("T014", 24, ["T010"], ["compiler/a.ax"], "locks: [tests/selfhost]\n"))
     write(d, T + "T015-late.md", task("T015", 25, ["T011"], ["compiler/b.ax"]))
     write(d, T + "T016-broken.md", task("T016", 26, ["T015"], ["compiler/c.ax"]))
+    write(d, T + "T017-retire.md", task("T017", 27, ["T015"], ["tests/selfhost/demo2"]))
     commit_all(d)
     rc, out = bundles_cli(d, "check", "--root", d)
     check("D bundles.py check passes on a fresh tree", rc == 0 and "0 FAILED" not in out, out)
@@ -876,6 +877,39 @@ def test_d():
           and not os.path.exists(os.path.join(d, "_workspaces", "locks", "snap-T016.json")), out)
     rc, out = tc(d, "accept", "T016")
     check("accept refuses when the regeneration fails", rc == 1 and where(d, "T016")[0] == "doing", out)
+    # restore compiler/c.ax and requeue T016 so T017 can test retiring a generated bundle cleanly
+    sh(["git", "checkout", "--", "compiler/c.ax"], d)
+    tc(d, "requeue", "T016", "--no-attempt", "--reason", "cleanup")
+
+    # retiring a generated bundle: generator replaces B2 with B3
+    B3 = "tests/selfhost/demo2/bundle2_merged.ax"
+    tc(d, "start", "T017", "--agent", "T017-impl")
+    write(d, "tests/selfhost/demo2/gen_demo2_tests.py", GEN_SRC % (["c.ax"], B3))
+    pass_gate(d, "T017", ["tests/selfhost/demo2/gen_demo2_tests.py"])
+    rc, out = tc(d, "snapshot", "T017")
+    s17 = os.path.join(d, "build-snap-T017")
+    check("snapshot deletes retired generated bundle and writes replacement + manifest",
+          rc == 0 and "1 retired" in out and not os.path.exists(os.path.join(s17, B2))
+          and os.path.isfile(os.path.join(s17, B3))
+          and B2 not in open(os.path.join(s17, MAN)).read()
+          and B3 in open(os.path.join(s17, MAN)).read(), out)
+    # mutating generator after snapshot to another output must REGATE
+    B4 = "tests/selfhost/demo2/bundle2_v2.ax"
+    write(d, "tests/selfhost/demo2/gen_demo2_tests.py", GEN_SRC % (["c.ax"], B4))
+    rc, out = tc(d, "accept", "T017")
+    check("retiring/renaming bundle changed after snapshot -> REGATE",
+          rc == 5 and where(d, "T017")[0] == "doing", out)
+    # restore B3 and re-snapshot -> accept commits B3 and removes B2 from git and working tree
+    write(d, "tests/selfhost/demo2/gen_demo2_tests.py", GEN_SRC % (["c.ax"], B3))
+    rc, out = tc(d, "snapshot", "T017")
+    rc2, out2 = tc(d, "accept", "T017")
+    rc_b2, _ = sh(["git", "cat-file", "-e", f"HEAD:{B2}"], d)
+    check("accept commits replacement bundle, deletes retired bundle from git and working tree, updates manifest",
+          rc == 0 and rc2 == 0 and "1 retired" in out2 and rc_b2 != 0
+          and not os.path.exists(os.path.join(d, B2))
+          and os.path.isfile(os.path.join(d, B3))
+          and show_head(d, B3) == "// generated\nc1"
+          and B2 not in show_head(d, MAN) and B3 in show_head(d, MAN), out2)
     sh(["git", "worktree", "prune"], d)
 
 

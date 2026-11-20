@@ -1198,7 +1198,8 @@ def regen_snapshot(i, d, head, record=True):
     if record:
         os.makedirs(LOCKS, exist_ok=True)
         with open(rec, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump({"task": i, "base": head, "time": now(), "blobs": blob_ids(d, r.outputs)}, fh, indent=1)
+            json.dump({"task": i, "base": head, "time": now(),
+                       "blobs": blob_ids(d, r.outputs), "removed": list(r.removed)}, fh, indent=1)
             fh.write("\n")
     return r
 
@@ -1246,8 +1247,10 @@ def bundles_for_commit(tasks, t, files, gate_check):
         die(f"{i}: a generator's --check fails right after regeneration (non-deterministic generator?); "
             "nothing staged", 1)
     gen = sorted(set(r.outputs))
-    new, old = blob_ids(d, gen), head_blob_ids(gen)
-    changed = [p for p in gen if new.get(p) != old.get(p)]
+    retired = sorted(set(r.removed) - set(gen))
+    all_gen = sorted(set(gen) | set(retired))
+    new, old = blob_ids(d, gen), head_blob_ids(all_gen)
+    changed = [p for p in all_gen if new.get(p) != old.get(p)]
     if gate_check and changed:
         rec_path = snap_record_path(i)
         try:
@@ -1275,11 +1278,25 @@ def bundles_for_commit(tasks, t, files, gate_check):
             sys.exit(5)
     others = {x: own_paths(o) for x, o in tasks.items() if o["dir"] == "doing" and x != i}
     dirty = set(dirty_under(changed)) if changed else set()
-    keep = [f for f in files if f not in gen and not is_generated(f)]
+    keep = [f for f in files if f not in all_gen and not is_generated(f)]
     prestaged = []
+    retired_set = set(retired)
+    retired_changed = 0
     for p in changed:
         src, dst = os.path.join(d, p), os.path.join(ROOT, p)
         held = [x for x, ps in others.items() if any(under(p, q) for q in ps)]
+        if p in retired_set:
+            retired_changed += 1
+            if p in dirty and held:
+                git_lit("update-index", "--force-remove", p)
+                prestaged.append(p)
+                print(f"note: {p} removal staged from the snapshot; main-tree copy untouched (dirty, inside "
+                      f"the paths/locks of running task {', '.join(held)})")
+                continue
+            if os.path.isfile(dst):
+                os.remove(dst)
+            keep.append(p)
+            continue
         if p in dirty and held:
             # another running task may hold a deliberate input there (refreshed goldens): index only
             sha = subprocess.run(["git", "hash-object", "-w", f"--path={p}", src], cwd=ROOT,
@@ -1292,8 +1309,13 @@ def bundles_for_commit(tasks, t, files, gate_check):
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copyfile(src, dst)
         keep.append(p)
+    extra = []
+    if retired_changed:
+        extra.append(f"{retired_changed} retired")
+    if prestaged:
+        extra.append(f"{len(prestaged)} staged index-only")
     print(f"bundles: {len(changed)} generated file(s) change in this commit"
-          + (f" ({len(prestaged)} staged index-only)" if prestaged else ""))
+          + (f" ({', '.join(extra)})" if extra else ""))
     return sorted(set(keep)), prestaged
 
 

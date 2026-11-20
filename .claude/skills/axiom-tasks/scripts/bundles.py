@@ -84,11 +84,15 @@ def _run_group(tree, group, check):
 
 
 class Result:
-    def __init__(self, ok, outputs, failures, seconds, ngen):
+    def __init__(self, ok, outputs, failures, seconds, ngen, removed=None):
         self.ok, self.outputs, self.failures, self.seconds, self.ngen = ok, outputs, failures, seconds, ngen
+        self.removed = list(removed or [])
 
     def summary(self, what):
-        s = f"bundles {what}: {self.ngen} generator(s), {len(self.outputs)} file(s), {self.seconds:.0f}s"
+        s = f"bundles {what}: {self.ngen} generator(s), {len(self.outputs)} file(s)"
+        if self.removed:
+            s += f", {len(self.removed)} retired"
+        s += f", {self.seconds:.0f}s"
         return s + ("" if self.ok else f", {len(self.failures)} FAILED")
 
     def failure_text(self):
@@ -124,9 +128,23 @@ def write_manifest(tree, outputs):
 
 
 def regen(tree, jobs=DEFAULT_JOBS):
-    """Write every bundle of `tree` and its manifest. Result.outputs includes the manifest."""
+    """Write every bundle of `tree` and its manifest, and delete any previously-manifested bundle
+    that no generator writes anymore (retired bundles). Result.outputs includes the manifest;
+    Result.removed lists the retired bundle paths."""
+    old_entries = set()
+    try:
+        with open(os.path.join(tree, MANIFEST), encoding="utf-8") as fh:
+            old_entries = _manifest_entries(fh.read())
+    except OSError:
+        pass
     r = run(tree, check=False, jobs=jobs)
     if r.ok and r.ngen:
+        retired = sorted(old_entries - set(r.outputs) - {MANIFEST})
+        for p in retired:
+            fp = os.path.join(tree, p)
+            if os.path.isfile(fp):
+                os.remove(fp)
+        r.removed = retired
         write_manifest(tree, r.outputs)
         r.outputs = sorted(set(r.outputs) | {MANIFEST})
     return r
