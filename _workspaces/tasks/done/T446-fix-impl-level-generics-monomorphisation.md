@@ -8,13 +8,15 @@ model: opus
 gate_model: opus
 depends: [T452]
 priority: 21
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 900
 paths: [compiler/traits/mono.ax, tests/run/generic_impl_mono]
 locks: [compiler/traits/solver.ax, compiler/types/typeck.ax, compiler/types/layout.ax, compiler/mir/builder.ax, compiler/lir/builder.ax]
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/SPEC-03-core-semantics.md, spec/SPEC-04-core-extensibility.md]
 covers: [REQ-TST-072, REQ-TST-051]
+started: 2026-11-20 15:19:07
+finished: 2026-11-20 17:48:53
 ---
 # T446 — Fix: monomorphisation of impl-level generic parameters
 
@@ -49,3 +51,5 @@ natively (T422 FU-F, FU-G; ADR-0042 §2).
 
 ## Log
 - 2026-11-13 created by axiom-architect (ADR-0042 §2; T422 FU-F, FU-G)
+- 2026-11-20 15:19:07 started (attempt 1) T446-impl
+- 2026-11-20 17:48:53 accepted by QA -> done
