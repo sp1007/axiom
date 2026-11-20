@@ -10847,6 +10847,59 @@ fn sort_fields(fl: *mut FieldLayout, count: usize) {
     }
 }
 
+// T444a (ADR-0043 §4): the single source of truth for an enum variant's payload layout. The
+// discriminant occupies bytes [0, 4); payload fields are placed after it in `sort_fields` order,
+// each aligned to its own alignment. Both the enum's size (`type_size`) and every payload field
+// offset (`type_enum_field_offset`, used by construction, pattern projection, the interpreter and
+// LIR lowering) come from this one walk, so no second ordering or base-offset rule exists.
+// Returns the offset of `field_idx` (0 when out of range) and writes the payload end offset
+// (measured from the start of the enum, tag included) to `*out_end`.
+struct VariantPlacement {
+    pub field_offset: u32,
+    pub end: u32,
+}
+
+fn place_variant_fields(vf: *mut TypeId, count: usize, field_idx: usize, ti: view<TypeInterner>) -> VariantPlacement {
+    if count == 0 {
+        return VariantPlacement { field_offset: 0u32, end: SIZE_4 };
+    }
+    let fbytes = mul_usize(count, size_of<FieldLayout>());
+    let fl = unsafe { heap_alloc(fbytes, align_of<FieldLayout>()) as *mut FieldLayout };
+    let mut i: usize = 0;
+    while (i < count) {
+        let fty_v = unsafe { (*typeid_at(vf, i)).v };
+        let fa = type_align(TypeId { v: fty_v }, ti);
+        let fs = type_size(TypeId { v: fty_v }, ti);
+        let fp = unsafe { field_layout_at(fl, i) };
+        unsafe {
+            (*fp).index = i as u32;
+            (*fp).align = fa;
+            (*fp).size = fs;
+        }
+        i = i + 1;
+    }
+    sort_fields(fl, count);
+    let mut offset: u32 = SIZE_4;
+    let mut target_offset: u32 = 0u32;
+    let mut j: usize = 0;
+    while (j < count) {
+        let fp = unsafe { field_layout_at(fl, j) };
+        let f_index = unsafe { (*fp).index };
+        let fa = unsafe { (*fp).align };
+        let fs = unsafe { (*fp).size };
+        offset = align_up_u32(offset, fa);
+        if (f_index as usize) == field_idx {
+            target_offset = offset;
+        }
+        offset = offset + fs;
+        j = j + 1;
+    }
+    unsafe {
+        heap_free(fl as *mut u8, fbytes, align_of<FieldLayout>());
+    }
+    VariantPlacement { field_offset: target_offset, end: offset }
+}
+
 pub fn type_align(id: TypeId, ti: view<TypeInterner>) -> u32 {
     if id.v == 0u32 {
         return ALIGN_1;
@@ -10979,6 +11032,7 @@ pub fn type_size(id: TypeId, ti: view<TypeInterner>) -> u32 {
         return SIZE_16;
     }
 
+    let self_v = id.v;
     let ty = type_get(ti, id);
     if (ty as usize) == 0 {
         return SIZE_0;
@@ -11021,8 +11075,10 @@ pub fn type_size(id: TypeId, ti: view<TypeInterner>) -> u32 {
         return (esz * (arr_len as isize)) as u32;
     }
     if k == TY_ENUM {
-        let mut max_align: u32 = ALIGN_4;
-        let mut max_payload_size: u32 = SIZE_0;
+        // T444a: the end of the furthest variant, measured from the start of the enum by the
+        // same placement walk that yields the field offsets (tag at [0, 4), payload after it).
+        let max_align = type_align(TypeId { v: self_v }, ti);
+        let mut max_end: u32 = SIZE_4;
         let vcount = unsafe { (*ty).variant_count };
         let vcounts = unsafe { (*ty).variant_field_counts };
         let vfields = unsafe { (*ty).variant_fields };
@@ -11032,53 +11088,15 @@ pub fn type_size(id: TypeId, ti: view<TypeInterner>) -> u32 {
                 let count = unsafe { *usize_at(vcounts, i) };
                 if count > 0 {
                     let vf = unsafe { *typeid_ptr_at(vfields, i) };
-                    let fl = unsafe {
-                        let fbytes = mul_usize(count, size_of<FieldLayout>());
-                        heap_alloc(fbytes, align_of<FieldLayout>()) as *mut FieldLayout
-                    };
-                    let mut j: usize = 0;
-                    while (j < count) {
-                        let fty_v = unsafe { (*typeid_at(vf, j)).v };
-                        let fa = type_align(TypeId { v: fty_v }, ti);
-                        let fs = type_size(TypeId { v: fty_v }, ti);
-                        if fa > max_align {
-                            max_align = fa;
-                        }
-                        let fp = unsafe { field_layout_at(fl, j) };
-                        unsafe {
-                            (*fp).index = j as u32;
-                            (*fp).align = fa;
-                            (*fp).size = fs;
-                        }
-                        j = j + 1;
-                    }
-                    sort_fields(fl, count);
-                    let mut offset: u32 = 0u32;
-                    let mut k_idx: usize = 0;
-                    while (k_idx < count) {
-                        let fp = unsafe { field_layout_at(fl, k_idx) };
-                        let fa = unsafe { (*fp).align };
-                        let fs = unsafe { (*fp).size };
-                        offset = align_up_u32(offset, fa);
-                        offset = offset + fs;
-                        k_idx = k_idx + 1;
-                    }
-                    unsafe {
-                        heap_free(
-                            fl as *mut u8,
-                            mul_usize(count, size_of<FieldLayout>()),
-                            align_of<FieldLayout>()
-                        );
-                    }
-                    if offset > max_payload_size {
-                        max_payload_size = offset;
+                    let placed = place_variant_fields(vf, count, count, ti);
+                    if placed.end > max_end {
+                        max_end = placed.end;
                     }
                 }
                 i = i + 1;
             }
         }
-        let total_size = SIZE_4 + max_payload_size;
-        return align_up_u32(total_size, max_align);
+        return align_up_u32(max_end, max_align);
     }
     if k == TY_TUPLE || k == TY_STRUCT || k == TY_COROUTINE {
         let count = unsafe { (*ty).field_count };
@@ -11265,43 +11283,8 @@ pub fn type_enum_field_offset(
         return 0u32;
     }
     let vf = unsafe { *typeid_ptr_at(vfields, variant_idx as usize) };
-    let fl = unsafe {
-        heap_alloc(mul_usize(count, size_of<FieldLayout>()), align_of<FieldLayout>()) as *mut FieldLayout
-    };
-    let mut i: usize = 0;
-    while (i < count) {
-        let fty_v = unsafe { (*typeid_at(vf, i)).v };
-        let fa = type_align(TypeId { v: fty_v }, ti);
-        let fs = type_size(TypeId { v: fty_v }, ti);
-        let fp = unsafe { field_layout_at(fl, i) };
-        unsafe {
-            (*fp).index = i as u32;
-            (*fp).align = fa;
-            (*fp).size = fs;
-        }
-        i = i + 1;
-    }
-    sort_fields(fl, count);
-    let mut offset: u32 = SIZE_4;
-    let mut target_offset: u32 = 0u32;
-    let mut j: usize = 0;
-    while (j < count) {
-        let fp = unsafe { field_layout_at(fl, j) };
-        let f_index = unsafe { (*fp).index };
-        let fa = unsafe { (*fp).align };
-        let fs = unsafe { (*fp).size };
-        offset = align_up_u32(offset, fa);
-        if (f_index as usize) == field_idx {
-            target_offset = offset;
-            break;
-        }
-        offset = offset + fs;
-        j = j + 1;
-    }
-    unsafe {
-        heap_free(fl as *mut u8, mul_usize(count, size_of<FieldLayout>()), align_of<FieldLayout>());
-    }
-    target_offset
+    let placed = place_variant_fields(vf, count, field_idx, ti);
+    placed.field_offset
 }
 
 // Axiom Compiler — LIR Data Model & Text Printer (compiler/lir/lir.ax)

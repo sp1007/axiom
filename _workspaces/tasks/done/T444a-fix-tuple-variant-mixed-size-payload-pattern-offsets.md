@@ -8,7 +8,7 @@ model: opus
 gate_model: sonnet
 depends: [T444]
 priority: 22
-status: doing
+status: done
 attempts: 1
 timeout_min: 600
 paths: [tests/run/enum_payload_mixed]
@@ -16,7 +16,7 @@ locks: [compiler/types/layout.ax, compiler/mir/builder.ax, compiler/interp, comp
 spec: [spec/decisions/ADR-0043-cyclic-type-graphs-and-symbol-id-space.md, spec/SPEC-03-core-semantics.md]
 covers: [REQ-LAY-136, REQ-TST-072]
 started: 2026-11-20 17:50:13
-agent: t444a-impl
+finished: 2026-11-20 22:14:26
 ---
 # T444a — Fix: mixed-size tuple-variant payload offsets in patterns
 
@@ -53,3 +53,4 @@ construction, in pattern bindings and in field projections, in the oracle and na
 - 2026-11-17 created by axiom-architect (T444 report F2; ADR-0043 §4)
 - 2026-11-20 17:50:13 started (attempt 1) t444a-impl
 - 2026-11-20 18:44:49 lock widened by orchestrator: + tests/selfhost/types/qa_types_layout.ax.in (golden asserted buggy enum size 16; correct 24 per layout fix)
+- 2026-11-20 22:14:26 accepted by QA -> done
