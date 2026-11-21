@@ -8,13 +8,15 @@ model: sonnet
 gate_model: sonnet
 depends: [T434]
 priority: 24
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 600
 paths: [tests/parse/generic_args_ambiguity, tests/run/generic_fn_value]
 locks: [compiler/syntax, compiler/parser, compiler/types/typeck.ax, compiler/mir/builder.ax, spec/SPEC-02-grammar.md]
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/SPEC-02-grammar.md]
 covers: [REQ-TST-072, REQ-TST-062]
+started: 2026-11-21 10:49:07
+agent: T422a-impl
 ---
 # T422a — Fix: `<` after a field access, and generic functions as values
 
@@ -50,3 +52,4 @@ ADR-0042 §2).
 
 ## Log
 - 2026-11-13 created by axiom-architect (ADR-0042 §2; T422 FU-A, FU-J)
+- 2026-11-21 10:49:07 started (attempt 1) T422a-impl

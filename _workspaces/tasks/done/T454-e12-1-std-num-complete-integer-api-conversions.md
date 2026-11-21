@@ -8,14 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T452, T453]
 priority: 144
-status: doing
+status: done
 attempts: 1
 paths: [std/core/num.ax, std/core/convert.ax, std/text/fmt/int.ax, tests/std/num, compiler/traits/solver.ax]
 locks: [std/core/prelude.ax]
 spec: [spec/SPEC-40-integers.md, tasks/0327, tasks/0334, tasks/0431]
 covers: [REQ-SIMD-211, REQ-SIMD-241, REQ-SIMD-242]
 started: 2026-11-21 04:35:39
-agent: T454-impl
+finished: 2026-11-21 11:36:44
 ---
 # T454 — E12.1 — std.core.num complete integer API, fallible TryFrom/TryInto & endian byte conversions
 
@@ -45,3 +45,4 @@ Complete `std/core/num.ax`, `std/core/convert.ax`, and `std/text/fmt/int.ax` acr
 ## Log
 - 2026-11-03 00:30:00 created by T212 (P12 phase planning)
 - 2026-11-21 04:35:39 started (attempt 1) T454-impl
+- 2026-11-21 11:36:44 accepted by QA -> done
