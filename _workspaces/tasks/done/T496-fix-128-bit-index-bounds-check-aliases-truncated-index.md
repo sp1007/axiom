@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T455]
 priority: 22
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 600
 paths: [tests/run/numeric/mixed_int_matrix/gen_matrix.py, tests/run/numeric/mixed_int_matrix/index_trap_u128_alias.ax, tests/run/numeric/mixed_int_matrix/index_trap_u128_alias_hi.ax, tests/run/numeric/mixed_int_matrix/index_trap_i128_alias.ax, tests/run/numeric/mixed_int_matrix/repro_u128_index_alias.ax, tests/run/index_128_range]
 locks: [compiler/mir/builder.ax]
 spec: [spec/decisions/ADR-0044-t455-integer-model-gaps.md, spec/SPEC-40-integers.md, spec/SPEC-03-core-semantics.md]
 covers: [REQ-OWNER-007]
+started: 2026-11-21 12:33:45
+finished: 2026-11-21 13:42:33
 ---
 # T496 — 128-bit index bounds check (ADR-0044 §1)
 
@@ -48,3 +50,5 @@ checked, so the access silently reads an unrelated element (a memory-safety-leve
 
 ## Log
 - 2026-11-21 created by axiom-architect (T455 gate; ADR-0044 §1; FU-T455-IDX128)
+- 2026-11-21 12:33:45 started (attempt 1) T496-impl
+- 2026-11-21 13:42:33 accepted by QA -> done

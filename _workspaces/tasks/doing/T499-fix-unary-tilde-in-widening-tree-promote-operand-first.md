@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T455]
 priority: 26
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 600
 paths: [tests/run/numeric/mixed_int_matrix/tilde_widening.ax, tests/run/numeric/tilde_tree, tests/ui/tilde_tree]
 locks: [compiler/types/typeck.ax]
 spec: [spec/decisions/ADR-0044-t455-integer-model-gaps.md, spec/SPEC-40-integers.md]
 covers: [REQ-OWNER-007]
+started: 2026-11-21 12:33:46
+agent: T499-impl
 ---
 # T499 — unary `~` is a tree node of a widening integer tree (ADR-0044 §2)
 
@@ -50,3 +52,4 @@ giving `1000`. A `~x` outside a widening tree keeps `x`'s type (`let r: u8 = ~b8
 
 ## Log
 - 2026-11-21 created by axiom-architect (T455 gate; ADR-0044 §2; FU-T455-TILDE)
+- 2026-11-21 12:33:46 started (attempt 1) T499-impl

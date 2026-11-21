@@ -614,10 +614,10 @@ def all_files():
     f["index_trap_i8_neg.ax"] = gen_index_trap("i8", -128, "negative")
     f["index_trap_u8_oob.ax"] = gen_index_trap("u8", 255, "past the end")
     f["index_trap_i128_neg.ax"] = gen_index_trap("i128", -1, "negative")
-    # ADR-0044 §1: 128-bit values whose low 64 bits are a valid index must still trap (xfail until T496)
-    f["index_trap_u128_alias.ax"] = gen_index_trap("u128", (1 << 64) + 1, "alias", "T496")
-    f["index_trap_u128_alias_hi.ax"] = gen_index_trap("u128", (1 << 127) + 2, "alias", "T496")
-    f["index_trap_i128_alias.ax"] = gen_index_trap("i128", -(1 << 64) + 1, "alias", "T496")
+    # ADR-0044 §1: 128-bit values whose low 64 bits are a valid index must still trap (fixed by T496)
+    f["index_trap_u128_alias.ax"] = gen_index_trap("u128", (1 << 64) + 1, "alias")
+    f["index_trap_u128_alias_hi.ax"] = gen_index_trap("u128", (1 << 127) + 2, "alias")
+    f["index_trap_i128_alias.ax"] = gen_index_trap("i128", -(1 << 64) + 1, "alias")
     f["promoted_no_trap.ax"] = gen_no_trap_in_ctx()
     f["trap_add_i64.ax"] = gen_promoted_trap(
         "add", "s64: i64, s32: i32", "s64 + s32 * 3", "9223372036854775807i64, 1i32", "i64", "arithmetic overflow",
