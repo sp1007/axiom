@@ -1,0 +1,1384 @@
+// test: run
+// modes: interp native
+// timeout: 120
+// covers: REQ-CONC-151, REQ-CONC-189
+// stdout: OK qa_fiber_many 134550 180\n
+
+module std.sys.windows.heap
+
+@link("kernel32")
+extern "system" {
+    fn GetProcessHeap() -> *mut u8;
+    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;
+    fn HeapReAlloc(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8, dwBytes: usize) -> *mut u8;
+    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;
+}
+
+pub unsafe fn __ax_host_heap_alloc(size: usize, align: usize) -> *mut u8 {
+    if size == 0 {
+        return 0 as *mut u8;
+    }
+    let h = GetProcessHeap();
+    if h as usize == 0 {
+        return 0 as *mut u8;
+    }
+    let alloc_bytes: usize = if size < 16 { 16 } else { size };
+    HeapAlloc(h, 8u32, alloc_bytes)
+}
+
+pub unsafe fn __ax_host_heap_realloc(p: *mut u8, old_size: usize, new_size: usize, align: usize) -> *mut u8 {
+    if p as usize == 0 {
+        return __ax_host_heap_alloc(new_size, align);
+    }
+    if new_size == 0 {
+        return 0 as *mut u8;
+    }
+    let h = GetProcessHeap();
+    if h as usize == 0 {
+        return 0 as *mut u8;
+    }
+    let alloc_bytes: usize = if new_size < 16 { 16 } else { new_size };
+    HeapReAlloc(h, 8u32, p, alloc_bytes)
+}
+
+pub unsafe fn __ax_host_heap_free(p: *mut u8, size: usize, align: usize) {
+    if p as usize != 0 {
+        let h = GetProcessHeap();
+        if h as usize != 0 {
+            HeapFree(h, 0u32, p);
+        }
+    }
+}
+
+module std.sys.windows.thread
+
+@link("kernel32")
+extern "system" {
+    fn GetProcessHeap() -> *mut u8;
+    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;
+    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;
+    fn CreateThread(
+        lpThreadAttributes: *mut u8,
+        dwStackSize: usize,
+        lpStartAddress: fn(*mut u8) -> u32,
+        lpParameter: *mut u8,
+        dwCreationFlags: u32,
+        lpThreadId: *mut u32
+    ) -> *mut u8;
+    fn WaitForSingleObject(hHandle: *mut u8, dwMilliseconds: u32) -> u32;
+    fn CloseHandle(hObject: *mut u8) -> i32;
+    fn GetCurrentThreadId() -> u32;
+    fn SwitchToThread() -> i32;
+    fn Sleep(dwMilliseconds: u32);
+    fn ExitThread(dwExitCode: u32);
+    fn ExitProcess(uExitCode: u32);
+    fn GetModuleHandleA(lpModuleName: *const u8) -> *mut u8;
+    fn GetProcAddress(hModule: *mut u8, lpProcName: *const u8) -> *mut u8;
+    fn VirtualProtect(lpAddress: *mut u8, dwSize: usize, flNewProtect: u32, lpflOldProtect: *mut u32) -> i32;
+    fn InitializeCriticalSection(lpCriticalSection: *mut u8);
+    fn EnterCriticalSection(lpCriticalSection: *mut u8);
+    fn LeaveCriticalSection(lpCriticalSection: *mut u8);
+    fn GetLastError() -> u32;
+}
+
+@link("api-ms-win-core-synch-l1-2-0")
+extern "system" {
+    fn WaitOnAddress(address: *const u8, compareAddress: *const u8, addressSize: usize, dwMilliseconds: u32) -> i32;
+    fn WakeByAddressSingle(address: *const u8);
+    fn WakeByAddressAll(address: *const u8);
+}
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+@repr(C)
+struct WinThreadSlot {
+    in_use: u32,
+    finished: u32,
+    detached: u32,
+    joining: u32,
+    panicked: u32,
+    win_tid: u32,
+    generation: u32,
+    pad0: u32,
+    logical_id: u64,
+    os_handle: *mut u8,
+    entry: fn(*mut u8) -> i64,
+    ctx: *mut u8,
+    ret_val: i64,
+}
+
+@repr(C)
+struct WinThreadRt {
+    cs: [6]u64,
+    main_win_tid: u32,
+    pad0: u32,
+    orig_exit_process: usize,
+    next_logical_id: u64,
+    slots: *mut *mut WinThreadSlot,
+    slot_cap: usize,
+}
+
+unsafe fn fn_entry_to_addr(f: fn(*mut u8) -> i64) -> usize {
+    let tmp: [1]fn(*mut u8) -> i64 = [f];
+    *(address_of(tmp[0]) as *const usize)
+}
+
+unsafe fn fn_exit_to_addr(f: fn(u32) -> u32) -> usize {
+    let tmp: [1]fn(u32) -> u32 = [f];
+    *(address_of(tmp[0]) as *const usize)
+}
+
+unsafe fn addr_to_fn_exit(addr: usize) -> fn(u32) -> u32 {
+    let tmp: [1]usize = [addr];
+    *(address_of(tmp[0]) as *const fn(u32) -> u32)
+}
+
+unsafe fn slot_ptr_at(arr: *mut *mut WinThreadSlot, idx: usize) -> *mut *mut WinThreadSlot {
+    ((arr as usize) + idx * size_of<*mut WinThreadSlot>()) as *mut *mut WinThreadSlot
+}
+
+unsafe fn pe_first_import_desc() -> *mut u8 {
+    let base = GetModuleHandleA(0 as *const u8);
+    if (base as usize) == 0 {
+        return 0 as *mut u8;
+    }
+    if *((base as *const u16)) != 0x5A4Du16 {
+        return 0 as *mut u8;
+    }
+    let lfanew = *((base + 0x3C) as *const u32) as usize;
+    let nt = base + lfanew;
+    if *((nt as *const u32)) != 0x00004550u32 {
+        return 0 as *mut u8;
+    }
+    let opt = nt + 24;
+    if *((opt as *const u16)) != 0x020Bu16 {
+        return 0 as *mut u8;
+    }
+    let imp_rva = *((opt + 120) as *const u32) as usize;
+    if imp_rva == 0 {
+        return 0 as *mut u8;
+    }
+    base + imp_rva
+}
+
+unsafe fn win_rt_peek() -> *mut WinThreadRt {
+    let desc0 = pe_first_import_desc();
+    if (desc0 as usize) == 0 {
+        return 0 as *mut WinThreadRt;
+    }
+    let lo = *((desc0 + 4) as *const u32) as usize;
+    let hi = *((desc0 + 8) as *const u32) as usize;
+    (lo | (hi << 32)) as *mut WinThreadRt
+}
+
+fn win_exit_process_hook(code: u32) -> u32 {
+    unsafe {
+        let rt = win_rt_peek();
+        if (rt as usize) != 0 {
+            let cur_tid = GetCurrentThreadId();
+            if cur_tid != (*rt).main_win_tid && code == 101u32 {
+                let cs_ptr = address_of_mut((*rt).cs[0]) as *mut u8;
+                EnterCriticalSection(cs_ptr);
+                let mut idx: usize = 1;
+                while idx < (*rt).slot_cap {
+                    let s = *slot_ptr_at((*rt).slots, idx);
+                    if (s as usize) != 0 && (*s).in_use != 0u32 && (*s).finished == 0u32 && (*s).win_tid == cur_tid {
+                        (*s).panicked = 1u32;
+                        (*s).ret_val = -101i64;
+                        (*s).finished = 1u32;
+                        (*s).win_tid = 0u32;
+                        if (*s).detached != 0u32 {
+                            let h = (*s).os_handle;
+                            (*s).os_handle = 0 as *mut u8;
+                            (*s).in_use = 0u32;
+                            LeaveCriticalSection(cs_ptr);
+                            if (h as usize) != 0 {
+                                CloseHandle(h);
+                            }
+                        } else {
+                            let p_ctx = (*s).ctx;
+                            if (p_ctx as usize) != 0 && *(p_ctx as *const u64) == 0x4158544852504B54u64 {
+                                let lw = (p_ctx + 8) as *mut u32;
+                                *lw = (*lw) | 1u32;
+                            }
+                            LeaveCriticalSection(cs_ptr);
+                        }
+                        ExitThread(101u32);
+                    }
+                    idx = idx + 1;
+                }
+                LeaveCriticalSection(cs_ptr);
+            }
+            if (*rt).orig_exit_process != 0usize {
+                let orig = addr_to_fn_exit((*rt).orig_exit_process);
+                orig(code);
+            }
+        }
+        ExitProcess(code);
+        0u32
+    }
+}
+
+unsafe fn win_install_exit_hook(rt: *mut WinThreadRt) {
+    let base = GetModuleHandleA(0 as *const u8);
+    let desc0 = pe_first_import_desc();
+    if (base as usize) == 0 || (desc0 as usize) == 0 {
+        return;
+    }
+    let k32_name: [13]u8 = [107u8, 101u8, 114u8, 110u8, 101u8, 108u8, 51u8, 50u8, 46u8, 100u8, 108u8, 108u8, 0u8];
+    let ep_name: [12]u8 = [69u8, 120u8, 105u8, 116u8, 80u8, 114u8, 111u8, 99u8, 101u8, 115u8, 115u8, 0u8];
+    let hk32 = GetModuleHandleA(address_of(k32_name[0]));
+    if (hk32 as usize) == 0 {
+        return;
+    }
+    let real_ep = GetProcAddress(hk32, address_of(ep_name[0])) as usize;
+    if real_ep == 0usize {
+        return;
+    }
+    (*rt).orig_exit_process = real_ep;
+    let hook_addr = fn_exit_to_addr(win_exit_process_hook);
+    let mut d = desc0;
+    while *((d + 16) as *const u32) != 0u32 {
+        let ft_rva = *((d + 16) as *const u32) as usize;
+        let mut iat = (base + ft_rva) as *mut usize;
+        while *iat != 0usize {
+            if *iat == real_ep {
+                let mut old_prot: [1]u32 = [0u32];
+                let ok = VirtualProtect(iat as *mut u8, 8usize, 0x04u32, address_of_mut(old_prot[0]));
+                if ok != 0 {
+                    *iat = hook_addr;
+                    let mut tmp_prot: [1]u32 = [0u32];
+                    VirtualProtect(iat as *mut u8, 8usize, old_prot[0], address_of_mut(tmp_prot[0]));
+                }
+            }
+            iat = ((iat as usize) + 8usize) as *mut usize;
+        }
+        d = d + 20;
+    }
+}
+
+unsafe fn win_rt_get() -> *mut WinThreadRt {
+    let existing = win_rt_peek();
+    if (existing as usize) != 0 {
+        return existing;
+    }
+    let desc0 = pe_first_import_desc();
+    let heap = GetProcessHeap();
+    if (desc0 as usize) == 0 || (heap as usize) == 0 {
+        return 0 as *mut WinThreadRt;
+    }
+    let rt = HeapAlloc(heap, 8u32, size_of<WinThreadRt>()) as *mut WinThreadRt;
+    if (rt as usize) == 0 {
+        return 0 as *mut WinThreadRt;
+    }
+    let init_cap: usize = 256;
+    let slots = HeapAlloc(heap, 8u32, init_cap * size_of<*mut WinThreadSlot>()) as *mut *mut WinThreadSlot;
+    if (slots as usize) == 0 {
+        HeapFree(heap, 0u32, rt as *mut u8);
+        return 0 as *mut WinThreadRt;
+    }
+    InitializeCriticalSection(address_of_mut((*rt).cs[0]) as *mut u8);
+    (*rt).main_win_tid = GetCurrentThreadId();
+    (*rt).next_logical_id = 2u64;
+    (*rt).slots = slots;
+    (*rt).slot_cap = init_cap;
+    win_install_exit_hook(rt);
+
+    let mut old_prot: [1]u32 = [0u32];
+    if VirtualProtect(desc0, 16usize, 0x04u32, address_of_mut(old_prot[0])) != 0 {
+        let addr = rt as usize;
+        *((desc0 + 4) as *mut u32) = (addr & 0xFFFFFFFFusize) as u32;
+        *((desc0 + 8) as *mut u32) = ((addr >> 32) & 0xFFFFFFFFusize) as u32;
+    }
+    rt
+}
+
+fn win_thread_trampoline(param: *mut u8) -> u32 {
+    unsafe {
+        let rt = win_rt_peek();
+        let s = param as *mut WinThreadSlot;
+        if (rt as usize) == 0 || (s as usize) == 0 {
+            return 1u32;
+        }
+        let cs_ptr = address_of_mut((*rt).cs[0]) as *mut u8;
+        EnterCriticalSection(cs_ptr);
+        (*s).win_tid = GetCurrentThreadId();
+        let entry = (*s).entry;
+        let ctx = (*s).ctx;
+        LeaveCriticalSection(cs_ptr);
+
+        let rv = entry(ctx);
+
+        EnterCriticalSection(cs_ptr);
+        (*s).ret_val = rv;
+        (*s).finished = 1u32;
+        (*s).win_tid = 0u32;
+        if (*s).detached != 0u32 {
+            let h = (*s).os_handle;
+            (*s).os_handle = 0 as *mut u8;
+            (*s).in_use = 0u32;
+            LeaveCriticalSection(cs_ptr);
+            if (h as usize) != 0 {
+                CloseHandle(h);
+            }
+        } else {
+            LeaveCriticalSection(cs_ptr);
+        }
+        0u32
+    }
+}
+
+unsafe fn win_alloc_slot(rt: *mut WinThreadRt) -> usize {
+    let heap = GetProcessHeap();
+    let mut idx: usize = 1;
+    while idx < (*rt).slot_cap {
+        let pp = slot_ptr_at((*rt).slots, idx);
+        let mut s = *pp;
+        if (s as usize) == 0 {
+            s = HeapAlloc(heap, 8u32, size_of<WinThreadSlot>()) as *mut WinThreadSlot;
+            if (s as usize) == 0 {
+                return 0;
+            }
+            *pp = s;
+            return idx;
+        }
+        if (*s).in_use == 0u32 {
+            return idx;
+        }
+        idx = idx + 1;
+    }
+    if (*rt).slot_cap >= 32768 {
+        return 0;
+    }
+    let old_cap = (*rt).slot_cap;
+    let new_cap = old_cap * 2;
+    let new_arr = HeapAlloc(heap, 8u32, new_cap * size_of<*mut WinThreadSlot>()) as *mut *mut WinThreadSlot;
+    if (new_arr as usize) == 0 {
+        return 0;
+    }
+    ptr_copy_nonoverlapping<*mut WinThreadSlot>((*rt).slots as *const *mut WinThreadSlot, new_arr, old_cap);
+    HeapFree(heap, 0u32, (*rt).slots as *mut u8);
+    (*rt).slots = new_arr;
+    (*rt).slot_cap = new_cap;
+    let s = HeapAlloc(heap, 8u32, size_of<WinThreadSlot>()) as *mut WinThreadSlot;
+    if (s as usize) == 0 {
+        return 0;
+    }
+    *slot_ptr_at((*rt).slots, old_cap) = s;
+    old_cap
+}
+
+pub unsafe fn __ax_host_thread_spawn(entry: fn(*mut u8) -> i64, ctx: *mut u8, stack_size: usize) -> i64 {
+    if fn_entry_to_addr(entry) == 0usize {
+        return -4i64;
+    }
+    let rt = win_rt_get();
+    if (rt as usize) == 0 {
+        return -9i64;
+    }
+    let cs_ptr = address_of_mut((*rt).cs[0]) as *mut u8;
+    EnterCriticalSection(cs_ptr);
+    let idx = win_alloc_slot(rt);
+    if idx == 0 {
+        LeaveCriticalSection(cs_ptr);
+        return -9i64;
+    }
+    let s = *slot_ptr_at((*rt).slots, idx);
+    let mut gen = (*s).generation + 1u32;
+    if gen == 0u32 || gen > 0x7FFFu32 {
+        gen = 1u32;
+    }
+    (*s).in_use = 1u32;
+    (*s).finished = 0u32;
+    (*s).detached = 0u32;
+    (*s).joining = 0u32;
+    (*s).panicked = 0u32;
+    (*s).win_tid = 0u32;
+    (*s).generation = gen;
+    (*s).logical_id = (*rt).next_logical_id;
+    (*rt).next_logical_id = (*rt).next_logical_id + 1u64;
+    (*s).os_handle = 0 as *mut u8;
+    (*s).entry = entry;
+    (*s).ctx = ctx;
+    (*s).ret_val = 0i64;
+    if (ctx as usize) != 0 && *(ctx as *const u64) == 0x4158544852504B54u64 {
+        *((ctx + 32) as *mut u64) = (*s).logical_id;
+    }
+
+    let mut tid: [1]u32 = [0u32];
+    let h = CreateThread(0 as *mut u8, stack_size, win_thread_trampoline, s as *mut u8, 0u32, address_of_mut(tid[0]));
+    if (h as usize) == 0 {
+        (*s).in_use = 0u32;
+        LeaveCriticalSection(cs_ptr);
+        return -9i64;
+    }
+    (*s).os_handle = h;
+    (*s).win_tid = tid[0];
+    let handle_val: i64 = ((gen as i64) << 16) | (idx as i64);
+    LeaveCriticalSection(cs_ptr);
+    handle_val
+}
+
+pub unsafe fn __ax_host_thread_join(h: i64, out_ret: *mut i64) -> i64 {
+    if h <= 0i64 {
+        return -4i64;
+    }
+    let rt = win_rt_peek();
+    if (rt as usize) == 0 {
+        return -4i64;
+    }
+    let idx = (h & 0xFFFFi64) as usize;
+    let gen = ((h >> 16) & 0x7FFFi64) as u32;
+    let cs_ptr = address_of_mut((*rt).cs[0]) as *mut u8;
+    EnterCriticalSection(cs_ptr);
+    if idx == 0 || idx >= (*rt).slot_cap {
+        LeaveCriticalSection(cs_ptr);
+        return -4i64;
+    }
+    let s = *slot_ptr_at((*rt).slots, idx);
+    if (s as usize) == 0 || (*s).in_use == 0u32 || (*s).generation != gen || (*s).detached != 0u32 || (*s).joining != 0u32 {
+        LeaveCriticalSection(cs_ptr);
+        return -4i64;
+    }
+    if (*s).finished == 0u32 && (*s).win_tid == GetCurrentThreadId() {
+        LeaveCriticalSection(cs_ptr);
+        return -4i64;
+    }
+    (*s).joining = 1u32;
+    let os_h = (*s).os_handle;
+    LeaveCriticalSection(cs_ptr);
+
+    if (os_h as usize) != 0 {
+        WaitForSingleObject(os_h, 0xFFFFFFFFu32);
+    }
+
+    EnterCriticalSection(cs_ptr);
+    let rv = (*s).ret_val;
+    (*s).os_handle = 0 as *mut u8;
+    (*s).joining = 0u32;
+    (*s).in_use = 0u32;
+    LeaveCriticalSection(cs_ptr);
+
+    if (os_h as usize) != 0 {
+        CloseHandle(os_h);
+    }
+    if (out_ret as usize) != 0 {
+        *out_ret = rv;
+    }
+    0i64
+}
+
+pub fn __ax_host_thread_detach(h: i64) -> i64 {
+    if h <= 0i64 {
+        return -4i64;
+    }
+    unsafe {
+        let rt = win_rt_peek();
+        if (rt as usize) == 0 {
+            return -4i64;
+        }
+        let idx = (h & 0xFFFFi64) as usize;
+        let gen = ((h >> 16) & 0x7FFFi64) as u32;
+        let cs_ptr = address_of_mut((*rt).cs[0]) as *mut u8;
+        EnterCriticalSection(cs_ptr);
+        if idx == 0 || idx >= (*rt).slot_cap {
+            LeaveCriticalSection(cs_ptr);
+            return -4i64;
+        }
+        let s = *slot_ptr_at((*rt).slots, idx);
+        if (s as usize) == 0 || (*s).in_use == 0u32 || (*s).generation != gen || (*s).detached != 0u32 || (*s).joining != 0u32 {
+            LeaveCriticalSection(cs_ptr);
+            return -4i64;
+        }
+        if (*s).finished != 0u32 {
+            let os_h = (*s).os_handle;
+            (*s).os_handle = 0 as *mut u8;
+            (*s).in_use = 0u32;
+            LeaveCriticalSection(cs_ptr);
+            if (os_h as usize) != 0 {
+                CloseHandle(os_h);
+            }
+            return 0i64;
+        }
+        (*s).detached = 1u32;
+        LeaveCriticalSection(cs_ptr);
+        0i64
+    }
+}
+
+pub fn __ax_host_thread_current_id() -> u64 {
+    unsafe {
+        let cur_tid = GetCurrentThreadId();
+        let rt = win_rt_get();
+        if (rt as usize) == 0 {
+            return if cur_tid == 0u32 { 1u64 } else { cur_tid as u64 };
+        }
+        if cur_tid == (*rt).main_win_tid {
+            return 1u64;
+        }
+        let cs_ptr = address_of_mut((*rt).cs[0]) as *mut u8;
+        EnterCriticalSection(cs_ptr);
+        let mut idx: usize = 1;
+        while idx < (*rt).slot_cap {
+            let s = *slot_ptr_at((*rt).slots, idx);
+            if (s as usize) != 0 && (*s).in_use != 0u32 && (*s).finished == 0u32 && (*s).win_tid == cur_tid {
+                let lid = (*s).logical_id;
+                LeaveCriticalSection(cs_ptr);
+                return lid;
+            }
+            idx = idx + 1;
+        }
+        LeaveCriticalSection(cs_ptr);
+        0x8000000000000000u64 | (cur_tid as u64)
+    }
+}
+
+pub fn __ax_host_thread_yield() {
+    unsafe {
+        SwitchToThread();
+    }
+}
+
+pub fn __ax_host_thread_sleep_ns(ns: u64) {
+    if ns == 0u64 {
+        unsafe { Sleep(0u32); }
+        return;
+    }
+    let mut ms64 = ns / 1_000_000u64;
+    if (ns % 1_000_000u64) != 0u64 {
+        ms64 = ms64 + 1u64;
+    }
+    let ms32 = if ms64 >= 0xFFFFFFFEu64 { 0xFFFFFFFEu32 } else { ms64 as u32 };
+    unsafe {
+        Sleep(ms32);
+    }
+}
+
+pub unsafe fn __ax_host_futex_wait(addr: *const u32, expected: u32, timeout_ns: u64) -> i64 {
+    if (addr as usize) == 0 || ((addr as usize) & 3usize) != 0usize {
+        return -4i64;
+    }
+    let mut timeout_ms: u32 = 0u32;
+    if timeout_ns == 0xFFFFFFFFFFFFFFFFu64 {
+        timeout_ms = 0xFFFFFFFFu32;
+    } else if timeout_ns > 0u64 {
+        let mut ms64 = timeout_ns / 1_000_000u64;
+        if (timeout_ns % 1_000_000u64) != 0u64 {
+            ms64 = ms64 + 1u64;
+        }
+        timeout_ms = if ms64 >= 0xFFFFFFFEu64 { 0xFFFFFFFEu32 } else { ms64 as u32 };
+    }
+    let exp_box: [1]u32 = [expected];
+    let ok = WaitOnAddress(addr as *const u8, address_of(exp_box[0]) as *const u8, 4usize, timeout_ms);
+    if ok != 0 {
+        return 0i64;
+    }
+    if GetLastError() == 1460u32 {
+        return -5i64;
+    }
+    0i64
+}
+
+pub unsafe fn __ax_host_futex_wake(addr: *const u32, count: u32) -> i64 {
+    if (addr as usize) == 0 || ((addr as usize) & 3usize) != 0usize {
+        return -4i64;
+    }
+    if count == 0u32 {
+        return 0i64;
+    }
+    if count == 1u32 {
+        WakeByAddressSingle(addr as *const u8);
+        return 1i64;
+    }
+    WakeByAddressAll(addr as *const u8);
+    count as i64
+}
+
+module std.sys.windows.fiber
+
+// Native backing of host.fiber_create / fiber_resume / fiber_yield / fiber_destroy on x86_64-windows
+// (SPEC-34 AXS-EXEC-055): Win32 fibers (ConvertThreadToFiberEx, CreateFiberEx, SwitchToFiber,
+// DeleteFiber). Win32 gives no exported way to read the current fiber, so all bookkeeping lives in a
+// per-thread table (@thread_local) that also supplies the handle validation required by the host contract.
+
+@link("kernel32")
+extern "system" {
+    fn GetProcessHeap() -> *mut u8;
+    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;
+    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;
+    fn GetCurrentThreadId() -> u32;
+    fn IsThreadAFiber() -> i32;
+    fn ConvertThreadToFiberEx(lpParameter: *mut u8, dwFlags: u32) -> *mut u8;
+    fn CreateFiberEx(
+        dwStackCommitSize: usize,
+        dwStackReserveSize: usize,
+        dwFlags: u32,
+        lpStartAddress: fn(*mut u8) -> u32,
+        lpParameter: *mut u8
+    ) -> *mut u8;
+    fn SwitchToFiber(lpFiber: *mut u8);
+    fn DeleteFiber(lpFiber: *mut u8);
+}
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+const FIBER_ST_SUSPENDED: u32 = 0u32;
+const FIBER_ST_RUNNING: u32 = 1u32;
+const FIBER_ST_COMPLETED: u32 = 2u32;
+
+const DEFAULT_STACK_COMMIT: usize = 65536;
+const DEFAULT_STACK_RESERVE: usize = 262144;
+const HEAP_ZERO_MEMORY: u32 = 8u32;
+
+@repr(C)
+struct WinFiberSlot {
+    in_use: u32,
+    status: u32,
+    generation: u32,
+    owner_tid: u32,
+    entry: fn(*mut u8) -> i64,
+    ctx: *mut u8,
+    win_fiber: *mut u8,
+    caller_fiber: *mut u8,
+    prev_cur: *mut WinFiberSlot,
+    yield_or_ret: i64,
+    resume_arg: i64,
+}
+
+// Per-thread state: slot table, the fiber currently running on this thread (null on the root
+// context) and the Win32 fiber the thread was converted into.
+@thread_local
+static mut FIBER_TABLE: *mut *mut WinFiberSlot = 0 as *mut *mut WinFiberSlot;
+@thread_local
+static mut FIBER_TABLE_CAP: usize = 0;
+@thread_local
+static mut FIBER_CUR: *mut WinFiberSlot = 0 as *mut WinFiberSlot;
+@thread_local
+static mut FIBER_ROOT: *mut u8 = 0 as *mut u8;
+
+unsafe fn fn_entry_to_addr(f: fn(*mut u8) -> i64) -> usize {
+    let tmp: [1]fn(*mut u8) -> i64 = [f];
+    *(address_of(tmp[0]) as *const usize)
+}
+
+unsafe fn table_at(arr: *mut *mut WinFiberSlot, idx: usize) -> *mut *mut WinFiberSlot {
+    ((arr as usize) + idx * size_of<*mut WinFiberSlot>()) as *mut *mut WinFiberSlot
+}
+
+unsafe fn lookup_slot(h: i64) -> *mut WinFiberSlot {
+    if h <= 0i64 {
+        return 0 as *mut WinFiberSlot;
+    }
+    // handle = (owner thread id << 31) | (generation << 16) | (slot index + 1): unique in the process,
+    // so a handle of another thread never resolves to a slot of the calling thread.
+    let idx1 = ((h as u64) & 0xFFFFu64) as usize;
+    let gen = (((h as u64) >> 16u64) & 0x7FFFu64) as u32;
+    let htid = ((h as u64) >> 31u64) as u32;
+    if htid != GetCurrentThreadId() {
+        return 0 as *mut WinFiberSlot;
+    }
+    if idx1 == 0 || idx1 > FIBER_TABLE_CAP {
+        return 0 as *mut WinFiberSlot;
+    }
+    let s = *table_at(FIBER_TABLE, idx1 - 1);
+    if (s as usize) == 0 || (*s).in_use == 0u32 || (*s).generation != gen || (*s).owner_tid != GetCurrentThreadId() {
+        return 0 as *mut WinFiberSlot;
+    }
+    s
+}
+
+// Returns the 0-based index of a free slot (creating it) or 0xFFFFFFFF on allocation failure.
+unsafe fn alloc_slot_index() -> usize {
+    let heap = GetProcessHeap();
+    if (heap as usize) == 0 {
+        return 0xFFFFFFFFusize;
+    }
+    let mut i: usize = 0;
+    while i < FIBER_TABLE_CAP {
+        let pp = table_at(FIBER_TABLE, i);
+        let s = *pp;
+        if (s as usize) == 0 {
+            let ns = HeapAlloc(heap, HEAP_ZERO_MEMORY, size_of<WinFiberSlot>()) as *mut WinFiberSlot;
+            if (ns as usize) == 0 {
+                return 0xFFFFFFFFusize;
+            }
+            *pp = ns;
+            return i;
+        }
+        if (*s).in_use == 0u32 {
+            return i;
+        }
+        i = i + 1;
+    }
+    let old_cap = FIBER_TABLE_CAP;
+    let new_cap: usize = if old_cap == 0 { 16 } else { old_cap * 2 };
+    let new_tbl = HeapAlloc(heap, HEAP_ZERO_MEMORY, new_cap * size_of<*mut WinFiberSlot>()) as *mut *mut WinFiberSlot;
+    if (new_tbl as usize) == 0 {
+        return 0xFFFFFFFFusize;
+    }
+    if old_cap > 0 {
+        ptr_copy_nonoverlapping<*mut WinFiberSlot>(FIBER_TABLE as *const *mut WinFiberSlot, new_tbl, old_cap);
+        HeapFree(heap, 0u32, FIBER_TABLE as *mut u8);
+    }
+    FIBER_TABLE = new_tbl;
+    FIBER_TABLE_CAP = new_cap;
+    let ns = HeapAlloc(heap, HEAP_ZERO_MEMORY, size_of<WinFiberSlot>()) as *mut WinFiberSlot;
+    if (ns as usize) == 0 {
+        return 0xFFFFFFFFusize;
+    }
+    *table_at(FIBER_TABLE, old_cap) = ns;
+    old_cap
+}
+
+// Win32 fiber start routine. It must never return: when the entry function is done it records the
+// result and switches back to whoever resumed the fiber; the resumer then deletes the fiber.
+fn win_fiber_trampoline(param: *mut u8) -> u32 {
+    unsafe {
+        let slot = param as *mut WinFiberSlot;
+        let entry = (*slot).entry;
+        let ctx = (*slot).ctx;
+        let rv = entry(ctx);
+        (*slot).yield_or_ret = rv;
+        (*slot).status = FIBER_ST_COMPLETED;
+        SwitchToFiber((*slot).caller_fiber);
+    }
+    // Unreachable: a completed fiber is never switched to again.
+    0u32
+}
+
+pub unsafe fn __ax_host_fiber_create(entry: fn(*mut u8) -> i64, ctx: *mut u8, stack_commit: usize, stack_reserve: usize) -> i64 {
+    if fn_entry_to_addr(entry) == 0usize {
+        return -4i64;
+    }
+    let idx = alloc_slot_index();
+    if idx == 0xFFFFFFFFusize || idx >= 0xFFFFusize {
+        return -9i64;
+    }
+    let s = *table_at(FIBER_TABLE, idx);
+    let mut gen = (*s).generation + 1u32;
+    if gen == 0u32 || gen > 0x7FFFu32 {
+        gen = 1u32;
+    }
+    let commit: usize = if stack_commit == 0 { DEFAULT_STACK_COMMIT } else { stack_commit };
+    let reserve: usize = if stack_reserve == 0 { DEFAULT_STACK_RESERVE } else { stack_reserve };
+    (*s).in_use = 1u32;
+    (*s).status = FIBER_ST_SUSPENDED;
+    (*s).generation = gen;
+    (*s).owner_tid = GetCurrentThreadId();
+    (*s).entry = entry;
+    (*s).ctx = ctx;
+    (*s).caller_fiber = 0 as *mut u8;
+    (*s).prev_cur = 0 as *mut WinFiberSlot;
+    (*s).yield_or_ret = 0i64;
+    (*s).resume_arg = 0i64;
+    let wf = CreateFiberEx(commit, reserve, 0u32, win_fiber_trampoline, s as *mut u8);
+    if (wf as usize) == 0 {
+        (*s).in_use = 0u32;
+        return -9i64;
+    }
+    (*s).win_fiber = wf;
+    (((GetCurrentThreadId() as u64) << 31u64) | ((gen as u64) << 16u64) | ((idx + 1) as u64)) as i64
+}
+
+pub unsafe fn __ax_host_fiber_resume(h: i64, arg: i64, out_val: *mut i64) -> i64 {
+    let s = lookup_slot(h);
+    if (s as usize) == 0 || (*s).status != FIBER_ST_SUSPENDED {
+        return -4i64;
+    }
+    let mut caller: *mut u8 = 0 as *mut u8;
+    if (FIBER_CUR as usize) != 0 {
+        caller = (*FIBER_CUR).win_fiber;
+    } else {
+        if (FIBER_ROOT as usize) == 0 {
+            if IsThreadAFiber() != 0 {
+                // The thread already runs as a fiber we do not own: its root cannot be recovered.
+                return -9i64;
+            }
+            let root = ConvertThreadToFiberEx(0 as *mut u8, 0u32);
+            if (root as usize) == 0 {
+                return -9i64;
+            }
+            FIBER_ROOT = root;
+        }
+        caller = FIBER_ROOT;
+    }
+    (*s).caller_fiber = caller;
+    (*s).prev_cur = FIBER_CUR;
+    (*s).resume_arg = arg;
+    (*s).status = FIBER_ST_RUNNING;
+    FIBER_CUR = s;
+    SwitchToFiber((*s).win_fiber);
+    // Back on the resumer's stack: the fiber yielded or finished.
+    FIBER_CUR = (*s).prev_cur;
+    if (out_val as usize) != 0 {
+        *out_val = (*s).yield_or_ret;
+    }
+    if (*s).status == FIBER_ST_COMPLETED {
+        return 1i64;
+    }
+    0i64
+}
+
+pub unsafe fn __ax_host_fiber_yield(val: i64) -> i64 {
+    let s = FIBER_CUR;
+    if (s as usize) == 0 {
+        return -4i64;
+    }
+    (*s).yield_or_ret = val;
+    (*s).status = FIBER_ST_SUSPENDED;
+    SwitchToFiber((*s).caller_fiber);
+    // Resumed again.
+    (*s).resume_arg
+}
+
+pub unsafe fn __ax_host_fiber_destroy(h: i64) -> i64 {
+    let s = lookup_slot(h);
+    if (s as usize) == 0 || (*s).status == FIBER_ST_RUNNING {
+        return -4i64;
+    }
+    DeleteFiber((*s).win_fiber);
+    (*s).win_fiber = 0 as *mut u8;
+    (*s).in_use = 0u32;
+    0i64
+}
+
+// std.fiber - Stackful Fiber<Y, R>, FiberBuilder & cooperative FiberScheduler (SPEC-34 §5, AXS-EXEC-050..056)
+module std.fiber
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.core.host.fiber_create
+use std.core.host.fiber_resume
+use std.core.host.fiber_yield
+use std.core.host.fiber_destroy
+use std.core.host.thread_current_id
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic fn needs_drop<T>() -> bool { false }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+@intrinsic unsafe fn drop_in_place<T>(p: *mut T) {}
+@intrinsic fn panic(msg: str) {}
+
+// Default stack budget (SPEC-34 AXS-EXEC-051): 64 KiB committed, 256 KiB reserved.
+const FIBER_DEFAULT_STACK_COMMIT: usize = 65536;
+const FIBER_DEFAULT_STACK_RESERVE: usize = 262144;
+
+// Placeholder whose *name* the compiler rewrites, inside a generic function, to that very function
+// (same device as std.thread): it lets the monomorphic trampoline pass itself as the fiber entry.
+fn __ax_fiber_self_entry(ctx: *mut u8) -> i64 {
+    let _ = ctx;
+    0i64
+}
+
+// Per-thread counter that makes FiberId unique: the id is (thread id << 32) | counter.
+@thread_local
+static mut FIBER_ID_COUNTER: u64 = 0u64;
+
+@derive(Copy)
+pub struct FiberId {
+    pub id: u64,
+}
+
+impl FiberId {
+    pub fn as_u64(self: view<FiberId>) -> u64 {
+        self.id
+    }
+
+    pub fn eq(self: view<FiberId>, other: view<FiberId>) -> bool {
+        self.id == other.id
+    }
+
+    pub fn clone(self: view<FiberId>) -> FiberId {
+        *self
+    }
+}
+
+pub enum FiberState<Y, R> {
+    Yielded(Y),
+    Completed(R),
+    Panicked,
+}
+
+pub struct FiberBuilder {
+    pub stack_commit: usize,
+    pub stack_reserve: usize,
+}
+
+// Heap control slot shared by the Fiber handle and the monomorphic trampoline.
+// phase 0 = create the host fiber, phase 1 = fiber entry (runs the closure), phase 2 = dispose the
+// closure of a fiber that never started.
+@repr(C)
+struct FiberSlot {
+    pub phase: u32,
+    pub pad0: u32,
+    pub stack_commit: usize,
+    pub stack_reserve: usize,
+    pub raw_handle: i64,
+    pub closure_ptr: *mut u8,
+    pub result_ptr: *mut u8,
+    pub cleanup_fn: fn(*mut u8) -> i64,
+}
+
+pub struct Fiber<Y, R> {
+    pub raw_handle: i64,
+    pub id: FiberId,
+    pub slot: *mut u8,
+    pub owner_thread: u64,
+    pub completed: bool,
+}
+
+// A fiber keeps thread-local references and stack views alive: it never migrates between OS threads.
+impl<Y, R> !Send for Fiber<Y, R> {}
+impl<Y, R> !Share for Fiber<Y, R> {}
+
+fn box_size(sz: usize) -> usize {
+    if sz == 0 { 8 } else { sz }
+}
+
+fn box_align(al: usize) -> usize {
+    if al < 8 { 8 } else { al }
+}
+
+unsafe fn fiber_trampoline<F: FnOnce<R>, R>(raw_typed: *mut (F, R)) -> i64 {
+    let raw = raw_typed as *mut u8;
+    let slot = raw as *mut FiberSlot;
+    let ph = (*slot).phase;
+    if ph == 0u32 {
+        (*slot).cleanup_fn = __ax_fiber_self_entry;
+        (*slot).phase = 1u32;
+        let h = fiber_create(__ax_fiber_self_entry, raw, (*slot).stack_commit, (*slot).stack_reserve);
+        (*slot).raw_handle = h;
+        return h;
+    }
+    if ph == 2u32 {
+        let c_ptr = (*slot).closure_ptr;
+        (*slot).closure_ptr = 0 as *mut u8;
+        if (c_ptr as usize) != 0 {
+            // Move the closure into a local so that its captures are dropped at the end of the block
+            // (drop_in_place on a closure type is a no-op), then free the box.
+            {
+                let _dead: F = *(c_ptr as *mut F);
+            }
+            heap_free(c_ptr, box_size(size_of<F>()), box_align(align_of<F>()));
+        }
+        return 0i64;
+    }
+
+    // Fiber entry: runs on the fiber's own stack.
+    let c_ptr = (*slot).closure_ptr;
+    (*slot).closure_ptr = 0 as *mut u8;
+    let f_box = c_ptr as *mut F;
+    let f_val = *f_box;
+    heap_free(c_ptr, box_size(size_of<F>()), box_align(align_of<F>()));
+
+    let out_val: R = f_val();
+    let r_raw = heap_alloc(box_size(size_of<R>()), box_align(align_of<R>()));
+    let r_box = r_raw as *mut R;
+    *r_box = out_val;
+    (*slot).result_ptr = r_raw;
+    0i64
+}
+
+unsafe fn spawn_raw_slot<F: FnOnce<R>, R>(f: F, commit: usize, reserve: usize) -> *mut FiberSlot {
+    let f_raw = heap_alloc(box_size(size_of<F>()), box_align(align_of<F>()));
+    if (f_raw as usize) == 0 {
+        return 0 as *mut FiberSlot;
+    }
+    let f_box = f_raw as *mut F;
+    *f_box = f;
+    let s_raw = heap_alloc(size_of<FiberSlot>(), align_of<FiberSlot>());
+    if (s_raw as usize) == 0 {
+        {
+            let _dead: F = *f_box;
+        }
+        heap_free(f_raw, box_size(size_of<F>()), box_align(align_of<F>()));
+        return 0 as *mut FiberSlot;
+    }
+    let slot = s_raw as *mut FiberSlot;
+    (*slot).phase = 0u32;
+    (*slot).pad0 = 0u32;
+    (*slot).stack_commit = commit;
+    (*slot).stack_reserve = reserve;
+    (*slot).raw_handle = 0i64;
+    (*slot).closure_ptr = f_raw;
+    (*slot).result_ptr = 0 as *mut u8;
+    (*slot).cleanup_fn = __ax_fiber_self_entry;
+    let h = fiber_trampoline<F, R>(slot as *mut (F, R));
+    if h <= 0i64 {
+        (*slot).phase = 2u32;
+        let cfn = (*slot).cleanup_fn;
+        let _ = cfn(s_raw);
+        heap_free(s_raw, size_of<FiberSlot>(), align_of<FiberSlot>());
+        return 0 as *mut FiberSlot;
+    }
+    slot
+}
+
+unsafe fn next_fiber_id() -> FiberId {
+    FIBER_ID_COUNTER = FIBER_ID_COUNTER + 1u64;
+    FiberId { id: (thread_current_id() << 32u64) | FIBER_ID_COUNTER }
+}
+
+impl FiberBuilder {
+    pub fn new() -> FiberBuilder {
+        FiberBuilder {
+            stack_commit: FIBER_DEFAULT_STACK_COMMIT,
+            stack_reserve: FIBER_DEFAULT_STACK_RESERVE,
+        }
+    }
+
+    pub fn stack_size(mut self: FiberBuilder, commit: usize, reserve: usize) -> FiberBuilder {
+        self.stack_commit = commit;
+        self.stack_reserve = reserve;
+        self
+    }
+
+    pub fn spawn<F: FnOnce<R>, Y, R>(self: FiberBuilder, f: F) -> Fiber<Y, R> {
+        let slot = unsafe { spawn_raw_slot<F, R>(f, self.stack_commit, self.stack_reserve) };
+        if (slot as usize) == 0 {
+            panic("failed to create fiber");
+        }
+        let h = unsafe { (*slot).raw_handle };
+        Fiber {
+            raw_handle: h,
+            id: unsafe { next_fiber_id() },
+            slot: slot as *mut u8,
+            owner_thread: thread_current_id(),
+            completed: false,
+        }
+    }
+}
+
+impl<Y, R> Fiber<Y, R> {
+    pub fn new<F>(f: F) -> Fiber<Y, R> {
+        FiberBuilder.new().spawn<F, Y, R>(f)
+    }
+
+    pub fn spawn<F>(f: F) -> Fiber<Y, R> {
+        FiberBuilder.new().spawn<F, Y, R>(f)
+    }
+
+    pub fn id(self: view<Fiber<Y, R>>) -> FiberId {
+        self.id
+    }
+
+    pub fn is_completed(self: view<Fiber<Y, R>>) -> bool {
+        self.completed
+    }
+
+    pub fn resume(self: mut_view<Fiber<Y, R>>) -> FiberState<Y, R> {
+        if self.completed || self.raw_handle <= 0i64 {
+            panic("fiber resumed after it completed");
+            return FiberState.Panicked;
+        }
+        let mut out: i64 = 0i64;
+        let rc = unsafe { fiber_resume(self.raw_handle, 0i64, address_of_mut(out)) };
+        if rc == 0i64 {
+            // yield_val moved a heap cell holding the yielded Y; take it over.
+            let cell = (out as usize) as *mut Y;
+            let y: Y = unsafe { *cell };
+            unsafe {
+                heap_free(cell as *mut u8, box_size(size_of<Y>()), box_align(align_of<Y>()));
+            }
+            return FiberState.Yielded(y);
+        }
+        if rc == 1i64 {
+            let slot = self.slot as *mut FiberSlot;
+            let r_raw = unsafe { (*slot).result_ptr };
+            unsafe {
+                (*slot).result_ptr = 0 as *mut u8;
+            }
+            let r: R = unsafe { *(r_raw as *mut R) };
+            unsafe {
+                heap_free(r_raw, box_size(size_of<R>()), box_align(align_of<R>()));
+            }
+            self.finish_host();
+            return FiberState.Completed(r);
+        }
+        if rc == 2i64 {
+            self.finish_host();
+            return FiberState.Panicked;
+        }
+        panic("fiber resume rejected (wrong OS thread, already running or destroyed)");
+        FiberState.Panicked
+    }
+
+    // The fiber reached a terminal state: release its host stack now.
+    fn finish_host(self: mut_view<Fiber<Y, R>>) {
+        let h = self.raw_handle;
+        self.raw_handle = 0i64;
+        self.completed = true;
+        if h > 0i64 {
+            let _ = fiber_destroy(h);
+        }
+    }
+}
+
+impl<Y, R> Drop for Fiber<Y, R> {
+    fn drop(self: mut_view<Fiber<Y, R>>) {
+        let slot_raw = self.slot;
+        if (slot_raw as usize) == 0 {
+            return;
+        }
+        self.slot = 0 as *mut u8;
+        let h = self.raw_handle;
+        self.raw_handle = 0i64;
+        if h > 0i64 {
+            // A suspended fiber's stack is released without unwinding it (live locals are leaked,
+            // like Win32 DeleteFiber); a running fiber or a foreign thread is rejected (AFIBER-31, AFIBER-45).
+            let rc = fiber_destroy(h);
+            if rc != 0i64 {
+                panic("cannot destroy a running fiber or a fiber owned by another thread");
+            }
+        }
+        let slot = slot_raw as *mut FiberSlot;
+        unsafe {
+            if ((*slot).closure_ptr as usize) != 0 {
+                (*slot).phase = 2u32;
+                let cfn = (*slot).cleanup_fn;
+                let _ = cfn(slot_raw);
+            }
+            let r_raw = (*slot).result_ptr;
+            (*slot).result_ptr = 0 as *mut u8;
+            if (r_raw as usize) != 0 {
+                if needs_drop<R>() {
+                    drop_in_place<R>(r_raw as *mut R);
+                }
+                heap_free(r_raw, box_size(size_of<R>()), box_align(align_of<R>()));
+            }
+            heap_free(slot_raw, size_of<FiberSlot>(), align_of<FiberSlot>());
+        }
+    }
+}
+
+// Suspends the active fiber, handing `val` to the code that resumed it.
+pub fn yield_val<Y>(val: Y) {
+    unsafe {
+        let cell = heap_alloc(box_size(size_of<Y>()), box_align(align_of<Y>()));
+        let cell_y = cell as *mut Y;
+        *cell_y = val;
+        let rc = fiber_yield((cell as usize) as i64);
+        if rc < 0i64 {
+            // Not running inside a fiber: take the value back so nothing leaks.
+            let _back: Y = *cell_y;
+            heap_free(cell, box_size(size_of<Y>()), box_align(align_of<Y>()));
+            panic("yield_val called outside of a fiber");
+        }
+    }
+}
+
+pub fn yield_now() {
+    yield_val(());
+}
+
+// Cooperative round-robin scheduler for Fiber<(), ()> on the current thread (FIFO order).
+pub struct FiberScheduler {
+    pub queue: *mut Fiber<(), ()>,
+    pub len: usize,
+    pub cap: usize,
+}
+
+impl !Send for FiberScheduler {}
+impl !Share for FiberScheduler {}
+
+impl FiberScheduler {
+    pub fn new() -> FiberScheduler {
+        FiberScheduler {
+            queue: 0 as *mut Fiber<(), ()>,
+            len: 0,
+            cap: 0,
+        }
+    }
+
+    pub fn spawn<F: FnOnce<()>>(self: mut_view<FiberScheduler>, f: F) {
+        let fb: Fiber<(), ()> = FiberBuilder.new().spawn<F, (), ()>(f);
+        unsafe {
+            if self.len == self.cap {
+                let new_cap: usize = if self.cap == 0 { 4 } else { self.cap * 2 };
+                let sz = size_of<Fiber<(), ()>>();
+                let raw = heap_alloc(new_cap * sz, align_of<Fiber<(), ()>>());
+                let new_q = raw as *mut Fiber<(), ()>;
+                if self.len > 0 {
+                    ptr_copy_nonoverlapping<u8>(self.queue as *const u8, new_q as *mut u8, self.len * sz);
+                    heap_free(self.queue as *mut u8, self.cap * sz, align_of<Fiber<(), ()>>());
+                }
+                self.queue = new_q;
+                self.cap = new_cap;
+            }
+            let dst = self.queue + self.len;
+            *dst = fb;
+        }
+        self.len = self.len + 1;
+    }
+
+    pub fn pending(self: view<FiberScheduler>) -> usize {
+        let mut n: usize = 0;
+        let mut i: usize = 0;
+        while i < self.len {
+            let p = unsafe { self.queue + i };
+            if !unsafe { (*p).completed } {
+                n = n + 1;
+            }
+            i = i + 1;
+        }
+        n
+    }
+
+    // Drives every queued fiber, one resume per round, until all of them completed.
+    pub fn run(self: mut_view<FiberScheduler>) {
+        let mut remaining: usize = self.pending();
+        while remaining > 0 {
+            let mut i: usize = 0;
+            while i < self.len {
+                let p = unsafe { self.queue + i };
+                if !unsafe { (*p).completed } {
+                    let st = unsafe { (*p).resume() };
+                    match st {
+                        FiberState.Yielded(_u) => {}
+                        FiberState.Completed(_u) => {
+                            remaining = remaining - 1;
+                        }
+                        FiberState.Panicked => {
+                            remaining = remaining - 1;
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        self.release_all();
+    }
+
+    fn release_all(self: mut_view<FiberScheduler>) {
+        let mut i: usize = 0;
+        while i < self.len {
+            unsafe {
+                drop_in_place<Fiber<(), ()>>(self.queue + i);
+            }
+            i = i + 1;
+        }
+        self.len = 0;
+    }
+}
+
+impl Drop for FiberScheduler {
+    fn drop(self: mut_view<FiberScheduler>) {
+        self.release_all();
+        if (self.queue as usize) != 0 {
+            let sz = size_of<Fiber<(), ()>>();
+            unsafe {
+                heap_free(self.queue as *mut u8, self.cap * sz, align_of<Fiber<(), ()>>());
+            }
+            self.queue = 0 as *mut Fiber<(), ()>;
+            self.cap = 0;
+        }
+    }
+}
+
+module main
+
+use std.fiber.Fiber
+use std.fiber.FiberState
+use std.fiber.FiberScheduler
+use std.fiber.yield_now
+use std.fiber.yield_val
+
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+fn bump(counter: *mut i64) {
+    unsafe {
+        *counter = *counter + 1i64;
+    }
+}
+
+pub fn main() -> i32 {
+    let mut counter: i64 = 0i64;
+    let cp: *mut i64 = unsafe { address_of_mut(counter) };
+
+    // 1. Create/finish/drop 300 fibers one after the other: slots and Win32 fibers are recycled,
+    //    handles do not leak (a leak of the 256 KiB reservations would exhaust the address space
+    //    or the slot table long before 300 iterations).
+    let mut i: i64 = 0i64;
+    let mut total: i64 = 0i64;
+    while i < 300i64 {
+        let mut f: Fiber<i64, i64> = Fiber.new(|| -> i64 {
+            yield_val<i64>(i);
+            i * 2i64
+        });
+        match f.resume() {
+            FiberState.Yielded(v) => { total = total + v; },
+            FiberState.Completed(_r) => { check_at(33, false); },
+            FiberState.Panicked => { check_at(34, false); },
+        }
+        match f.resume() {
+            FiberState.Yielded(_v) => { check_at(37, false); },
+            FiberState.Completed(r) => { total = total + r; },
+            FiberState.Panicked => { check_at(39, false); },
+        }
+        i = i + 1i64;
+    }
+    // sum over i of 3 * i = 3 * (299 * 300 / 2)
+    check_at(44, total == 134550i64);
+
+    // 2. Create/suspend/drop 200 fibers (destroyed while suspended): the host stack is released on drop.
+    let mut j: i64 = 0i64;
+    while j < 200i64 {
+        let mut g: Fiber<(), i64> = Fiber.new(|| -> i64 {
+            yield_now();
+            1i64
+        });
+        match g.resume() {
+            FiberState.Yielded(_u) => {},
+            FiberState.Completed(_r) => { check_at(55, false); },
+            FiberState.Panicked => { check_at(56, false); },
+        }
+        j = j + 1i64;
+    }
+
+    // 3. 60 fibers alive at once under one scheduler (queue grows 4 -> 8 -> ... -> 64 and moves the
+    //    Fiber records), each yielding 3 times.
+    let mut sched = FiberScheduler.new();
+    let mut k: i64 = 0i64;
+    while k < 60i64 {
+        sched.spawn(|| {
+            yield_now();
+            bump(cp);
+            yield_now();
+            bump(cp);
+            yield_now();
+            bump(cp);
+        });
+        k = k + 1i64;
+    }
+    check_at(76, view(sched).pending() == 60);
+    sched.run();
+    check_at(78, view(sched).pending() == 0);
+    check_at(79, counter == 180i64);
+
+    print("OK qa_fiber_many ");
+    print_int(total);
+    print(" ");
+    print_int(counter);
+    print("\n");
+    0
+}
+
+// Failure reporting: `check(cond)` in src/<name>.axsrc is rewritten to `check_at(<source line>, cond)`,
+// so a failing assertion prints its line before the (timeout-bounded) spin. Not `assert()`: the
+// stdout comparison is the evidence in native mode (standing rule T134).
+fn check_at(line: i32, cond: bool) {
+    if !cond {
+        print("FAIL line ");
+        print_int(line as i64);
+        print("\n");
+        loop {}
+    }
+}

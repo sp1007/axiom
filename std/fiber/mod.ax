@@ -1,0 +1,435 @@
+// std.fiber - Stackful Fiber<Y, R>, FiberBuilder & cooperative FiberScheduler (SPEC-34 §5, AXS-EXEC-050..056)
+module std.fiber
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.core.host.fiber_create
+use std.core.host.fiber_resume
+use std.core.host.fiber_yield
+use std.core.host.fiber_destroy
+use std.core.host.thread_current_id
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic fn needs_drop<T>() -> bool { false }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+@intrinsic unsafe fn drop_in_place<T>(p: *mut T) {}
+@intrinsic fn panic(msg: str) {}
+
+// Default stack budget (SPEC-34 AXS-EXEC-051): 64 KiB committed, 256 KiB reserved.
+const FIBER_DEFAULT_STACK_COMMIT: usize = 65536;
+const FIBER_DEFAULT_STACK_RESERVE: usize = 262144;
+
+// Placeholder whose *name* the compiler rewrites, inside a generic function, to that very function
+// (same device as std.thread): it lets the monomorphic trampoline pass itself as the fiber entry.
+fn __ax_fiber_self_entry(ctx: *mut u8) -> i64 {
+    let _ = ctx;
+    0i64
+}
+
+// Per-thread counter that makes FiberId unique: the id is (thread id << 32) | counter.
+@thread_local
+static mut FIBER_ID_COUNTER: u64 = 0u64;
+
+@derive(Copy)
+pub struct FiberId {
+    pub id: u64,
+}
+
+impl FiberId {
+    pub fn as_u64(self: view<FiberId>) -> u64 {
+        self.id
+    }
+
+    pub fn eq(self: view<FiberId>, other: view<FiberId>) -> bool {
+        self.id == other.id
+    }
+
+    pub fn clone(self: view<FiberId>) -> FiberId {
+        *self
+    }
+}
+
+pub enum FiberState<Y, R> {
+    Yielded(Y),
+    Completed(R),
+    Panicked,
+}
+
+pub struct FiberBuilder {
+    pub stack_commit: usize,
+    pub stack_reserve: usize,
+}
+
+// Heap control slot shared by the Fiber handle and the monomorphic trampoline.
+// phase 0 = create the host fiber, phase 1 = fiber entry (runs the closure), phase 2 = dispose the
+// closure of a fiber that never started.
+@repr(C)
+struct FiberSlot {
+    pub phase: u32,
+    pub pad0: u32,
+    pub stack_commit: usize,
+    pub stack_reserve: usize,
+    pub raw_handle: i64,
+    pub closure_ptr: *mut u8,
+    pub result_ptr: *mut u8,
+    pub cleanup_fn: fn(*mut u8) -> i64,
+}
+
+pub struct Fiber<Y, R> {
+    pub raw_handle: i64,
+    pub id: FiberId,
+    pub slot: *mut u8,
+    pub owner_thread: u64,
+    pub completed: bool,
+}
+
+// A fiber keeps thread-local references and stack views alive: it never migrates between OS threads.
+impl<Y, R> !Send for Fiber<Y, R> {}
+impl<Y, R> !Share for Fiber<Y, R> {}
+
+fn box_size(sz: usize) -> usize {
+    if sz == 0 { 8 } else { sz }
+}
+
+fn box_align(al: usize) -> usize {
+    if al < 8 { 8 } else { al }
+}
+
+unsafe fn fiber_trampoline<F: FnOnce<R>, R>(raw_typed: *mut (F, R)) -> i64 {
+    let raw = raw_typed as *mut u8;
+    let slot = raw as *mut FiberSlot;
+    let ph = (*slot).phase;
+    if ph == 0u32 {
+        (*slot).cleanup_fn = __ax_fiber_self_entry;
+        (*slot).phase = 1u32;
+        let h = fiber_create(__ax_fiber_self_entry, raw, (*slot).stack_commit, (*slot).stack_reserve);
+        (*slot).raw_handle = h;
+        return h;
+    }
+    if ph == 2u32 {
+        let c_ptr = (*slot).closure_ptr;
+        (*slot).closure_ptr = 0 as *mut u8;
+        if (c_ptr as usize) != 0 {
+            // Move the closure into a local so that its captures are dropped at the end of the block
+            // (drop_in_place on a closure type is a no-op), then free the box.
+            {
+                let _dead: F = *(c_ptr as *mut F);
+            }
+            heap_free(c_ptr, box_size(size_of<F>()), box_align(align_of<F>()));
+        }
+        return 0i64;
+    }
+
+    // Fiber entry: runs on the fiber's own stack.
+    let c_ptr = (*slot).closure_ptr;
+    (*slot).closure_ptr = 0 as *mut u8;
+    let f_box = c_ptr as *mut F;
+    let f_val = *f_box;
+    heap_free(c_ptr, box_size(size_of<F>()), box_align(align_of<F>()));
+
+    let out_val: R = f_val();
+    let r_raw = heap_alloc(box_size(size_of<R>()), box_align(align_of<R>()));
+    let r_box = r_raw as *mut R;
+    *r_box = out_val;
+    (*slot).result_ptr = r_raw;
+    0i64
+}
+
+unsafe fn spawn_raw_slot<F: FnOnce<R>, R>(f: F, commit: usize, reserve: usize) -> *mut FiberSlot {
+    let f_raw = heap_alloc(box_size(size_of<F>()), box_align(align_of<F>()));
+    if (f_raw as usize) == 0 {
+        return 0 as *mut FiberSlot;
+    }
+    let f_box = f_raw as *mut F;
+    *f_box = f;
+    let s_raw = heap_alloc(size_of<FiberSlot>(), align_of<FiberSlot>());
+    if (s_raw as usize) == 0 {
+        {
+            let _dead: F = *f_box;
+        }
+        heap_free(f_raw, box_size(size_of<F>()), box_align(align_of<F>()));
+        return 0 as *mut FiberSlot;
+    }
+    let slot = s_raw as *mut FiberSlot;
+    (*slot).phase = 0u32;
+    (*slot).pad0 = 0u32;
+    (*slot).stack_commit = commit;
+    (*slot).stack_reserve = reserve;
+    (*slot).raw_handle = 0i64;
+    (*slot).closure_ptr = f_raw;
+    (*slot).result_ptr = 0 as *mut u8;
+    (*slot).cleanup_fn = __ax_fiber_self_entry;
+    let h = fiber_trampoline<F, R>(slot as *mut (F, R));
+    if h <= 0i64 {
+        (*slot).phase = 2u32;
+        let cfn = (*slot).cleanup_fn;
+        let _ = cfn(s_raw);
+        heap_free(s_raw, size_of<FiberSlot>(), align_of<FiberSlot>());
+        return 0 as *mut FiberSlot;
+    }
+    slot
+}
+
+unsafe fn next_fiber_id() -> FiberId {
+    FIBER_ID_COUNTER = FIBER_ID_COUNTER + 1u64;
+    FiberId { id: (thread_current_id() << 32u64) | FIBER_ID_COUNTER }
+}
+
+impl FiberBuilder {
+    pub fn new() -> FiberBuilder {
+        FiberBuilder {
+            stack_commit: FIBER_DEFAULT_STACK_COMMIT,
+            stack_reserve: FIBER_DEFAULT_STACK_RESERVE,
+        }
+    }
+
+    pub fn stack_size(mut self: FiberBuilder, commit: usize, reserve: usize) -> FiberBuilder {
+        self.stack_commit = commit;
+        self.stack_reserve = reserve;
+        self
+    }
+
+    pub fn spawn<F: FnOnce<R>, Y, R>(self: FiberBuilder, f: F) -> Fiber<Y, R> {
+        let slot = unsafe { spawn_raw_slot<F, R>(f, self.stack_commit, self.stack_reserve) };
+        if (slot as usize) == 0 {
+            panic("failed to create fiber");
+        }
+        let h = unsafe { (*slot).raw_handle };
+        Fiber {
+            raw_handle: h,
+            id: unsafe { next_fiber_id() },
+            slot: slot as *mut u8,
+            owner_thread: thread_current_id(),
+            completed: false,
+        }
+    }
+}
+
+impl<Y, R> Fiber<Y, R> {
+    pub fn new<F>(f: F) -> Fiber<Y, R> {
+        FiberBuilder.new().spawn<F, Y, R>(f)
+    }
+
+    pub fn spawn<F>(f: F) -> Fiber<Y, R> {
+        FiberBuilder.new().spawn<F, Y, R>(f)
+    }
+
+    pub fn id(self: view<Fiber<Y, R>>) -> FiberId {
+        self.id
+    }
+
+    pub fn is_completed(self: view<Fiber<Y, R>>) -> bool {
+        self.completed
+    }
+
+    pub fn resume(self: mut_view<Fiber<Y, R>>) -> FiberState<Y, R> {
+        if self.completed || self.raw_handle <= 0i64 {
+            panic("fiber resumed after it completed");
+            return FiberState.Panicked;
+        }
+        let mut out: i64 = 0i64;
+        let rc = unsafe { fiber_resume(self.raw_handle, 0i64, address_of_mut(out)) };
+        if rc == 0i64 {
+            // yield_val moved a heap cell holding the yielded Y; take it over.
+            let cell = (out as usize) as *mut Y;
+            let y: Y = unsafe { *cell };
+            unsafe {
+                heap_free(cell as *mut u8, box_size(size_of<Y>()), box_align(align_of<Y>()));
+            }
+            return FiberState.Yielded(y);
+        }
+        if rc == 1i64 {
+            let slot = self.slot as *mut FiberSlot;
+            let r_raw = unsafe { (*slot).result_ptr };
+            unsafe {
+                (*slot).result_ptr = 0 as *mut u8;
+            }
+            let r: R = unsafe { *(r_raw as *mut R) };
+            unsafe {
+                heap_free(r_raw, box_size(size_of<R>()), box_align(align_of<R>()));
+            }
+            self.finish_host();
+            return FiberState.Completed(r);
+        }
+        if rc == 2i64 {
+            self.finish_host();
+            return FiberState.Panicked;
+        }
+        panic("fiber resume rejected (wrong OS thread, already running or destroyed)");
+        FiberState.Panicked
+    }
+
+    // The fiber reached a terminal state: release its host stack now.
+    fn finish_host(self: mut_view<Fiber<Y, R>>) {
+        let h = self.raw_handle;
+        self.raw_handle = 0i64;
+        self.completed = true;
+        if h > 0i64 {
+            let _ = fiber_destroy(h);
+        }
+    }
+}
+
+impl<Y, R> Drop for Fiber<Y, R> {
+    fn drop(self: mut_view<Fiber<Y, R>>) {
+        let slot_raw = self.slot;
+        if (slot_raw as usize) == 0 {
+            return;
+        }
+        self.slot = 0 as *mut u8;
+        let h = self.raw_handle;
+        self.raw_handle = 0i64;
+        if h > 0i64 {
+            // A suspended fiber's stack is released without unwinding it (live locals are leaked,
+            // like Win32 DeleteFiber); a running fiber or a foreign thread is rejected (AFIBER-31, AFIBER-45).
+            let rc = fiber_destroy(h);
+            if rc != 0i64 {
+                panic("cannot destroy a running fiber or a fiber owned by another thread");
+            }
+        }
+        let slot = slot_raw as *mut FiberSlot;
+        unsafe {
+            if ((*slot).closure_ptr as usize) != 0 {
+                (*slot).phase = 2u32;
+                let cfn = (*slot).cleanup_fn;
+                let _ = cfn(slot_raw);
+            }
+            let r_raw = (*slot).result_ptr;
+            (*slot).result_ptr = 0 as *mut u8;
+            if (r_raw as usize) != 0 {
+                if needs_drop<R>() {
+                    drop_in_place<R>(r_raw as *mut R);
+                }
+                heap_free(r_raw, box_size(size_of<R>()), box_align(align_of<R>()));
+            }
+            heap_free(slot_raw, size_of<FiberSlot>(), align_of<FiberSlot>());
+        }
+    }
+}
+
+// Suspends the active fiber, handing `val` to the code that resumed it.
+pub fn yield_val<Y>(val: Y) {
+    unsafe {
+        let cell = heap_alloc(box_size(size_of<Y>()), box_align(align_of<Y>()));
+        let cell_y = cell as *mut Y;
+        *cell_y = val;
+        let rc = fiber_yield((cell as usize) as i64);
+        if rc < 0i64 {
+            // Not running inside a fiber: take the value back so nothing leaks.
+            let _back: Y = *cell_y;
+            heap_free(cell, box_size(size_of<Y>()), box_align(align_of<Y>()));
+            panic("yield_val called outside of a fiber");
+        }
+    }
+}
+
+pub fn yield_now() {
+    yield_val(());
+}
+
+// Cooperative round-robin scheduler for Fiber<(), ()> on the current thread (FIFO order).
+pub struct FiberScheduler {
+    pub queue: *mut Fiber<(), ()>,
+    pub len: usize,
+    pub cap: usize,
+}
+
+impl !Send for FiberScheduler {}
+impl !Share for FiberScheduler {}
+
+impl FiberScheduler {
+    pub fn new() -> FiberScheduler {
+        FiberScheduler {
+            queue: 0 as *mut Fiber<(), ()>,
+            len: 0,
+            cap: 0,
+        }
+    }
+
+    pub fn spawn<F: FnOnce<()>>(self: mut_view<FiberScheduler>, f: F) {
+        let fb: Fiber<(), ()> = FiberBuilder.new().spawn<F, (), ()>(f);
+        unsafe {
+            if self.len == self.cap {
+                let new_cap: usize = if self.cap == 0 { 4 } else { self.cap * 2 };
+                let sz = size_of<Fiber<(), ()>>();
+                let raw = heap_alloc(new_cap * sz, align_of<Fiber<(), ()>>());
+                let new_q = raw as *mut Fiber<(), ()>;
+                if self.len > 0 {
+                    ptr_copy_nonoverlapping<u8>(self.queue as *const u8, new_q as *mut u8, self.len * sz);
+                    heap_free(self.queue as *mut u8, self.cap * sz, align_of<Fiber<(), ()>>());
+                }
+                self.queue = new_q;
+                self.cap = new_cap;
+            }
+            let dst = self.queue + self.len;
+            *dst = fb;
+        }
+        self.len = self.len + 1;
+    }
+
+    pub fn pending(self: view<FiberScheduler>) -> usize {
+        let mut n: usize = 0;
+        let mut i: usize = 0;
+        while i < self.len {
+            let p = unsafe { self.queue + i };
+            if !unsafe { (*p).completed } {
+                n = n + 1;
+            }
+            i = i + 1;
+        }
+        n
+    }
+
+    // Drives every queued fiber, one resume per round, until all of them completed.
+    pub fn run(self: mut_view<FiberScheduler>) {
+        let mut remaining: usize = self.pending();
+        while remaining > 0 {
+            let mut i: usize = 0;
+            while i < self.len {
+                let p = unsafe { self.queue + i };
+                if !unsafe { (*p).completed } {
+                    let st = unsafe { (*p).resume() };
+                    match st {
+                        FiberState.Yielded(_u) => {}
+                        FiberState.Completed(_u) => {
+                            remaining = remaining - 1;
+                        }
+                        FiberState.Panicked => {
+                            remaining = remaining - 1;
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        self.release_all();
+    }
+
+    fn release_all(self: mut_view<FiberScheduler>) {
+        let mut i: usize = 0;
+        while i < self.len {
+            unsafe {
+                drop_in_place<Fiber<(), ()>>(self.queue + i);
+            }
+            i = i + 1;
+        }
+        self.len = 0;
+    }
+}
+
+impl Drop for FiberScheduler {
+    fn drop(self: mut_view<FiberScheduler>) {
+        self.release_all();
+        if (self.queue as usize) != 0 {
+            let sz = size_of<Fiber<(), ()>>();
+            unsafe {
+                heap_free(self.queue as *mut u8, self.cap * sz, align_of<Fiber<(), ()>>());
+            }
+            self.queue = 0 as *mut Fiber<(), ()>;
+            self.cap = 0;
+        }
+    }
+}

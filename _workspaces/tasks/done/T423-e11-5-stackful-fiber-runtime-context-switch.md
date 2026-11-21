@@ -8,14 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T420, T090]
 priority: 146
-status: doing
+status: done
 attempts: 1
 paths: [std/fiber, std/sys/windows/fiber.ax, tests/std/fiber]
 locks: [std/core/host.ax, compiler/interp/oracle.ax, compiler/interp/interp.ax, compiler/types/typeck.ax, compiler/lir/builder.ax]
 spec: [spec/SPEC-34-executors-fibers.md, 0204, 0205, tasks/0277, tasks/0836]
 covers: [REQ-CONC-151, REQ-CONC-189]
 started: 2026-11-21 17:39:48
-agent: T423-impl
+finished: 2026-11-21 23:24:20
 ---
 # T423 — E11.5 — Stackful Fiber runtime & cooperative context switching
 
@@ -44,3 +44,4 @@ Implement stackful `Fiber<T>` execution (`std.fiber`) with explicit stack budget
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
 - 2026-11-21 17:39:48 started (attempt 1) T423-impl
+- 2026-11-21 23:24:20 accepted by QA -> done
