@@ -8,13 +8,15 @@ model: sonnet
 gate_model: sonnet
 depends: [T453]
 priority: 9
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 300
-paths: [tests/run/print_int_unsigned]
-locks: [compiler/lir/builder.ax, compiler/link/import.ax]
+paths: [tests/run/print_int_unsigned, compiler/lir/builder.ax, compiler/link/import.ax]
+locks: []
 spec: [spec/SPEC-40-integers.md]
 covers: [REQ-TST-072, REQ-OWNER-007]
+started: 2026-11-22 03:33:38
+finished: 2026-11-22 04:04:10
 ---
 # T453a — `print_int` of large unsigned values
 
@@ -45,3 +47,5 @@ Cause (architect): the `TY_BUILTIN_PRINT_INT` lowering in `compiler/lir/builder.
 
 ## Log
 - 2026-11-21 created by axiom-architect (triage-2026-11-21; T453 follow-up, T454 follow-up 8)
+- 2026-11-22 03:33:38 started (attempt 1) T453a-impl
+- 2026-11-22 04:04:10 accepted by QA -> done
