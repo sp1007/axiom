@@ -21,6 +21,7 @@ A moved value cannot be read or moved again.
 
 ### AXS-OWN-003: Copy Semantics
 Types implementing the `Copy` trait do not transfer ownership upon assignment or argument passing. The original place remains `OWNED`.
+Composite types: a fixed array `[N]T` is `Copy` if and only if `T` is `Copy` (an array of a non-Copy type moves); tuples and closures likewise follow their components. A by-value use of a Copy array emits `MIR_OP_COPY` (the backend may elide the physical copy). `str` is never `Copy`. (ADR-0044 §3; test `tests/run/numeric/mixed_int_matrix/array_copy.ax`, xfail until T498.)
 
 ### AXS-OWN-004: Partial Move
 A struct value can be partially moved if specific fields are accessed and moved. The remaining unmoved fields retain their `OWNED` state. The parent struct transitions to `PARTIAL`.

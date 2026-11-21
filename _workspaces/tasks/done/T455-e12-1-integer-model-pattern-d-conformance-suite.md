@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T450, T451, T452, T453, T454]
 priority: 145
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tests/conformance/p12/e12_1_integers, tests/run/numeric/mixed_int_matrix]
 spec: [spec/SPEC-40-integers.md, spec/requirements/OWNER.md, tasks/0327, tasks/0334, tasks/0431]
 covers: [REQ-OWNER-007, REQ-SIMD-100, REQ-SIMD-262]
+started: 2026-11-21 11:37:30
+finished: 2026-11-21 12:23:15
 ---
 # T455 — E12.1 — Integer model completion & Pattern D mixed-width conformance suite
 
@@ -38,3 +40,5 @@ Certify the `E12.1` integer model completion and `REQ-OWNER-007` Pattern D pure-
 
 ## Log
 - 2026-11-03 00:30:00 created by T212 (P12 phase planning)
+- 2026-11-21 11:37:30 started (attempt 1) T455-impl
+- 2026-11-21 12:23:15 accepted by QA -> done
