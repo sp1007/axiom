@@ -19304,6 +19304,96 @@ fn isel_chunk_size(rem: u32) -> u32 {
     }
 }
 
+// T498a: an aggregate of 3, 5, 6 or 7 bytes has no single x86 access of its exact width. Widening it to an
+// 8-byte access stores past its end and overwrites the neighbouring field/element (and reads past it on
+// loads). These helpers move such a value between memory and RCX with exact-width pieces only.
+fn isel_size_is_odd_aggregate(size: u32) -> bool {
+    size < 8u32 && size != 0u32 && size != 1u32 && size != 2u32 && size != 4u32
+}
+
+// RCX = zero-extended value of `size` bytes at [base + index*scale + disp]. Built from the top byte down
+// with 1- and 2-byte loads (they preserve the upper bits of RCX; a 4-byte load would clear them).
+fn isel_emit_odd_load_mem(
+    mi: mut_view<X64MIBody>,
+    mbb: mut_view<X64MIBb>,
+    size: u32,
+    base: i32,
+    index: i32,
+    scale: u8,
+    disp: i32
+) {
+    isel_mi_ri(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, REG_RCX, 0i64);
+    let mut pos = size;
+    let mut first = true;
+    if (pos & 1u32) != 0u32 {
+        pos = pos - 1u32;
+        isel_mi_rm_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, 1u8, REG_RCX, base, index, scale, disp + (pos as i32));
+        first = false;
+    }
+    while pos > 0u32 {
+        pos = pos - 2u32;
+        if !first {
+            isel_mi_ri(mut_view(*mi), mut_view(*mbb), X64_MI_SHL, REG_RCX, 16i64);
+        }
+        isel_mi_rm_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, 2u8, REG_RCX, base, index, scale, disp + (pos as i32));
+        first = false;
+    }
+}
+
+// Same as isel_emit_odd_load_mem, reading from frame slot `slot`.
+fn isel_emit_odd_load_slot(mi: mut_view<X64MIBody>, mbb: mut_view<X64MIBb>, size: u32, slot: u32) {
+    isel_mi_ri(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, REG_RCX, 0i64);
+    let mut pos = size;
+    let mut first = true;
+    if (pos & 1u32) != 0u32 {
+        pos = pos - 1u32;
+        isel_mi_rf_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, 1u8, REG_RCX, slot, pos as i32);
+        first = false;
+    }
+    while pos > 0u32 {
+        pos = pos - 2u32;
+        if !first {
+            isel_mi_ri(mut_view(*mi), mut_view(*mbb), X64_MI_SHL, REG_RCX, 16i64);
+        }
+        isel_mi_rf_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, 2u8, REG_RCX, slot, pos as i32);
+        first = false;
+    }
+}
+
+// [base + index*scale + disp .. +size) = low `size` bytes of RCX, as 4+2+1 pieces (RCX is shifted, clobbered).
+fn isel_emit_odd_store_mem(
+    mi: mut_view<X64MIBody>,
+    mbb: mut_view<X64MIBb>,
+    size: u32,
+    base: i32,
+    index: i32,
+    scale: u8,
+    disp: i32
+) {
+    let mut off: u32 = 0u32;
+    while off < size {
+        let chunk = isel_chunk_size(size - off);
+        isel_mi_mr_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, chunk as u8, base, index, scale, disp + (off as i32), REG_RCX);
+        off = off + chunk;
+        if off < size {
+            isel_mi_ri(mut_view(*mi), mut_view(*mbb), X64_MI_SHR, REG_RCX, (chunk * 8u32) as i64);
+        }
+    }
+}
+
+// Same as isel_emit_odd_store_mem, writing frame slot `slot`.
+fn isel_emit_odd_store_slot(mi: mut_view<X64MIBody>, mbb: mut_view<X64MIBb>, size: u32, slot: u32) {
+    let mut off: u32 = 0u32;
+    while off < size {
+        let chunk = isel_chunk_size(size - off);
+        isel_mi_fr_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, chunk as u8, slot, off as i32, REG_RCX);
+        off = off + chunk;
+        if off < size {
+            isel_mi_ri(mut_view(*mi), mut_view(*mbb), X64_MI_SHR, REG_RCX, (chunk * 8u32) as i64);
+        }
+    }
+}
+
 pub fn x64_reg_class_for_kind(ty_kind: u8, byte_size: u32) -> u8 {
     if ty_kind == 100u8 {
         REG_CLASS_XMM
@@ -20617,12 +20707,12 @@ fn isel_raw_lower_abi(cx: *mut RawIselCtx, inst: *const LirInst, interner: view<
             }
         } else if loc_kind == ABI_LOC_INDIRECT {
             let dty = isel_cx_vreg_ty(cx as *const RawIselCtx, dest_v);
-            let mut load_sz = x64_cached_type_size(dty, interner);
+            let load_sz = x64_cached_type_size(dty, interner);
             unsafe {
-                if load_sz <= 8u32 {
-                    if load_sz != 1u32 && load_sz != 2u32 && load_sz != 4u32 && load_sz != 8u32 {
-                        load_sz = 8u32;
-                    }
+                if isel_size_is_odd_aggregate(load_sz) {
+                    isel_emit_odd_load_mem(mut_view(*mi), mut_view(*mbb), load_sz, REG_RAX, REG_NONE, 1u8, 0);
+                    isel_mi_fr(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, slot_offset + dest_v, 0, REG_RCX);
+                } else if load_sz <= 8u32 {
                     isel_mi_rm_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, load_sz as u8, REG_RCX, REG_RAX, REG_NONE, 1u8, 0);
                     isel_mi_fr_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, load_sz as u8, slot_offset + dest_v, 0, REG_RCX);
                 } else {
@@ -20739,11 +20829,11 @@ pub fn x64_isel_raw_in_arena(
                 let raw_size = x64_cached_type_size(TypeId { v: load_ty_v }, interner);
                 unsafe {
                     isel_mi_rf(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, REG_RAX, slot_offset + ptr_v, 0);
-                    if raw_size <= 8u32 {
-                        let mut load_sz = raw_size;
-                        if load_sz != 1u32 && load_sz != 2u32 && load_sz != 4u32 && load_sz != 8u32 {
-                            load_sz = 8u32;
-                        }
+                    if isel_size_is_odd_aggregate(raw_size) {
+                        isel_emit_odd_load_mem(mut_view(*mi), mut_view(*mbb), raw_size, REG_RAX, REG_NONE, 1u8, 0);
+                        isel_mi_fr(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, slot_offset + dest_v, 0, REG_RCX);
+                    } else if raw_size <= 8u32 {
+                        let load_sz = raw_size;
                         isel_mi_ri(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, REG_RCX, 0i64);
                         isel_mi_rm_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, load_sz as u8, REG_RCX, REG_RAX, REG_NONE, 1u8, 0);
 
@@ -20774,14 +20864,13 @@ pub fn x64_isel_raw_in_arena(
                 let ptr_v = unsafe { (*inst).ptr.v };
                 let val_v = unsafe { (*inst).val.v };
                 let val_ty = isel_vreg_ty(lir, val_v);
-                let mut size = x64_cached_type_size(val_ty, interner);
+                let size = x64_cached_type_size(val_ty, interner);
                 unsafe {
                     isel_mi_rf(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, REG_RAX, slot_offset + ptr_v, 0);
                     isel_mi_rf(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, REG_RCX, slot_offset + val_v, 0);
-                    if size <= 8u32 {
-                        if size != 1u32 && size != 2u32 && size != 4u32 && size != 8u32 {
-                            size = 8u32;
-                        }
+                    if isel_size_is_odd_aggregate(size) {
+                        isel_emit_odd_store_mem(mut_view(*mi), mut_view(*mbb), size, REG_RAX, REG_NONE, 1u8, 0);
+                    } else if size <= 8u32 {
                         isel_mi_mr_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, size as u8, REG_RAX, REG_NONE, 1u8, 0, REG_RCX);
                     } else {
                         let mut off: u32 = 0u32;
@@ -22071,11 +22160,11 @@ fn isel_opt_lower_abi_call_inst(
             isel_mi_fr(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, slot_offset + dest_v, 0, loc_ro as i32);
         } else if loc_kind == ABI_LOC_INDIRECT {
             let d_ty = isel_vreg_ty(lir, dest_v);
-            let mut size = x64_cached_type_size(d_ty, interner);
-            if size <= 8u32 {
-                if size != 1u32 && size != 2u32 && size != 4u32 && size != 8u32 {
-                    size = 8u32;
-                }
+            let size = x64_cached_type_size(d_ty, interner);
+            if isel_size_is_odd_aggregate(size) {
+                isel_emit_odd_load_mem(mut_view(*mi), mut_view(*mbb), size, REG_RAX, REG_NONE, 1u8, 0);
+                isel_mi_fr(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, slot_offset + dest_v, 0, REG_RCX);
+            } else if size <= 8u32 {
                 isel_mi_rm_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, size as u8, REG_RCX, REG_RAX, REG_NONE, 1u8, 0);
                 isel_mi_fr_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, size as u8, slot_offset + dest_v, 0, REG_RCX);
             } else {
@@ -22108,14 +22197,21 @@ fn isel_opt_lower_load_store_inst(
     if kind == LIR_INST_LOAD {
         let ptr_v = unsafe { (*inst).ptr.v };
         let load_ty = unsafe { (*inst).ty };
-        let mut size = x64_cached_type_size(TypeId { v: load_ty.v }, interner);
+        let size = x64_cached_type_size(TypeId { v: load_ty.v }, interner);
         let is_signed = isel_type_is_signed_int(load_ty, interner);
         let mut direct_slot: u32 = 0u32;
         let is_slot_ld = isel_vreg_is_stack_addr(ctx, ptr_v, mut_view(direct_slot));
-        if size <= 8u32 {
-            if size != 1u32 && size != 2u32 && size != 4u32 && size != 8u32 {
-                size = 8u32;
+        if isel_size_is_odd_aggregate(size) {
+            if is_slot_ld {
+                isel_emit_odd_load_slot(mut_view(*mi), mut_view(*mbb), size, direct_slot);
+            } else {
+                let addr = isel_match_addr(ctx, lir, interner, ptr_v, cur_bb);
+                let act_idx = isel_emit_addr_load(ctx, lir, interner, mut_view(*mi), mut_view(*mbb), view(addr), REG_RAX, REG_R10);
+                let act_sc = if act_idx == REG_NONE { 1u8 } else { addr.scale };
+                isel_emit_odd_load_mem(mut_view(*mi), mut_view(*mbb), size, REG_RAX, act_idx, act_sc, addr.disp);
             }
+            isel_mi_fr(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, slot_offset + dest_v, 0, REG_RCX);
+        } else if size <= 8u32 {
             if is_slot_ld {
                 tag_vreg = dest_v;
                 if size < 8u32 {
@@ -22165,13 +22261,21 @@ fn isel_opt_lower_load_store_inst(
         let ptr_v = unsafe { (*inst).ptr.v };
         let val_v = unsafe { (*inst).val.v };
         let val_ty = isel_vreg_ty(lir, val_v);
-        let mut size = x64_cached_type_size(val_ty, interner);
+        let size = x64_cached_type_size(val_ty, interner);
         let mut direct_slot: u32 = 0u32;
         let is_slot_st = isel_vreg_is_stack_addr(ctx, ptr_v, mut_view(direct_slot));
-        if size <= 8u32 {
-            if size != 1u32 && size != 2u32 && size != 4u32 && size != 8u32 {
-                size = 8u32;
+        if isel_size_is_odd_aggregate(size) {
+            if is_slot_st {
+                isel_emit_load_vreg(ctx, lir, interner, mut_view(*mi), mut_view(*mbb), REG_RCX, val_v);
+                isel_emit_odd_store_slot(mut_view(*mi), mut_view(*mbb), size, direct_slot);
+            } else {
+                let addr = isel_match_addr(ctx, lir, interner, ptr_v, cur_bb);
+                let act_idx = isel_emit_addr_load(ctx, lir, interner, mut_view(*mi), mut_view(*mbb), view(addr), REG_RAX, REG_R10);
+                let act_sc = if act_idx == REG_NONE { 1u8 } else { addr.scale };
+                isel_emit_load_vreg(ctx, lir, interner, mut_view(*mi), mut_view(*mbb), REG_RCX, val_v);
+                isel_emit_odd_store_mem(mut_view(*mi), mut_view(*mbb), size, REG_RAX, act_idx, act_sc, addr.disp);
             }
+        } else if size <= 8u32 {
             if is_slot_st {
                 isel_emit_load_vreg(ctx, lir, interner, mut_view(*mi), mut_view(*mbb), REG_RCX, val_v);
                 isel_mi_fr_sz(mut_view(*mi), mut_view(*mbb), X64_MI_MOV, size as u8, direct_slot, 0, REG_RCX);
@@ -32787,14 +32891,14 @@ fn test_non_pow2_small_aggregate_and_closure_call(a: mut_view<Arena>, ti_ptr: *m
         (*i0).dest.v = 0u32;
         (*i0).slot.v = 0u32;
 
-        // inst 1: LOAD [6]u8 from ptr vreg 0 -> size 6 promoted to 8-byte MOV without shift truncation
+        // inst 1: LOAD [6]u8 from ptr vreg 0 -> exact-width 2+2+2 loads into RCX (T498a: never an 8-byte access)
         let i1 = lir_inst_at(insts, 1);
         lir_inst_reset(mut_view(*i1), LIR_INST_LOAD);
         (*i1).dest.v = 1u32;
         (*i1).ptr.v = 0u32;
         (*i1).ty.v = arr6_v;
 
-        // inst 2: STORE [6]u8 from vreg 1 to ptr vreg 0 -> size 6 promoted to 8-byte MOV
+        // inst 2: STORE [6]u8 from vreg 1 to ptr vreg 0 -> exact-width 4+2 stores (T498a)
         let i2 = lir_inst_at(insts, 2);
         lir_inst_reset(mut_view(*i2), LIR_INST_STORE);
         (*i2).ptr.v = 0u32;
@@ -32807,7 +32911,7 @@ fn test_non_pow2_small_aggregate_and_closure_call(a: mut_view<Arena>, ti_ptr: *m
         (*i3).dst_addr.v = 0u32;
         (*i3).callee_vreg.v = 2u32;
 
-        // inst 4: ABI_RESULT INDIRECT for [6]u8 -> single 8-byte load/store pair
+        // inst 4: ABI_RESULT INDIRECT for [6]u8 -> exact-width loads, one 8-byte store to the vreg slot
         let i4 = lir_inst_at(insts, 4);
         lir_inst_reset(mut_view(*i4), LIR_INST_ABI_RESULT);
         (*i4).dest.v = 3u32;
@@ -32840,21 +32944,42 @@ fn test_non_pow2_small_aggregate_and_closure_call(a: mut_view<Arena>, ti_ptr: *m
        (unsafe { (*m1).ops[1].frame.slot_id }) != 0u32 {
         return 202;
     }
-    // LOAD [6]u8: insts 3..6 are MOV RAX, [frame#1]; MOV RCX, 0; MOV (sz=8) RCX, [RAX]; MOV [frame#2], RCX
-    let m_load = unsafe { bb_inst_at(mbb0, 5) };
-    let m_load_store = unsafe { bb_inst_at(mbb0, 6) };
-    if (unsafe { (*m_load).opcode }) != X64_MI_MOV || (unsafe { (*m_load).size }) != 8u8 ||
-       (unsafe { (*m_load_store).opcode }) != X64_MI_MOV {
+    // LOAD [6]u8 (T498a): inst 3 MOV RAX, [frame#1]; 4 MOV RCX, 0; 5 MOV (sz=2) RCX, [RAX+4]; 6 SHL RCX, 16;
+    // 7 MOV (sz=2) RCX, [RAX+2]; 8 SHL RCX, 16; 9 MOV (sz=2) RCX, [RAX+0]; 10 MOV [frame#2], RCX
+    let m_ld_hi = unsafe { bb_inst_at(mbb0, 5) };
+    let m_ld_lo = unsafe { bb_inst_at(mbb0, 9) };
+    let m_load_store = unsafe { bb_inst_at(mbb0, 10) };
+    if (unsafe { (*m_ld_hi).opcode }) != X64_MI_MOV || (unsafe { (*m_ld_hi).size }) != 2u8 ||
+       (unsafe { (*m_ld_hi).ops[1].kind }) != X64_OP_MEM || (unsafe { (*m_ld_hi).ops[1].mem.disp }) != 4 ||
+       (unsafe { (*m_ld_lo).opcode }) != X64_MI_MOV || (unsafe { (*m_ld_lo).size }) != 2u8 ||
+       (unsafe { (*m_ld_lo).ops[1].mem.disp }) != 0 ||
+       (unsafe { (*m_load_store).opcode }) != X64_MI_MOV || (unsafe { (*m_load_store).ops[0].kind }) != X64_OP_FRAME {
         return 203;
     }
-    // STORE [6]u8: insts 7..9 are MOV RAX, [frame#1]; MOV RCX, [frame#2]; MOV (sz=8) [RAX], RCX
-    let m_store = unsafe { bb_inst_at(mbb0, 9) };
-    if (unsafe { (*m_store).opcode }) != X64_MI_MOV || (unsafe { (*m_store).size }) != 8u8 {
+    // STORE [6]u8 (T498a): 11 MOV RAX, [frame#1]; 12 MOV RCX, [frame#2]; 13 MOV (sz=4) [RAX], RCX; 14 SHR RCX, 32;
+    // 15 MOV (sz=2) [RAX+4], RCX
+    let m_st_lo = unsafe { bb_inst_at(mbb0, 13) };
+    let m_st_hi = unsafe { bb_inst_at(mbb0, 15) };
+    if (unsafe { (*m_st_lo).opcode }) != X64_MI_MOV || (unsafe { (*m_st_lo).size }) != 4u8 ||
+       (unsafe { (*m_st_lo).ops[0].kind }) != X64_OP_MEM || (unsafe { (*m_st_lo).ops[0].mem.disp }) != 0 ||
+       (unsafe { (*m_st_hi).opcode }) != X64_MI_MOV || (unsafe { (*m_st_hi).size }) != 2u8 ||
+       (unsafe { (*m_st_hi).ops[0].mem.disp }) != 4 {
         return 204;
     }
-    // CALL closure: inst 10 is MOV RCX, [frame#1 + 0]; inst 11 is MOV R10, [frame#3 + 0]; inst 12 is CALL R10
-    let m_sret = unsafe { bb_inst_at(mbb0, 10) };
-    let m_call = unsafe { bb_inst_at(mbb0, 12) };
+    // No access through a register base may be wider than the 6-byte aggregate.
+    let mut cur_mi = unsafe { (*mbb0).first_inst };
+    while (cur_mi as usize) != 0 {
+        let k0 = unsafe { (*cur_mi).ops[0].kind };
+        let k1 = unsafe { (*cur_mi).ops[1].kind };
+        if (unsafe { (*cur_mi).opcode }) == X64_MI_MOV && (k0 == X64_OP_MEM || k1 == X64_OP_MEM) &&
+           (unsafe { (*cur_mi).size }) == 8u8 {
+            return 206;
+        }
+        cur_mi = unsafe { (*cur_mi).next };
+    }
+    // CALL closure: inst 16 is MOV RCX, [frame#1 + 0]; inst 17 is MOV R10, [frame#3 + 0]; inst 18 is CALL R10
+    let m_sret = unsafe { bb_inst_at(mbb0, 16) };
+    let m_call = unsafe { bb_inst_at(mbb0, 18) };
     if (unsafe { (*m_sret).opcode }) != X64_MI_MOV || (unsafe { (*m_sret).ops[0].reg }) != REG_RCX ||
        (unsafe { (*m_call).opcode }) != X64_MI_CALL || (unsafe { (*m_call).ops[0].reg }) != REG_R10 {
         return 205;

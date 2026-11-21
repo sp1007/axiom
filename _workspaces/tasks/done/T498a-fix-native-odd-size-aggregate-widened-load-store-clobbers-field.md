@@ -8,13 +8,15 @@ model: opus
 gate_model: opus
 depends: [T498]
 priority: 2
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 600
-paths: [tests/run/agg_odd_size, tests/run/array_copy/nested_and_field.ax, compiler/target/x64/isel.ax]
+paths: [tests/run/agg_odd_size, tests/run/array_copy/nested_and_field.ax, compiler/target/x64/isel.ax, tests/selfhost/isel/qa_isel_frame_seam_and_edge_cases.ax.in]
 locks: [compiler/lir/builder.ax, compiler/lir/lir.ax, compiler/abi/win64.ax, compiler/target/x64/frame.ax]
 spec: [spec/SPEC-51-raw-memory-volatile-mmio-layout.md, spec/SPEC-10-ownership.md]
 covers: [REQ-TST-072, REQ-OWNER-007]
+started: 2026-11-21 23:24:55
+finished: 2026-11-22 01:02:49
 ---
 # T498a — odd-size aggregates must be copied with exact-width accesses
 
@@ -63,3 +65,5 @@ Layout is `vals@0` (6 bytes) and `tag@6`; the LIR stores `vals` with an 8-byte `
 
 ## Log
 - 2026-11-21 created by axiom-architect (triage-2026-11-21; FU-T498-AGG-WIDEN)
+- 2026-11-21 23:24:55 started (attempt 1) T498a-impl
+- 2026-11-22 01:02:49 accepted by QA -> done
