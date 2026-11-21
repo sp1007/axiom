@@ -399,7 +399,7 @@ COMPTIME_GROUPS = [
             False,
             True,
             1,
-            96,
+            168,
             0,
             500000,
             128,

@@ -8,7 +8,7 @@ model: sonnet
 gate_model: sonnet
 depends: [T452]
 priority: 27
-status: doing
+status: done
 attempts: 1
 timeout_min: 600
 paths: [tests/ui/const_shift_range, tests/run/int_min_literals, compiler/diag/format.ax, tests/ui/int128/const_overflow_neg.ax, tests/conformance/p19/e19_4_diagnostics_ai, tests/run/diag_ux2, tests/selfhost/interp_opt/gen_interp_opt_tests.py]
@@ -16,7 +16,7 @@ locks: [compiler/diag/code.ax, compiler/diag/explain/mod.ax, compiler/interp, co
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/SPEC-40-integers.md, spec/SPEC-03-core-semantics.md, spec/diagnostics.md]
 covers: [REQ-TST-025, REQ-TST-096]
 started: 2026-11-21 01:48:14
-agent: T483-impl
+finished: 2026-11-21 10:48:30
 ---
 # T483 — `AX_CONST_SHIFT_RANGE` and MIN literals
 
@@ -50,3 +50,4 @@ literal (SPEC-40 AXS-INT-004: range check after folding unary `-`).
 ## Log
 - 2026-11-13 created by axiom-architect (ADR-0042 §4; T452-qa spec gap and i64 MIN literal)
 - 2026-11-21 01:48:14 started (attempt 1) T483-impl
+- 2026-11-21 10:48:30 accepted by QA -> done

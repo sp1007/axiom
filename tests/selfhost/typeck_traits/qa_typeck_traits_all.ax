@@ -2904,6 +2904,7 @@ pub const AX_ASYNC_POLL_AFTER_COMPLETE: u32 = 164u32;
 pub const AX_ASYNC_BLOCKING_IN_ASYNC: u32 = 165u32;
 pub const AX_CONC_TLS_ESCAPE: u32 = 166u32;
 pub const AX_TYPE_INVALID_TLS_DECL: u32 = 167u32;
+pub const AX_CONST_SHIFT_RANGE: u32 = 168u32;
 
 pub fn diag_code_name(c: DiagCode) -> Str {
     match c.v {
@@ -2953,6 +2954,7 @@ pub fn diag_code_name(c: DiagCode) -> Str {
         162u32 => "AX_ASYNC_RECURSIVE_FUTURE", 163u32 => "AX_ASYNC_AWAIT_IN_DROP",
         164u32 => "AX_ASYNC_POLL_AFTER_COMPLETE", 165u32 => "AX_ASYNC_BLOCKING_IN_ASYNC",
         166u32 => "AX_CONC_TLS_ESCAPE", 167u32 => "AX_TYPE_INVALID_TLS_DECL",
+        168u32 => "AX_CONST_SHIFT_RANGE",
         _ => "<unknown>",
     }
 }
@@ -3052,6 +3054,7 @@ pub fn diag_code_default_message(c: DiagCode) -> Str {
         165u32 => "blocking operation invoked inside an async body",
         166u32 => "thread-local borrow cannot escape function or thread",
         167u32 => "@thread_local attribute is only valid on static items with constant initializers",
+        168u32 => "shift count is negative or not below the bit width of the shifted type during constant evaluation",
         _ => "",
     }
 }
@@ -3666,6 +3669,19 @@ const CONC_CODE_NAMES_DATA: [369]u8 = [
     65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 73u8, 78u8, 86u8, 65u8, 76u8, 73u8, 68u8, 95u8, 84u8, 76u8, 83u8, 95u8, 68u8, 69u8, 67u8, 76u8,
 ];
 
+// T483: name of code 168 (the byte table above only covers codes below 133; later codes keep their own table).
+const CONST_SHIFT_RANGE_NAME: [20]u8 = [
+    65u8, 88u8, 95u8, 67u8, 79u8, 78u8, 83u8, 84u8, 95u8, 83u8, 72u8, 73u8, 70u8, 84u8, 95u8, 82u8, 65u8, 78u8, 71u8, 69u8,
+];
+
+fn diag_buf_push_const_shift_range_name(b: mut_view<DiagBuffer>) {
+    let mut i: usize = 0;
+    while i < 20 {
+        diag_buf_push_byte(mut_view(*b), CONST_SHIFT_RANGE_NAME[i]);
+        i = i + 1;
+    }
+}
+
 fn diag_buf_push_conc_name(b: mut_view<DiagBuffer>, start: usize, end: usize) {
     let mut i = start;
     while i < end {
@@ -3691,6 +3707,7 @@ pub fn diag_buf_push_code_name(b: mut_view<DiagBuffer>, c: DiagCode) {
     if c.v == 152u32 { diag_buf_push_conc_name(b, 295, 327); return; }
     if c.v == 166u32 { diag_buf_push_conc_name(b, 327, 345); return; }
     if c.v == 167u32 { diag_buf_push_conc_name(b, 345, 369); return; }
+    if c.v == 168u32 { diag_buf_push_const_shift_range_name(b); return; }
     if c.v >= 133u32 {
         diag_buf_push_fmt_str(b, 0, 9);
         return;
@@ -27829,6 +27846,7 @@ use compiler.diag.code.AX_CONC_SPAWN_REQUIRES_MOVE
 use compiler.diag.code.AX_CONST_CYCLE
 use compiler.diag.code.AX_CONST_DIV_ZERO
 use compiler.diag.code.AX_CONST_OVERFLOW
+use compiler.diag.code.AX_CONST_SHIFT_RANGE
 use compiler.diag.code.AX_MOVE_USE_AFTER_MOVE
 use compiler.diag.code.AX_NAME_PRIVATE
 use compiler.diag.code.AX_NAME_UNRESOLVED
@@ -28234,6 +28252,7 @@ pub struct LitCheck {
     pub value_hi: u64,
     pub ty: TypeId,
     pub negated: bool,
+    pub unary: *mut HirExpr,
 }
 
 pub struct NegCheck {
@@ -29092,6 +29111,7 @@ fn push_lit_check(cx: mut_view<TypeckCtx>, sp: view<Span>, value: u64, value_hi:
         (*e).value_hi = value_hi;
         (*e).ty.v = ty.v;
         (*e).negated = false;
+        (*e).unary = 0 as *mut HirExpr;
     }
     cx.lits_len = cx.lits_len + 1;
 }
@@ -29345,6 +29365,40 @@ fn int_fits(k: u8, mag: u64, mag_hi: u64, negated: bool) -> bool {
     false
 }
 
+// T483 (SPEC-40 AXS-INT-004): `-9223372036854775808` of type i64/isize (the one literal whose magnitude is not
+// representable, so the checked `0 - x` that MIR builds for `-lit` panics) is folded into one literal node once the
+// literal's type is final and its range check (applied to the magnitude with the sign) has passed. Every other
+// `-lit` already reaches MIR correctly and keeps its MIR (byte-identical to the axiom0 goldens that the selfhost
+// bundles compare against); i128 has its own MIR builder path. The folded node holds the 128-bit two's
+// complement of the magnitude, so `-9223372036854775808i64` reaches MIR as the constant `i64.MIN` instead of the
+// checked `0 - 9223372036854775808` that panics. TC_TOK_FLAG_NEG_FOLDED marks the node: a second typeck pass over the
+// same HIR (the literal now stands alone) recovers the magnitude and range-checks it as negated again.
+const TC_TOK_FLAG_NEG_FOLDED: u16 = 0x8000u16;
+
+fn tc_fold_neg_literal(up: *mut HirExpr) {
+    unsafe {
+        let inner: *mut HirExpr = (*up).inner;
+        if (inner as usize) == 0 { return; }
+        if (*inner).kind != HIR_EXPR_LITERAL || (*inner).literal.kind != TOK_INT { return; }
+        let lo = (*inner).literal.int_val;
+        let hi = token_int_hi(view((*inner).literal));
+        let mut r_lo: u64 = 0u64;
+        let mut r_hi: u64 = 0u64;
+        tc_u128_neg(lo, hi, mut_view(r_lo), mut_view(r_hi));
+        (*up).kind = HIR_EXPR_LITERAL;
+        (*up).literal.kind = (*inner).literal.kind;
+        (*up).literal.suffix = (*inner).literal.suffix;
+        (*up).literal.flags = (*inner).literal.flags | TC_TOK_FLAG_NEG_FOLDED;
+        (*up).literal.span.file.v = (*inner).literal.span.file.v;
+        (*up).literal.span.start = (*inner).literal.span.start;
+        (*up).literal.span.end = (*inner).literal.span.end;
+        (*up).literal.int_val = r_lo;
+        (*up).literal.char_val = (r_hi & 0xFFFFFFFFu64) as u32;
+        (*up).literal.str_len = ((r_hi >> 32u64) & 0xFFFFFFFFu64) as usize;
+        (*up).inner = 0 as *mut HirExpr;
+    }
+}
+
 fn check_literal_ranges(cx: mut_view<TypeckCtx>) {
     let mut i: usize = 0;
     while (i < cx.lits_len) {
@@ -29367,6 +29421,11 @@ fn check_literal_ranges(cx: mut_view<TypeckCtx>) {
                 let st = if neg { unsafe { (*lc).neg_span.start } } else { unsafe { (*lc).span.start } };
                 let en = if neg { unsafe { (*lc).neg_span.end } } else { unsafe { (*lc).span.end } };
                 type_error_sp(mut_view(*cx), fv, st, en, AX_TYPE_LITERAL_OUT_OF_RANGE);
+            } else if neg && !is_uns {
+                let up: *mut HirExpr = unsafe { (*lc).unary };
+                if (up as usize) != 0 && (unsafe { (*up).kind }) == HIR_EXPR_UNARY && (k == TY_I64 || k == TY_ISIZE) && val == 0x8000000000000000u64 && val_hi == 0u64 {
+                    tc_fold_neg_literal(up);
+                }
             }
         }
         i = i + 1;
@@ -29410,8 +29469,16 @@ fn int_literal_type(cx: mut_view<TypeckCtx>, tok: view<Token>, sp: view<Span>) -
         let err_v = unsafe { (*cx.thir).interner.t_error.v };
         return (TypeId { v: err_v });
     }
-    let val: u64 = tok.int_val;
-    let val_hi: u64 = token_int_hi(tok);
+    let mut val: u64 = tok.int_val;
+    let mut val_hi: u64 = token_int_hi(tok);
+    let folded = (tok.flags & TC_TOK_FLAG_NEG_FOLDED) != 0u16;
+    if folded {
+        let mut m_lo: u64 = 0u64;
+        let mut m_hi: u64 = 0u64;
+        tc_u128_neg(val, val_hi, mut_view(m_lo), mut_view(m_hi));
+        val = m_lo;
+        val_hi = m_hi;
+    }
     let suf: u8 = tok.suffix;
     let mut ty = suffix_to_type(mut_view(*cx), suf);
     if ty.v == 0u32 {
@@ -29419,6 +29486,10 @@ fn int_literal_type(cx: mut_view<TypeckCtx>, tok: view<Token>, sp: view<Span>) -
         ty.v = iv.v;
     }
     push_lit_check(mut_view(*cx), sp, val, val_hi, (TypeId { v: ty.v }));
+    if folded {
+        let lc = unsafe { litcheck_at(cx.lits, cx.lits_len - 1) };
+        unsafe { (*lc).negated = true; }
+    }
     ty
 }
 
@@ -30140,7 +30211,7 @@ fn eval_const_expr_u128(cx: mut_view<TypeckCtx>, expr: *const HirExpr, out_lo: m
         if op == BINOP_SHL {
             let sh_bits = if opnd_bits != 0u64 { opnd_bits } else { 128u64 };
             if rv_hi != 0u64 || rv_lo >= sh_bits {
-                *out_err = AX_CONST_OVERFLOW;
+                *out_err = AX_CONST_SHIFT_RANGE;
                 return false;
             }
             tc_u128_shl(lv_lo, lv_hi, rv_lo, is_128, mut_view(r_lo), mut_view(r_hi));
@@ -30150,7 +30221,7 @@ fn eval_const_expr_u128(cx: mut_view<TypeckCtx>, expr: *const HirExpr, out_lo: m
         if op == BINOP_SHR {
             let sh_bits = if opnd_bits != 0u64 { opnd_bits } else { 128u64 };
             if rv_hi != 0u64 || rv_lo >= sh_bits {
-                *out_err = AX_CONST_OVERFLOW;
+                *out_err = AX_CONST_SHIFT_RANGE;
                 return false;
             }
             tc_u128_shr(lv_lo, lv_hi, rv_lo, is_128, is_sig, mut_view(r_lo), mut_view(r_hi));
@@ -34584,6 +34655,7 @@ fn check_unary_in_arith(cx: mut_view<TypeckCtx>, expr: *const HirExpr, ctx_ty: T
                 let lc = unsafe { litcheck_at(cx.lits, before) };
                 unsafe {
                     (*lc).negated = true;
+                    (*lc).unary = expr as *mut HirExpr;
                     (*lc).neg_span.file.v = (*expr).span.file.v;
                     (*lc).neg_span.start = (*expr).span.start;
                     (*lc).neg_span.end = (*expr).span.end;
@@ -34827,6 +34899,7 @@ fn check_unary(cx: mut_view<TypeckCtx>, expr: *const HirExpr) -> TypeId {
                 let lc = unsafe { litcheck_at(cx.lits, before) };
                 unsafe {
                     (*lc).negated = true;
+                    (*lc).unary = expr as *mut HirExpr;
                     (*lc).neg_span.file.v = (*expr).span.file.v;
                     (*lc).neg_span.start = (*expr).span.start;
                     (*lc).neg_span.end = (*expr).span.end;
