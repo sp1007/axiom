@@ -8,15 +8,15 @@ model: sonnet
 gate_model: sonnet
 depends: [T452]
 priority: 24
-status: doing
+status: done
 attempts: 1
 timeout_min: 600
 paths: [tests/run/fn_ptr_field_call, tests/run/interp_step_limit_flush]
-locks: [compiler/mir/builder.ax, compiler/lir/builder.ax, compiler/interp]
+locks: [compiler/mir/builder.ax, compiler/lir/builder.ax, compiler/interp, compiler/hir/lower.ax]
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/SPEC-03-core-semantics.md]
 covers: [REQ-TST-072, REQ-TST-046]
 started: 2026-11-21 13:43:00
-agent: T422b-impl
+finished: 2026-11-21 16:05:14
 ---
 # T422b — Fix: calls through fn-pointer field expressions; oracle stdout on step-limit
 
@@ -45,3 +45,4 @@ step-limit error still writes the stdout produced before the limit (T421 FU-2, T
 ## Log
 - 2026-11-13 created by axiom-architect (ADR-0042 §2; T421 FU-2, T422 FU-K)
 - 2026-11-21 13:43:00 started (attempt 1) T422b-impl
+- 2026-11-21 16:05:14 accepted by QA -> done
