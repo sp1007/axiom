@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T498]
 priority: 8
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 480
 paths: [compiler/own/init.ax, tests/run/own_index_copy, tests/ui/own_index_copy]
 locks: []
 spec: [spec/SPEC-10-ownership.md]
 covers: [REQ-TST-072]
+started: 2026-11-22 02:54:37
+finished: 2026-11-22 03:33:15
 ---
 # T498b — Copy reads through an index do not move the array
 
@@ -48,3 +50,5 @@ following `FIELD` projection against the array node, so `hs[i].1` is treated as 
 
 ## Log
 - 2026-11-21 created by axiom-architect (triage-2026-11-21; FU-T498-FNPTR-INDEX, T422b QA note)
+- 2026-11-22 02:54:37 started (attempt 1) T498b-impl
+- 2026-11-22 03:33:15 accepted by QA -> done

@@ -68471,13 +68471,22 @@ use compiler.hir.hir.HirItem
 use compiler.hir.hir.HirParam
 use compiler.types.types.CAP_MOVE
 use compiler.types.types.ClosureCapture
+use compiler.types.types.TY_ARRAY
 use compiler.types.types.TY_CLOSURE
+use compiler.types.types.TY_ENUM
 use compiler.types.types.TY_NEVER
 use compiler.types.types.TY_PARAM
+use compiler.types.types.TY_SLICE
+use compiler.types.types.TY_STRUCT
+use compiler.types.types.TY_TUPLE
 use compiler.types.types.TY_UNIT
 use compiler.types.types.Thir
 use compiler.types.types.mul_usize
 use compiler.types.types.type_get
+use compiler.types.types.type_is_copy
+use compiler.types.types.typeid_at
+use compiler.types.types.typeid_ptr_at
+use compiler.types.types.usize_at
 use compiler.mir.mir.MIR_BORROW_MUT
 use compiler.mir.mir.MIR_LOCAL_ARG
 use compiler.mir.mir.MIR_LOCAL_CONST
@@ -68486,6 +68495,8 @@ use compiler.mir.mir.MIR_OP_MOVE
 use compiler.mir.mir.MIR_PROJ_DEREF
 use compiler.mir.mir.MIR_PROJ_DOWNCAST
 use compiler.mir.mir.MIR_PROJ_FIELD
+use compiler.mir.mir.MIR_PROJ_INDEX
+use compiler.mir.mir.MIR_PROJ_SUB_SLICE
 use compiler.mir.mir.MIR_RVALUE_AGGREGATE
 use compiler.mir.mir.MIR_RVALUE_BINARY_OP
 use compiler.mir.mir.MIR_RVALUE_CAST
@@ -68547,7 +68558,6 @@ use compiler.own.move_ck.path_ctx_init
 use compiler.own.move_ck.path_child
 use compiler.own.move_ck.path_node_at
 use compiler.own.move_ck.ptr_copy_nonoverlapping
-use compiler.own.move_ck.resolve_place
 use compiler.own.move_ck.update_parent
 
 @intrinsic fn size_of<T>() -> usize { 0 }
@@ -68582,6 +68592,8 @@ pub struct OwnVisitor {
     pub thir: *const Thir,
     pub cap_tracker: *mut MirCapTracker,
     pub cap_arena: *mut Arena,
+    // T498b: for the Copy-ness of a value read through an array index (0 when unknown).
+    pub str_in: *const StrInterner,
 }
 
 unsafe fn own_state_ptr_at_mut(base: *mut *mut OwnStateInfo, idx: usize) -> *mut *mut OwnStateInfo {
@@ -68669,10 +68681,136 @@ fn emit_own_diag(sink: mut_view<DiagSink>, is_uninit: bool, loc: Span, has_move_
     diag_sink_report(sink, view(d));
 }
 
+// T498b: the path-tree node of `place`. Resolution stops at the first INDEX/SUB_SLICE projection:
+// array elements are not tracked separately (element-level tracking is post-v1, REQ-OWN-049), so
+// `hs[i].f` resolves to the node of `hs` and never to a field node of `hs` (`hs.f`).
+fn own_resolve_node(ctx: view<PathCtx>, place: view<MirPlace>) -> u32 {
+    let lv = place.local.v as usize;
+    if lv >= ctx.local_count {
+        return 0u32;
+    }
+    let mut node = unsafe { *own_u32_at(ctx.local_roots as *const u32, lv) };
+    let mut i: usize = 0;
+    while i < place.proj_count {
+        let pr = unsafe { mir_proj_at(place.projs, i) };
+        let pk = unsafe { (*pr).kind };
+        if pk == MIR_PROJ_INDEX || pk == MIR_PROJ_SUB_SLICE || pk == MIR_PROJ_DEREF {
+            return node;
+        }
+        if pk == MIR_PROJ_FIELD || pk == MIR_PROJ_DOWNCAST {
+            let f = if pk == MIR_PROJ_DOWNCAST { unsafe { (*pr).variant_idx } } else { unsafe { (*pr).field_idx } };
+            node = path_child(ctx, node, pk, f);
+        }
+        i = i + 1;
+    }
+    node
+}
+
+// T498b: true when `place` reaches an array/slice element (an INDEX or SUB_SLICE projection before
+// any DEREF).
+fn own_place_indexed(place: view<MirPlace>) -> bool {
+    let mut i: usize = 0;
+    while i < place.proj_count {
+        let pr = unsafe { mir_proj_at(place.projs, i) };
+        let pk = unsafe { (*pr).kind };
+        if pk == MIR_PROJ_DEREF {
+            return false;
+        }
+        if pk == MIR_PROJ_INDEX || pk == MIR_PROJ_SUB_SLICE {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+// T498b: the type of `place`, following its projections (as `mir_drop_place_type`); 0 when a step
+// is not known.
+fn own_place_type(body: view<MirBody>, thir: view<Thir>, place: view<MirPlace>) -> TypeId {
+    if (place.local.v as usize) >= body.local_count {
+        return TypeId { v: 0u32 };
+    }
+    let decl = unsafe { mir_local_at(body.locals, place.local.v as usize) };
+    let mut cur: u32 = unsafe { (*decl).ty.v };
+    let mut i: usize = 0;
+    while i < place.proj_count {
+        if cur == 0u32 || (cur as usize) > thir.interner.len {
+            return TypeId { v: 0u32 };
+        }
+        let t = type_get(view(thir.interner), TypeId { v: cur });
+        if (t as usize) == 0 {
+            return TypeId { v: 0u32 };
+        }
+        let kind = unsafe { (*t).kind };
+        let pr = unsafe { mir_proj_at(place.projs, i) };
+        let pk = unsafe { (*pr).kind };
+        let mut next: u32 = 0u32;
+        if pk == MIR_PROJ_DEREF {
+            next = unsafe { (*t).pointee.v };
+        } else if pk == MIR_PROJ_FIELD {
+            let fi = (unsafe { (*pr).field_idx }) as usize;
+            if (kind == TY_STRUCT || kind == TY_TUPLE) && fi < (unsafe { (*t).field_count }) {
+                next = unsafe { (*typeid_at((*t).fields, fi)).v };
+            }
+        } else if pk == MIR_PROJ_INDEX {
+            if kind == TY_ARRAY || kind == TY_SLICE {
+                next = unsafe { (*t).elem.v };
+            }
+        } else if pk == MIR_PROJ_SUB_SLICE {
+            next = cur;
+        } else if pk == MIR_PROJ_DOWNCAST {
+            // A downcast keeps the enum; the FIELD that follows reads the variant's payload field.
+            if kind == TY_ENUM && i + 1 < place.proj_count {
+                let nx = unsafe { mir_proj_at(place.projs, i + 1) };
+                if (unsafe { (*nx).kind }) == MIR_PROJ_FIELD {
+                    let vi = (unsafe { (*pr).variant_idx }) as usize;
+                    let fi = (unsafe { (*nx).field_idx }) as usize;
+                    if vi < (unsafe { (*t).variant_count }) && (unsafe { (*t).variant_field_counts as usize }) != 0 {
+                        let fc = unsafe { *usize_at((*t).variant_field_counts, vi) };
+                        if fi < fc {
+                            let vf = unsafe { *typeid_ptr_at((*t).variant_fields, vi) };
+                            next = unsafe { (*typeid_at(vf, fi)).v };
+                            i = i + 1;
+                        }
+                    }
+                }
+            }
+        }
+        cur = next;
+        i = i + 1;
+    }
+    TypeId { v: cur }
+}
+
+// T498b: a COPY/MOVE operand whose place goes through an array index and whose value is Copy
+// (`hs[i].f` with `f: i32`, a `fn` pointer, `[2]u8`, a view...) only reads the array: it checks
+// that the array is initialised and not moved, and moves nothing. The MIR builder emits COPY for
+// every type except `str` and non-Copy arrays (structs are moved with COPY too), so the operand kind
+// alone cannot decide; the projected type does. A non-Copy element or field moved out through an
+// index still moves (marks) the whole array.
+fn own_operand_is_indexed_copy_read(
+    body: *const MirBody,
+    thir: *const Thir,
+    str_in: *const StrInterner,
+    op: view<MirOperand>
+) -> bool {
+    if (body as usize) == 0 || (thir as usize) == 0 || (str_in as usize) == 0 {
+        return false;
+    }
+    if !own_place_indexed(view(op.place)) {
+        return false;
+    }
+    let ty = unsafe { own_place_type(view(*body), view(*thir), view(op.place)) };
+    if ty.v == 0u32 {
+        return false;
+    }
+    unsafe { type_is_copy(TypeId { v: ty.v }, view(*thir), view(*str_in)) }
+}
+
 pub fn own_check_use(v: mut_view<OwnVisitor>, place: view<MirPlace>, loc: Span) {
     let mut base = mir_place_local(MirLocalId { v: 0u32 });
     truncate_at_deref(place, mut_view(base));
-    let node = unsafe { resolve_place(view(*v.ctx), view(base)) };
+    let node = unsafe { own_resolve_node(view(*v.ctx), view(base)) };
     let st_p = unsafe { own_state_at(v.state as *const OwnStateInfo, node as usize) };
     let st = unsafe { (*st_p).state };
     if st != OWN_OWNED && v.report {
@@ -68695,7 +68833,7 @@ pub fn own_do_move(v: mut_view<OwnVisitor>, place: view<MirPlace>, loc: Span) {
         own_check_use(v, view(base), loc);
         return;
     }
-    let node = unsafe { resolve_place(view(*v.ctx), place) };
+    let node = unsafe { own_resolve_node(view(*v.ctx), place) };
     let np = unsafe { path_node_at((*v.ctx).nodes as *const PathNode, node as usize) };
     let is_cp = unsafe { (*np).is_copy };
     if !is_cp {
@@ -68713,7 +68851,7 @@ pub fn own_do_assign(v: mut_view<OwnVisitor>, place: view<MirPlace>, loc: Span) 
         own_check_use(v, view(base), loc);
         return;
     }
-    let node = unsafe { resolve_place(view(*v.ctx), place) };
+    let node = unsafe { own_resolve_node(view(*v.ctx), place) };
     unsafe {
         mark_state(v.state, view(*v.ctx), node, OWN_OWNED, loc);
         update_parent(v.state, view(*v.ctx), node);
@@ -68732,6 +68870,9 @@ pub fn own_visit_operand(v: mut_view<OwnVisitor>, op: view<MirOperand>, loc: Spa
     };
     if op.kind == MIR_OP_COPY || op.kind == MIR_OP_MOVE {
         own_check_use(mut_view(*v), view(op.place), own_span_copy(view(op_loc)));
+        if own_operand_is_indexed_copy_read(v.body, v.thir, v.str_in, op) {
+            return;
+        }
         own_do_move(v, view(op.place), op_loc);
     }
 }
@@ -68998,6 +69139,9 @@ fn own_bits_resolve(ctx: view<PathCtx>, place: view<MirPlace>, out_had_deref: mu
     if place.proj_count == 0 {
         return node;
     }
+    // T498b: after an INDEX/SUB_SLICE the node stays the array's (REQ-OWN-049: no element-level
+    // tracking); a later DEREF is still reported through `out_had_deref`.
+    let mut indexed = false;
     let mut i: usize = 0;
     while i < place.proj_count {
         let pr = unsafe { mir_proj_at(place.projs, i) };
@@ -69006,7 +69150,10 @@ fn own_bits_resolve(ctx: view<PathCtx>, place: view<MirPlace>, out_had_deref: mu
             *out_had_deref = true;
             return node;
         }
-        if pk == MIR_PROJ_FIELD || pk == MIR_PROJ_DOWNCAST {
+        if pk == MIR_PROJ_INDEX || pk == MIR_PROJ_SUB_SLICE {
+            indexed = true;
+        }
+        if !indexed && (pk == MIR_PROJ_FIELD || pk == MIR_PROJ_DOWNCAST) {
             let f = if pk == MIR_PROJ_DOWNCAST { unsafe { (*pr).variant_idx } } else { unsafe { (*pr).field_idx } };
             node = path_child(ctx, node, pk, f);
         }
@@ -69082,29 +69229,40 @@ fn own_bits_use_and_move(bits: *mut u64, ctx: view<PathCtx>, place: view<MirPlac
     }
 }
 
-fn own_bits_visit_operand(bits: *mut u64, ctx: view<PathCtx>, op: view<MirOperand>, check_errors: bool, found_error: mut_view<bool>) {
+// T498b: what the 1-bit solver needs to type a place read through an array index.
+struct OwnTyEnv {
+    body: *const MirBody,
+    thir: *const Thir,
+    str_in: *const StrInterner,
+}
+
+fn own_bits_visit_operand(bits: *mut u64, ctx: view<PathCtx>, env: view<OwnTyEnv>, op: view<MirOperand>, check_errors: bool, found_error: mut_view<bool>) {
     if op.kind == MIR_OP_COPY || op.kind == MIR_OP_MOVE {
+        if own_operand_is_indexed_copy_read(env.body, env.thir, env.str_in, op) {
+            own_bits_check_use(bits as *const u64, ctx, view(op.place), check_errors, found_error);
+            return;
+        }
         own_bits_use_and_move(bits, ctx, view(op.place), check_errors, found_error);
     }
 }
 
-fn own_bits_visit_rvalue(bits: *mut u64, ctx: view<PathCtx>, rv: view<MirRvalue>, check_errors: bool, found_error: mut_view<bool>) {
+fn own_bits_visit_rvalue(bits: *mut u64, ctx: view<PathCtx>, env: view<OwnTyEnv>, rv: view<MirRvalue>, check_errors: bool, found_error: mut_view<bool>) {
     let k = rv.kind;
     if k == MIR_RVALUE_USE || k == MIR_RVALUE_REPEAT || k == MIR_RVALUE_CAST || k == MIR_RVALUE_UNARY_OP {
-        own_bits_visit_operand(bits, ctx, view(rv.use_op), check_errors, found_error);
+        own_bits_visit_operand(bits, ctx, env, view(rv.use_op), check_errors, found_error);
     } else if k == MIR_RVALUE_REF || k == MIR_RVALUE_LEN || k == MIR_RVALUE_DISCRIMINANT {
         if check_errors {
             own_bits_check_use(bits as *const u64, ctx, view(rv.place), true, found_error);
         }
     } else if k == MIR_RVALUE_BINARY_OP || k == MIR_RVALUE_OVERFLOWS_BINARY_OP {
-        own_bits_visit_operand(bits, ctx, view(rv.lhs), check_errors, mut_view(*found_error));
-        own_bits_visit_operand(bits, ctx, view(rv.rhs), check_errors, found_error);
+        own_bits_visit_operand(bits, ctx, env, view(rv.lhs), check_errors, mut_view(*found_error));
+        own_bits_visit_operand(bits, ctx, env, view(rv.rhs), check_errors, found_error);
     } else if k == MIR_RVALUE_AGGREGATE {
         let mut i: usize = 0;
         while i < rv.operand_count {
             let op = unsafe { mir_op_at(rv.operands, i) };
             unsafe {
-                own_bits_visit_operand(bits, ctx, view(*op), check_errors, mut_view(*found_error));
+                own_bits_visit_operand(bits, ctx, env, view(*op), check_errors, mut_view(*found_error));
             }
             i = i + 1;
         }
@@ -69116,6 +69274,7 @@ fn own_bits_visit_bb(
     ctx: view<PathCtx>,
     body: view<MirBody>,
     thir: view<Thir>,
+    env: view<OwnTyEnv>,
     bb: view<MirBb>,
     ret_needs_check: bool,
     check_errors: bool,
@@ -69127,7 +69286,7 @@ fn own_bits_visit_bb(
         let sk = unsafe { (*st).kind };
         if sk == MIR_STMT_ASSIGN {
             unsafe {
-                own_bits_visit_rvalue(bits, ctx, view((*st).rvalue), check_errors, mut_view(*found_error));
+                own_bits_visit_rvalue(bits, ctx, env, view((*st).rvalue), check_errors, mut_view(*found_error));
                 own_bits_do_assign(bits, ctx, view((*st).place), check_errors, mut_view(*found_error));
             }
         } else if sk == MIR_STMT_DROP {
@@ -69142,7 +69301,7 @@ fn own_bits_visit_bb(
     }
     let tk = bb.terminator.kind;
     if tk == MIR_TERM_SWITCH_INT {
-        own_bits_visit_operand(bits, ctx, view(bb.terminator.discr), check_errors, found_error);
+        own_bits_visit_operand(bits, ctx, env, view(bb.terminator.discr), check_errors, found_error);
     } else if tk == MIR_TERM_DROP {
         if bb.terminator.expected {
             own_bits_use_and_move(bits, ctx, view(bb.terminator.drop_place), check_errors, found_error);
@@ -69183,7 +69342,7 @@ fn own_bits_visit_bb(
             }
         }
         if moves_callee {
-            own_bits_visit_operand(bits, ctx, view(bb.terminator.func), check_errors, mut_view(*found_error));
+            own_bits_visit_operand(bits, ctx, env, view(bb.terminator.func), check_errors, mut_view(*found_error));
         } else {
             own_bits_check_use(bits as *const u64, ctx, view(bb.terminator.func.place), check_errors, mut_view(*found_error));
         }
@@ -69191,7 +69350,7 @@ fn own_bits_visit_bb(
         while a < bb.terminator.arg_count {
             let arg_op = unsafe { mir_op_at(bb.terminator.args, a) };
             unsafe {
-                own_bits_visit_operand(bits, ctx, view(*arg_op), check_errors, mut_view(*found_error));
+                own_bits_visit_operand(bits, ctx, env, view(*arg_op), check_errors, mut_view(*found_error));
             }
             a = a + 1;
         }
@@ -69200,7 +69359,7 @@ fn own_bits_visit_bb(
         own_bits_use_and_move(bits, ctx, view(bb.terminator.drop_place), check_errors, mut_view(*found_error));
         own_bits_do_assign(bits, ctx, view(bb.terminator.destination), check_errors, found_error);
     } else if tk == MIR_TERM_ASSERT {
-        own_bits_visit_operand(bits, ctx, view(bb.terminator.cond), check_errors, found_error);
+        own_bits_visit_operand(bits, ctx, env, view(bb.terminator.cond), check_errors, found_error);
     } else if tk == MIR_TERM_RETURN {
         if ret_needs_check && check_errors && !(*found_error) {
             let rnode = if ctx.local_count > 0 {
@@ -69322,7 +69481,8 @@ fn own_check_exact_fallback(
     arg_count: usize,
     rpo_post: *const u32,
     rpo_pos: *const u32,
-    rpo_len: usize
+    rpo_len: usize,
+    str_in: *const StrInterner
 ) {
     let bb_count = body.bb_count;
     let ctx_cnt = unsafe { (*ctx).count };
@@ -69382,6 +69542,7 @@ fn own_check_exact_fallback(
         thir: unsafe { address_of(*thir) },
         cap_tracker: 0 as *mut MirCapTracker,
         cap_arena: 0 as *mut Arena,
+        str_in: str_in,
     };
     let mut targets: [16]u32 = [0u32; 16];
 
@@ -69547,6 +69708,11 @@ pub fn own_check_init_only(
     let rpo_len = own_compute_rpo(view(*body), rpo_post, rpo_pos);
 
     let temp_bits = unsafe { own_u64_at_mut(all_bits, mul_usize(bb_count, words)) };
+    let ty_env = OwnTyEnv {
+        body: unsafe { address_of(*body) },
+        thir: unsafe { address_of(*thir) },
+        str_in: unsafe { address_of(*str_in) },
+    };
     let mut targets: [16]u32 = [0u32; 16];
     let mut found_error = false;
     let mut need_recheck = false;
@@ -69570,6 +69736,7 @@ pub fn own_check_init_only(
                         view(*ctx),
                         view(*body),
                         thir,
+                        view(ty_env),
                         view(*bb_p),
                         ret_needs_check,
                         check_now,
@@ -69628,6 +69795,7 @@ pub fn own_check_init_only(
                         view(*ctx),
                         view(*body),
                         thir,
+                        view(ty_env),
                         view(*bb_p),
                         ret_needs_check,
                         true,
@@ -69653,7 +69821,8 @@ pub fn own_check_init_only(
             arg_count,
             rpo_post as *const u32,
             rpo_pos as *const u32,
-            rpo_len
+            rpo_len,
+            unsafe { address_of(*str_in) }
         );
     }
 
