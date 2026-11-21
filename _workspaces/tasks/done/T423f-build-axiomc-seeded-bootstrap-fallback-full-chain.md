@@ -8,13 +8,15 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 35
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 240
-paths: [tests/tools/build_axiomc_fallback]
-locks: [tools/build_axiomc.py]
+paths: [tests/tools/build_axiomc_fallback, tools/build_axiomc.py]
+locks: []
 spec: [spec/decisions/ADR-0046-t423-fiber-followups-and-tracked-xfail.md]
 covers: [REQ-TST-072]
+started: 2026-11-22 04:05:18
+finished: 2026-11-22 04:31:40
 ---
 # T423f — Seeded bootstrap fallback
 
@@ -43,3 +45,5 @@ a human/agent must rerun with `--full-chain` (~8 minutes). Every change that add
 
 ## Log
 - 2026-11-21 created by axiom-architect (triage-t423; T423 QA follow-up 5 / report F5)
+- 2026-11-22 04:05:18 started (attempt 1) T423f-impl
+- 2026-11-22 04:31:40 accepted by QA -> done

@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T498]
 priority: 15
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 600
-paths: [compiler/interp/value.ax, compiler/interp/frame.ax, tests/run/interp_big_args]
-locks: [compiler/interp/interp.ax, compiler/interp/oracle.ax]
+paths: [compiler/interp/value.ax, compiler/interp/frame.ax, tests/run/interp_big_args, compiler/interp/interp.ax, compiler/interp/oracle.ax]
+locks: []
 spec: [spec/SPEC-10-ownership.md, spec/SPEC-03-core-semantics.md]
 covers: [REQ-TST-072, REQ-TOOL-009]
+started: 2026-11-22 04:05:16
+agent: T498c-impl
 ---
 # T498c — the oracle must pass aggregates of any size by value
 
@@ -47,3 +49,4 @@ Native code is correct. The oracle is the semantic reference (differential tests
 
 ## Log
 - 2026-11-21 created by axiom-architect (triage-2026-11-21; FU-T498-INTERP-ARG256)
+- 2026-11-22 04:05:16 started (attempt 1) T498c-impl

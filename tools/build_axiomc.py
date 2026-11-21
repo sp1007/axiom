@@ -14,6 +14,12 @@ Python 3 standard library only.
    `bootstrap/axiom0`), the bundle text, the producing compiler binary and the stage flags. File mtimes are never
    consulted (a snapshot keeps main-tree mtimes, so an edited file can be older than the binary). Each binary
    prints `REUSED <bin> (inputs <hash16>)` or `REBUILT <bin> (reason)`; pass `--force` to rebuild everything.
+4. Seeded fast bootstrap (T487) falls back to the full chain (T423f): when the seed was chosen by `auto` (the default,
+   or a literal `--seed auto`) and stage "seeded A" (A = seed(new sources)) fails to compile -- a new host intrinsic or
+   new syntax the cached seed does not know -- the same invocation prints
+   `bootstrap: seeded A failed, falling back to full chain` and reruns the full `axiom0 -> c1 -> c2 (-> c3)` chain,
+   whose result becomes the new cached seed. An explicit `--seed <path>` still fails hard (the caller asked for that
+   seed); a failure of any later seeded stage (B, C, B == C, stage-0 smoke parity) is never retried.
 """
 
 import argparse
@@ -25,6 +31,59 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bootstrap  # noqa: E402
+
+
+SEEDED_A_FAIL_MARKER = "bootstrap: FAIL seeded A"
+FALLBACK_NOTICE = "bootstrap: seeded A failed, falling back to full chain"
+
+
+class _StderrTee(object):
+    """Forward everything written to stderr unchanged and keep a copy (to recognise the seeded-A failure line)."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.parts = []
+
+    def write(self, text):
+        self.parts.append(text)
+        return self.inner.write(text)
+
+    def flush(self):
+        return self.inner.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def text(self):
+        return "".join(self.parts)
+
+
+def run_bootstrap(boot_argv, allow_full_chain_fallback):
+    """Run `bootstrap.main(boot_argv)`; with `allow_full_chain_fallback`, rerun it as a full chain when it failed
+    because the seed could not compile the new sources (stage "seeded A")."""
+    if not allow_full_chain_fallback:
+        return bootstrap.main(boot_argv)
+    real_stderr = sys.stderr
+    tee = _StderrTee(real_stderr)
+    sys.stderr = tee
+    try:
+        rc = bootstrap.main(boot_argv)
+    finally:
+        sys.stderr = real_stderr
+    if rc == 0 or SEEDED_A_FAIL_MARKER not in tee.text():
+        return rc
+    print(FALLBACK_NOTICE, flush=True)
+    chain_argv = []
+    skip = False
+    for tok in boot_argv:
+        if skip:
+            skip = False
+        elif tok == "--seed":
+            skip = True
+        else:
+            chain_argv.append(tok)
+    chain_argv.append("--full-chain")
+    return bootstrap.main(chain_argv)
 
 
 def find_cmake_and_ninja_env():
@@ -117,7 +176,9 @@ def main(argv=None):
         "--seed",
         default=None,
         help="Seed Stage-2 compiler path for seeded fast bootstrap (A=seed(src), B=A(src), C=B(src), B==C), "
-        "or 'auto' (default when not --force/--full-chain/--trust-root) to resolve from --cache-dir (T487)",
+        "or 'auto' (default when not --force/--full-chain/--trust-root) to resolve from --cache-dir (T487); "
+        "with 'auto' a seed that cannot compile the new sources falls back to the full chain (T423f), "
+        "an explicit path fails hard",
     )
     ap.add_argument(
         "--cache-dir",
@@ -206,7 +267,9 @@ def main(argv=None):
     if args.time_passes:
         boot_argv.append("--time-passes")
 
-    rc = bootstrap.main(boot_argv)
+    # T423f: only an `auto` seed (the cached one, not a path the caller chose) may fall back to the full chain.
+    fallback_ok = eff_seed == "auto" and not args.full_chain and not args.trust_root
+    rc = run_bootstrap(boot_argv, fallback_ok)
     if rc != 0:
         return rc
 
