@@ -552,7 +552,8 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_UNSAFE_INTERP_UB` | E | T061a/T061c/T502 | undefined behaviour detected by the MIR interpreter oracle (`UB-01..UB-12`: null/dangling/out-of-bounds/misaligned/uninit/invalid-value/read-only-write/provenance-forgery/capability-conflict/overlapping-copy/invalid-fn-ptr/ffi-abi violation; exit code 125; `SPEC-50` AXS-UNS-015..016, AXS-UNS-050) |
 | `AX_CONST_OVERFLOW` | E | T061/T451 | arithmetic overflow during constant evaluation (`SPEC-03` AXS-SEM-030, `SPEC-40` AXS-INT-005) |
 | `AX_CONST_DIV_ZERO` | E | T061/T451 | division by zero during constant evaluation (`SPEC-03` AXS-SEM-032, `SPEC-40` AXS-INT-005) |
-| `AX_CONST_SHIFT_RANGE` | E | T061/T451 | shift count out of range during constant evaluation (`SPEC-03` AXS-SEM-034, `SPEC-40` AXS-INT-005) |
+| `AX_CONST_SHIFT_RANGE` | E | T061/T451/T483 | shift count out of range during constant evaluation (`SPEC-03` AXS-SEM-034, `SPEC-40` AXS-INT-005); `axiomc` registry id 168 (`compiler/diag/code.ax`, T483) |
+| `AX_TYPE_INDEX_NOT_INT` | E | T497 | array/slice index expression (or a range bound `a[lo..hi]`) is not an integer type: `bool`, float, struct, tuple, `view` (`SPEC-40` AXS-INT-053, AXS-INT-060 display number 2014); `axiomc` registry id 169 (`compiler/diag/code.ax`, T497) |
 | `AX_DRIVER_NO_STD` | E | T060 | no std root found (ADR-0006 §8) |
 | `AX_FFI_NOT_IN_ORACLE` | E | T065/T503 | the interpreter reached a direct `extern` call without a host intrinsic or mock binding (ADR-0002 §4, `SPEC-50` AXS-UNS-036) |
 | `AX_UNSAFE_AT_HOSTED` | E | T504/T525/T526 | `@addr` / `@at` placement on `static` or `fn` in the `hosted` profile without `--freestanding` or `--allow-fixed-addr` (ADR-0001, `SPEC-50` AXS-UNS-023, AXS-UNS-050; `SPEC-55` AXS-ADR-014, AXS-ADR-050; formerly `AX_ADDR_HOSTED`) |

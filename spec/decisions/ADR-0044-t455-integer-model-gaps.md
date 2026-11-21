@@ -21,8 +21,9 @@ Status: accepted (2026-11-21, architect; owner-delegated decision). Type C (sema
 - Revisit: có cho §3 (nếu việc sao chép mảng lớn gây chi phí bất ngờ, thêm lint hoặc `@copy_large` chứ không đổi quy tắc Copy).
 
 ## Context
-- Source: `_workspaces/reports/T455-report.md` (follow-ups 1-4) and `T455-qa.md`; repro files
-  `tests/run/numeric/mixed_int_matrix/repro_u128_index_alias.ax`, `repro_index_not_int_code.ax`.
+- Source: `_workspaces/reports/T455-report.md` (follow-ups 1-4) and `T455-qa.md`; the original repro files
+  `repro_u128_index_alias.ax` and `repro_index_not_int_code.ax` (`tests/run/numeric/mixed_int_matrix`) were removed by their fix
+  tasks; their cases now live in `index_trap_u128_alias.ax` / `index_trap_i128_alias.ax` (T496) and `tests/ui/index_not_int/bool.ax` (T497).
 - SPEC-40 AXS-INT-053 and AXS-INT-054 §1 say the non-`usize` index is converted with `Cast(IntToInt, i, usize)`
   and then bounds-checked as `idx_usize < len`. For `T` wider than 64 bits the cast truncates, so
   `2^64 + 1` becomes `1`. For 64-bit `T` (`i64`, `u64`, `isize`) the cast is exact on the Windows x64 target; a negative

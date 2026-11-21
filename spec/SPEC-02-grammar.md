@@ -561,8 +561,9 @@ on a place; they are dedicated forms, not calls (the operand is not moved). [tas
 ADR-0009 §2; ADR-0010 §8]
 
 **AXS-GRM-070 — Indexing and sub-ranges.** `a[i]` indexes. Inside index brackets the open range
-forms are available: `s[a..b]`, `s[a..]`, `s[..b]` (ADR-0006 §5). `a..` and `..b` are not
-expressions elsewhere. [tasks/0476 §86-87; ADR-0006 §5]
+forms are available: `s[a..b]`, `s[a..]`, `s[..b]` (ADR-0006 §5), and the inclusive forms
+`s[a..=b]`, `s[..=b]` (end `b` included, length `b - a + 1`; bounds rule in ADR-0045). `a..` and `..b`
+are not expressions elsewhere; `a..=` is a syntax error. [tasks/0476 §86-87; ADR-0006 §5; ADR-0045]
 
 **AXS-GRM-071 — Pointer member access.** `p->field` is sugar for `(*p).field` (unsafe; lowered when
 building HIR). [tasks/0476 §60]
