@@ -8,13 +8,15 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 0
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 180
 paths: [tests/ui/slice/iter_move.ax, tests/ui/slice/qa_slice_iter_move.ax, tests/run/slice/copy_array_owner_view.ax]
 locks: []
 spec: [spec/SPEC-10-ownership.md, spec/SPEC-11-capability.md, spec/decisions/ADR-0044-t455-integer-model-gaps.md]
 covers: [REQ-OWNER-007]
+started: 2026-11-22 02:29:44
+finished: 2026-11-22 02:54:19
 ---
 # T498d — make the slice iterator move tests move a non-Copy owner again
 
@@ -54,3 +56,5 @@ live is `AX_CAP_OUTLIVES_OWNER` (SPEC-11 AXS-CAP-004).
 
 ## Log
 - 2026-11-22 created by axiom-architect (p0-slice-iter-move; regression check in T499a-qa.md, culprit T498 9f31ed56)
+- 2026-11-22 02:29:44 started (attempt 1) T498d-impl
+- 2026-11-22 02:54:19 accepted by QA -> done
