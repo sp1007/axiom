@@ -39,7 +39,7 @@ PROBE_TEMPLATE = HERE / "e19_4_diagnostics_ai_probe.ax.in"
 
 EXPECTED_PROBE_STDOUT = (
     "probe[ux2_causal_fp_taint] move_ok=true cap_ok=true conc_ok=true async_ok=true fp_stable=true render_ok=true vn_cols=8 emitted=4 suppressed=3 reinit_ok=true\n"
-    "probe[fix_and_explain] safety_ok=true converged_ok=true rollback_ok=true codegen_invoked=false areas_ok=true entries=38 alias_ok=true unknown_exit2=true\n"
+    "probe[fix_and_explain] safety_ok=true converged_ok=true rollback_ok=true codegen_invoked=false areas_ok=true entries=39 alias_ok=true unknown_exit2=true\n"
     "probe[layout_and_meta] domain_ok=true layout_human=true layout_json=true layout_wasm=true containers=8 effects=12 axmeta_ok=true\n"
     "probe[ai_queries_and_gates] queries_ok=true patch_reloc_rej=true patch_bypass_rej=true patch_uam_rej=true patch_clean_ok=true pe_clean_ok=true pe_dirty_rej=true\n"
     "E19-4-DIAGNOSTICS-AI-CONFORMANCE-PROBE-PASS\n"

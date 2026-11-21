@@ -8,7 +8,7 @@ model: sonnet
 gate_model: sonnet
 depends: [T455]
 priority: 28
-status: doing
+status: done
 attempts: 1
 timeout_min: 480
 paths: [tests/ui/index_not_int, tests/run/numeric/mixed_int_matrix/repro_index_not_int_code.ax, compiler/diag/format.ax, tests/run/diag_ux2, tests/conformance/p19/e19_4_diagnostics_ai, compiler/diag/code.ax, compiler/diag/explain/mod.ax, compiler/types/typeck.ax, tests/typeck/int128/int_promotion_neg.ax]
@@ -16,7 +16,7 @@ locks: [compiler/diag/code.ax, compiler/diag/explain/mod.ax, compiler/types/type
 spec: [spec/decisions/ADR-0044-t455-integer-model-gaps.md, spec/SPEC-40-integers.md, spec/diagnostics.md]
 covers: [REQ-OWNER-007]
 started: 2026-11-21 14:58:03
-agent: T497-impl
+finished: 2026-11-21 17:38:23
 ---
 # T497 — `AX_TYPE_INDEX_NOT_INT` (2014)
 
@@ -47,3 +47,4 @@ not defined in `compiler/diag/code.ax`; `a[true]` reports `AX_TYPE_MISMATCH` and
 ## Log
 - 2026-11-21 created by axiom-architect (T455 gate; ADR-0044 §4; FU-T455-IDXCODE)
 - 2026-11-21 14:58:03 started (attempt 1) T497-impl
+- 2026-11-21 17:38:23 accepted by QA -> done

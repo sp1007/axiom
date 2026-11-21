@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T455]
 priority: 24
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 600
-paths: [tests/run/numeric/mixed_int_matrix/array_copy.ax, tests/run/array_copy, tests/ui/array_copy]
+paths: [tests/run/numeric/mixed_int_matrix/array_copy.ax, tests/run/array_copy, tests/ui/array_copy, compiler/mir/builder.ax]
 locks: [compiler/mir/builder.ax]
 spec: [spec/decisions/ADR-0044-t455-integer-model-gaps.md, spec/SPEC-10-ownership.md, spec/SPEC-51-raw-memory-volatile-mmio-layout.md]
 covers: [REQ-OWNER-007]
+started: 2026-11-21 16:05:44
+agent: T498-impl
 ---
 # T498 — `[N]T` is Copy iff `T` is Copy (ADR-0044 §3)
 
@@ -50,3 +52,4 @@ Root cause located by the architect: `mb_operand_from_place` in `compiler/mir/bu
 
 ## Log
 - 2026-11-21 created by axiom-architect (T455 gate; ADR-0044 §3; FU-T455-ARRCOPY)
+- 2026-11-21 16:05:44 started (attempt 1) T498-impl

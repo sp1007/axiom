@@ -31,7 +31,7 @@ EXPECTED_PROBE_STDOUT = (
     "probe[causal_and_fp] move_ok=true cap_ok=true conc_ok=true fp_stable=true render_ok=true vn_cols=8\n"
     "probe[poison_taint] emitted=4 suppressed=3 reinit_ok=true\n"
     "probe[fix_engine] safety_ok=true converged_ok=true rollback_ok=true codegen_invoked=false\n"
-    "probe[explain_cli] all_areas_ok=true entries=38 json_ok=true alias_ok=true unknown_exit2=true\n"
+    "probe[explain_cli] all_areas_ok=true entries=39 json_ok=true alias_ok=true unknown_exit2=true\n"
     "DIAG-UX2-PROBE-PASS\n"
 )
 
