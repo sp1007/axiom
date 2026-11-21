@@ -3,6 +3,7 @@
 ## Tóm tắt
 Đặc tả này quy định hệ thống Deterministic Destruction (Drop). Mọi control-flow edge (bao gồm early return, break, panic) đều phải dọn dẹp tài nguyên thông qua Drop elaboration. Phân biệt rõ Custom Drop (người dùng viết) và Compiler-derived Drop. Gọi `drop(x)` tường minh sẽ dọn dẹp tài nguyên nhưng không nhất thiết phải giải phóng bộ nhớ ngay lập tức (phụ thuộc vào MIR drop flags). Khi panic, chương trình thực hiện dọn dẹp theo drop stack; nếu panic trong lúc Drop đang unwind thì sẽ abort để tránh hậu quả khó lường.
 Phép gán drop giá trị cũ của place (kể cả qua `view`/`mut_view`), còn ghi qua con trỏ thô thì không bao giờ drop (AXS-DROP-007); trait `Drop` của ngôn ngữ được nhận diện theo phân giải tên, không theo hậu tố `.Drop` (AXS-DROP-008) — ADR-0036.
+Binding theo giá trị trong arm của `match` (và `if let`/`while let`) bị drop ở cuối arm, không phải cuối khối bao quanh (AXS-DROP-009) — ADR-0047.
 
 ## 1. Deterministic Destruction
 
@@ -47,6 +48,16 @@ named `Drop` is declared in or imported into the module. A qualified path to a u
 (`impl m.Drop for T`) or a shadowing user `trait Drop` is an ordinary trait: its `drop` method is an
 ordinary method, is not called at scope end, and makes `T` neither droppable nor non-`Copy`.
 [ADR-0036 §5; T141 round 1]
+
+### AXS-DROP-009: Drop Scope of Pattern Bindings (`match`, `if let`, `while let`)
+Each `match` arm is a drop scope. A by-value binding introduced by the arm's pattern (nested and `@` bindings included) that is
+still initialised when the arm ends is dropped at the end of the arm — after the arm body's own locals, in reverse order of the
+bindings' left-to-right position in the pattern — and on every edge leaving the arm early (`return`, `break`, `continue`, `?`,
+unwinding). A binding moved out inside the arm is not dropped there (AXS-DROP-003). `if let P = e { A }` drops the bindings of
+`P` at the end of `A`; `while let P = e { A }` at the end of each iteration. Scrutinee parts not moved into bindings stay in the
+scrutinee place (partial-move drop flags) and are dropped with that place; for a temporary scrutinee they are dropped at the end
+of the `match`/`if let` statement. Bindings of `let P = e;` (and `let ... else`) follow the ordinary `let` rule (end of the
+enclosing block). [ADR-0047; `0134 §26` APATTERN-28; `0159 §26`; fix task T445a]
 
 ## 2. Requirements for MIR
 

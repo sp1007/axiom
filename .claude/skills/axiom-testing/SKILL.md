@@ -63,8 +63,11 @@ the catch-up task must leave `grep -rn "native-after: <its id>" tests` empty. Ne
 `modes: interp` for this purpose.
 
 **`// xfail: T123 <reason>`** — an expected failure for a **spec gap that has an ADR** and an open
-task (never for an implementation bug). It is reported XFAIL; if it passes it is XPASS, which counts
-as a failure until the directive is removed.
+task, or (ADR-0044, ADR-0046 D1) a minimal repro of a compiler/tooling bug found by a task *outside*
+the owning area, naming an **open fix task filed by the architect** that has the test file in its
+`paths:` and must remove the line. Never for a bug in the task's own change set, never naming the
+task under gate. It is reported XFAIL; if it passes it is XPASS, which counts as a failure until the
+directive is removed.
 
 **Native-only tests.** The MIR interpreter runs heap and OS code through the host intrinsics
 (ADR-0002), so std and compiler-port tests run in both modes. The only accepted reasons for

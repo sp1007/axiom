@@ -88,7 +88,8 @@ layer violations, non-determinism, undocumented semantic choices. Style nits are
 ## Phase gates (QA-owned gate tasks; ADR-0005 §3, ROADMAP R9)
 A gate is **PASS or BLOCKED** — never "passes, with follow-ups". All tests pass; the only tolerated
 non-passing tests are `// xfail: <task-id>` entries for a spec gap that has an architect ADR and an
-open task. An implementation bug found by the gate is not yours to patch in the compiler: report
+open task, or for a tracked compiler-bug repro naming an open architect-filed fix task that owns the
+file (ADR-0046 D1; never the task under gate). An implementation bug found by the gate is not yours to patch in the compiler: report
 `STATUS: BLOCKED <what fails>` with a minimal repro; the architect files the fix task and the gate
 resumes after it. Every core gate runs `python tools/gatecheck.py` (from T022), `reqcov.py --strict`
 and `harness_check.py`; fuzz campaigns are a fixed `--seed`/`--iterations` command with 0 findings;

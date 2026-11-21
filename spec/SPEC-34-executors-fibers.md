@@ -8,6 +8,7 @@ Các quyết định cốt lõi:
 - **Khối điều khiển `TaskControlBlock` nội xâm và máy trạng thái `Waker` nguyên tử không mất đánh thức (`0202 §6–7`, `0205 §9–17`, `tasks/0620 §9–11`)**: `TaskControlBlock` nhúng liên kết hàng đợi nội xâm (`queue_next`) để chuyển trạng thái `WAITING -> READY` mà không cấp phát bộ nhớ trên đường nóng; giao thức chuyển trạng thái nguyên tử `IDLE <-> POLLING <-> NOTIFIED` đảm bảo `Waker.wake()` có tính lũy đẳng (idempotent) và không bao giờ làm mất tín hiệu đánh thức xảy ra đồng thời khi đang `poll()`.
 - **Đồng thời có cấu trúc (`TaskGroup`), hủy bỏ hợp tác (`CancellationToken`), `ResourceGovernor` và đồng bộ hóa bất đồng bộ an toàn khi hủy (`tasks/0620`, `tasks/0621`, `tasks/0834`)**: Mọi tác vụ con trong `TaskGroup` không được sống vượt quá phạm vi nhóm trừ khi gọi `.detach()` tường minh; lỗi hoặc `panic` ở một tác vụ con tự động phát tín hiệu hủy hợp tác tới các tác vụ anh em và thu hồi sạch tài nguyên trước khi thoát phạm vi (`REQ-CONC-040`, `REQ-CONC-149`..`150`, `REQ-ASY-019`, `REQ-ASY-051`); `AsyncMutex<T>`, `AsyncRwLock<T>`, `AsyncSemaphore` và kênh bất đồng bộ (`std.async.channel`) cho phép giữ guard qua `.await` và đảm bảo khi một tác vụ đang chờ bị hủy bỏ giữa chừng, quyền đánh thức sẽ được chuyển tiếp chính xác cho tác vụ kế tiếp mà không gây khóa chết (`deadlock`).
 - **Thực thi có ngăn xếp `Fiber<Y, R>` (`std.fiber`, `0204`, `tasks/0277`)**: Cung cấp ngữ cảnh thực thi có ngăn xếp độc lập ở không gian người dùng với dung lượng cam kết/dự trữ tường minh (`FiberBuilder`), chuyển ngữ cảnh hợp tác chi phí thấp qua `resume`/`yield_val` (`host.fiber_create`, `host.fiber_resume`, `host.fiber_yield`, `host.fiber_destroy`), và mặc định ghim cố định vào luồng OS khởi tạo (`!Send`, `!Share`) để bảo toàn tính toàn vẹn của `@thread_local` và các con trỏ/view trên ngăn xếp (`REQ-CONC-151`, `REQ-CONC-189`).
+- **Bổ sung sau T423 (`ADR-0046`)**: huỷ fiber chưa chạy thì drop closure đúng một lần; huỷ fiber đang treo thì giải phóng ngăn xếp nhưng không drop biến cục bộ còn sống (rò rỉ an toàn); handle native phải gắn với luồng sở hữu; panic trong fiber native phải trả `Panicked` (task T423b); các sai khác được chấp nhận của bản cài đặt T423 ghi ở AXS-EXEC-053.3, 054 và 055.4.
 
 Status: draft (T420, 2026-11-03)
 Owner: axiom-architect
@@ -697,6 +698,18 @@ The canonical operations exposed by `std.fiber` are:
 1. **Deterministic `Drop` cleanup on fiber completion and destruction (`0204 §18–20`, `tasks/0277 §13`)**:
    - When the fiber's entry closure `f()` returns `r: R`, all local variables inside `f()` are dropped in standard reverse lexical declaration order before the fiber trampoline stores `r` and yields terminal control back to the caller (`tasks/0277 §13`).
    - When `Fiber<Y, R>` is dropped (`impl<Y, R> Drop for Fiber<Y, R>`), it invokes `host.fiber_destroy(self.raw_handle)` and frees the control slot.
+2. **Destroying a fiber per state (`ADR-0046` D3)**:
+   - `Created` (never resumed): the entry closure is never run, and it is dropped exactly once — every captured value runs its `Drop` (QA `qa_fiber_drop`; relies on `drop_in_place<F>` of a closure type, compiler fix `T423a`; until then `std.fiber` moves the closure out of its box into a local).
+   - `Yielded` (suspended): the stack and the host record are released; live locals of the fiber's frames are **not** dropped (they leak; memory-safe, never UB), exactly as Win32 `DeleteFiber`. Values already yielded to the resumer belong to the resumer and are dropped by it.
+   - `Completed` / `Panicked`: nothing is live on the stack; the result was moved out by `resume`.
+   - `Running`: destroy is rejected (`-4`), `Drop` panics (rule AXS-EXEC-051.2).
+   - Cooperative cancellation with unwinding of a suspended fiber is not part of v1 (`ADR-0046` Revisit).
+3. **T423 implementation shape (accepted deviations, `ADR-0046` D2)** — the code block above is the logical model; the committed `std/fiber/mod.ax` differs as follows, and these are conforming:
+   - `FiberScheduler` keeps its FIFO ready queue in a raw heap array (`queue: *mut Fiber<(), ()>`, `len`, `cap`; regrowth moves the `Fiber` records) instead of `Vec<Fiber<(), ()>>`, so a fiber bundle does not pull in `std.alloc.vec`. Observable contract unchanged: FIFO rounds, every fiber dropped once, dropping a never-run scheduler destroys every queued fiber.
+   - `FiberId` is `@derive(Copy)` with methods `eq`, `clone`, `as_u64` (the other derives do not resolve in a bundle yet); the id value is `(thread id << 32) | per-thread counter`, unique per process.
+   - `Fiber.new` / `Fiber.spawn` are declared without the `F: FnOnce<R>` bound until `T423d` (a method bound naming the impl-level generic `R` is rejected today); `FiberBuilder.spawn<F: FnOnce<R>, Y, R>` carries the bound. `Y` is inferred from the expected type (`let f: Fiber<i64, i64> = Fiber.new(...)`).
+   - Inside a closure body a generic call needs explicit type arguments (`yield_val<i64>(x)`) until `T423c`.
+   - Additional public items: `Fiber.owner_thread`, `Fiber.completed`, `FiberScheduler.pending()`.
 
 **AXS-EXEC-054** (Host-interface fiber intrinsics in `std.core.host`; `T423`, `SPEC-04 AXS-EXT-110, AXS-EXT-130`, `ADR-0002`, `0204 §6–8, §26–28 AFIBER-25..26, AFIBER-43`, `tasks/0277 §7–9`).
 In accordance with `ADR-0002` and `SPEC-04 AXS-EXT-110`, stackful context creation, switching, and teardown cross four host intrinsics declared in `std/core/host.ax` (`module std.core.host`), implemented natively in `std/sys/windows/fiber.ax` (`__ax_host_fiber_*`) and deterministically in `compiler/interp/oracle.ax` and `compiler/interp/interp.ax`:
@@ -710,7 +723,7 @@ pub unsafe fn fiber_create(entry: fn(*mut u8) -> i64, ctx: *mut u8, stack_commit
 }
 
 @intrinsic
-pub unsafe fn fiber_resume(h: i64, arg: i64, out_val: *mut i64) -> i64 {
+pub unsafe fn fiber_resume(h: i64, resume_arg: i64, out_val: *mut i64) -> i64 {
     0
 }
 
@@ -734,6 +747,10 @@ The normative contract of each fiber host intrinsic is:
 | `host.fiber_yield` | `fn(val: i64) -> i64` | Suspends the currently executing fiber, stores `val` into the resumer's `*out_val`, switches execution back to the caller that invoked `fiber_resume`, and returns the `arg` passed to the next `fiber_resume` when resumed. Returns `-4` (`InvalidInput`) if called outside an active fiber context (i.e., on the root thread context). |
 | `host.fiber_destroy` | `fn(h: i64) -> i64` | Destroys fiber handle `h` and releases its stack and OS/oracle fiber record. Returns `0` on success, or `-4` (`InvalidInput`) if `h <= 0`, `h` belongs to a different thread, `h` was already destroyed, or `h` is currently `Running` (`AFIBER-31`, `AFIBER-45`). |
 
+Notes (`ADR-0046` D2, D4):
+- The second parameter of `fiber_resume` is named `resume_arg` (in the table above `arg` denotes the same parameter): inside `module std.core.host` a parameter named `arg` would shadow `host.arg`.
+- The `2` (`Panicked`) result is required in both modes. Until `T423b` the native Windows implementation does not contain a panic raised on a fiber stack (the process exits with `101`); the oracle already returns `2`. The test `tests/std/fiber/fiber_panic_contained.ax` carries `// native-after: T423b` for this temporary divergence.
+
 **AXS-EXEC-055** (Windows x64 native fiber implementation in `std/sys/windows/fiber.ax`; `T423`, `0204 §6–8, §26–28 AFIBER-25..26, AFIBER-43`, `tasks/0277 §7–9`).
 On `x86_64-windows` (`std/sys/windows/fiber.ax`), `__ax_host_fiber_*` lowers onto Win32 kernel32 fiber primitives (`@link("kernel32")`):
 1. **Thread-to-fiber conversion**: Before switching into a user fiber for the first time on an OS thread, `__ax_host_fiber_resume` checks `IsThreadAFiber()`; if `0`, it calls `ConvertThreadToFiberEx(null, 0)` (or `ConvertThreadToFiber(null)`) and records the root Win32 fiber pointer `GetCurrentFiber()` as the caller's return target.
@@ -745,6 +762,8 @@ On `x86_64-windows` (`std/sys/windows/fiber.ax`), `__ax_host_fiber_*` lowers ont
    - `__ax_host_fiber_resume` verifies `slot.owner_thread_id == GetCurrentThreadId()` and `slot.status == 0`, saves the current active `WinFiberSlot` pointer and `slot.caller_win_fiber = GetCurrentFiber()`, sets `slot.status = 1`, and calls `SwitchToFiber(slot.win_fiber)`. Win32 `SwitchToFiber` saves and restores all Win64 ABI non-volatile registers (`RBX, RBP, RDI, RSI, R12..R15, XMM6..XMM15, RSP, RIP`) plus the TEB stack base/limit/deallocation pointers in user space without a kernel syscall (`0204 §6, §30`, `tasks/0277 §9`).
    - `__ax_host_fiber_yield(val)` writes `slot.yield_or_ret = val`, sets `slot.status = 0`, and calls `SwitchToFiber(slot.caller_win_fiber)`. When resumed, it returns `slot.resume_arg`.
    - `__ax_host_fiber_destroy(h)` verifies `slot.status != 1` (`Running` check, `AFIBER-31`) and `slot.owner_thread_id == GetCurrentThreadId()`, calls `DeleteFiber(slot.win_fiber)`, and frees `slot`.
+4. **T423 implementation shape (`ADR-0046` D2, D5)**: Win32 exports no "current fiber" function (`GetCurrentFiber`/`GetFiberData` are TEB macros), so the slots live in a per-thread (`@thread_local`) table and the running slot and the converted root fiber are thread-local too; nested resume and `yield` need no `GetCurrentFiber`. A handle MUST identify its owner thread: a handle created on another thread returns `-4` from `fiber_resume`/`fiber_destroy` even when the calling thread owns a slot with the same index (a handle of the form `(generation << 32) | index` alone is not enough; QA `qa_fiber_foreign_collision`).
+5. **Panic containment (`T423b`)**: a panic raised on a fiber stack marks the slot `Panicked`, switches back to the resumer (`caller_win_fiber`) and makes `fiber_resume` return `2`; the panicking fiber's live locals are not dropped (same rule as a destroyed suspended fiber, AXS-EXEC-053.2), and the OS thread and every other fiber keep running.
 
 **AXS-EXEC-056** (MIR interpreter oracle deterministic stackful fiber simulation; `T423`, `compiler/interp/oracle.ax`, `compiler/interp/interp.ax`, `INV-DET-003`).
 In the MIR interpreter (`compiler/interp/`), `host.fiber_*` executes deterministically by maintaining a table of `InterpFiber` records:
