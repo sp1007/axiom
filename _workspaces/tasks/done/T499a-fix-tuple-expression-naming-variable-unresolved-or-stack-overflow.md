@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T454, T499]
 priority: 6
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 480
 paths: [tests/run/tuple_expr_names, tests/ui/tuple_expr_names, tests/std/num/tuple_names_xfail.ax]
 locks: [compiler/resolve/resolver.ax, compiler/hir/lower.ax, compiler/types/typeck.ax, compiler/parser/mod.ax]
 spec: [spec/SPEC-02-grammar.md, spec/SPEC-03-core-semantics.md]
 covers: [REQ-TST-072]
+started: 2026-11-22 01:03:21
+finished: 2026-11-22 02:27:15
 ---
 # T499a — `(x, y)` with variables
 
@@ -47,3 +49,5 @@ for ordinary code.
 
 ## Log
 - 2026-11-21 created by axiom-architect (triage-2026-11-21; T454 follow-up 4, T499 QA F1)
+- 2026-11-22 01:03:21 started (attempt 1) T499a-impl
+- 2026-11-22 02:27:15 accepted by QA -> done
