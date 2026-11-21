@@ -11,7 +11,7 @@ priority: 27
 status: doing
 attempts: 1
 timeout_min: 600
-paths: [tests/ui/const_shift_range, tests/run/int_min_literals]
+paths: [tests/ui/const_shift_range, tests/run/int_min_literals, compiler/diag/format.ax, tests/ui/int128/const_overflow_neg.ax, tests/conformance/p19/e19_4_diagnostics_ai, tests/run/diag_ux2, tests/selfhost/interp_opt/gen_interp_opt_tests.py]
 locks: [compiler/diag/code.ax, compiler/diag/explain/mod.ax, compiler/interp, compiler/interp_opt/session.ax, compiler/types/typeck.ax]
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/SPEC-40-integers.md, spec/SPEC-03-core-semantics.md, spec/diagnostics.md]
 covers: [REQ-TST-025, REQ-TST-096]

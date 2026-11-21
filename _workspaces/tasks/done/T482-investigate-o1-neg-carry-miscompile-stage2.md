@@ -8,13 +8,15 @@ model: opus
 gate_model: opus
 depends: [T452]
 priority: 26
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 900
 paths: [tests/run/o1_neg_carry_repro]
 locks: [compiler/opt, compiler/mir/builder.ax, compiler/lir/builder.ax, compiler/target/x64]
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/SPEC-40-integers.md, spec/SPEC-20-selfhost.md]
 covers: [REQ-TST-043, REQ-TST-090]
+started: 2026-11-21 05:19:59
+finished: 2026-11-21 09:37:17
 ---
 # T482 — Investigate: O1 miscompile behind the neg_carry workaround
 
@@ -53,3 +55,5 @@ T452-qa neg_carry decision; ADR-0042 §4).
 
 ## Log
 - 2026-11-13 created by axiom-architect (ADR-0042 §4; T452 FU-T452-NEG)
+- 2026-11-21 05:19:59 started (attempt 1) T482-impl
+- 2026-11-21 09:37:17 accepted by QA -> done
