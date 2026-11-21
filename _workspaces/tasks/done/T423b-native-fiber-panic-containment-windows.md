@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T423]
 priority: 40
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 480
-paths: [std/sys/windows/fiber.ax, tests/std/fiber/fiber_panic_contained.ax, tests/std/fiber/src/fiber_panic_contained.axsrc, tests/std/fiber/native_panic]
-locks: [std/sys/windows/thread.ax, std/fiber/mod.ax, tests/std/fiber/gen_tests.py]
+paths: [std/sys/windows/fiber.ax, tests/std/fiber, std/sys/windows/thread.ax, std/fiber/mod.ax]
+locks: []
 spec: [spec/SPEC-34-executors-fibers.md, spec/SPEC-54-panic-unwinding.md, spec/SPEC-32-threads-sync.md, spec/decisions/ADR-0046-t423-fiber-followups-and-tracked-xfail.md]
 covers: [REQ-CONC-189, REQ-TST-072]
+started: 2026-11-22 04:32:11
+finished: 2026-11-22 05:18:44
 ---
 # T423b — Native fiber panic containment
 
@@ -51,3 +53,5 @@ hook (`std/sys/windows/thread.ax` `win_exit_process_hook`, code 101) and ends th
 
 ## Log
 - 2026-11-21 created by axiom-architect (triage-t423, ADR-0046 D4; T423 QA F3 / report F1)
+- 2026-11-22 04:32:11 started (attempt 1) T423b-impl
+- 2026-11-22 05:18:44 accepted by QA -> done

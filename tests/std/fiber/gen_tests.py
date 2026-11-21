@@ -3,7 +3,8 @@
 
 Each run test is one `.ax` file that concatenates, verbatim, the live std sources it needs
 (std/sys/windows/heap.ax, thread.ax, fiber.ax, std/fiber/mod.ax ...) with the test program from
-`src/<name>.axsrc`. This guarantees the tests exercise exactly the code in std/fiber and
+`src/<name>.axsrc` (`native_panic/src/<name>.axsrc` for the T423b native panic-containment tests,
+written to `native_panic/<name>.ax`). This guarantees the tests exercise exactly the code in std/fiber and
 std/sys/windows/fiber.ax (same scheme as tests/std/async/* and tests/std/sync). `--check` fails when
 a committed bundle is out of date.
 """
@@ -61,19 +62,57 @@ TESTS = {
     "qa_fiber_resume_finished": ("before\\n", FIBER_SOURCES, 60),
     "qa_fiber_yield_outside": ("before\\n", FIBER_SOURCES, 60),
     "qa_fiber_handle_reuse": ("OK qa_fiber_handle_reuse 300 300 150 150\\n", FIBER_SOURCES, 120),
+    # T423b: native panic containment (a panic on a fiber stack makes fiber_resume return 2).
+    "native_panic/np_main_thread": ("OK np_main_thread 0 2 0 1010 0 1030 1040\\n", FIBER_SOURCES, 60),
+    "native_panic/np_nested": ("OK np_nested 0 22005\\n", FIBER_SOURCES, 60),
+    "native_panic/np_spawned_thread": ("OK np_spawned_thread 2 1007200 -1\\n", FIBER_THREAD_SOURCES, 60),
+    "native_panic/np_after_yields": ("OK np_after_yields 4 110 2 5\\n", FIBER_SOURCES, 60),
+    "native_panic/np_scheduler": ("OK np_scheduler 7 10 90 30 11 31 12 40\\n", FIBER_SOURCES, 60),
+    "native_panic/np_resume_after_panic": ("panicked\\nbefore\\n", FIBER_SOURCES, 60),
+    "native_panic/np_host_contract": ("OK np_host_contract 0 9 2 0 -4 0 -4 1 5\\n", FIBER_SOURCES, 60),
+    # QA-added adversarial tests (T423b gate).
+    "native_panic/qa_np_thread_first": ("OK qa_np_thread_first 801 802 803 804 -1 2\\n", FIBER_THREAD_SOURCES, 120),
+    "native_panic/qa_np_three_deep": ("OK qa_np_three_deep 0 1502\\n", FIBER_SOURCES, 60),
+    "native_panic/qa_np_drop_not_run": ("OK qa_np_drop_not_run 0 1\\n", FIBER_SOURCES, 60),
+    "native_panic/qa_np_exit_passthrough": ("panicked\\nin fiber\\n", FIBER_SOURCES, 60),
+    "native_panic/qa_np_plain_after": ("contained\\n", FIBER_SOURCES, 60),
 }
 
 # Tests whose expected outcome is a panic (exit 101, stdout up to the panic point).
 EXPECT_EXIT = {
     "qa_fiber_resume_finished": 101,
     "qa_fiber_yield_outside": 101,
+    "native_panic/np_resume_after_panic": 101,
+    "native_panic/qa_np_exit_passthrough": 3,
+    "native_panic/qa_np_plain_after": 101,
 }
 
-# Tests whose native mode is skipped until a catch-up task lands (`// native-after:`): a panic inside a
-# native fiber ends the process (exit 101); containment as FiberState.Panicked exists only in the oracle.
-NATIVE_AFTER = {
-    "fiber_panic_contained": "T423b",
-}
+# Native-only tests (direct FFI is native-only, ADR-0002).
+NATIVE_ONLY = {"native_panic/qa_np_exit_passthrough"}
+
+# Tests whose native mode is skipped until a catch-up task lands (`// native-after: <task>`). Empty since
+# T423b made native fibers contain panics (fiber_panic_contained runs in both modes).
+NATIVE_AFTER = {}
+
+# Requirement ids of the generated header (default: the T423 fiber requirements).
+DEFAULT_COVERS = "REQ-CONC-151, REQ-CONC-189"
+NATIVE_PANIC_COVERS = "REQ-CONC-189, REQ-TST-072"
+
+
+def covers_of(name):
+    if name.startswith("native_panic/"):
+        return NATIVE_PANIC_COVERS
+    return DEFAULT_COVERS
+
+
+def src_path_of(name):
+    """`name` is `<test>` (src/<test>.axsrc) or `<dir>/<test>` (<dir>/src/<test>.axsrc)."""
+    parts = name.split("/")
+    return os.path.join(HERE, *parts[:-1], "src", parts[-1] + ".axsrc")
+
+
+def target_path_of(name):
+    return os.path.join(HERE, *name.split("/")) + ".ax"
 
 
 def read_text(path):
@@ -104,13 +143,13 @@ def number_checks(text):
 
 
 def build_bundle(name, expected_stdout, sources, timeout):
-    modes = "interp native"
+    modes = "native" if name in NATIVE_ONLY else "interp native"
     header = (
         "// test: run\n"
         "// modes: %s\n"
         "// timeout: %d\n"
-        "// covers: REQ-CONC-151, REQ-CONC-189\n"
-        "// stdout: %s\n" % (modes, timeout, expected_stdout)
+        "// covers: %s\n"
+        "// stdout: %s\n" % (modes, timeout, covers_of(name), expected_stdout)
     )
     if name in EXPECT_EXIT:
         header += "// exit: %d\n" % EXPECT_EXIT[name]
@@ -119,7 +158,7 @@ def build_bundle(name, expected_stdout, sources, timeout):
     parts = [header.rstrip("\n")]
     for rel in sources:
         parts.append(read_text(os.path.join(ROOT, rel.replace("/", os.sep))).strip())
-    parts.append(number_checks(read_text(os.path.join(SRC, name + ".axsrc"))).strip())
+    parts.append(number_checks(read_text(src_path_of(name))).strip())
     parts.append(CHECK_DEF.strip())
     return "\n\n".join(parts) + "\n"
 
@@ -134,13 +173,13 @@ def main():
     mismatches = []
     for name in names:
         expected_stdout, sources, timeout = TESTS[name]
-        src_path = os.path.join(SRC, name + ".axsrc")
+        src_path = src_path_of(name)
         if not os.path.exists(src_path):
             if args.check:
-                mismatches.append(name + ": missing src/" + name + ".axsrc")
+                mismatches.append(name + ": missing " + os.path.relpath(src_path, HERE).replace(os.sep, "/"))
             continue
         expected = build_bundle(name, expected_stdout, sources, timeout)
-        target = os.path.join(HERE, name + ".ax")
+        target = target_path_of(name)
         if args.check:
             if not os.path.exists(target):
                 mismatches.append(name + ".ax: does not exist")
