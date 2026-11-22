@@ -1,0 +1,151 @@
+module main
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.prelude.Context
+use std.asyn.executor.LocalExecutor
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskResult
+use std.asyn.task.LocalTaskHandle
+use std.asyn.task.tcb_poll_fn
+use std.fiber.Fiber
+use std.fiber.FiberState
+use std.fiber.yield_val
+use std.thread.spawn
+
+// Fibers and tasks compose without sharing a stack (AXS-EXEC-050..052, REQ-CONC-151/189/190):
+//  A. A LocalExecutor task owns a fiber and resumes it once per poll: the fiber suspends mid-stack
+//     between polls while the executor interleaves a second, plain task.
+//  B. Four OS threads each create and drive their own fiber (fibers are thread-pinned, `!Send`):
+//     each thread gets its own sequence back, unaffected by the others.
+//  C. A fiber created on the main thread is still resumable on the main thread after the worker
+//     threads ran and finished.
+
+struct FiberTask {
+    pub fiber: Fiber<i64, i64>,
+    pub sum: i64,
+    pub polls: i64,
+}
+
+impl Future for FiberTask {
+    type Output = i64;
+    fn poll(self: mut_view<FiberTask>, cx: mut_view<Context>) -> Poll<i64> {
+        self.polls = self.polls + 1i64;
+        match self.fiber.resume() {
+            FiberState.Yielded(v) => {
+                self.sum = self.sum + v;
+                let mut w = cx.waker();
+                view(w).wake_by_ref();
+                Poll.Pending
+            },
+            FiberState.Completed(r) => Poll.Ready(self.sum * 100i64 + r),
+            FiberState.Panicked => Poll.Ready(-1i64),
+        }
+    }
+}
+
+fn poll_fiber_task(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<FiberTask, i64>;
+    tcb_poll_fn<FiberTask, i64>(tcb, cx)
+}
+
+struct Ticker {
+    pub left: i64,
+    pub polls: i64,
+}
+
+impl Future for Ticker {
+    type Output = i64;
+    fn poll(self: mut_view<Ticker>, cx: mut_view<Context>) -> Poll<i64> {
+        self.polls = self.polls + 1i64;
+        if self.left > 0i64 {
+            self.left = self.left - 1i64;
+            let mut w = cx.waker();
+            view(w).wake_by_ref();
+            return Poll.Pending;
+        }
+        Poll.Ready(self.polls)
+    }
+}
+
+fn poll_ticker(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Ticker, i64>;
+    tcb_poll_fn<Ticker, i64>(tcb, cx)
+}
+
+fn thread_body(base: i64) -> i64 {
+    let mut f: Fiber<i64, i64> = Fiber.new(|| -> i64 {
+        yield_val<i64>(base + 1i64);
+        yield_val<i64>(base + 2i64);
+        base + 3i64
+    });
+    let mut acc: i64 = 0i64;
+    let mut going = true;
+    while going {
+        match f.resume() {
+            FiberState.Yielded(v) => { acc = acc + v; },
+            FiberState.Completed(r) => { acc = acc + r; going = false; },
+            FiberState.Panicked => { acc = -1i64; going = false; },
+        }
+    }
+    acc
+}
+
+pub fn main() -> i32 {
+    // C (created first, resumed last)
+    let mut fmain: Fiber<i64, i64> = Fiber.new(|| -> i64 {
+        yield_val<i64>(5i64);
+        6i64
+    });
+    let m1 = match fmain.resume() {
+        FiberState.Yielded(v) => v,
+        FiberState.Completed(r) => -1i64,
+        FiberState.Panicked => -2i64,
+    };
+
+    // A
+    let mut exec = LocalExecutor.new();
+    let fa: Fiber<i64, i64> = Fiber.new(|| -> i64 {
+        yield_val<i64>(1i64);
+        yield_val<i64>(2i64);
+        yield_val<i64>(3i64);
+        4i64
+    });
+    let ht: LocalTaskHandle<i64> = exec.spawn_local(FiberTask { fiber: fa, sum: 0i64, polls: 0i64 }, poll_fiber_task);
+    let hk: LocalTaskHandle<i64> = exec.spawn_local(Ticker { left: 6i64, polls: 0i64 }, poll_ticker);
+    exec.run();
+    let a_task = match ht.join() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let a_tick = match hk.join() { TaskResult.Completed(v) => v, _ => -1i64 };
+    check(a_task == 604i64);
+    check(a_tick == 7i64);
+
+    // B
+    let t1 = spawn(|| -> i64 { thread_body(10i64) });
+    let t2 = spawn(|| -> i64 { thread_body(20i64) });
+    let t3 = spawn(|| -> i64 { thread_body(30i64) });
+    let t4 = spawn(|| -> i64 { thread_body(40i64) });
+    let r1 = match t1.join() { Result.Ok(x) => x, Result.Err(_e) => -1i64 };
+    let r2 = match t2.join() { Result.Ok(x) => x, Result.Err(_e) => -1i64 };
+    let r3 = match t3.join() { Result.Ok(x) => x, Result.Err(_e) => -1i64 };
+    let r4 = match t4.join() { Result.Ok(x) => x, Result.Err(_e) => -1i64 };
+    check(r1 == 36i64 && r2 == 66i64 && r3 == 96i64 && r4 == 126i64);
+
+    // C
+    let m2 = match fmain.resume() {
+        FiberState.Yielded(v) => -1i64,
+        FiberState.Completed(r) => r,
+        FiberState.Panicked => -2i64,
+    };
+    check(view(fmain).is_completed());
+
+    print("OK fiber_in_async_and_threads ");
+    print_int(a_task);
+    print(" ");
+    print_int(a_tick);
+    print(" ");
+    print_int(r1 + r2 + r3 + r4);
+    print(" ");
+    print_int(m1 * 10i64 + m2);
+    print("\n");
+    0
+}

@@ -1,0 +1,321 @@
+module main
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.prelude.Context
+use std.core.host.heap_alloc
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.asyn.executor.Executor
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskError
+use std.asyn.task.TaskResult
+use std.asyn.task.TaskHandle
+use std.asyn.task.TaskId
+use std.asyn.group.TaskGroup
+use std.asyn.group.GroupResults
+use std.asyn.group.GroupError
+use std.asyn.group.group_poll_fn
+use std.asyn.group.results_get_ptr
+use std.asyn.group.task_panic
+
+// Sibling failure cancels siblings -- and only siblings (AXS-EXEC-020 item 2, REQ-ASY-019).
+//
+//   root --- A ---- failer + 2 loopers + 1 sleeper       (A fails: 1 panicked, 3 cancelled)
+//        |-- B ---- 4 steppers (10, 20, 30, 40)          (unaffected: join_all Ok, sum 100)
+//        |-- C ---- 1 stepper (9)                        (unaffected by the failure below it)
+//        |    `-- C2 --- failer + looper                 (C2 fails; C and its stepper do not care)
+//        `-- 1 stepper (7)                               (root: unaffected)
+//
+// The failure of a group cancels that group's other children and its own token; it never travels up
+// to the parent group or sideways to a sibling group. `alive` (constructed minus dropped futures) is 0
+// at the end: no future of a cancelled or failed subtree leaks or is dropped twice.
+
+fn new_counter() -> *mut Atomic<i64> {
+    let raw = unsafe { heap_alloc(8, 8) };
+    let p = raw as *mut Atomic<i64>;
+    unsafe {
+        *p = Atomic.new(0i64);
+    }
+    p
+}
+
+fn born(alive: *mut Atomic<i64>) {
+    unsafe {
+        (*alive).fetch_add(1i64, Ordering.AcqRel);
+    }
+}
+
+fn died(alive: *mut Atomic<i64>) {
+    unsafe {
+        (*alive).fetch_sub(1i64, Ordering.AcqRel);
+    }
+}
+
+// Yields `delay` times, then returns `val`.
+struct Stepper {
+    pub val: i64,
+    pub delay: i64,
+    pub step: i64,
+    pub alive: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Stepper {}
+
+impl Future for Stepper {
+    type Output = i64;
+    fn poll(self: mut_view<Stepper>, cx: mut_view<Context>) -> Poll<i64> {
+        if self.step < self.delay {
+            self.step = self.step + 1i64;
+            let mut w = cx.waker();
+            view(w).wake_by_ref();
+            return Poll.Pending;
+        }
+        Poll.Ready(self.val)
+    }
+}
+
+impl Drop for Stepper {
+    fn drop(self: mut_view<Stepper>) {
+        died(self.alive);
+    }
+}
+
+fn poll_stepper(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Stepper, i64>;
+    group_poll_fn<Stepper, i64>(tcb, cx)
+}
+
+// Reports a panic after `delay` polls.
+struct Failer {
+    pub delay: i64,
+    pub step: i64,
+    pub alive: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Failer {}
+
+impl Future for Failer {
+    type Output = i64;
+    fn poll(self: mut_view<Failer>, cx: mut_view<Context>) -> Poll<i64> {
+        if self.step < self.delay {
+            self.step = self.step + 1i64;
+            let mut w = cx.waker();
+            view(w).wake_by_ref();
+            return Poll.Pending;
+        }
+        task_panic(mut_view(*cx));
+        Poll.Pending
+    }
+}
+
+impl Drop for Failer {
+    fn drop(self: mut_view<Failer>) {
+        died(self.alive);
+    }
+}
+
+fn poll_failer(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Failer, i64>;
+    group_poll_fn<Failer, i64>(tcb, cx)
+}
+
+// Runs until cancelled (re-wakes itself).
+struct Looper {
+    pub alive: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Looper {}
+
+impl Future for Looper {
+    type Output = i64;
+    fn poll(self: mut_view<Looper>, cx: mut_view<Context>) -> Poll<i64> {
+        let mut w = cx.waker();
+        view(w).wake_by_ref();
+        Poll.Pending
+    }
+}
+
+impl Drop for Looper {
+    fn drop(self: mut_view<Looper>) {
+        died(self.alive);
+    }
+}
+
+fn poll_looper(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Looper, i64>;
+    group_poll_fn<Looper, i64>(tcb, cx)
+}
+
+// Parks without ever waking itself: only the cancellation wake can end it.
+struct Sleeper {
+    pub alive: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Sleeper {}
+
+impl Future for Sleeper {
+    type Output = i64;
+    fn poll(self: mut_view<Sleeper>, cx: mut_view<Context>) -> Poll<i64> {
+        Poll.Pending
+    }
+}
+
+impl Drop for Sleeper {
+    fn drop(self: mut_view<Sleeper>) {
+        died(self.alive);
+    }
+}
+
+fn poll_sleeper(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Sleeper, i64>;
+    group_poll_fn<Sleeper, i64>(tcb, cx)
+}
+
+fn is_ok(r: Result<TaskId, GroupError>) -> bool {
+    match r {
+        Result.Ok(id) => true,
+        Result.Err(e) => false,
+    }
+}
+
+fn add_stepper(group: mut_view<TaskGroup>, exec: view<Executor>, val: i64, delay: i64, alive: *mut Atomic<i64>) {
+    born(alive);
+    let h: TaskHandle<i64> = exec.spawn(Stepper { val: val, delay: delay, step: 0i64, alive: alive }, poll_stepper);
+    check(is_ok(mut_view(*group).adopt(h)));
+}
+
+fn add_failer(group: mut_view<TaskGroup>, exec: view<Executor>, delay: i64, alive: *mut Atomic<i64>) {
+    born(alive);
+    let h: TaskHandle<i64> = exec.spawn(Failer { delay: delay, step: 0i64, alive: alive }, poll_failer);
+    check(is_ok(mut_view(*group).adopt(h)));
+}
+
+fn add_looper(group: mut_view<TaskGroup>, exec: view<Executor>, alive: *mut Atomic<i64>) {
+    born(alive);
+    let h: TaskHandle<i64> = exec.spawn(Looper { alive: alive }, poll_looper);
+    check(is_ok(mut_view(*group).adopt(h)));
+}
+
+fn add_sleeper(group: mut_view<TaskGroup>, exec: view<Executor>, alive: *mut Atomic<i64>) {
+    born(alive);
+    let h: TaskHandle<i64> = exec.spawn(Sleeper { alive: alive }, poll_sleeper);
+    check(is_ok(mut_view(*group).adopt(h)));
+}
+
+fn sum_results(r: view<GroupResults<i64>>) -> i64 {
+    let mut s: i64 = 0i64;
+    let mut i: usize = 0usize;
+    while i < r.len() {
+        s = s + unsafe { *results_get_ptr(r, i) };
+        i = i + 1usize;
+    }
+    s
+}
+
+fn is_panicked_err(r: Result<GroupResults<i64>, TaskError>) -> bool {
+    match r {
+        Result.Ok(v) => false,
+        Result.Err(e) => match e {
+            TaskError.Panicked => true,
+            TaskError.Cancelled => false,
+        },
+    }
+}
+
+pub fn main() -> i32 {
+    let exec = Executor.new(4);
+    let alive = new_counter();
+    let mut a_panicked: i64 = 0i64;
+    let mut a_cancelled: i64 = 0i64;
+    let mut a_other: i64 = 0i64;
+    let mut b_sum: i64 = 0i64;
+    let mut c_val: i64 = 0i64;
+
+    {
+        let mut root = TaskGroup.new();
+        let root_tok = root.cancellation_token();
+        let mut ga = TaskGroup.with_cancellation(view(root_tok));
+        let mut gb = TaskGroup.with_cancellation(view(root_tok));
+        let mut gc = TaskGroup.with_cancellation(view(root_tok));
+        let gc_tok = gc.cancellation_token();
+        let mut gc2 = TaskGroup.with_cancellation(view(gc_tok));
+
+        add_failer(mut_view(ga), view(exec), 3i64, alive);
+        add_looper(mut_view(ga), view(exec), alive);
+        add_sleeper(mut_view(ga), view(exec), alive);
+        add_sleeper(mut_view(ga), view(exec), alive);
+        add_stepper(mut_view(gb), view(exec), 10i64, 2i64, alive);
+        add_stepper(mut_view(gb), view(exec), 20i64, 4i64, alive);
+        add_stepper(mut_view(gb), view(exec), 30i64, 6i64, alive);
+        add_stepper(mut_view(gb), view(exec), 40i64, 8i64, alive);
+        add_stepper(mut_view(gc), view(exec), 9i64, 50i64, alive);
+        add_failer(mut_view(gc2), view(exec), 1i64, alive);
+        add_sleeper(mut_view(gc2), view(exec), alive);
+        add_stepper(mut_view(root), view(exec), 7i64, 3i64, alive);
+
+        // A: the failer's panic cancels its three siblings.
+        let mut k: i32 = 0i32;
+        while k < 4i32 {
+            let r: Option<TaskResult<i64>> = mut_view(ga).next_blocking();
+            match r {
+                Option.Some(res) => match res {
+                    TaskResult.Panicked => { a_panicked = a_panicked + 1i64; },
+                    TaskResult.Cancelled => { a_cancelled = a_cancelled + 1i64; },
+                    TaskResult.Completed(v) => { a_other = a_other + 1i64; },
+                },
+                Option.None => { check(false); },
+            }
+            k = k + 1i32;
+        }
+        check(ga.is_failed());
+        check(ga.is_cancelled());
+        check(ga.live_count() == 0usize);
+
+        // C2 fails and is consumed; the failure does not make C or the root fail or cancel.
+        let r2: Result<GroupResults<i64>, TaskError> = gc2.join_all();
+        check(is_panicked_err(r2));
+        check(!gc.is_cancelled());
+        check(!gc.is_failed());
+        check(!gb.is_failed());
+        check(!root.is_failed());
+        check(!root.is_cancelled());
+        check(!gb.is_cancelled());
+
+        // B, C and the root's own stepper complete normally.
+        let jb: Result<GroupResults<i64>, TaskError> = gb.join_all();
+        b_sum = match jb {
+            Result.Ok(r) => if r.len() == 4usize { sum_results(view(r)) } else { 0i64 - 1i64 },
+            Result.Err(e) => 0i64 - 2i64,
+        };
+        let jc: Result<GroupResults<i64>, TaskError> = gc.join_all();
+        c_val = match jc {
+            Result.Ok(r) => if r.len() == 1usize { sum_results(view(r)) } else { 0i64 - 1i64 },
+            Result.Err(e) => 0i64 - 2i64,
+        };
+        let jr: Result<GroupResults<i64>, TaskError> = root.join_all();
+        let r_val = match jr {
+            Result.Ok(r) => if r.len() == 1usize { sum_results(view(r)) } else { 0i64 - 1i64 },
+            Result.Err(e) => 0i64 - 2i64,
+        };
+        check(r_val == 7i64);
+    }
+    let a = unsafe { (*alive).load(Ordering.Acquire) };
+    check(a == 0i64);
+    check(a_other == 0i64);
+
+    exec.shutdown();
+
+    print("OK sibling_failure_isolation ");
+    print_int(a_panicked);
+    print(" ");
+    print_int(a_cancelled);
+    print(" ");
+    print_int(b_sum);
+    print(" ");
+    print_int(c_val);
+    print(" ");
+    print_int(a);
+    print("\n");
+    0
+}

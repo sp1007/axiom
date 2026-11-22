@@ -1,0 +1,170 @@
+module main
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.prelude.Context
+use std.asyn.executor.LocalExecutor
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskResult
+use std.asyn.task.LocalTaskHandle
+use std.asyn.task.tcb_poll_fn
+use std.asyn.channel.async_channel_bounded
+use std.asyn.channel.AsyncSender
+use std.asyn.channel.AsyncReceiver
+use std.asyn.channel.RecvFuture
+use std.asyn.channel.SendFuture
+use std.asyn.channel.TryRecvError
+use std.asyn.channel.TrySendError
+
+// Cancellation safety of async channels (AXS-EXEC-034, REQ-CONC-049): a cancelled receiver or sender
+// never swallows a message and never blocks the next waiter. Driven by real task cancellation on the
+// deterministic LocalExecutor.
+//  R1: two receivers wait on an empty channel; the first is cancelled; the next send reaches the second.
+//  R2: a send already woke the first receiver (not yet re-polled) when that receiver is cancelled:
+//      the message must not be lost (the second receiver, or the channel, still has it).
+//  S1: capacity-1 channel is full with 4; two senders (5, 6) are blocked; the first sender is
+//      cancelled; draining the channel yields 4 then 6, never 5.
+
+struct RecvTask {
+    pub fut: RecvFuture<i64>,
+}
+
+impl Future for RecvTask {
+    type Output = i64;
+    fn poll(self: mut_view<RecvTask>, cx: mut_view<Context>) -> Poll<i64> {
+        match self.fut.poll_recv(mut_view(*cx)) {
+            Poll.Ready(r) => match r {
+                Result.Ok(v) => Poll.Ready(v),
+                Result.Err(e) => Poll.Ready(-1i64),
+            },
+            Poll.Pending => Poll.Pending,
+        }
+    }
+}
+
+fn poll_recv_task(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<RecvTask, i64>;
+    tcb_poll_fn<RecvTask, i64>(tcb, cx)
+}
+
+struct SendTask {
+    pub fut: SendFuture<i64>,
+}
+
+impl Future for SendTask {
+    type Output = i64;
+    fn poll(self: mut_view<SendTask>, cx: mut_view<Context>) -> Poll<i64> {
+        match self.fut.poll_send(mut_view(*cx)) {
+            Poll.Ready(r) => match r {
+                Result.Ok(u) => Poll.Ready(1i64),
+                Result.Err(e) => Poll.Ready(-2i64),
+            },
+            Poll.Pending => Poll.Pending,
+        }
+    }
+}
+
+fn poll_send_task(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<SendTask, i64>;
+    tcb_poll_fn<SendTask, i64>(tcb, cx)
+}
+
+fn tick_n(exec: mut_view<LocalExecutor>, n: i32) {
+    let mut k: i32 = 0i32;
+    while k < n {
+        let more = mut_view(*exec).try_tick();
+        k = k + 1i32;
+    }
+}
+
+// Value of a completed task, -100 for cancelled, -200 for panicked.
+fn val(r: TaskResult<i64>) -> i64 {
+    match r {
+        TaskResult.Completed(v) => v,
+        TaskResult.Cancelled => -100i64,
+        TaskResult.Panicked => -200i64,
+    }
+}
+
+// Next value in the channel, or -1 when empty.
+fn drain_one(rx: view<AsyncReceiver<i64>>) -> i64 {
+    match rx.try_recv() {
+        Result.Ok(v) => v,
+        Result.Err(e) => -1i64,
+    }
+}
+
+pub fn main() -> i32 {
+    // R1
+    let p1 = async_channel_bounded<i64>(4usize);
+    let tx1 = p1.tx;
+    let rx1 = p1.rx;
+    let mut exec = LocalExecutor.new();
+    let ha: LocalTaskHandle<i64> = exec.spawn_local(RecvTask { fut: rx1.recv() }, poll_recv_task);
+    let hb: LocalTaskHandle<i64> = exec.spawn_local(RecvTask { fut: rx1.recv() }, poll_recv_task);
+    tick_n(mut_view(exec), 2i32);
+    ha.cancel();
+    tick_n(mut_view(exec), 1i32);
+    let sent = tx1.try_send(9i64);
+    check(match sent { Result.Ok(u) => true, Result.Err(e) => false });
+    exec.run();
+    let r1a = val(ha.join());
+    let r1b = val(hb.join());
+    check(r1a == -100i64);
+    check(r1b == 9i64);
+    check(drain_one(view(rx1)) == -1i64);
+
+    // R2
+    let p2 = async_channel_bounded<i64>(4usize);
+    let tx2 = p2.tx;
+    let rx2 = p2.rx;
+    let hc: LocalTaskHandle<i64> = exec.spawn_local(RecvTask { fut: rx2.recv() }, poll_recv_task);
+    let hd: LocalTaskHandle<i64> = exec.spawn_local(RecvTask { fut: rx2.recv() }, poll_recv_task);
+    tick_n(mut_view(exec), 2i32);
+    let sent2 = tx2.try_send(7i64);
+    check(match sent2 { Result.Ok(u) => true, Result.Err(e) => false });
+    // the send woke receiver `hc`; cancel it before it ran again
+    hc.cancel();
+    exec.run();
+    let r2c = val(hc.join());
+    let r2d = val(hd.join());
+    let left = drain_one(view(rx2));
+    // The 7 is delivered exactly once: to the second receiver, or left in the channel.
+    let lost_or_dup = !((r2d == 7i64 && left == -1i64) || (left == 7i64 && r2d == -100i64));
+    check(!lost_or_dup);
+    check(r2c == -100i64 || r2c == 7i64);
+
+    // S1
+    let p3 = async_channel_bounded<i64>(1usize);
+    let tx3 = p3.tx;
+    let rx3 = p3.rx;
+    let first = tx3.try_send(4i64);
+    check(match first { Result.Ok(u) => true, Result.Err(e) => false });
+    let he: LocalTaskHandle<i64> = exec.spawn_local(SendTask { fut: tx3.send(5i64) }, poll_send_task);
+    let hf: LocalTaskHandle<i64> = exec.spawn_local(SendTask { fut: tx3.send(6i64) }, poll_send_task);
+    tick_n(mut_view(exec), 2i32);
+    he.cancel();
+    tick_n(mut_view(exec), 1i32);
+    let s_a = drain_one(view(rx3));
+    exec.run();
+    let s_b = drain_one(view(rx3));
+    let s_c = drain_one(view(rx3));
+    let rf = val(hf.join());
+    let re = val(he.join());
+    check(s_a == 4i64);
+    check(s_b == 6i64);
+    check(s_c == -1i64);
+    check(rf == 1i64);
+    check(re == -100i64);
+
+    print("OK channel_cancel_safety ");
+    print_int(r1b);
+    print(" ");
+    print_int(s_b);
+    print(" ");
+    print_int(if lost_or_dup { 1i64 } else { 0i64 });
+    print(" ");
+    print_int(rf + re + 100i64);
+    print("\n");
+    0
+}

@@ -1,0 +1,171 @@
+module main
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.prelude.Context
+use std.core.host.heap_alloc
+use std.core.host.monotonic_ns
+use std.core.host.heap_free
+use std.core.host.stdio
+use std.core.host.write
+use std.asyn.executor.LocalExecutor
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskResult
+use std.asyn.task.LocalTaskHandle
+use std.asyn.task.tcb_poll_fn
+use std.asyn.channel.async_channel_bounded
+use std.asyn.channel.AsyncSender
+use std.asyn.channel.AsyncReceiver
+use std.asyn.channel.RecvFuture
+use std.asyn.channel.SendFuture
+
+// Async channel ping-pong throughput: two LocalExecutor tasks bounce an integer over two capacity-1
+// channels (real SendFuture / RecvFuture, waker handoff on every message). One "op" = one message.
+
+// state 0: sending, 1: receiving
+struct Ping {
+    pub tx: AsyncSender<i64>,
+    pub rx: AsyncReceiver<i64>,
+    pub sf: SendFuture<i64>,
+    pub rf: RecvFuture<i64>,
+    pub state: i32,
+    pub i: i64,
+    pub n: i64,
+    pub sum: i64,
+}
+
+impl Future for Ping {
+    type Output = i64;
+    fn poll(self: mut_view<Ping>, cx: mut_view<Context>) -> Poll<i64> {
+        loop {
+            if self.state == 0i32 {
+                match self.sf.poll_send(mut_view(*cx)) {
+                    Poll.Ready(r) => {
+                        self.rf = self.rx.recv();
+                        self.state = 1i32;
+                    },
+                    Poll.Pending => { return Poll.Pending; },
+                }
+            } else {
+                match self.rf.poll_recv(mut_view(*cx)) {
+                    Poll.Ready(r) => {
+                        match r {
+                            Result.Ok(v) => { self.sum = self.sum + v; },
+                            Result.Err(e) => { return Poll.Ready(-1i64); },
+                        }
+                        self.i = self.i + 1i64;
+                        if self.i >= self.n {
+                            return Poll.Ready(self.sum);
+                        }
+                        self.sf = self.tx.send(self.i);
+                        self.state = 0i32;
+                    },
+                    Poll.Pending => { return Poll.Pending; },
+                }
+            }
+        }
+    }
+}
+
+fn poll_ping(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Ping, i64>;
+    tcb_poll_fn<Ping, i64>(tcb, cx)
+}
+
+// Echoes every received value back incremented by one.
+struct Pong {
+    pub tx: AsyncSender<i64>,
+    pub rx: AsyncReceiver<i64>,
+    pub sf: SendFuture<i64>,
+    pub rf: RecvFuture<i64>,
+    pub state: i32,
+    pub i: i64,
+    pub n: i64,
+}
+
+impl Future for Pong {
+    type Output = i64;
+    fn poll(self: mut_view<Pong>, cx: mut_view<Context>) -> Poll<i64> {
+        loop {
+            if self.state == 0i32 {
+                match self.rf.poll_recv(mut_view(*cx)) {
+                    Poll.Ready(r) => {
+                        match r {
+                            Result.Ok(v) => {
+                                self.sf = self.tx.send(v + 1i64);
+                                self.state = 1i32;
+                            },
+                            Result.Err(e) => { return Poll.Ready(-1i64); },
+                        }
+                    },
+                    Poll.Pending => { return Poll.Pending; },
+                }
+            } else {
+                match self.sf.poll_send(mut_view(*cx)) {
+                    Poll.Ready(r) => {
+                        self.i = self.i + 1i64;
+                        if self.i >= self.n {
+                            return Poll.Ready(self.i);
+                        }
+                        self.rf = self.rx.recv();
+                        self.state = 0i32;
+                    },
+                    Poll.Pending => { return Poll.Pending; },
+                }
+            }
+        }
+    }
+}
+
+fn poll_pong(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Pong, i64>;
+    tcb_poll_fn<Pong, i64>(tcb, cx)
+}
+
+// Runs one ping-pong session of `n` round trips (2n messages); returns Ping's sum of echoes.
+fn session(n: i64) -> i64 {
+    let a = async_channel_bounded<i64>(1usize);
+    let b = async_channel_bounded<i64>(1usize);
+    // ping sends on `a`, receives on `b`; pong receives on `a`, sends on `b`
+    let a_tx = a.tx;
+    let a_rx = a.rx;
+    let b_tx = b.tx;
+    let b_rx = b.rx;
+    let ping_sf = a_tx.send(0i64);
+    let ping_rf = b_rx.recv();
+    let pong_rf = a_rx.recv();
+    let pong_sf = b_tx.send(0i64);
+    let mut exec = LocalExecutor.new();
+    let hp: LocalTaskHandle<i64> = exec.spawn_local(Ping { tx: a_tx, rx: b_rx, sf: ping_sf, rf: ping_rf, state: 0i32, i: 0i64, n: n, sum: 0i64 }, poll_ping);
+    let hq: LocalTaskHandle<i64> = exec.spawn_local(Pong { tx: b_tx, rx: a_rx, sf: pong_sf, rf: pong_rf, state: 0i32, i: 0i64, n: n }, poll_pong);
+    exec.run();
+    let sum = match hp.join() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let pn = match hq.join() { TaskResult.Completed(v) => v, _ => -1i64 };
+    check(pn == n);
+    sum
+}
+
+pub fn main() -> i32 {
+    let n: i64 = 20i64;
+    let samples = new_samples();
+    let mut r: usize = 0usize;
+    while r < 5usize {
+        let t0 = now_ns();
+        let s = session(n);
+        let t1 = now_ns();
+        // sum over i in 0..n of (i + 1)
+        check(s == n * (n + 1i64) / 2i64);
+        unsafe {
+            *(samples + r) = t1 - t0;
+        }
+        r = r + 1usize;
+    }
+    let med = median5(samples);
+    report((2i64 * n) as u64, med);
+    // Generous bound: < 2 s per message.
+    check(med / ((2i64 * n) as u64) < 2000000000u64);
+    print("OK channel_ping_pong ");
+    print_int(n);
+    print("\n");
+    0
+}

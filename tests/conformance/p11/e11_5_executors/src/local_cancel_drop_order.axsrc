@@ -1,0 +1,157 @@
+module main
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.prelude.Context
+use std.core.host.heap_alloc
+use std.asyn.executor.LocalExecutor
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskResult
+use std.asyn.task.LocalTaskHandle
+use std.asyn.task.tcb_poll_fn
+
+// Deterministic structured cancellation on the single-threaded LocalExecutor (AXS-EXEC-016,
+// REQ-ASY-060): poll order is strict FIFO, cancellation is observed at the next poll of the task
+// (the future is dropped exactly once and `poll` is never entered again), and dropping an unawaited
+// LocalTaskHandle cancels the task. `plog` records the task id on every poll, `dlog` on every drop
+// of a future; `alive` counts constructed minus dropped futures (never negative, 0 at the end).
+
+struct Probe {
+    pub id: i64,
+    pub sleeper: bool,
+    pub step: i64,
+    pub plog: *mut i64,
+    pub dlog: *mut i64,
+    pub alive: *mut i64,
+}
+
+impl Future for Probe {
+    type Output = i64;
+    fn poll(self: mut_view<Probe>, cx: mut_view<Context>) -> Poll<i64> {
+        unsafe {
+            *self.plog = *self.plog * 10i64 + self.id;
+        }
+        if self.sleeper {
+            // parks forever: only cancellation can end it
+            return Poll.Pending;
+        }
+        if self.step == 0i64 {
+            self.step = 1i64;
+            let mut w = cx.waker();
+            view(w).wake_by_ref();
+            return Poll.Pending;
+        }
+        Poll.Ready(self.id * 100i64)
+    }
+}
+
+impl Drop for Probe {
+    fn drop(self: mut_view<Probe>) {
+        unsafe {
+            *self.dlog = *self.dlog * 10i64 + self.id;
+            *self.alive = *self.alive - 1i64;
+        }
+    }
+}
+
+fn poll_probe(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Probe, i64>;
+    tcb_poll_fn<Probe, i64>(tcb, cx)
+}
+
+fn cell() -> *mut i64 {
+    let raw = unsafe { heap_alloc(8, 8) };
+    let p = raw as *mut i64;
+    unsafe {
+        *p = 0i64;
+    }
+    p
+}
+
+fn probe(id: i64, sleeper: bool, plog: *mut i64, dlog: *mut i64, alive: *mut i64) -> Probe {
+    unsafe {
+        *alive = *alive + 1i64;
+    }
+    Probe { id: id, sleeper: sleeper, step: 0i64, plog: plog, dlog: dlog, alive: alive }
+}
+
+fn tick_n(exec: mut_view<LocalExecutor>, n: i32) {
+    let mut k: i32 = 0i32;
+    while k < n {
+        let more = mut_view(*exec).try_tick();
+        k = k + 1i32;
+    }
+}
+
+// 1 = completed with the expected value, 2 = cancelled, 9 = anything else.
+fn kind(r: TaskResult<i64>, expect: i64) -> i64 {
+    match r {
+        TaskResult.Completed(v) => if v == expect { 1i64 } else { 9i64 },
+        TaskResult.Cancelled => 2i64,
+        TaskResult.Panicked => 9i64,
+    }
+}
+
+pub fn main() -> i32 {
+    let plog = cell();
+    let dlog = cell();
+    let alive = cell();
+    let mut exec = LocalExecutor.new();
+
+    let h1: LocalTaskHandle<i64> = exec.spawn_local(probe(1i64, false, plog, dlog, alive), poll_probe);
+    let h2: LocalTaskHandle<i64> = exec.spawn_local(probe(2i64, false, plog, dlog, alive), poll_probe);
+    let h3: LocalTaskHandle<i64> = exec.spawn_local(probe(3i64, true, plog, dlog, alive), poll_probe);
+    let h4: LocalTaskHandle<i64> = exec.spawn_local(probe(4i64, true, plog, dlog, alive), poll_probe);
+    check(unsafe { *alive } == 4i64);
+
+    // First round: strict spawn (FIFO) order.
+    tick_n(mut_view(exec), 4i32);
+    check(unsafe { *plog } == 1234i64);
+    check(unsafe { *dlog } == 0i64);
+    // The two finishing tasks complete in the order they were re-queued; their futures drop at completion.
+    tick_n(mut_view(exec), 2i32);
+    check(unsafe { *plog } == 123412i64);
+    check(unsafe { *dlog } == 12i64);
+    check(exec.active_task_count() == 2usize);
+
+    // Cancel the parked sleepers in the reverse order of creation: the cancellation wakes are
+    // queued in that order, the futures are dropped without being polled again.
+    h4.cancel();
+    h3.cancel();
+    check(unsafe { *dlog } == 12i64);
+    tick_n(mut_view(exec), 2i32);
+    check(unsafe { *plog } == 123412i64);
+    check(unsafe { *dlog } == 1243i64);
+    check(exec.active_task_count() == 0usize);
+
+    // Dropping an unawaited handle cancels its task; the future is dropped at the next tick.
+    {
+        let h5: LocalTaskHandle<i64> = exec.spawn_local(probe(5i64, true, plog, dlog, alive), poll_probe);
+        tick_n(mut_view(exec), 1i32);
+        check(unsafe { *plog } == 1234125i64);
+        check(unsafe { *dlog } == 1243i64);
+    }
+    tick_n(mut_view(exec), 1i32);
+    check(unsafe { *dlog } == 12435i64);
+    check(exec.active_task_count() == 0usize);
+
+    let mut kinds: i64 = 0i64;
+    kinds = kinds * 10i64 + kind(h1.join(), 100i64);
+    kinds = kinds * 10i64 + kind(h2.join(), 200i64);
+    kinds = kinds * 10i64 + kind(h3.join(), 0i64);
+    kinds = kinds * 10i64 + kind(h4.join(), 0i64);
+    check(kinds == 1122i64);
+    let a = unsafe { *alive };
+    check(a == 0i64);
+
+    print("OK local_cancel_drop_order ");
+    print_int(unsafe { *plog });
+    print(" ");
+    print_int(unsafe { *dlog });
+    print(" ");
+    print_int(kinds);
+    print(" ");
+    print_int(a);
+    print("\n");
+    0
+}

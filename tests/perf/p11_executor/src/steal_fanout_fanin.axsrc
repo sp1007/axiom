@@ -1,0 +1,105 @@
+module main
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.prelude.Context
+use std.core.host.heap_alloc
+use std.core.host.monotonic_ns
+use std.core.host.heap_free
+use std.core.host.stdio
+use std.core.host.write
+use std.asyn.executor.Executor
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskResult
+use std.asyn.task.TaskHandle
+use std.asyn.group.TaskGroup
+use std.asyn.group.group_poll_fn
+
+// Multi-thread work-stealing fan-out / fan-in latency: each round fans `fan` tasks (3 polls each)
+// out over a 4-worker Executor through a TaskGroup and fans the results back in (`next_blocking`).
+// The reported figure is the median (of 5 rounds) wall time per task from spawn to collected result.
+
+struct Job {
+    pub val: i64,
+    pub step: i32,
+}
+
+unsafe impl Send for Job {}
+
+impl Future for Job {
+    type Output = i64;
+    fn poll(self: mut_view<Job>, cx: mut_view<Context>) -> Poll<i64> {
+        if self.step < 2i32 {
+            self.step = self.step + 1i32;
+            let mut w = cx.waker();
+            view(w).wake_by_ref();
+            return Poll.Pending;
+        }
+        Poll.Ready(self.val)
+    }
+}
+
+fn poll_job(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Job, i64>;
+    group_poll_fn<Job, i64>(tcb, cx)
+}
+
+// Returns the sum of the collected values.
+fn round(exec: view<Executor>, fan: i64) -> i64 {
+    let mut group = TaskGroup.new();
+    let mut i: i64 = 1i64;
+    while i <= fan {
+        let h: TaskHandle<i64> = exec.spawn(Job { val: i, step: 0i32 }, poll_job);
+        let r = mut_view(group).adopt(h);
+        check(match r { Result.Ok(id) => true, Result.Err(e) => false });
+        i = i + 1i64;
+    }
+    let mut sum: i64 = 0i64;
+    let mut got: i64 = 0i64;
+    loop {
+        let r: Option<TaskResult<i64>> = mut_view(group).next_blocking();
+        match r {
+            Option.Some(res) => match res {
+                TaskResult.Completed(v) => {
+                    sum = sum + v;
+                    got = got + 1i64;
+                },
+                TaskResult.Cancelled => { check(false); },
+                TaskResult.Panicked => { check(false); },
+            },
+            Option.None => { break; },
+        }
+    }
+    check(got == fan);
+    sum
+}
+
+pub fn main() -> i32 {
+    let fan: i64 = 16i64;
+    let exec = Executor.new(4);
+    let samples = new_samples();
+    let mut r: usize = 0usize;
+    while r < 5usize {
+        let t0 = now_ns();
+        let s = round(view(exec), fan);
+        let t1 = now_ns();
+        check(s == fan * (fan + 1i64) / 2i64);
+        unsafe {
+            *(samples + r) = t1 - t0;
+        }
+        r = r + 1usize;
+    }
+    let steals = exec.steal_count();
+    exec.shutdown();
+    let med = median5(samples);
+    report(fan as u64, med);
+    eput("steals=");
+    eput_u64(steals as u64);
+    eput("\n");
+    // Generous bound: < 2 s per task.
+    check(med / (fan as u64) < 2000000000u64);
+    print("OK steal_fanout_fanin ");
+    print_int(fan);
+    print("\n");
+    0
+}

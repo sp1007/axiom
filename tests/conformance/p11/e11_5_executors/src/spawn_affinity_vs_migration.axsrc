@@ -1,0 +1,263 @@
+module main
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.prelude.Context
+use std.core.host.heap_alloc
+use std.core.host.thread_yield
+use std.core.host.thread_current_id
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.asyn.executor.Executor
+use std.asyn.executor.LocalExecutor
+use std.asyn.executor.WorkerData
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskResult
+use std.asyn.task.TaskHandle
+use std.asyn.task.LocalTaskHandle
+use std.asyn.task.tcb_poll_fn
+use std.thread.spawn
+
+// Thread affinity (spawn_local, REQ-CONC-151) versus work-stealing migration (spawn, REQ-CONC-148),
+// proven deterministically:
+//  A. `need` rendezvous tasks that block their OS thread until all of them have started can only
+//     finish when they run on `need` distinct worker threads (none of them is the main thread).
+//  B. A task running on a worker spawns two rendezvous children; their first scheduling lands in
+//     that worker's local deque, so the second child can only ever run if another worker steals it
+//     (`steal_count() >= 1`, children on two different threads).
+//  C. A LocalExecutor created inside an OS thread polls every task, at every poll, on that thread.
+//  D. The task header records the pinning: owner_thread_id == owner thread for spawn_local, 0 for spawn.
+
+fn new_u64_array(n: usize) -> *mut u64 {
+    let raw = unsafe { heap_alloc(n * 8, 8) };
+    let p = raw as *mut u64;
+    let mut i: usize = 0usize;
+    while i < n {
+        unsafe {
+            *(p + i) = 0u64;
+        }
+        i = i + 1usize;
+    }
+    p
+}
+
+fn at(p: *mut u64, i: usize) -> *mut u64 {
+    unsafe { p + i }
+}
+
+fn new_counter() -> *mut Atomic<i64> {
+    let raw = unsafe { heap_alloc(8, 8) };
+    let p = raw as *mut Atomic<i64>;
+    unsafe {
+        *p = Atomic.new(0i64);
+    }
+    p
+}
+
+// Records the polling thread in `slot`, counts itself in and blocks the thread until `need` tasks
+// have started (thread-blocking, deliberately not an `.await`).
+struct Rendezvous {
+    pub counter: *mut Atomic<i64>,
+    pub need: i64,
+    pub slot: *mut u64,
+}
+
+unsafe impl Send for Rendezvous {}
+
+impl Future for Rendezvous {
+    type Output = i64;
+    fn poll(self: mut_view<Rendezvous>, cx: mut_view<Context>) -> Poll<i64> {
+        unsafe {
+            *self.slot = thread_current_id();
+            (*self.counter).fetch_add(1i64, Ordering.AcqRel);
+        }
+        while unsafe { (*self.counter).load(Ordering.Acquire) } < self.need {
+            unsafe {
+                thread_yield();
+            }
+        }
+        Poll.Ready(1i64)
+    }
+}
+
+fn poll_rendezvous(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Rendezvous, i64>;
+    tcb_poll_fn<Rendezvous, i64>(tcb, cx)
+}
+
+// Spawns two rendezvous children from inside a worker thread (-> that worker's local deque).
+struct Parent {
+    pub exec: Executor,
+    pub counter: *mut Atomic<i64>,
+    pub slots: *mut u64,
+    pub parent_slot: *mut u64,
+    pub done: bool,
+}
+
+unsafe impl Send for Parent {}
+
+impl Future for Parent {
+    type Output = i64;
+    fn poll(self: mut_view<Parent>, cx: mut_view<Context>) -> Poll<i64> {
+        unsafe {
+            *self.parent_slot = thread_current_id();
+        }
+        let c0: TaskHandle<i64> = self.exec.spawn(Rendezvous { counter: self.counter, need: 2i64, slot: self.slots }, poll_rendezvous);
+        let c1: TaskHandle<i64> = self.exec.spawn(Rendezvous { counter: self.counter, need: 2i64, slot: at(self.slots, 1usize) }, poll_rendezvous);
+        c0.detach();
+        c1.detach();
+        Poll.Ready(2i64)
+    }
+}
+
+fn poll_parent(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Parent, i64>;
+    tcb_poll_fn<Parent, i64>(tcb, cx)
+}
+
+// Yields `rounds` times, recording the polling thread on every poll.
+struct Hopper {
+    pub rounds: i64,
+    pub step: i64,
+    pub seen: *mut u64,
+    pub polls: *mut Atomic<i64>,
+}
+
+impl Future for Hopper {
+    type Output = i64;
+    fn poll(self: mut_view<Hopper>, cx: mut_view<Context>) -> Poll<i64> {
+        let n = unsafe { (*self.polls).fetch_add(1i64, Ordering.AcqRel) };
+        unsafe {
+            *(self.seen + (n as usize)) = thread_current_id();
+        }
+        if self.step < self.rounds {
+            self.step = self.step + 1i64;
+            let mut w = cx.waker();
+            view(w).wake_by_ref();
+            return Poll.Pending;
+        }
+        Poll.Ready(self.step)
+    }
+}
+
+fn poll_hopper(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Hopper, i64>;
+    tcb_poll_fn<Hopper, i64>(tcb, cx)
+}
+
+// Runs inside an OS thread: LocalExecutor with 8 tasks x 6 polls; returns 1 when every recorded
+// poll happened on this very thread and the executor/headers report it as the owner.
+fn local_in_thread() -> i64 {
+    let me: u64 = thread_current_id();
+    let mut exec = LocalExecutor.new();
+    let seen = new_u64_array(64usize);
+    let polls = new_counter();
+    let mut ok: i64 = 1i64;
+    if exec.owner_thread != me {
+        ok = 0i64;
+    }
+    let mut hs: [8]i64 = [0i64; 8];
+    let mut k: i32 = 0i32;
+    let mut headers_ok: i64 = 1i64;
+    while k < 8i32 {
+        let h: LocalTaskHandle<i64> = exec.spawn_local(Hopper { rounds: 5i64, step: 0i64, seen: seen, polls: polls }, poll_hopper);
+        if unsafe { (*h.raw_task).owner_thread_id } != me {
+            headers_ok = 0i64;
+        }
+        h.detach();
+        k = k + 1i32;
+    }
+    exec.run();
+    let total = unsafe { (*polls).load(Ordering.Acquire) };
+    if total != 48i64 {
+        ok = 0i64;
+    }
+    let mut i: usize = 0usize;
+    while i < 48usize {
+        if unsafe { *(seen + i) } != me {
+            ok = 0i64;
+        }
+        i = i + 1usize;
+    }
+    ok * headers_ok
+}
+
+pub fn main() -> i32 {
+    let main_tid: u64 = thread_current_id();
+    let exec = Executor.new(4);
+
+    // A. four rendezvous tasks need four distinct worker threads.
+    let counter_a = new_counter();
+    let slots_a = new_u64_array(4usize);
+    let a0: TaskHandle<i64> = exec.spawn(Rendezvous { counter: counter_a, need: 4i64, slot: slots_a }, poll_rendezvous);
+    let a1: TaskHandle<i64> = exec.spawn(Rendezvous { counter: counter_a, need: 4i64, slot: at(slots_a, 1usize) }, poll_rendezvous);
+    let a2: TaskHandle<i64> = exec.spawn(Rendezvous { counter: counter_a, need: 4i64, slot: at(slots_a, 2usize) }, poll_rendezvous);
+    let a3: TaskHandle<i64> = exec.spawn(Rendezvous { counter: counter_a, need: 4i64, slot: at(slots_a, 3usize) }, poll_rendezvous);
+    // D (spawn side): a work-stealing task is not pinned.
+    let unpinned = unsafe { (*a0.raw_task).owner_thread_id } == 0u64;
+    let r0 = match a0.join() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r1 = match a1.join() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r2 = match a2.join() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r3 = match a3.join() { TaskResult.Completed(v) => v, _ => -1i64 };
+    check(r0 + r1 + r2 + r3 == 4i64);
+    let t0 = unsafe { *slots_a };
+    let t1 = unsafe { *(at(slots_a, 1usize)) };
+    let t2 = unsafe { *(at(slots_a, 2usize)) };
+    let t3 = unsafe { *(at(slots_a, 3usize)) };
+    let distinct_a = t0 != t1 && t0 != t2 && t0 != t3 && t1 != t2 && t1 != t3 && t2 != t3;
+    let off_main = t0 != main_tid && t1 != main_tid && t2 != main_tid && t3 != main_tid;
+    // every observed thread is one of the executor's worker threads
+    let mut in_pool: i64 = 0i64;
+    let mut wi: usize = 0usize;
+    while wi < 4usize {
+        let w: *mut WorkerData = unsafe { (*exec.inner).workers + wi };
+        let wt: u64 = unsafe { (*w).tid.load(Ordering.Acquire) };
+        if wt == t0 || wt == t1 || wt == t2 || wt == t3 {
+            in_pool = in_pool + 1i64;
+        }
+        wi = wi + 1usize;
+    }
+    let a_ok = distinct_a && off_main && in_pool == 4i64;
+
+    // B. children spawned from a worker are stolen by another worker.
+    let counter_b = new_counter();
+    let slots_b = new_u64_array(2usize);
+    let parent_slot = new_u64_array(1usize);
+    let steals_before = exec.steal_count();
+    let hp: TaskHandle<i64> = exec.spawn(Parent { exec: exec, counter: counter_b, slots: slots_b, parent_slot: parent_slot, done: false }, poll_parent);
+    let rp = match hp.join() { TaskResult.Completed(v) => v, _ => -1i64 };
+    check(rp == 2i64);
+    while unsafe { (*counter_b).load(Ordering.Acquire) } < 2i64 {
+        unsafe {
+            thread_yield();
+        }
+    }
+    // the rendezvous completes once both children have started; their slots are then written
+    let b0 = unsafe { *slots_b };
+    let b1 = unsafe { *(slots_b + 1usize) };
+    let ptid = unsafe { *parent_slot };
+    let stolen = exec.steal_count() - steals_before;
+    let b_ok = b0 != b1 && b0 != 0u64 && b1 != 0u64 && (b0 != ptid || b1 != ptid) && stolen >= 1usize;
+
+    exec.shutdown();
+
+    // C + D (local side).
+    let jt = spawn(|| -> i64 {
+        local_in_thread()
+    });
+    let c_res = match jt.join() {
+        Result.Ok(x) => x,
+        Result.Err(_e) => -1i64,
+    };
+
+    print("OK spawn_affinity_vs_migration ");
+    print_int(if a_ok { 1i64 } else { 0i64 });
+    print(" ");
+    print_int(if b_ok { 1i64 } else { 0i64 });
+    print(" ");
+    print_int(c_res);
+    print(" ");
+    print_int(if unpinned { 1i64 } else { 0i64 });
+    print("\n");
+    0
+}

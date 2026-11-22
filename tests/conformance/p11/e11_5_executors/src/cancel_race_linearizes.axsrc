@@ -1,0 +1,98 @@
+module main
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.prelude.Context
+use std.core.host.heap_alloc
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.asyn.executor.Executor
+use std.asyn.task.TaskControlBlock
+use std.asyn.task.TaskResult
+use std.asyn.task.TaskHandle
+use std.asyn.group.group_poll_fn
+
+// Completion-versus-cancellation race on the work-stealing Executor (AXS-EXEC-023 item 2,
+// REQ-CONC-155): a task that finishes after `step` polls is cancelled from the main thread at a
+// varying moment. The outcome is linearizable: exactly one of Completed(7) or Cancelled, never
+// Panicked, never a wrong value, and the future is dropped exactly once either way (`alive` == 0).
+
+struct Racer {
+    pub step: i64,
+    pub alive: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Racer {}
+
+impl Future for Racer {
+    type Output = i64;
+    fn poll(self: mut_view<Racer>, cx: mut_view<Context>) -> Poll<i64> {
+        if self.step < 3i64 {
+            self.step = self.step + 1i64;
+            let mut w = cx.waker();
+            view(w).wake_by_ref();
+            return Poll.Pending;
+        }
+        Poll.Ready(7i64)
+    }
+}
+
+impl Drop for Racer {
+    fn drop(self: mut_view<Racer>) {
+        unsafe {
+            (*self.alive).fetch_sub(1i64, Ordering.AcqRel);
+        }
+    }
+}
+
+fn poll_racer(raw: *mut u8, cx: *mut u8) -> u32 {
+    let tcb = raw as *mut TaskControlBlock<Racer, i64>;
+    group_poll_fn<Racer, i64>(tcb, cx)
+}
+
+pub fn main() -> i32 {
+    let exec = Executor.new(4);
+    let raw = unsafe { heap_alloc(8, 8) };
+    let alive = raw as *mut Atomic<i64>;
+    unsafe {
+        *alive = Atomic.new(0i64);
+    }
+    let mut completed: i64 = 0i64;
+    let mut cancelled: i64 = 0i64;
+    let mut bad: i64 = 0i64;
+    let mut i: i64 = 0i64;
+    while i < 32i64 {
+        unsafe {
+            (*alive).fetch_add(1i64, Ordering.AcqRel);
+        }
+        let h: TaskHandle<i64> = exec.spawn(Racer { step: 0i64, alive: alive }, poll_racer);
+        // Vary the delay before the cancel request so it lands at different points of the task life.
+        let mut spin: i64 = 0i64;
+        while spin < (i % 16i64) * 40i64 {
+            spin = spin + 1i64;
+        }
+        h.cancel();
+        match h.join() {
+            TaskResult.Completed(v) => {
+                if v == 7i64 { completed = completed + 1i64; } else { bad = bad + 1i64; }
+            },
+            TaskResult.Cancelled => { cancelled = cancelled + 1i64; },
+            TaskResult.Panicked => { bad = bad + 1i64; },
+        }
+        i = i + 1i64;
+    }
+    exec.shutdown();
+    let a = unsafe { (*alive).load(Ordering.Acquire) };
+    check(bad == 0i64);
+    check(completed + cancelled == 32i64);
+    check(a == 0i64);
+
+    print("OK cancel_race_linearizes ");
+    print_int(completed + cancelled);
+    print(" ");
+    print_int(bad);
+    print(" ");
+    print_int(a);
+    print("\n");
+    0
+}
