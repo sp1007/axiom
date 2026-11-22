@@ -83853,6 +83853,63 @@ pub fn interp_copy_val(dst: mut_view<InterpValue>, src: view<InterpValue>) {
     }
 }
 
+// -------------------------------------------------------------------------------------------------
+// By-value call arguments larger than one InterpValue slot (T498c)
+//
+// A call-argument buffer is `n` InterpValue slots followed by a spill area. A value of at most
+// size_of<InterpValue>() bytes lives inline in its slot (the fast path, unchanged). A larger value is
+// copied byte-exact into the spill area, which the buffer grows to hold, and its slot keeps a spill
+// descriptor: vals[0] = byte offset of the value from the buffer start, vals[1] = its size,
+// vals[2] = INTERP_ARG_SPILL_MAGIC. Offsets (not pointers) keep the descriptor valid when the buffer
+// is reallocated, and the spill area dies with the buffer, so every existing
+// `heap_free(args, args_bytes, align_of<InterpValue>())` frees it. There is no size cap: the spill
+// size is the argument's own type size.
+// -------------------------------------------------------------------------------------------------
+
+pub const INTERP_ARG_SPILL_MAGIC: u64 = 0x4752414C4C495053u64;
+
+/// Writes the `size` bytes at `src` as argument `idx` of the buffer at `*buf_addr` (`*buf_bytes` bytes,
+/// slot `idx` already zeroed). Inline when it fits a slot, otherwise spilled; `*buf_addr` and
+/// `*buf_bytes` are updated when the buffer grows.
+pub unsafe fn interp_arg_store(buf_addr: mut_view<usize>, buf_bytes: mut_view<usize>, idx: usize, src: *const u8, size: usize) {
+    let slot_sz = size_of<InterpValue>();
+    if size <= slot_sz {
+        let dst = interp_val_at(*buf_addr as *mut InterpValue, idx) as *mut u8;
+        interp_copy_bytes(dst, src, size);
+        return;
+    }
+    let old_bytes = *buf_bytes;
+    let off = (old_bytes + 15) & (0xFFFFFFFFFFFFFFFFusize ^ 15usize);
+    let new_bytes = off + ((size + 15) & (0xFFFFFFFFFFFFFFFFusize ^ 15usize));
+    let new_buf = heap_alloc(new_bytes, align_of<InterpValue>());
+    interp_zero_bytes(new_buf, new_bytes);
+    interp_copy_bytes(new_buf, *buf_addr as *const u8, old_bytes);
+    heap_free(*buf_addr as *mut u8, old_bytes, align_of<InterpValue>());
+    interp_copy_bytes(new_buf + off, src, size);
+    let slot = interp_val_at(new_buf as *mut InterpValue, idx);
+    (*slot).vals[0] = off as u64;
+    (*slot).vals[1] = size as u64;
+    (*slot).vals[2] = INTERP_ARG_SPILL_MAGIC;
+    *buf_addr = new_buf as usize;
+    *buf_bytes = new_bytes;
+}
+
+/// Copies argument `idx` of the buffer `base` into a parameter's storage `dst` of `dst_cap` bytes
+/// (never less than one slot). A spilled argument is copied in full (up to `dst_cap`); an inline one
+/// copies its slot.
+pub unsafe fn interp_arg_load(dst: *mut u8, dst_cap: usize, base: *const InterpValue, idx: usize) {
+    let slot_sz = size_of<InterpValue>();
+    let slot = interp_val_at(base as *mut InterpValue, idx);
+    if dst_cap > slot_sz && (*slot).vals[2] == INTERP_ARG_SPILL_MAGIC && (*slot).vals[1] > (slot_sz as u64) {
+        let spill_sz = (*slot).vals[1] as usize;
+        let n = if spill_sz < dst_cap { spill_sz } else { dst_cap };
+        let src = ((base as usize) + ((*slot).vals[0] as usize)) as *const u8;
+        interp_copy_bytes(dst, src, n);
+        return;
+    }
+    interp_copy_bytes(dst, slot as *const u8, slot_sz);
+}
+
 pub unsafe fn interp_zero_bytes(dst: *mut u8, count: usize) {
     if (dst as usize) == 0 || count == 0 {
         return;
@@ -87077,6 +87134,7 @@ use compiler.interp.value.InterpValue
 use compiler.interp.value.MirBodyEntry
 use compiler.interp.value.MirBodyMap
 use compiler.interp.value.interp_alloc_at
+use compiler.interp.value.interp_arg_load
 use compiler.interp.value.interp_copy_bytes
 use compiler.interp.value.interp_ensure_const_str_alloc
 use compiler.interp.value.interp_mul_usize
@@ -87084,7 +87142,6 @@ use compiler.interp.value.interp_panic
 use compiler.interp.value.interp_register_alloc
 use compiler.interp.value.interp_resolve_synth_ptr
 use compiler.interp.value.interp_u8_ptr_at
-use compiler.interp.value.interp_val_at
 use compiler.interp.value.interp_validate_raw_ptr
 use compiler.interp.value.interp_zero_bytes
 use compiler.interp.value.interp_zero_val
@@ -87289,9 +87346,15 @@ pub fn frame_init(
         while i < arg_count {
             if i + 1 < local_count {
                 let dst = unsafe { *interp_u8_ptr_at(frm.local_ptrs, i + 1) };
-                let src = unsafe { interp_val_at(args_raw as *mut InterpValue, i) as *const u8 };
+                // Storage size of the parameter local (>= one slot): the distance to the next local,
+                // or to the end of the frame storage for the last local.
+                let dst_end: usize = if i + 2 < local_count {
+                    unsafe { *interp_u8_ptr_at(frm.local_ptrs, i + 2) as usize }
+                } else {
+                    (storage as usize) + total_storage
+                };
                 unsafe {
-                    interp_copy_bytes(dst, src, val_sz);
+                    interp_arg_load(dst, dst_end - (dst as usize), args_raw, i);
                 }
             }
             i = i + 1;
@@ -87909,6 +87972,7 @@ use compiler.interp.value.InterpValue
 use compiler.interp.value.MirBodyMap
 use compiler.interp.value.interp_alloc_at
 use compiler.interp.value.interp_check_step_limit
+use compiler.interp.value.interp_arg_store
 use compiler.interp.value.interp_copy_bytes
 use compiler.interp.value.interp_ctx_alloc_zeroed
 use compiler.interp.value.interp_ctx_dealloc
@@ -91680,12 +91744,15 @@ fn prepare_call_args_from_term(
     let cap_count: usize = if callee_param_count > term_arg_count { callee_param_count - term_arg_count } else { 0 };
     let alloc_args: usize = if total_args > 0 { total_args } else { 1 };
     let args_bytes = interp_mul_usize(alloc_args, size_of<InterpValue>());
-    let call_args = unsafe { heap_alloc(args_bytes, align_of<InterpValue>()) as *mut InterpValue };
+    let call_args0 = unsafe { heap_alloc(args_bytes, align_of<InterpValue>()) as *mut InterpValue };
     unsafe {
-        interp_zero_bytes(call_args as *mut u8, args_bytes);
+        interp_zero_bytes(call_args0 as *mut u8, args_bytes);
     }
+    // T498c: an argument larger than one slot is spilled behind the slots (interp_arg_store), which can
+    // reallocate the buffer; `buf_addr`/`buf_bytes` track it and are returned to the caller.
+    let mut buf_addr: usize = call_args0 as usize;
+    let mut buf_bytes: usize = args_bytes;
     *out_total_args = total_args;
-    *out_args_bytes = args_bytes;
 
     if cap_count > 0 && (unsafe { (*term).func.kind }) != MIR_OP_CONST {
         let mut func_ty = TypeId { v: 0u32 };
@@ -91708,10 +91775,9 @@ fn prepare_call_args_from_term(
                 offset = (offset + mask) & (mask ^ 0xFFFFFFFFu32);
             }
             let copy_s: usize = if s > 0u32 { s as usize } else { 8 };
-            let dst_arg = unsafe { interp_val_at(call_args, c) as *mut u8 };
             let src_cap = unsafe { closure_ptr + (offset as usize) };
             unsafe {
-                interp_copy_bytes(dst_arg, src_cap as *const u8, copy_s);
+                interp_arg_store(mut_view(buf_addr), mut_view(buf_bytes), c, src_cap as *const u8, copy_s);
             }
             offset = offset + (copy_s as u32);
             c = c + 1;
@@ -91723,8 +91789,8 @@ fn prepare_call_args_from_term(
     let mut a_idx: usize = 0;
     while a_idx < term_arg_count {
         let arg_op = unsafe { mir_op_at(term_args, a_idx) };
-        let dst_slot = unsafe { interp_val_at(call_args, cap_count + a_idx) };
         if (unsafe { (*arg_op).kind }) == MIR_OP_CONST {
+            let dst_slot = unsafe { interp_val_at(buf_addr as *mut InterpValue, cap_count + a_idx) };
             unsafe {
                 eval_operand(mut_view(*ctx), frame, view(*arg_op), mut_view(*dst_slot));
                 let resolved_fn = resolve_const_op_val(view(*ctx), frame, view(*arg_op));
@@ -91736,19 +91802,17 @@ fn prepare_call_args_from_term(
             let mut src_ty = TypeId { v: 0u32 };
             let mut src_len: u64 = 0u64;
             let src = get_place_ptr(mut_view(*ctx), frame, unsafe { view((*arg_op).place) }, mut_view(src_ty), mut_view(src_len));
-            let mut s_sz = unsafe { type_size(src_ty, view((*ctx.thir).interner)) as usize };
-            if s_sz > size_of<InterpValue>() {
-                s_sz = size_of<InterpValue>();
-            }
+            let s_sz = unsafe { type_size(src_ty, view((*ctx.thir).interner)) as usize };
             if s_sz > 0 {
                 unsafe {
-                    interp_copy_bytes(dst_slot as *mut u8, src as *const u8, s_sz);
+                    interp_arg_store(mut_view(buf_addr), mut_view(buf_bytes), cap_count + a_idx, src as *const u8, s_sz);
                 }
             }
         }
         a_idx = a_idx + 1;
     }
-    call_args
+    *out_args_bytes = buf_bytes;
+    buf_addr as *mut InterpValue
 }
 
 fn exec_task_terminator(
