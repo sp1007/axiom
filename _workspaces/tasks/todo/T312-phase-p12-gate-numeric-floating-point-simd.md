@@ -6,7 +6,7 @@ owner: axiom-qa
 reviewer: axiom-architect
 model: opus
 gate_model: opus
-depends: [T212, T450, T451, T452, T453, T454, T455, T456, T457, T458, T459, T460, T461, T462, T463, T464, T465, T466, T467, T468, T469, T470, T471, T472, T473, T474, T475, T476, T477, T478, T479, T480, T481, T482, T483, T484, T498e, T498f, T498g, T499b, T423h]
+depends: [T212, T450, T451, T452, T453, T454, T455, T456, T457, T458, T459, T460, T461, T462, T463, T464, T465, T466, T467, T468, T469, T470, T471, T472, T473, T474, T475, T476, T477, T478, T479, T480, T481, T482, T483, T484, T498e, T498f, T498g, T499b, T499c, T423h]
 priority: 312
 status: todo
 attempts: 0
@@ -37,3 +37,4 @@ Certify that phase P12 meets the exit criteria of every epic (`E12.1`–`E12.5`)
 ## Log
 - 2026-11-03 00:30:00 updated depends to include T450-T479 in T212 (P12 phase planning)
 - 2026-11-22 depends += T498e, T498f, T498g, T499b, T423h (architect, triage-1122)
+- 2026-11-22 depends += T499c (architect, unblock-T499b: single sound exhaustiveness checker)

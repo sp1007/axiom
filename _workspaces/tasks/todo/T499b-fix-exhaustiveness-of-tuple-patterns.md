@@ -6,15 +6,17 @@ owner: axiom-semantics
 reviewer: axiom-qa
 model: opus
 gate_model: sonnet
-depends: [T499a]
+depends: [T499a, T498g]
 priority: 18
 status: todo
 attempts: 0
 timeout_min: 480
-paths: [compiler/types/exhaust.ax, tests/ui/exhaust_tuple, tests/run/exhaust_tuple, tests/run/tuple_expr_names/match_and_destructure.ax]
+paths: [compiler/types/exhaust.ax, compiler/types/typeck.ax, tests/ui/exhaust_tuple, tests/run/exhaust_tuple, tests/run/tuple_expr_names/match_and_destructure.ax, tests/std/num/static_dispatch_xfail.ax]
 locks: []
 spec: [spec/SPEC-02-grammar.md, spec/SPEC-03-core-semantics.md]
 covers: [REQ-TST-072]
+started: 2026-11-22 11:00:54
+unblocks: 1
 ---
 # T499b — Tuple patterns in the exhaustiveness checker
 
@@ -30,6 +32,21 @@ fn h(t: (bool, bool)) -> i32 { match t { (true, true) => 1, (false, _) => 2 } } 
 
 Also `match (1i64, 2i64) { (p, q) => p + q }` and `match t { (p, _) => p }`. Tests work around it with a trailing `_` arm
 (`tests/run/tuple_expr_names/match_and_destructure.ax`).
+
+## Resume after unblock (attempt 2) — read first
+Attempt 1 is finished except for one file; see `_workspaces/reports/T499b-report.md` and `_workspaces/reports/unblock-T499b.md`.
+The live checker is `tc_match_check_exhaustiveness` in `compiler/types/typeck.ax`; `exhaust.match_check_exhaustiveness` is
+only referenced under `if false {}`. So:
+- `compiler/types/exhaust.ax` (`match_check_tuple_exhaustiveness`) and all tests listed in the report's `## Files changed`
+  are already in the main tree, uncommitted. Do NOT redo them; review only if the gate shows a problem.
+- This task now owns `compiler/types/typeck.ax` (it starts after T498g is accepted). Apply
+  `_workspaces/T499b-typeck.patch` (import `match_check_tuple_exhaustiveness`; in `tc_match_check_exhaustiveness`, after the
+  `HIR_EXPR_MATCH` check, return early when the tuple checker handled the scrutinee). If `git apply --check` fails because
+  T498g changed nearby lines, re-apply the same two hunks by hand.
+- Do not remove the duplicate checker in `typeck.ax` here; that is follow-up T499c.
+- Test hygiene (folded in by unblock-T499b): `tests/std/num/static_dispatch_xfail.ax` now XPASSes (fixed by T448). Delete
+  its `// xfail: T454 ...` line (keep file name and expected output) and confirm it PASSes in all its modes.
+- Re-gate from a fresh `taskctl snapshot` (bundles regenerate there); the change set includes `typeck.ax`.
 
 ## Scope
 - `compiler/types/exhaust.ax`: treat a tuple pattern as a constructor with one field per element and specialise the matrix
@@ -47,6 +64,8 @@ Also `match (1i64, 2i64) { (p, q) => p + q }` and `match t { (p, _) => p }`. Tes
 ## Acceptance
 - [ ] `f`, `g` compile and run in all three modes; `h` and the other incomplete cases report `AX_PAT_NON_EXHAUSTIVE`.
 - [ ] `tests/ui`, `tests/run`, selfhost typeck/exhaust groups pass; gate per axiom-qa.md "Per-task gate scope".
+- [ ] `compiler/types/typeck.ax` routes tuple scrutinees to `exhaust.match_check_tuple_exhaustiveness`.
+- [ ] `tests/std/num/static_dispatch_xfail.ax` has no `xfail:` directive and PASSes.
 - [ ] Report `_workspaces/reports/T499b-report.md` with exact `## Files changed`.
 
 ## Out of scope
@@ -54,3 +73,6 @@ Also `match (1i64, 2i64) { (p, q) => p + q }` and `match t { (p, _) => p }`. Tes
 
 ## Log
 - 2026-11-22 created by axiom-architect (triage-1122; T499a-report follow-up 1)
+- 2026-11-22 11:00:54 started (attempt 1) T499b-impl
+- 2026-11-22 11:35:28 block: needs 5-line change in compiler/types/typeck.ax (live checker tc_match_check_exhaustiveness bypasses exhaust.ax); typeck.ax held by T498g; patch ready at _workspaces/T499b-typeck.patch
+- 2026-11-22 11:37:00 unblocked (cycle 1) 

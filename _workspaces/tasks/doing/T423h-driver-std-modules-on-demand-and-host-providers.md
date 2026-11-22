@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T423b, T437b]
 priority: 25
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 480
-paths: [compiler/driver/pipeline.ax, compiler/driver/opts.ax, tests/modules/std_on_demand, tests/run/host]
-locks: [compiler/diag/code.ax, compiler/diag/explain/mod.ax]
+paths: [compiler/driver/pipeline.ax, compiler/driver/opts.ax, tests/modules/std_on_demand, tests/run/host, compiler/diag/code.ax, compiler/diag/explain/mod.ax]
+locks: []
 spec: [spec/decisions/ADR-0048-std-module-loading-host-providers.md, spec/decisions/ADR-0002-oracle-host-interface.md, spec/decisions/ADR-0006-bootstrap-forms-manifest-std-root.md, spec/decisions/ADR-0041-complete-suite-baseline-and-test-cache.md]
 covers: [REQ-TST-072]
+started: 2026-11-22 11:35:42
+agent: T423h-impl
 ---
 # T423h — std modules on demand; host providers in native builds
 
@@ -54,3 +56,4 @@ Implement ADR-0048. Today (triage-1122, reproduced with the current stage-2 comp
 
 ## Log
 - 2026-11-22 created by axiom-architect (triage-1122; T423b-qa follow-up 3; ADR-0048)
+- 2026-11-22 11:35:42 started (attempt 1) T423h-impl
