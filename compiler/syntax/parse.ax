@@ -1026,11 +1026,50 @@ fn parse_dotted_name_into(parser: mut_view<Parser>, dst: mut_view<AstDottedName>
     dst.count = count;
 }
 
+// Parses `a.b.c` into `dst` inside a `use` tree (accepting `async` as a module segment per SPEC-52 AXS-FRE-020).
+fn parse_use_dotted_name_into(parser: mut_view<Parser>, dst: mut_view<AstDottedName>) {
+    ast_set_span(mut_view(dst.span), peek_span(view(*parser)));
+    let capacity = MAX_DOTTED_NAME_SEGMENTS;
+    let bytes = capacity * size_of<StrId>();
+    let buf = arena_alloc_raw(unsafe { mut_view(*parser.arena) }, bytes, align_of<StrId>()) as *mut StrId;
+    let mut count: usize = 0;
+    while !check(view(*parser), TOK_EOF) && count < capacity {
+        if check(view(*parser), TOK_IDENT) {
+            unsafe {
+                (*(str_id_ptr(buf, count))).v = peek_ident(view(*parser)).v;
+            }
+            count = count + 1;
+            advance(mut_view(*parser));
+        } else if check(view(*parser), TOK_KW_ASYNC) {
+            let ab = arena_alloc_raw(unsafe { mut_view(*parser.arena) }, 5, 1);
+            unsafe {
+                *(ab + 0) = 97u8;
+                *(ab + 1) = 115u8;
+                *(ab + 2) = 121u8;
+                *(ab + 3) = 110u8;
+                *(ab + 4) = 99u8;
+                let aid = interner_intern_bytes(mut_view(*parser.interner), ab as *const u8, 5);
+                (*(str_id_ptr(buf, count))).v = aid.v;
+            }
+            count = count + 1;
+            advance(mut_view(*parser));
+        } else {
+            report_here(mut_view(*parser), AX_PARSE_EXPECTED_TOKEN, MSG_EXPECTED_IDENTIFIER);
+            break;
+        }
+        if !consume(mut_view(*parser), TOK_DOT) {
+            break;
+        }
+    }
+    dst.segments = buf;
+    dst.count = count;
+}
+
 // Parses a use declaration: `a.b`, `a.b as c` or `a.{b, c}`.
 fn parse_use_tree(parser: mut_view<Parser>) -> *mut AstUseTree {
     let tree = alloc_use_tree(parser.arena, peek_span(view(*parser)));
     unsafe {
-        parse_dotted_name_into(mut_view(*parser), mut_view((*tree).path));
+        parse_use_dotted_name_into(mut_view(*parser), mut_view((*tree).path));
         if consume(mut_view(*parser), TOK_KW_AS) {
             if check(view(*parser), TOK_IDENT) {
                 (*tree).alias.v = peek_ident(view(*parser)).v;
@@ -1187,6 +1226,20 @@ fn is_ident_i128_or_u128(interner: view<StrInterner>, id_v: u32) -> bool {
     }
 }
 
+fn is_ident_never(interner: view<StrInterner>, id_v: u32) -> bool {
+    if id_v == 0u32 {
+        return false;
+    }
+    let sv = interner_get(interner, StrId { v: id_v });
+    if sv.len != 5 || (sv.ptr as usize) == 0 {
+        return false;
+    }
+    unsafe {
+        *(sv.ptr + 0) == 110u8 && *(sv.ptr + 1) == 101u8 && *(sv.ptr + 2) == 118u8 &&
+            *(sv.ptr + 3) == 101u8 && *(sv.ptr + 4) == 114u8
+    }
+}
+
 // Parses a path type `a.B<T>.C`.  Inside a cast (`x as T`) the generic arguments are parsed speculatively.
 fn parse_path_type(parser: mut_view<Parser>, type_node: *mut AstType) {
     unsafe {
@@ -1209,7 +1262,8 @@ fn parse_path_type(parser: mut_view<Parser>, type_node: *mut AstType) {
         }
         let segs = (*type_node).segments as *const AstTypePathSegment;
         if segs as usize != 0 && ((*segs).next as usize) == 0 && ((*segs).generic_args as usize) == 0 &&
-                is_ident_i128_or_u128(view(*parser.interner), (*segs).name.v) {
+                (is_ident_i128_or_u128(view(*parser.interner), (*segs).name.v) ||
+                 is_ident_never(view(*parser.interner), (*segs).name.v)) {
             (*type_node).kind = TYPE_PATH | 128u8;
         }
     }
@@ -2224,6 +2278,9 @@ fn parse_params(parser: mut_view<Parser>) -> *mut AstParam {
     unsafe {
         while more_before(view(*parser), TOK_RPAREN) {
             let param = alloc_param(parser.arena, peek_span(view(*parser)));
+            if peek_kind(view(*parser)) == TOK_AT && peek_nth_kind(view(*parser), 1) == TOK_IDENT {
+                (*param).attrs = parse_attributes(mut_view(*parser));
+            }
             if consume(mut_view(*parser), TOK_KW_MUT) {
                 (*param).is_mut = true;
             }
@@ -2266,6 +2323,9 @@ fn parse_stmt(parser: mut_view<Parser>) -> *mut AstStmt {
                     empty_span());
             (*stmt).has_semi = true;
             return stmt;
+        }
+        if peek_kind(view(*parser)) == TOK_AT && peek_nth_kind(view(*parser), 1) == TOK_IDENT {
+            (*stmt).attrs = parse_attributes(mut_view(*parser));
         }
         let kind = peek_kind(view(*parser));
         let ident = peek_ident(view(*parser));
@@ -3021,20 +3081,31 @@ fn parse_extern_block_item(parser: mut_view<Parser>, item: *mut AstItem) {
 
 // True when the current token starts a function item (possibly with `unsafe`, `extern "abi"`, `async`, `comptime`).
 fn at_fn_item_start(parser: view<Parser>) -> bool {
-    let kind = peek_kind(parser);
-    let next_kind = peek_nth_kind(parser, 1);
-    let second_next_kind = peek_nth_kind(parser, 2);
-    let third_next_kind = peek_nth_kind(parser, 3);
-    kind == TOK_KW_FN ||
-        (kind == TOK_KW_UNSAFE &&
-            (next_kind == TOK_KW_FN || (next_kind == TOK_KW_ASYNC && second_next_kind == TOK_KW_FN))) ||
-        (kind == TOK_KW_EXTERN &&
-            (next_kind == TOK_KW_FN ||
-                (next_kind == TOK_KW_ASYNC && second_next_kind == TOK_KW_FN) ||
-                (next_kind == TOK_STR &&
-                    (second_next_kind == TOK_KW_FN ||
-                        (second_next_kind == TOK_KW_ASYNC && third_next_kind == TOK_KW_FN))))) ||
-        kind == TOK_KW_ASYNC || kind == TOK_KW_COMPTIME
+    let k0 = peek_kind(parser);
+    if k0 == TOK_KW_FN || k0 == TOK_KW_ASYNC || k0 == TOK_KW_COMPTIME {
+        return true;
+    }
+    if k0 != TOK_KW_UNSAFE && k0 != TOK_KW_EXTERN {
+        return false;
+    }
+    let mut off: usize = 0;
+    while off < 8 {
+        let k = peek_nth_kind(parser, off);
+        if k == TOK_KW_FN {
+            return true;
+        }
+        if k == TOK_KW_UNSAFE || k == TOK_KW_ASYNC || k == TOK_KW_COMPTIME {
+            off = off + 1;
+        } else if k == TOK_KW_EXTERN {
+            off = off + 1;
+            if peek_nth_kind(parser, off) == TOK_STR {
+                off = off + 1;
+            }
+        } else {
+            return false;
+        }
+    }
+    false
 }
 
 // Parses one item: attributes, visibility and the declaration, recovering from errors by skipping tokens.

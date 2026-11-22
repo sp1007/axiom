@@ -8,14 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T511]
 priority: 161
-status: doing
+status: done
 attempts: 1
 paths: [compiler/driver, compiler/hir, compiler/types, tests/ui/freestanding]
 locks: [compiler/syntax, compiler/diag/code.ax]
 spec: [spec/SPEC-52-freestanding-runtime-composition.md, 0143, 0097, tasks/0358, tasks/0359, tasks/0455]
 covers: [REQ-ABI-102, REQ-ABI-031]
 started: 2026-11-23 00:20:57
-agent: t512-impl
+finished: 2026-11-23 04:02:05
 ---
 # T512 — E13.3 — Profile checking (--profile freestanding|kernel|system|hosted), @entry/@naked/@section & runtime capability graph
 
@@ -43,3 +43,4 @@ Implement `--profile hosted|freestanding|kernel|system` CLI/manifest selection, 
 ## Log
 - 2026-11-03 02:02:00 created by T213 (P13 phase planning)
 - 2026-11-23 00:20:57 started (attempt 1) t512-impl
+- 2026-11-23 04:02:05 accepted by QA -> done

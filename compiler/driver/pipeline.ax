@@ -25,9 +25,13 @@ use compiler.source.span.Span
 use compiler.source.manager.SourceDatabase
 use compiler.source.manager.source_db_span_text
 use compiler.diag.code.AX_IO_FILE_NOT_FOUND
+use compiler.diag.code.AX_NAME_UNRESOLVED_IMPORT
+use compiler.diag.code.AX_NAME_FREESTANDING_FORBIDDEN_IMPORT
 use compiler.diag.code.DiagCode
 use compiler.diag.code.DiagDataKind
 use compiler.diag.code.DiagSeverity
+use compiler.diag.code.diag_code_default_message
+use compiler.diag.code.diag_code_severity
 use compiler.diag.emitter.Diagnostic
 use compiler.diag.emitter.DiagDataEntry
 use compiler.diag.emitter.DiagDataValue
@@ -59,6 +63,8 @@ use compiler.lexer.session.session_lex_file
 use compiler.lexer.session.session_render_tokens_into
 use compiler.syntax.ast.Ast
 use compiler.syntax.ast.AstItem
+use compiler.syntax.ast.AstUseTree
+use compiler.syntax.ast.ITEM_USE
 use compiler.parser.session.session_parse_tokens
 use compiler.parser.session.session_render_ast_into
 use compiler.resolve.symtab.NodeMap
@@ -146,6 +152,8 @@ use compiler.types.types.sym_constmap_get
 use compiler.types.layout.type_size
 use compiler.types.layout.type_align
 use compiler.types.typeck.patch_unknown_intrinsic_diag_buf
+use compiler.types.typeck.fre_is_forbidden_std_layer3_seg
+use compiler.types.typeck.typeck_check_profile
 use compiler.typeck.session.session_render_thir_into
 use compiler.traits.mono.MonoInstance
 use compiler.traits.mono.MonoEngine
@@ -345,7 +353,12 @@ use compiler.driver.opts.ARTIFACT_EXE
 use compiler.driver.opts.ARTIFACT_OBJ
 use compiler.driver.opts.ARTIFACT_LIB
 use compiler.driver.opts.ARTIFACT_DLL
+use compiler.driver.opts.PROFILE_HOSTED
+use compiler.driver.opts.PROFILE_FREESTANDING
+use compiler.driver.opts.PROFILE_KERNEL
+use compiler.driver.opts.PROFILE_SYSTEM
 use compiler.driver.opts.AX_DRIVER_INVALID_ARTIFACT_KIND
+use compiler.driver.opts.AX_DRIVER_INVALID_PROFILE
 use compiler.driver.opts.AX_FFI_GENERIC_EXPORT
 use compiler.driver.opts.err_run_kind_not_supported
 use compiler.driver.opts.DriverOptions
@@ -367,6 +380,7 @@ use compiler.driver.opts.sv_slot_get
 use compiler.driver.opts.sv_slot_set
 use compiler.driver.opts.arena_clone_sv
 use compiler.driver.opts.driver_parse_artifact_kind
+use compiler.driver.opts.driver_parse_profile
 use compiler.driver.opts.derive_file_stem_sv
 use compiler.driver.opts.derive_default_output_path
 use compiler.driver.opts.emit_driver_diag
@@ -787,6 +801,8 @@ pub struct PipelineCtx {
     pub own_ns: [8]u64,
     pub interp_rc: i32,
     pub panic_msg: StrView,
+    pub eff_profile: u32,
+    pub invalid_profile: bool,
 }
 
 pub fn pipeline_ctx_init(ctx: mut_view<PipelineCtx>) {
@@ -860,6 +876,8 @@ pub fn pipeline_ctx_init(ctx: mut_view<PipelineCtx>) {
     }
     ctx.interp_rc = 0;
     sv_clear(mut_view(ctx.panic_msg));
+    ctx.eff_profile = PROFILE_HOSTED;
+    ctx.invalid_profile = false;
 }
 
 pub fn pipeline_ctx_free(ctx: mut_view<PipelineCtx>) {
@@ -2181,6 +2199,9 @@ fn pipe_std_resolve_use(
 
 // A linked Windows image is being built (`build` of an exe or dll): host intrinsics need their provider modules.
 fn pipe_wants_host_providers(ctx: view<PipelineCtx>, dopts: view<DriverOptions>, lits: view<PipeStdLits>) -> bool {
+    if ctx.eff_profile == PROFILE_FREESTANDING || ctx.eff_profile == PROFILE_KERNEL {
+        return false;
+    }
     if dopts.cmd != CMD_BUILD || dopts.emit_kind == EMIT_OBJ {
         return false;
     }
@@ -2275,6 +2296,29 @@ fn pipe_add_host_providers(
     added
 }
 
+fn pipe_up_is_forbidden_layer3(up: view<StrView>) -> bool {
+    if up.len <= 4 || (up.ptr as usize) == 0 {
+        return false;
+    }
+    let ok_std = unsafe {
+        *(up.ptr + 0) == 115u8 && *(up.ptr + 1) == 116u8 &&
+        *(up.ptr + 2) == 100u8 && *(up.ptr + 3) == 46u8
+    };
+    if !ok_std {
+        return false;
+    }
+    let mut end: usize = 4;
+    while end < up.len {
+        let ch = unsafe { *(up.ptr + end) };
+        if ch == 46u8 {
+            break;
+        }
+        end = end + 1;
+    }
+    let seg = StrView { ptr: unsafe { up.ptr + 4 }, len: end - 4 };
+    fre_is_forbidden_std_layer3_seg(view(seg))
+}
+
 // ADR-0048: loads the std modules named by `use std.…` lines (transitively) and, for a linked Windows image, the
 // host provider modules. False after an error diagnostic.
 fn pipe_std_on_demand(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptions>) -> bool {
@@ -2295,15 +2339,21 @@ fn pipe_std_on_demand(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptions>) ->
         pi = pi + 1;
     }
     let native = pipe_wants_host_providers(view(*ctx), dopts, view(lits));
+    let is_free_or_kern = ctx.eff_profile == PROFILE_FREESTANDING || ctx.eff_profile == PROFILE_KERNEL;
     let mut fi: usize = 0;
     loop {
         while fi < ctx.proj.file_count {
+            let pf_cur = unsafe { project_file_const_at(ctx.proj.files as *const ProjectFile, fi) };
+            let cur_is_std = pf_is_std(pf_cur);
             let txt = pipe_std_file_text(mut_view(ctx.proj), fi);
             let mut pos: usize = 0;
             loop {
                 let up = pipe_next_std_use(view(lits), view(txt), mut_view(pos));
                 if up.len == 0 {
                     break;
+                }
+                if is_free_or_kern && !cur_is_std && pipe_up_is_forbidden_layer3(view(up)) {
+                    continue;
                 }
                 if !pipe_std_resolve_use(mut_view(*ctx), view(lits), mut_view(provided), mut_view(index), view(up)) {
                     return false;
@@ -2362,6 +2412,8 @@ pub fn pipe_write_dep_file(ctx: view<PipelineCtx>, dopts: view<DriverOptions>) {
 }
 
 pub fn pipeline_stage_source(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptions>) -> bool {
+    ctx.eff_profile = dopts.profile;
+    ctx.invalid_profile = false;
     if dopts.input_file.len == 0 {
         emit_driver_diag(mut_view(ctx.sess.diag_sink), AX_IO_FILE_NOT_FOUND, 0, 25);
         return false;
@@ -2392,6 +2444,24 @@ pub fn pipeline_stage_source(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptio
         mut_view(ctx.sess.diag_sink)
     ) {
         return false;
+    }
+
+    if !dopts.has_explicit_profile && ctx.proj.has_manifest && ctx.proj.manifest.profile.len > 0 {
+        let mut mp: u32 = PROFILE_HOSTED;
+        if !driver_parse_profile(view(ctx.proj.manifest.profile), mut_view(mp)) {
+            ctx.invalid_profile = true;
+            // "invalid profile in axiom.toml" (29 bytes)
+            let pmsg_b: [30]u8 = [
+                105u8, 110u8, 118u8, 97u8, 108u8, 105u8, 100u8, 32u8,
+                112u8, 114u8, 111u8, 102u8, 105u8, 108u8, 101u8, 32u8,
+                105u8, 110u8, 32u8, 97u8, 120u8, 105u8, 111u8, 109u8,
+                46u8, 116u8, 111u8, 109u8, 108u8, 0u8,
+            ];
+            let pmsg_sv = StrView { ptr: unsafe { address_of(pmsg_b[0]) }, len: 29 };
+            emit_driver_diag_text(mut_view(ctx.sess.diag_sink), AX_DRIVER_INVALID_PROFILE, view(pmsg_sv));
+            return false;
+        }
+        ctx.eff_profile = mp;
     }
 
     if dopts.cmd == CMD_BUILD {
@@ -2665,6 +2735,163 @@ pub fn pipeline_stage_parse(ctx: mut_view<PipelineCtx>) {
     ctx.ast.items = head_items;
 }
 
+fn pipe_fid_is_std_file(ctx: view<PipelineCtx>, fid_v: u32) -> bool {
+    if fid_v == 0u32 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < ctx.proj.file_count {
+        let pf = unsafe { project_file_const_at(ctx.proj.files as *const ProjectFile, i) };
+        if pf_get_fid_v(pf) == fid_v {
+            return pf_is_std(pf);
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn pipe_remove_unresolved_import_in_range(sink: mut_view<DiagSink>, fid_v: u32, r_start: u32, r_end: u32) {
+    if sink.len == 0 || (sink.diags as usize) == 0 {
+        return;
+    }
+    let dsz = size_of<Diagnostic>();
+    let mut i: usize = 0;
+    while i < sink.len {
+        let dp = ((sink.diags as usize) + opts_mul_usize(i, dsz)) as *mut Diagnostic;
+        let cv = unsafe { (*dp).code.v };
+        let pf = unsafe { (*dp).primary.file.v };
+        let ps = unsafe { (*dp).primary.start };
+        let pe = unsafe { (*dp).primary.end };
+        if cv == AX_NAME_UNRESOLVED_IMPORT && pf == fid_v && ps >= r_start && pe <= r_end {
+            let mut j: usize = i;
+            while j + 1 < sink.len {
+                let dst = ((sink.diags as usize) + opts_mul_usize(j, dsz)) as *mut Diagnostic;
+                let src = ((sink.diags as usize) + opts_mul_usize(j + 1, dsz)) as *mut Diagnostic;
+                unsafe { *dst = *src; }
+                j = j + 1;
+            }
+            sink.len = sink.len - 1;
+            if sink.errors > 0 {
+                sink.errors = sink.errors - 1;
+            }
+            continue;
+        }
+        i = i + 1;
+    }
+}
+
+fn pipe_emit_forbidden_import_at(sink: mut_view<DiagSink>, sp: Span) {
+    let code = DiagCode { v: AX_NAME_FREESTANDING_FORBIDDEN_IMPORT };
+    let s: str = diag_code_default_message(code);
+    let raw: StrView = unsafe { *(address_of(s) as *const StrView) };
+    let bytes: view<[u8]> = unsafe { *(address_of(s) as *const view<[u8]>) };
+    let buf = arena_alloc_raw(mut_view(sink.arena), raw.len + 1, 1);
+    let mut i: usize = 0;
+    while i < raw.len {
+        unsafe { *(buf + i) = bytes[i]; }
+        i = i + 1;
+    }
+    unsafe { *(buf + raw.len) = 0u8; }
+    let d = Diagnostic {
+        code: code,
+        severity: diag_code_severity(code),
+        message: StrView { ptr: buf as *const u8, len: raw.len },
+        primary: sp,
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: 0 as *mut DiagDataEntry,
+        data_count: 0,
+    };
+    diag_sink_report(mut_view(*sink), view(d));
+}
+
+fn pipe_walk_ast_forbidden_use_tree(
+    interner: view<StrInterner>,
+    sink: mut_view<DiagSink>,
+    item_sp: Span,
+    tree: *const AstUseTree,
+    has_std_prefix: bool,
+    emit_now: bool
+) {
+    let item_fid_v = item_sp.file.v;
+    let item_start = item_sp.start;
+    let item_end = item_sp.end;
+    let mut cur = tree;
+    while (cur as usize) != 0 {
+        let p_cnt = unsafe { (*cur).path.count };
+        let p_segs = unsafe { (*cur).path.segments };
+        let mut now_std = has_std_prefix;
+        let mut is_bad = false;
+        if !has_std_prefix {
+            if p_cnt >= 1 && (p_segs as usize) != 0 {
+                let s0_ptr = p_segs as *const StrId;
+                let s0 = interner_get(interner, StrId { v: unsafe { (*s0_ptr).v } });
+                let is_std = s0.len == 3 && (s0.ptr as usize) != 0 && unsafe {
+                    *(s0.ptr + 0) == 115u8 && *(s0.ptr + 1) == 116u8 && *(s0.ptr + 2) == 100u8
+                };
+                if is_std {
+                    now_std = true;
+                    if p_cnt >= 2 {
+                        let s1_ptr = ((p_segs as usize) + size_of<StrId>()) as *const StrId;
+                        let s1 = interner_get(interner, StrId { v: unsafe { (*s1_ptr).v } });
+                        if fre_is_forbidden_std_layer3_seg(view(s1)) {
+                            is_bad = true;
+                        }
+                    }
+                }
+            }
+        } else if p_cnt >= 1 && (p_segs as usize) != 0 {
+            let s0b_ptr = p_segs as *const StrId;
+            let s0b = interner_get(interner, StrId { v: unsafe { (*s0b_ptr).v } });
+            if fre_is_forbidden_std_layer3_seg(view(s0b)) {
+                is_bad = true;
+            }
+        }
+        if is_bad {
+            let csp = unsafe { (*cur).span };
+            if emit_now {
+                pipe_emit_forbidden_import_at(mut_view(*sink), csp);
+            } else {
+                let r_end = if csp.end > item_end { csp.end } else { item_end };
+                pipe_remove_unresolved_import_in_range(mut_view(*sink), csp.file.v, item_start, r_end);
+            }
+        } else {
+            let sub = unsafe { (*cur).subtrees as *const AstUseTree };
+            if (sub as usize) != 0 {
+                let next_sp = Span { file: FileId { v: item_fid_v }, start: item_start, end: item_end };
+                pipe_walk_ast_forbidden_use_tree(interner, mut_view(*sink), next_sp, sub, now_std, emit_now);
+            }
+        }
+        cur = unsafe { (*cur).next as *const AstUseTree };
+    }
+}
+
+fn pipe_process_ast_forbidden_imports(ctx: mut_view<PipelineCtx>, emit_now: bool) {
+    let mut it: *mut AstItem = ctx.ast.items;
+    while (it as usize) != 0 {
+        if (unsafe { (*it).kind }) == ITEM_USE {
+            let fid_v = unsafe { (*it).span.file.v };
+            if !pipe_fid_is_std_file(view(*ctx), fid_v) {
+                pipe_walk_ast_forbidden_use_tree(
+                    view(ctx.sess.interner),
+                    mut_view(ctx.sess.diag_sink),
+                    unsafe { (*it).span },
+                    unsafe { (*it).use_tree as *const AstUseTree },
+                    false,
+                    emit_now
+                );
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+}
+
 pub fn pipeline_stage_resolve(ctx: mut_view<PipelineCtx>) {
     if ctx.is_mir_input {
         return;
@@ -2675,6 +2902,12 @@ pub fn pipeline_stage_resolve(ctx: mut_view<PipelineCtx>) {
         view(ctx.ast),
         mut_view(ctx.rmap)
     );
+    if ctx.eff_profile == PROFILE_FREESTANDING || ctx.eff_profile == PROFILE_KERNEL {
+        pipe_process_ast_forbidden_imports(mut_view(*ctx), false);
+        if session_has_errors(view(ctx.sess)) {
+            pipe_process_ast_forbidden_imports(mut_view(*ctx), true);
+        }
+    }
 }
 
 pub fn pipeline_stage_hir(ctx: mut_view<PipelineCtx>) {
@@ -2700,16 +2933,43 @@ pub fn pipeline_stage_hir(ctx: mut_view<PipelineCtx>) {
     ctx.has_tls = any_tls;
 }
 
-fn pipeline_mask_tls_statics(items: *mut HirItem) {
+fn pipe_static_has_freestanding_attr(interner: view<StrInterner>, it: *const HirItem) -> bool {
+    if (it as usize) == 0 {
+        return false;
+    }
+    if (unsafe { (*it).is_tls }) || (unsafe { (*it).is_global_allocator }) ||
+       (unsafe { (*it).is_used }) || (unsafe { (*it).is_no_mangle }) {
+        return true;
+    }
+    let mut cur: *mut HirAttr = unsafe { (*it).attrs };
+    while (cur as usize) != 0 {
+        let sv = interner_get(interner, StrId { v: unsafe { (*cur).name.v } });
+        if sv.len == 7 && (sv.ptr as usize) != 0 && unsafe {
+            *(sv.ptr + 0) == 115u8 && *(sv.ptr + 1) == 101u8 && *(sv.ptr + 2) == 99u8 &&
+            *(sv.ptr + 3) == 116u8 && *(sv.ptr + 4) == 105u8 && *(sv.ptr + 5) == 111u8 &&
+            *(sv.ptr + 6) == 110u8
+        } {
+            return true;
+        }
+        cur = unsafe { (*cur).next };
+    }
+    false
+}
+
+fn pipeline_mask_allowed_statics(interner: view<StrInterner>, items: *mut HirItem, eff_profile: u32) -> bool {
+    let mut masked = false;
     let mut it = items;
     while (it as usize) != 0 {
         unsafe {
-            if (*it).kind == HIR_ITEM_STATIC && (*it).is_tls {
+            if (*it).kind == HIR_ITEM_STATIC &&
+               (eff_profile != PROFILE_HOSTED || pipe_static_has_freestanding_attr(interner, it as *const HirItem)) {
                 (*it).kind = 255u8;
+                masked = true;
             }
             it = (*it).next;
         }
     }
+    masked
 }
 
 fn pipeline_unmask_tls_statics(items: *mut HirItem) {
@@ -2725,7 +2985,6 @@ fn pipeline_unmask_tls_statics(items: *mut HirItem) {
 }
 
 pub fn pipeline_stage_typeck(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptions>) {
-    let _ = dopts;
     if ctx.is_mir_input || session_has_errors(view(ctx.sess)) {
         return;
     }
@@ -2737,6 +2996,27 @@ pub fn pipeline_stage_typeck(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptio
         mut_view(ctx.mono)
     );
     pipe_validate_exports(mut_view(*ctx));
+    let mut eff_kind: u32 = dopts.artifact_kind;
+    if dopts.emit_kind == EMIT_OBJ {
+        eff_kind = ARTIFACT_OBJ;
+    } else if !dopts.has_explicit_kind && ctx.proj.has_manifest && ctx.proj.manifest.kind.len > 0 {
+        let mut mk: u32 = ARTIFACT_EXE;
+        if driver_parse_artifact_kind(view(ctx.proj.manifest.kind), mut_view(mk)) {
+            eff_kind = mk;
+        }
+    }
+    let require_entry: bool = (dopts.cmd == CMD_CHECK || dopts.cmd == CMD_BUILD || dopts.cmd == CMD_RUN) && eff_kind == ARTIFACT_EXE;
+    let is_dll: bool = eff_kind == ARTIFACT_DLL && ctx.eff_profile != PROFILE_FREESTANDING && ctx.eff_profile != PROFILE_KERNEL;
+    typeck_check_profile(
+        view(ctx.hir),
+        view(ctx.thir),
+        mut_view(ctx.sess.diag_sink),
+        view(ctx.sess.interner),
+        ctx.eff_profile,
+        require_entry,
+        is_dll,
+        ctx.main_fid.v
+    );
     if session_has_errors(view(ctx.sess)) {
         return;
     }
@@ -2748,9 +3028,7 @@ pub fn pipeline_stage_typeck(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptio
     if session_has_errors(view(ctx.sess)) {
         return;
     }
-    if ctx.has_tls {
-        pipeline_mask_tls_statics(ctx.hir.items);
-    }
+    let masked_statics = pipeline_mask_allowed_statics(view(ctx.sess.interner), ctx.hir.items, ctx.eff_profile);
     let _ = session_comptime_check_and_eval(
         mut_view(ctx.sess),
         view(ctx.ast),
@@ -2758,7 +3036,7 @@ pub fn pipeline_stage_typeck(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptio
         view(ctx.hir),
         mut_view(ctx.thir)
     );
-    if ctx.has_tls {
+    if masked_statics {
         pipeline_unmask_tls_statics(ctx.hir.items);
     }
 }
@@ -4618,7 +4896,8 @@ fn pipe_validate_export_item(
         view(ctx.sess.interner),
         mut_view(has_export)
     );
-    if !has_export {
+    let has_no_mangle = unsafe { (*it).is_no_mangle };
+    if !has_export && !has_no_mangle {
         return;
     }
     if pipe_is_mono_clone(ctx.mono.instances_head, it) {
@@ -4632,6 +4911,9 @@ fn pipe_validate_export_item(
         ((gparams as usize) != 0 && (unsafe { (*gparams).params as usize }) != 0);
     if item_is_generic {
         pipe_report_generic_export(mut_view(ctx.sess.diag_sink), unsafe { (*it).span });
+        return;
+    }
+    if !has_export {
         return;
     }
     let ext_sv = if export_sv.len > 0 {
@@ -7588,7 +7870,10 @@ pub fn driver_execute_inspect(
     err_buf: mut_view<DiagBuffer>
 ) -> i32 {
     let ctx_ptr = pipeline_ctx_alloc();
-    let rc = driver_execute_inspect_ctx(unsafe { mut_view(*ctx_ptr) }, dopts, mut_view(*out_buf), mut_view(*err_buf));
+    let mut rc = driver_execute_inspect_ctx(unsafe { mut_view(*ctx_ptr) }, dopts, mut_view(*out_buf), mut_view(*err_buf));
+    if unsafe { (*ctx_ptr).invalid_profile } {
+        rc = AX_EXIT_USAGE;
+    }
     pipe_write_dep_file(unsafe { view(*ctx_ptr) }, dopts);
     pipeline_ctx_dealloc(ctx_ptr);
     rc
@@ -7602,6 +7887,9 @@ fn driver_execute_check_ctx(
 ) -> i32 {
     let ok = pipeline_run_stages(mut_view(*ctx), dopts, STAGE_OWN, mut_view(*out_buf));
     driver_flush_diagnostics(mut_view(*ctx), dopts, mut_view(*out_buf), mut_view(*err_buf));
+    if ctx.invalid_profile {
+        return AX_EXIT_USAGE;
+    }
     if ok && !session_has_errors(view(ctx.sess)) { AX_EXIT_OK } else { AX_EXIT_DIAG }
 }
 
@@ -7624,6 +7912,10 @@ fn driver_execute_run_ctx(
     err_buf: mut_view<DiagBuffer>
 ) -> i32 {
     let ok = pipeline_run_stages(mut_view(*ctx), dopts, STAGE_INTERP, mut_view(*out_buf));
+    if ctx.invalid_profile {
+        driver_flush_diagnostics(mut_view(*ctx), dopts, mut_view(*out_buf), mut_view(*err_buf));
+        return AX_EXIT_USAGE;
+    }
     if !dopts.has_explicit_kind && ctx.proj.has_manifest && ctx.proj.manifest.kind.len > 0 {
         let mut mk: u32 = ARTIFACT_EXE;
         if !driver_parse_artifact_kind(view(ctx.proj.manifest.kind), mut_view(mk)) {
@@ -7932,6 +8224,10 @@ fn driver_execute_build_into_ctx(
 
     if has_ax_sources {
         let ok = pipeline_run_stages(mut_view(*ctx), dopts, STAGE_MONO, mut_view(*out_buf));
+        if ctx.invalid_profile {
+            driver_flush_diagnostics(mut_view(*ctx), dopts, mut_view(*out_buf), mut_view(*err_buf));
+            return AX_EXIT_USAGE;
+        }
         if !ok || session_has_errors(view(ctx.sess)) {
             driver_flush_diagnostics(mut_view(*ctx), dopts, mut_view(*out_buf), mut_view(*err_buf));
             return AX_EXIT_DIAG;
