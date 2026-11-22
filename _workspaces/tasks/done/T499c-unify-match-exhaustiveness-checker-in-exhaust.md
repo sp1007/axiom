@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T499b]
 priority: 25
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 480
 paths: [compiler/types/exhaust.ax, compiler/types/typeck.ax, tests/ui/exhaust_unified, tests/run/exhaust_unified]
 locks: []
 spec: [spec/SPEC-03-core-semantics.md]
 covers: [REQ-TST-072]
+started: 2026-11-22 22:25:24
+finished: 2026-11-23 00:20:24
 ---
 # T499c — Single exhaustiveness checker
 
@@ -60,3 +62,5 @@ Two copies drift (T499b was blocked by exactly this), and the old scalar/enum ch
 
 ## Log
 - 2026-11-22 created by axiom-architect (unblock-T499b: remove the duplicate checker in typeck.ax)
+- 2026-11-22 22:25:24 started (attempt 1) t499c-impl
+- 2026-11-23 00:20:24 accepted by QA -> done

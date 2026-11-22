@@ -21665,10 +21665,9 @@ pub fn _shim_exhaust_diag_sink_report(sink: mut_view<DiagSink>, d: view<Diagnost
 }
 
 // Pattern Match Exhaustiveness and Unreachability Checker.
-// Port of bootstrap/axiom0/src/types/match/exhaust.c.
+// Unified column-wise usefulness algorithm (Maranget, SPEC-03) for all match scrutinee types.
 module compiler.types.exhaust
 
-use compiler.kernel.arena.Arena
 use compiler.kernel.arena.arena_alloc_raw
 use compiler.kernel.id.FileId
 use compiler.kernel.id.StrId
@@ -21683,7 +21682,6 @@ use compiler.diag.code.AX_PAT_NON_EXHAUSTIVE
 use compiler.diag.code.AX_PAT_UNREACHABLE
 use compiler.diag.code.DiagCode
 use compiler.diag.code.DiagSeverity
-use compiler.diag.code.diag_code_default_message
 use compiler.diag.emitter.DiagDataEntry
 use compiler.diag.emitter.DiagFix
 use compiler.diag.emitter.DiagLabel
@@ -21711,6 +21709,8 @@ use compiler.hir.hir.HirItem
 use compiler.hir.hir.HirMatchArm
 use compiler.hir.hir.HirPat
 use compiler.hir.hir.HirVariantDecl
+use compiler.types.types.TY_ERROR
+use compiler.types.types.TY_UNIT
 use compiler.types.types.TY_BOOL
 use compiler.types.types.TY_CHAR
 use compiler.types.types.TY_ENUM
@@ -21726,20 +21726,23 @@ use compiler.types.types.TY_U64
 use compiler.types.types.TY_USIZE
 use compiler.types.types.TY_I128
 use compiler.types.types.TY_U128
+use compiler.types.types.TY_INT_VAR
 use compiler.types.types.TY_STRUCT
 use compiler.types.types.TY_TUPLE
 use compiler.types.types.AxType
 use compiler.types.types.Thir
+use compiler.types.types.TypeVarEntry
+use compiler.types.types.TypeVarTable
 use compiler.types.types.mul_usize
 use compiler.types.types.thir_get_pat_variant
 use compiler.types.types.type_get
+use compiler.types.types.type_vars_resolve
 use compiler.types.types.typeid_at
 use compiler.types.types.typeid_ptr_at
 use compiler.types.types.usize_at
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 @intrinsic fn align_of<T>() -> usize { 0 }
-@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
 
 @derive(Copy)
 pub struct PatInterval {
@@ -21755,16 +21758,22 @@ pub struct PatInterval128 {
     pub end_hi: u64,
 }
 
-unsafe fn pat_interval128_at(base: *const PatInterval128, idx: usize) -> *const PatInterval128 {
-    ((base as usize) + mul_usize(idx, size_of<PatInterval128>())) as *const PatInterval128
-}
+const EXHAUST_UNREACH_MSG: [19]u8 = [
+    117u8, 110u8, 114u8, 101u8, 97u8, 99u8, 104u8, 97u8, 98u8, 108u8,
+    101u8, 32u8, 112u8, 97u8, 116u8, 116u8, 101u8, 114u8, 110u8
+];
 
-unsafe fn pat_interval128_at_mut(base: *mut PatInterval128, idx: usize) -> *mut PatInterval128 {
-    ((base as usize) + mul_usize(idx, size_of<PatInterval128>())) as *mut PatInterval128
-}
+const EXHAUST_NONEX_MSG: [51]u8 = [
+    110u8, 111u8, 110u8, 45u8, 101u8, 120u8, 104u8, 97u8, 117u8, 115u8,
+    116u8, 105u8, 118u8, 101u8, 32u8, 112u8, 97u8, 116u8, 116u8, 101u8,
+    114u8, 110u8, 115u8, 58u8, 32u8, 109u8, 97u8, 116u8, 99u8, 104u8,
+    32u8, 109u8, 117u8, 115u8, 116u8, 32u8, 99u8, 111u8, 118u8, 101u8,
+    114u8, 32u8, 97u8, 108u8, 108u8, 32u8, 99u8, 97u8, 115u8, 101u8,
+    115u8
+];
 
 fn exhaust_is_signed_kind(tk: u8) -> bool {
-    tk == TY_I8 || tk == TY_I16 || tk == TY_I32 || tk == TY_I64 || tk == TY_ISIZE || tk == TY_I128
+    tk == TY_I8 || tk == TY_I16 || tk == TY_I32 || tk == TY_I64 || tk == TY_ISIZE || tk == TY_I128 || tk == TY_INT_VAR
 }
 
 fn exhaust_u128_le(a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64, is_signed: bool) -> bool {
@@ -21775,14 +21784,6 @@ fn exhaust_u128_le(a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64, is_signed: bool) 
         return a_hi < b_hi;
     }
     a_lo <= b_lo
-}
-
-unsafe fn pat_interval_at(base: *const PatInterval, idx: usize) -> *const PatInterval {
-    ((base as usize) + mul_usize(idx, size_of<PatInterval>())) as *const PatInterval
-}
-
-unsafe fn pat_interval_at_mut(base: *mut PatInterval, idx: usize) -> *mut PatInterval {
-    ((base as usize) + mul_usize(idx, size_of<PatInterval>())) as *mut PatInterval
 }
 
 fn exhaust_bytes_eq(a: *const u8, b: *const u8, n: usize) -> bool {
@@ -21806,13 +21807,17 @@ fn exhaust_bytes_eq(a: *const u8, b: *const u8, n: usize) -> bool {
 
 fn emit_pat_unreachable(sink: mut_view<DiagSink>, file_v: u32, start: u32, end: u32) {
     let code = DiagCode { v: AX_PAT_UNREACHABLE };
-    let msg_str = diag_code_default_message(code);
-    let msg_ptr = unsafe { *(address_of(msg_str) as *const *const u8) };
-    let msg_len = len(msg_str);
+    let buf = arena_alloc_raw(mut_view(sink.arena), 20, 1);
+    let mut i: usize = 0;
+    while (i < 19) {
+        unsafe { *(buf + i) = EXHAUST_UNREACH_MSG[i]; }
+        i = i + 1;
+    }
+    unsafe { *(buf + 19) = 0u8; }
     let d = Diagnostic {
         code: code,
         severity: DiagSeverity.Warning,
-        message: StrView { ptr: msg_ptr, len: msg_len },
+        message: StrView { ptr: buf as *const u8, len: 19 },
         primary: Span { file: FileId { v: file_v }, start: start, end: end },
         labels: 0 as *mut DiagLabel,
         label_count: 0,
@@ -21830,13 +21835,17 @@ fn emit_pat_unreachable(sink: mut_view<DiagSink>, file_v: u32, start: u32, end: 
 
 fn emit_pat_non_exhaustive(sink: mut_view<DiagSink>, file_v: u32, start: u32, end: u32) {
     let code = DiagCode { v: AX_PAT_NON_EXHAUSTIVE };
-    let msg_str = diag_code_default_message(code);
-    let msg_ptr = unsafe { *(address_of(msg_str) as *const *const u8) };
-    let msg_len = len(msg_str);
+    let buf = arena_alloc_raw(mut_view(sink.arena), 52, 1);
+    let mut i: usize = 0;
+    while (i < 51) {
+        unsafe { *(buf + i) = EXHAUST_NONEX_MSG[i]; }
+        i = i + 1;
+    }
+    unsafe { *(buf + 51) = 0u8; }
     let d = Diagnostic {
         code: code,
         severity: DiagSeverity.Error,
-        message: StrView { ptr: msg_ptr, len: msg_len },
+        message: StrView { ptr: buf as *const u8, len: 51 },
         primary: Span { file: FileId { v: file_v }, start: start, end: end },
         labels: 0 as *mut DiagLabel,
         label_count: 0,
@@ -21997,372 +22006,16 @@ pub fn get_pat_interval_128(pat: *const HirPat, is_signed: bool, out: mut_view<P
     false
 }
 
-fn is_int_or_char_kind(tk: u8) -> bool {
-    tk == TY_I8 || tk == TY_I16 || tk == TY_I32 || tk == TY_I64 || tk == TY_ISIZE || tk == TY_I128 ||
-    tk == TY_U8 || tk == TY_U16 || tk == TY_U32 || tk == TY_U64 || tk == TY_USIZE || tk == TY_U128 ||
-    tk == TY_CHAR
-}
-
-pub fn match_check_exhaustiveness(
-    thir: mut_view<Thir>,
-    str_in: view<StrInterner>,
-    db: view<SourceDatabase>,
-    sink: mut_view<DiagSink>,
-    expr: *const HirExpr,
-    val_ty: TypeId
-) {
-    if (expr as usize) == 0 {
-        return;
-    }
-    if (unsafe { (*expr).kind }) != HIR_EXPR_MATCH {
-        return;
-    }
-
-    // T499b: tuple scrutinees go through the column-wise usefulness algorithm below.
-    if match_check_tuple_exhaustiveness(mut_view(*thir), mut_view(*sink), expr, (TypeId { v: val_ty.v })) {
-        return;
-    }
-
-    let expr_file_v = unsafe { (*expr).span.file.v };
-    let expr_start = unsafe { (*expr).span.start };
-    let expr_end = unsafe { (*expr).span.end };
-
-    let mut has_unconditional_wildcard = false;
-    let mut arm = unsafe { (*expr).arms as *const HirMatchArm };
-    while ((arm as usize) != 0) {
-        let has_guard = (unsafe { (*arm).guard as usize }) != 0;
-        let ap = unsafe { (*arm).pat as *const HirPat };
-        if !has_guard && (ap as usize) != 0 {
-            let pk = unsafe { (*ap).kind };
-            if pk == HIR_PAT_WILDCARD || pk == HIR_PAT_BINDING {
-                has_unconditional_wildcard = true;
-                let mut unreach = unsafe { (*arm).next as *const HirMatchArm };
-                while ((unreach as usize) != 0) {
-                    let up = unsafe { (*unreach).pat as *const HirPat };
-                    if (up as usize) != 0 {
-                        let u_fv = unsafe { (*up).span.file.v };
-                        let u_st = unsafe { (*up).span.start };
-                        let u_en = unsafe { (*up).span.end };
-                        emit_pat_unreachable(mut_view(*sink), u_fv, u_st, u_en);
-                    }
-                    unreach = unsafe { (*unreach).next as *const HirMatchArm };
-                }
-                break;
-            }
-        }
-        arm = unsafe { (*arm).next as *const HirMatchArm };
-    }
-
-    let val_ty_v = val_ty.v;
-    let t = type_get(view(thir.interner), TypeId { v: val_ty_v });
-    if (t as usize) == 0 {
-        return;
-    }
-    let tk = unsafe { (*t).kind };
-
-    if is_int_or_char_kind(tk) {
-        let is_sig = exhaust_is_signed_kind(tk);
-        let cov_bytes = mul_usize(256, size_of<PatInterval128>());
-        let cov_raw = arena_alloc_raw(mut_view(thir.interner.arena), cov_bytes, align_of<PatInterval128>());
-        let covered = cov_raw as *mut PatInterval128;
-        let mut cov_count: usize = 0;
-
-        let mut iarm = unsafe { (*expr).arms as *const HirMatchArm };
-        while ((iarm as usize) != 0) {
-            let ap = unsafe { (*iarm).pat as *const HirPat };
-            let has_guard = (unsafe { (*iarm).guard as usize }) != 0;
-            if (ap as usize) != 0 {
-                let mut iv = PatInterval128 { start_lo: 0u64, start_hi: 0u64, end_lo: 0u64, end_hi: 0u64 };
-                let got_iv = get_pat_interval_128(ap, is_sig, mut_view(iv));
-                if got_iv {
-                    let non_empty = exhaust_u128_le(iv.start_lo, iv.start_hi, iv.end_lo, iv.end_hi, is_sig);
-                    let mut is_cov = !non_empty;
-                    let mut i: usize = 0;
-                    while (!is_cov && i < cov_count) {
-                        let ci = unsafe { pat_interval128_at(covered as *const PatInterval128, i) };
-                        if exhaust_u128_le(unsafe { (*ci).start_lo }, unsafe { (*ci).start_hi }, iv.start_lo, iv.start_hi, is_sig) &&
-                           exhaust_u128_le(iv.end_lo, iv.end_hi, unsafe { (*ci).end_lo }, unsafe { (*ci).end_hi }, is_sig) {
-                            is_cov = true;
-                            break;
-                        }
-                        i = i + 1;
-                    }
-                    if is_cov {
-                        let a_fv = unsafe { (*ap).span.file.v };
-                        let a_st = unsafe { (*ap).span.start };
-                        let a_en = unsafe { (*ap).span.end };
-                        emit_pat_unreachable(mut_view(*sink), a_fv, a_st, a_en);
-                    } else if !has_guard && cov_count < 256 {
-                        let dst = unsafe { pat_interval128_at_mut(covered, cov_count) };
-                        unsafe {
-                            (*dst).start_lo = iv.start_lo;
-                            (*dst).start_hi = iv.start_hi;
-                            (*dst).end_lo = iv.end_lo;
-                            (*dst).end_hi = iv.end_hi;
-                        }
-                        cov_count = cov_count + 1;
-                    }
-                } else if (unsafe { (*ap).kind }) == HIR_PAT_OR {
-                    let mut p = unsafe { (*ap).pats as *const HirPat };
-                    while ((p as usize) != 0) {
-                        let got_piv = get_pat_interval_128(p, is_sig, mut_view(iv));
-                        if got_piv {
-                            let non_empty = exhaust_u128_le(iv.start_lo, iv.start_hi, iv.end_lo, iv.end_hi, is_sig);
-                            let mut is_cov = !non_empty;
-                            let mut i: usize = 0;
-                            while (!is_cov && i < cov_count) {
-                                let ci = unsafe { pat_interval128_at(covered as *const PatInterval128, i) };
-                                if exhaust_u128_le(unsafe { (*ci).start_lo }, unsafe { (*ci).start_hi }, iv.start_lo, iv.start_hi, is_sig) &&
-                                   exhaust_u128_le(iv.end_lo, iv.end_hi, unsafe { (*ci).end_lo }, unsafe { (*ci).end_hi }, is_sig) {
-                                    is_cov = true;
-                                    break;
-                                }
-                                i = i + 1;
-                            }
-                            if is_cov {
-                                let p_fv = unsafe { (*p).span.file.v };
-                                let p_st = unsafe { (*p).span.start };
-                                let p_en = unsafe { (*p).span.end };
-                                emit_pat_unreachable(mut_view(*sink), p_fv, p_st, p_en);
-                            } else if !has_guard && cov_count < 256 {
-                                let dst = unsafe { pat_interval128_at_mut(covered, cov_count) };
-                                unsafe {
-                                    (*dst).start_lo = iv.start_lo;
-                                    (*dst).start_hi = iv.start_hi;
-                                    (*dst).end_lo = iv.end_lo;
-                                    (*dst).end_hi = iv.end_hi;
-                                }
-                                cov_count = cov_count + 1;
-                            }
-                        }
-                        p = unsafe { (*p).next as *const HirPat };
-                    }
-                }
-            }
-            iarm = unsafe { (*iarm).next as *const HirMatchArm };
-        }
-
-        if has_unconditional_wildcard {
-            return;
-        }
-        if tk == TY_U8 {
-            let mut all_u8 = true;
-            let mut v: u64 = 0u64;
-            while (v <= 255u64) {
-                let mut found = false;
-                let mut i: usize = 0;
-                while (i < cov_count) {
-                    let ci = unsafe { pat_interval128_at(covered as *const PatInterval128, i) };
-                    if exhaust_u128_le(unsafe { (*ci).start_lo }, unsafe { (*ci).start_hi }, v, 0u64, false) &&
-                       exhaust_u128_le(v, 0u64, unsafe { (*ci).end_lo }, unsafe { (*ci).end_hi }, false) {
-                        found = true;
-                        break;
-                    }
-                    i = i + 1;
-                }
-                if !found {
-                    all_u8 = false;
-                    break;
-                }
-                v = v + 1u64;
-            }
-            if all_u8 {
-                return;
-            }
-        }
-
-        emit_pat_non_exhaustive(mut_view(*sink), expr_file_v, expr_start, expr_end);
-        return;
-    }
-
-    match_check_exhaust_bool_or_enum(
-        mut_view(*thir),
-        str_in,
-        db,
-        mut_view(*sink),
-        expr,
-        val_ty,
-        tk,
-        has_unconditional_wildcard,
-        expr_file_v,
-        expr_start,
-        expr_end
-    );
-}
-
-fn match_check_exhaust_bool_or_enum(
-    thir: mut_view<Thir>,
-    str_in: view<StrInterner>,
-    db: view<SourceDatabase>,
-    sink: mut_view<DiagSink>,
-    expr: *const HirExpr,
-    val_ty: TypeId,
-    tk: u8,
-    has_unconditional_wildcard: bool,
-    expr_file_v: u32,
-    expr_start: u32,
-    expr_end: u32
-) {
-    let t = type_get(view(thir.interner), TypeId { v: val_ty.v });
-    if tk == TY_BOOL {
-        let mut has_true = false;
-        let mut has_false = false;
-        let mut barm = unsafe { (*expr).arms as *const HirMatchArm };
-        while ((barm as usize) != 0) {
-            let ap = unsafe { (*barm).pat as *const HirPat };
-            let has_guard = (unsafe { (*barm).guard as usize }) != 0;
-            if (ap as usize) != 0 && (unsafe { (*ap).kind }) == HIR_PAT_LITERAL {
-                let tok_k = unsafe { (*ap).tok.kind };
-                if tok_k == TOK_KW_TRUE {
-                    if has_true {
-                        let a_fv = unsafe { (*ap).span.file.v };
-                        let a_st = unsafe { (*ap).span.start };
-                        let a_en = unsafe { (*ap).span.end };
-                        emit_pat_unreachable(mut_view(*sink), a_fv, a_st, a_en);
-                    } else if !has_guard {
-                        has_true = true;
-                    }
-                } else if tok_k == TOK_KW_FALSE {
-                    if has_false {
-                        let a_fv = unsafe { (*ap).span.file.v };
-                        let a_st = unsafe { (*ap).span.start };
-                        let a_en = unsafe { (*ap).span.end };
-                        emit_pat_unreachable(mut_view(*sink), a_fv, a_st, a_en);
-                    } else if !has_guard {
-                        has_false = true;
-                    }
-                }
-            }
-            barm = unsafe { (*barm).next as *const HirMatchArm };
-        }
-        if has_unconditional_wildcard || (has_true && has_false) {
-            return;
-        }
-        emit_pat_non_exhaustive(mut_view(*sink), expr_file_v, expr_start, expr_end);
-        return;
-    }
-
-    if tk == TY_ENUM {
-        let def = unsafe { (*t).def as *const HirItem };
-        let count = unsafe { (*t).variant_count };
-        let alloc_cnt = if count > 0 { count } else { 1 };
-        let seen = arena_alloc_raw(mut_view(thir.interner.arena), alloc_cnt, 1);
-        let mut z: usize = 0;
-        while (z < count) {
-            unsafe { *(seen + z) = 0u8; }
-            z = z + 1;
-        }
-
-        let mut earm = unsafe { (*expr).arms as *const HirMatchArm };
-        while ((earm as usize) != 0) {
-            let ap = unsafe { (*earm).pat as *const HirPat };
-            let has_guard = (unsafe { (*earm).guard as usize }) != 0;
-            if (ap as usize) != 0 && (def as usize) != 0 {
-                let apk = unsafe { (*ap).kind };
-                if apk == HIR_PAT_PATH || apk == HIR_PAT_STRUCT {
-                    let p_file_v = unsafe { (*ap).path.span.file.v };
-                    let p_start = unsafe { (*ap).path.span.start };
-                    let p_end = unsafe { (*ap).path.span.end };
-                    let p_name_v = unsafe { (*ap).path.name.v };
-
-                    let mut ptext_ptr: *const u8 = 0 as *const u8;
-                    let mut ptext_len: usize = 0;
-                    if p_file_v != 0u32 && (db.files as usize) != 0 {
-                        let ftext = source_db_text(db, FileId { v: p_file_v });
-                        if (ftext.ptr as usize) != 0 && p_start <= p_end && (p_end as usize) <= ftext.len {
-                            ptext_ptr = ((ftext.ptr as usize) + (p_start as usize)) as *const u8;
-                            ptext_len = (p_end - p_start) as usize;
-                        }
-                    }
-
-                    let mut vname_ptr: *const u8 = ptext_ptr;
-                    let mut vname_len: usize = ptext_len;
-                    let mut ename_ptr: *const u8 = 0 as *const u8;
-                    let mut ename_len: usize = 0;
-
-                    let mut bi: usize = 0;
-                    while (bi < ptext_len) {
-                        if (unsafe { *(ptext_ptr + bi) }) == 46u8 {
-                            ename_ptr = ptext_ptr;
-                            ename_len = bi;
-                            vname_ptr = unsafe { ptext_ptr + (bi + 1) };
-                            vname_len = ptext_len - bi - 1;
-                        }
-                        bi = bi + 1;
-                    }
-
-                    if vname_len == 0 && p_name_v != 0u32 {
-                        let nv = interner_get(str_in, StrId { v: p_name_v });
-                        vname_ptr = nv.ptr;
-                        vname_len = nv.len;
-                    }
-
-                    let def_name_v = unsafe { (*def).name.v };
-                    let mut v = unsafe { (*def).variants as *const HirVariantDecl };
-                    let mut vidx: usize = 0;
-                    while ((v as usize) != 0 && vidx < count) {
-                        let v_name_v = unsafe { (*v).name.v };
-                        let var_name = interner_get(str_in, StrId { v: v_name_v });
-                        let mut enum_matches = true;
-                        if ename_len > 0 && def_name_v != 0u32 {
-                            let def_name = interner_get(str_in, StrId { v: def_name_v });
-                            if def_name.len != ename_len || !exhaust_bytes_eq(def_name.ptr, ename_ptr, ename_len) {
-                                enum_matches = false;
-                            }
-                        }
-                        if enum_matches && var_name.len == vname_len && exhaust_bytes_eq(var_name.ptr, vname_ptr, vname_len) {
-                            if (unsafe { *(seen + vidx) }) != 0u8 {
-                                let a_fv = unsafe { (*ap).span.file.v };
-                                let a_st = unsafe { (*ap).span.start };
-                                let a_en = unsafe { (*ap).span.end };
-                                emit_pat_unreachable(mut_view(*sink), a_fv, a_st, a_en);
-                            } else if !has_guard {
-                                unsafe { *(seen + vidx) = 1u8; }
-                            }
-                            break;
-                        }
-                        v = unsafe { (*v).next as *const HirVariantDecl };
-                        vidx = vidx + 1;
-                    }
-                }
-            }
-            earm = unsafe { (*earm).next as *const HirMatchArm };
-        }
-
-        if has_unconditional_wildcard {
-            return;
-        }
-        let mut all_seen = true;
-        let mut si: usize = 0;
-        while (si < count) {
-            if (unsafe { *(seen + si) }) == 0u8 {
-                all_seen = false;
-                break;
-            }
-            si = si + 1;
-        }
-        if !all_seen {
-            emit_pat_non_exhaustive(mut_view(*sink), expr_file_v, expr_start, expr_end);
-        }
-        return;
-    }
-
-    if has_unconditional_wildcard {
-        return;
-    }
-    emit_pat_non_exhaustive(mut_view(*sink), expr_file_v, expr_start, expr_end);
-}
-
 // ---------------------------------------------------------------------------------------------------------------
-// T499b: column-wise usefulness (Maranget, "Warnings for pattern matching") for tuple scrutinees.
+// Unified column-wise usefulness (Maranget, "Warnings for pattern matching") for all match scrutinee types.
 //
 // A matrix row is a vector of patterns, one per column; a null pattern pointer is a wildcard (fields introduced
-// by specialisation). Each column has a type that decides its constructor family:
-//   SINGLE  tuple / struct      one constructor, one field per element / declared field
+// by specialisation). Each column has a resolved type that decides its constructor family:
+//   SINGLE  tuple / struct / () one constructor, one field per element / declared field
 //   BOOL    bool                constructors `false` (0) and `true` (1)
-//   ENUM    enum                one constructor per variant (index from thir pat_variants), fields = payload
-//   INT     <= 64-bit ints/char literal and range patterns as intervals, split into disjoint segments
-//   OPAQUE  anything else       (i128/u128, unresolved, pointers, ...) only wildcards/bindings cover it
+//   ENUM    enum                one constructor per variant (from thir pat_variants or fallback), fields = payload
+//   INT     i8..i128/u8..u128/char  128-bit biased unsigned intervals split into exact disjoint segments
+//   OPAQUE  anything else       (str, slices, arrays, pointers, views, ...) only wildcards/bindings cover it
 // `useful(P, q)` is true when some value matches q and no row of P. A match is non-exhaustive iff `[_]` is
 // useful against its unguarded arms; an arm alternative is unreachable iff it is not useful against the
 // unguarded alternatives before it. Anything the checker cannot classify is treated conservatively: an unknown
@@ -22388,17 +22041,22 @@ const EX_MAX_DEPTH: u32 = 200u32;
 struct ExHead {
     kind: u8,
     ctor: usize,
-    lo: u64,
-    hi: u64,
+    lo_lo: u64,
+    lo_hi: u64,
+    hi_lo: u64,
+    hi_hi: u64,
 }
 
 @derive(Copy)
 struct ExCol {
     cat: u8,
     t: *mut AxType,
-    dom_lo: u64,
-    dom_hi: u64,
+    dom_lo_lo: u64,
+    dom_lo_hi: u64,
+    dom_hi_lo: u64,
+    dom_hi_hi: u64,
     is_signed: bool,
+    is_char: bool,
 }
 
 @derive(Copy)
@@ -22406,6 +22064,12 @@ struct ExMat {
     cells: *mut usize,
     n: usize,
     w: usize,
+}
+
+@derive(Copy)
+struct ExPt128 {
+    lo: u64,
+    hi: u64,
 }
 
 fn ex_alloc(thir: mut_view<Thir>, count: usize) -> *mut usize {
@@ -22421,12 +22085,67 @@ fn ex_set(base: *mut usize, idx: usize, v: usize) {
     unsafe { *usize_at(base, idx) = v; }
 }
 
-// Integer domain in the biased (order-preserving unsigned) encoding: signed values are XORed with the sign bit.
+fn ex_alloc_pts(thir: mut_view<Thir>, count: usize) -> *mut ExPt128 {
+    let c = if count > 0 { count } else { 1 };
+    arena_alloc_raw(mut_view(thir.interner.arena), mul_usize(c, size_of<ExPt128>()), align_of<ExPt128>()) as *mut ExPt128
+}
+
+unsafe fn ex_pt_at(base: *mut ExPt128, idx: usize) -> *mut ExPt128 {
+    ((base as usize) + mul_usize(idx, size_of<ExPt128>())) as *mut ExPt128
+}
+
+fn ex_get_pt(base: *mut ExPt128, idx: usize) -> ExPt128 {
+    let p = unsafe { ex_pt_at(base, idx) };
+    ExPt128 {
+        lo: unsafe { (*p).lo },
+        hi: unsafe { (*p).hi },
+    }
+}
+
+fn ex_set_pt(base: *mut ExPt128, idx: usize, lo: u64, hi: u64) {
+    let p = unsafe { ex_pt_at(base, idx) };
+    unsafe {
+        (*p).lo = lo;
+        (*p).hi = hi;
+    }
+}
+
+fn ex_u128_lt(a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64) -> bool {
+    if a_hi != b_hi {
+        return a_hi < b_hi;
+    }
+    a_lo < b_lo
+}
+
+fn ex_u128_le(a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64) -> bool {
+    if a_hi != b_hi {
+        return a_hi < b_hi;
+    }
+    a_lo <= b_lo
+}
+
+fn ex_u128_eq(a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64) -> bool {
+    a_lo == b_lo && a_hi == b_hi
+}
+
+// Precondition: (lo, hi) < (0xffffffffffffffff, 0xffffffffffffffff)
+fn ex_u128_inc(lo: u64, hi: u64, out_lo: mut_view<u64>, out_hi: mut_view<u64>) {
+    if lo == 0xffffffffffffffffu64 {
+        *out_lo = 0u64;
+        *out_hi = hi + 1u64;
+    } else {
+        *out_lo = lo + 1u64;
+        *out_hi = hi;
+    }
+}
+
+// Integer domain in the 128-bit biased (order-preserving unsigned) encoding: signed `hi` is XORed with 2^63.
 fn ex_int_width(tk: u8) -> u32 {
     if tk == TY_I8 || tk == TY_U8 { return 8u32; }
     if tk == TY_I16 || tk == TY_U16 { return 16u32; }
-    if tk == TY_I32 || tk == TY_U32 { return 32u32; }
+    if tk == TY_I32 || tk == TY_U32 || tk == TY_INT_VAR { return 32u32; }
     if tk == TY_I64 || tk == TY_U64 || tk == TY_ISIZE || tk == TY_USIZE { return 64u32; }
+    if tk == TY_I128 || tk == TY_U128 { return 128u32; }
     0u32
 }
 
@@ -22437,18 +22156,31 @@ fn ex_half(w: u32) -> u64 {
     0x8000000000000000u64
 }
 
-fn ex_col(thir: mut_view<Thir>, ty_v: usize) -> ExCol {
-    let mut c = ExCol { cat: EXC_OPAQUE, t: 0 as *mut AxType, dom_lo: 0u64, dom_hi: 0u64, is_signed: false };
+fn ex_col(thir: mut_view<Thir>, tv: mut_view<TypeVarTable>, ty_v: usize) -> ExCol {
+    let mut c = ExCol {
+        cat: EXC_OPAQUE,
+        t: 0 as *mut AxType,
+        dom_lo_lo: 0u64,
+        dom_lo_hi: 0u64,
+        dom_hi_lo: 0u64,
+        dom_hi_hi: 0u64,
+        is_signed: false,
+        is_char: false,
+    };
     if ty_v == 0 {
         return c;
     }
-    let t = type_get(view(thir.interner), TypeId { v: ty_v as u32 });
+    let resolved = type_vars_resolve(mut_view(*tv), view(thir.interner), TypeId { v: ty_v as u32 });
+    if resolved.v == 0u32 {
+        return c;
+    }
+    let t = type_get(view(thir.interner), TypeId { v: resolved.v });
     if (t as usize) == 0 {
         return c;
     }
     c.t = t;
     let tk = unsafe { (*t).kind };
-    if tk == TY_TUPLE || tk == TY_STRUCT {
+    if tk == TY_TUPLE || tk == TY_STRUCT || tk == TY_UNIT {
         c.cat = EXC_SINGLE;
     } else if tk == TY_BOOL {
         c.cat = EXC_BOOL;
@@ -22456,28 +22188,139 @@ fn ex_col(thir: mut_view<Thir>, ty_v: usize) -> ExCol {
         c.cat = EXC_ENUM;
     } else if tk == TY_CHAR {
         c.cat = EXC_INT;
-        c.dom_lo = 0u64;
-        c.dom_hi = 0x10ffffu64;
+        c.is_char = true;
+        c.dom_lo_lo = 0u64;
+        c.dom_lo_hi = 0u64;
+        c.dom_hi_lo = 0x10ffffu64;
+        c.dom_hi_hi = 0u64;
     } else {
         let w = ex_int_width(tk);
         if w != 0u32 {
             c.cat = EXC_INT;
-            let half = ex_half(w);
             if exhaust_is_signed_kind(tk) {
                 c.is_signed = true;
-                c.dom_lo = 0x8000000000000000u64 - half;
-                c.dom_hi = 0x7fffffffffffffffu64 + half;
+                if w == 128u32 {
+                    c.dom_lo_lo = 0u64;
+                    c.dom_lo_hi = 0u64;
+                    c.dom_hi_lo = 0xffffffffffffffffu64;
+                    c.dom_hi_hi = 0xffffffffffffffffu64;
+                } else {
+                    let half = ex_half(w);
+                    c.dom_lo_lo = (0xffffffffffffffffu64 - half) + 1u64;
+                    c.dom_lo_hi = 0x7fffffffffffffffu64;
+                    c.dom_hi_lo = half - 1u64;
+                    c.dom_hi_hi = 0x8000000000000000u64;
+                }
             } else {
-                c.dom_lo = 0u64;
-                c.dom_hi = if w == 64u32 { 0xffffffffffffffffu64 } else { half + half - 1u64 };
+                c.dom_lo_lo = 0u64;
+                c.dom_lo_hi = 0u64;
+                if w == 128u32 {
+                    c.dom_hi_lo = 0xffffffffffffffffu64;
+                    c.dom_hi_hi = 0xffffffffffffffffu64;
+                } else if w == 64u32 {
+                    c.dom_hi_lo = 0xffffffffffffffffu64;
+                    c.dom_hi_hi = 0u64;
+                } else {
+                    let half = ex_half(w);
+                    c.dom_hi_lo = half + half - 1u64;
+                    c.dom_hi_hi = 0u64;
+                }
             }
         }
     }
     c
 }
 
-fn ex_head(thir: mut_view<Thir>, col: ExCol, pat: *const HirPat) -> ExHead {
-    let mut h = ExHead { kind: EXH_UNKNOWN, ctor: 0, lo: 0u64, hi: 0u64 };
+// Resolves enum variant index from symbol/span-text/name when `thir.pat_variants` was not populated (direct HIR tests).
+fn ex_resolve_variant_fallback(
+    col: ExCol,
+    pat: *const HirPat,
+    str_in: view<StrInterner>,
+    db: view<SourceDatabase>,
+    out_idx: mut_view<usize>
+) -> bool {
+    let def = unsafe { (*col.t).def as *const HirItem };
+    let count = unsafe { (*col.t).variant_count };
+    if (def as usize) == 0 || count == 0 {
+        return false;
+    }
+    let p_file_v = unsafe { (*pat).path.span.file.v };
+    let p_start = unsafe { (*pat).path.span.start };
+    let p_end = unsafe { (*pat).path.span.end };
+    let p_name_v = unsafe { (*pat).path.name.v };
+    let p_sym_v = unsafe { (*pat).path.symbol.v };
+
+    let mut ptext_ptr: *const u8 = 0 as *const u8;
+    let mut ptext_len: usize = 0;
+    if p_file_v != 0u32 && (db.files as usize) != 0 {
+        let ftext = source_db_text(db, FileId { v: p_file_v });
+        if (ftext.ptr as usize) != 0 && p_start <= p_end && (p_end as usize) <= ftext.len {
+            ptext_ptr = ((ftext.ptr as usize) + (p_start as usize)) as *const u8;
+            ptext_len = (p_end - p_start) as usize;
+        }
+    }
+
+    let mut vname_ptr: *const u8 = ptext_ptr;
+    let mut vname_len: usize = ptext_len;
+    let mut ename_ptr: *const u8 = 0 as *const u8;
+    let mut ename_len: usize = 0;
+
+    let mut bi: usize = 0;
+    while (bi < ptext_len) {
+        if (unsafe { *(ptext_ptr + bi) }) == 46u8 {
+            ename_ptr = ptext_ptr;
+            ename_len = bi;
+            vname_ptr = unsafe { ptext_ptr + (bi + 1) };
+            vname_len = ptext_len - bi - 1;
+        }
+        bi = bi + 1;
+    }
+
+    if vname_len == 0 && p_name_v != 0u32 {
+        let nv = interner_get(str_in, StrId { v: p_name_v });
+        vname_ptr = nv.ptr;
+        vname_len = nv.len;
+    }
+
+    let def_name_v = unsafe { (*def).name.v };
+    let mut v = unsafe { (*def).variants as *const HirVariantDecl };
+    let mut vidx: usize = 0;
+    while ((v as usize) != 0 && vidx < count) {
+        let v_sym_v = unsafe { (*v).symbol.v };
+        let v_name_v = unsafe { (*v).name.v };
+        let sym_matched = p_sym_v != 0u32 && v_sym_v != 0u32 && v_sym_v == p_sym_v;
+        let mut text_matched = false;
+        if !sym_matched && (p_sym_v == 0u32 || v_sym_v == 0u32) {
+            let var_name = interner_get(str_in, StrId { v: v_name_v });
+            let mut enum_matches = true;
+            if ename_len > 0 && def_name_v != 0u32 {
+                let def_name = interner_get(str_in, StrId { v: def_name_v });
+                if def_name.len != ename_len || !exhaust_bytes_eq(def_name.ptr, ename_ptr, ename_len) {
+                    enum_matches = false;
+                }
+            }
+            if enum_matches && var_name.len == vname_len && exhaust_bytes_eq(var_name.ptr, vname_ptr, vname_len) {
+                text_matched = true;
+            }
+        }
+        if sym_matched || text_matched {
+            *out_idx = vidx;
+            return true;
+        }
+        v = unsafe { (*v).next as *const HirVariantDecl };
+        vidx = vidx + 1;
+    }
+    false
+}
+
+fn ex_head(
+    thir: mut_view<Thir>,
+    str_in: view<StrInterner>,
+    db: view<SourceDatabase>,
+    col: ExCol,
+    pat: *const HirPat
+) -> ExHead {
+    let mut h = ExHead { kind: EXH_UNKNOWN, ctor: 0, lo_lo: 0u64, lo_hi: 0u64, hi_lo: 0u64, hi_hi: 0u64 };
     if (pat as usize) == 0 {
         h.kind = EXH_WILD;
         return h;
@@ -22493,7 +22336,9 @@ fn ex_head(thir: mut_view<Thir>, col: ExCol, pat: *const HirPat) -> ExHead {
     }
     if col.cat == EXC_SINGLE {
         let tk = unsafe { (*col.t).kind };
-        if (tk == TY_TUPLE && pk == HIR_PAT_TUPLE) || (tk == TY_STRUCT && (pk == HIR_PAT_STRUCT || pk == HIR_PAT_PATH)) {
+        if (tk == TY_TUPLE && pk == HIR_PAT_TUPLE) ||
+           (tk == TY_UNIT && pk == HIR_PAT_TUPLE && (unsafe { (*pat).elems as usize }) == 0) ||
+           (tk == TY_STRUCT && (pk == HIR_PAT_STRUCT || pk == HIR_PAT_PATH)) {
             h.kind = EXH_CTOR;
         }
         return h;
@@ -22520,6 +22365,12 @@ fn ex_head(thir: mut_view<Thir>, col: ExCol, pat: *const HirPat) -> ExHead {
                     h.kind = EXH_CTOR;
                     h.ctor = vi;
                 }
+            } else {
+                let mut fidx: usize = 0;
+                if ex_resolve_variant_fallback(col, pat, str_in, db, mut_view(fidx)) {
+                    h.kind = EXH_CTOR;
+                    h.ctor = fidx;
+                }
             }
         }
         return h;
@@ -22527,21 +22378,33 @@ fn ex_head(thir: mut_view<Thir>, col: ExCol, pat: *const HirPat) -> ExHead {
     if col.cat == EXC_INT {
         let mut iv = PatInterval128 { start_lo: 0u64, start_hi: 0u64, end_lo: 0u64, end_hi: 0u64 };
         if get_pat_interval_128(pat, col.is_signed, mut_view(iv)) {
-            let mut lo = iv.start_lo;
-            let mut hi = iv.end_lo;
             let empty128 = !exhaust_u128_le(iv.start_lo, iv.start_hi, iv.end_lo, iv.end_hi, col.is_signed);
-            if col.is_signed {
-                lo = lo ^ 0x8000000000000000u64;
-                hi = hi ^ 0x8000000000000000u64;
-            }
-            if (lo < col.dom_lo) { lo = col.dom_lo; }
-            if hi > col.dom_hi { hi = col.dom_hi; }
-            if empty128 || lo > hi {
+            if empty128 {
                 h.kind = EXH_EMPTY;
-            } else {
+                return h;
+            }
+            let mut lo_lo = iv.start_lo;
+            let mut lo_hi = iv.start_hi;
+            let mut hi_lo = iv.end_lo;
+            let mut hi_hi = iv.end_hi;
+            if col.is_signed {
+                lo_hi = lo_hi ^ 0x8000000000000000u64;
+                hi_hi = hi_hi ^ 0x8000000000000000u64;
+            }
+            if ex_u128_lt(lo_lo, lo_hi, col.dom_lo_lo, col.dom_lo_hi) {
+                lo_lo = col.dom_lo_lo;
+                lo_hi = col.dom_lo_hi;
+            }
+            if ex_u128_lt(col.dom_hi_lo, col.dom_hi_hi, hi_lo, hi_hi) {
+                hi_lo = col.dom_hi_lo;
+                hi_hi = col.dom_hi_hi;
+            }
+            if !ex_u128_lt(hi_lo, hi_hi, lo_lo, lo_hi) {
                 h.kind = EXH_RANGE;
-                h.lo = lo;
-                h.hi = hi;
+                h.lo_lo = lo_lo;
+                h.lo_hi = lo_hi;
+                h.hi_lo = hi_lo;
+                h.hi_hi = hi_hi;
             }
         }
         return h;
@@ -22728,13 +22591,19 @@ fn ex_expand_or(thir: mut_view<Thir>, m: ExMat) -> ExMat {
 }
 
 // Row tails (columns 1..w) of the rows whose head is a wildcard: the default matrix D(P).
-fn ex_default(thir: mut_view<Thir>, col: ExCol, m: ExMat) -> ExMat {
+fn ex_default(
+    thir: mut_view<Thir>,
+    str_in: view<StrInterner>,
+    db: view<SourceDatabase>,
+    col: ExCol,
+    m: ExMat
+) -> ExMat {
     let nw = m.w - 1;
     let cells = ex_alloc(mut_view(*thir), m.n * nw);
     let mut n: usize = 0;
     let mut r: usize = 0;
     while (r < m.n) {
-        let h = ex_head(mut_view(*thir), col, ex_get(m.cells, r * m.w) as *const HirPat);
+        let h = ex_head(mut_view(*thir), str_in, db, col, ex_get(m.cells, r * m.w) as *const HirPat);
         if h.kind == EXH_WILD {
             let mut c: usize = 0;
             while (c < nw) {
@@ -22750,14 +22619,22 @@ fn ex_default(thir: mut_view<Thir>, col: ExCol, m: ExMat) -> ExMat {
 
 // Specialisation S(ctor, P) for SINGLE/BOOL/ENUM columns: rows headed by `ctor` or a wildcard, with the head
 // replaced by its `arity` fields.
-fn ex_specialize(thir: mut_view<Thir>, col: ExCol, ctor: usize, arity: usize, m: ExMat) -> ExMat {
+fn ex_specialize(
+    thir: mut_view<Thir>,
+    str_in: view<StrInterner>,
+    db: view<SourceDatabase>,
+    col: ExCol,
+    ctor: usize,
+    arity: usize,
+    m: ExMat
+) -> ExMat {
     let nw = arity + m.w - 1;
     let cells = ex_alloc(mut_view(*thir), m.n * nw);
     let mut n: usize = 0;
     let mut r: usize = 0;
     while (r < m.n) {
         let p = ex_get(m.cells, r * m.w) as *const HirPat;
-        let h = ex_head(mut_view(*thir), col, p);
+        let h = ex_head(mut_view(*thir), str_in, db, col, p);
         if h.kind == EXH_WILD || (h.kind == EXH_CTOR && h.ctor == ctor) {
             let mut i: usize = 0;
             while (i < arity) {
@@ -22777,16 +22654,27 @@ fn ex_specialize(thir: mut_view<Thir>, col: ExCol, ctor: usize, arity: usize, m:
     ExMat { cells: cells, n: n, w: nw }
 }
 
-// Specialisation for the integer segment starting at `seg_lo`: rows whose head is a wildcard or an interval
-// containing the segment (segments never straddle an interval boundary).
-fn ex_specialize_seg(thir: mut_view<Thir>, col: ExCol, seg_lo: u64, m: ExMat) -> ExMat {
+// Specialisation for the integer segment starting at `(seg_lo, seg_hi)`: rows whose head is a wildcard or an
+// interval containing the segment (segments never straddle an interval boundary).
+fn ex_specialize_seg(
+    thir: mut_view<Thir>,
+    str_in: view<StrInterner>,
+    db: view<SourceDatabase>,
+    col: ExCol,
+    seg_lo: u64,
+    seg_hi: u64,
+    m: ExMat
+) -> ExMat {
     let nw = m.w - 1;
     let cells = ex_alloc(mut_view(*thir), m.n * nw);
     let mut n: usize = 0;
     let mut r: usize = 0;
     while (r < m.n) {
-        let h = ex_head(mut_view(*thir), col, ex_get(m.cells, r * m.w) as *const HirPat);
-        if h.kind == EXH_WILD || (h.kind == EXH_RANGE && h.lo <= seg_lo && seg_lo <= h.hi) {
+        let h = ex_head(mut_view(*thir), str_in, db, col, ex_get(m.cells, r * m.w) as *const HirPat);
+        if h.kind == EXH_WILD ||
+           (h.kind == EXH_RANGE &&
+            ex_u128_le(h.lo_lo, h.lo_hi, seg_lo, seg_hi) &&
+            ex_u128_le(seg_lo, seg_hi, h.hi_lo, h.hi_hi)) {
             let mut c: usize = 0;
             while (c < nw) {
                 ex_set(cells, n * nw + c, ex_get(m.cells, r * m.w + 1 + c));
@@ -22831,38 +22719,65 @@ fn ex_tys_for_ctor(thir: mut_view<Thir>, col: ExCol, ctor: usize, arity: usize, 
     nt
 }
 
-fn ex_useful_ctor(thir: mut_view<Thir>, col: ExCol, ctor: usize, m: ExMat, tys: *mut usize, q: *mut usize, depth: u32) -> bool {
+fn ex_useful_ctor(
+    thir: mut_view<Thir>,
+    tv: mut_view<TypeVarTable>,
+    str_in: view<StrInterner>,
+    db: view<SourceDatabase>,
+    col: ExCol,
+    ctor: usize,
+    m: ExMat,
+    tys: *mut usize,
+    q: *mut usize,
+    depth: u32
+) -> bool {
     let arity = ex_arity(col, ctor);
-    let sm = ex_specialize(mut_view(*thir), col, ctor, arity, m);
+    let sm = ex_specialize(mut_view(*thir), str_in, db, col, ctor, arity, m);
     let sq = ex_specialize_q(mut_view(*thir), col, ctor, arity, q, m.w);
     let st = ex_tys_for_ctor(mut_view(*thir), col, ctor, arity, tys, m.w);
-    ex_useful(mut_view(*thir), sm, st, sq, depth + 1u32)
+    ex_useful(mut_view(*thir), mut_view(*tv), str_in, db, sm, st, sq, depth + 1u32)
 }
 
 fn ex_tail(q: *mut usize) -> *mut usize {
     unsafe { usize_at(q, 1) }
 }
 
-// Sorted, de-duplicated segment start points of an integer column: dom_lo, every interval start and every
-// interval end + 1 (clamped to the domain), over the rows of `m` and the head of q.
-fn ex_int_segments(thir: mut_view<Thir>, col: ExCol, m: ExMat, qh: ExHead, out_n: mut_view<usize>) -> *mut usize {
-    let cap = 2 * m.n + 3;
-    let pts = ex_alloc(mut_view(*thir), cap);
+// Sorted, de-duplicated 128-bit segment start points of an integer/char column: dom_lo, surrogate boundaries
+// for char, every interval start, and every interval end + 1 (clamped to the domain), over `m` and `qh`.
+fn ex_int_segments(
+    thir: mut_view<Thir>,
+    str_in: view<StrInterner>,
+    db: view<SourceDatabase>,
+    col: ExCol,
+    m: ExMat,
+    qh: ExHead,
+    out_n: mut_view<usize>
+) -> *mut ExPt128 {
+    let cap = 2 * m.n + 6;
+    let pts = ex_alloc_pts(mut_view(*thir), cap);
     let mut n: usize = 0;
-    ex_set(pts, n, col.dom_lo as usize);
+    ex_set_pt(pts, n, col.dom_lo_lo, col.dom_lo_hi);
     n = n + 1;
+    if col.is_char {
+        ex_set_pt(pts, n, 0xd800u64, 0u64);
+        n = n + 1;
+        ex_set_pt(pts, n, 0xe000u64, 0u64);
+        n = n + 1;
+    }
     let mut r: usize = 0;
     while (r <= m.n) {
         let mut h = qh;
         if (r < m.n) {
-            h = ex_head(mut_view(*thir), col, ex_get(m.cells, r * m.w) as *const HirPat);
+            h = ex_head(mut_view(*thir), str_in, db, col, ex_get(m.cells, r * m.w) as *const HirPat);
         }
         if h.kind == EXH_RANGE {
-            ex_set(pts, n, h.lo as usize);
+            ex_set_pt(pts, n, h.lo_lo, h.lo_hi);
             n = n + 1;
-            let h_hi = h.hi;
-            if (h_hi < col.dom_hi) {
-                ex_set(pts, n, (h.hi + 1u64) as usize);
+            if ex_u128_lt(h.hi_lo, h.hi_hi, col.dom_hi_lo, col.dom_hi_hi) {
+                let mut nlo: u64 = 0u64;
+                let mut nhi: u64 = 0u64;
+                ex_u128_inc(h.hi_lo, h.hi_hi, mut_view(nlo), mut_view(nhi));
+                ex_set_pt(pts, n, nlo, nhi);
                 n = n + 1;
             }
         }
@@ -22870,21 +22785,32 @@ fn ex_int_segments(thir: mut_view<Thir>, col: ExCol, m: ExMat, qh: ExHead, out_n
     }
     let mut i: usize = 1;
     while (i < n) {
-        let key = ex_get(pts, i);
+        let key = ex_get_pt(pts, i);
         let mut j = i;
-        while (j > 0 && ex_get(pts, j - 1) > key) {
-            ex_set(pts, j, ex_get(pts, j - 1));
+        while (j > 0) {
+            let prev = ex_get_pt(pts, j - 1);
+            if !ex_u128_lt(key.lo, key.hi, prev.lo, prev.hi) {
+                break;
+            }
+            ex_set_pt(pts, j, prev.lo, prev.hi);
             j = j - 1;
         }
-        ex_set(pts, j, key);
+        ex_set_pt(pts, j, key.lo, key.hi);
         i = i + 1;
     }
     let mut u: usize = 0;
     i = 0;
     while (i < n) {
-        if u == 0 || ex_get(pts, u - 1) != ex_get(pts, i) {
-            ex_set(pts, u, ex_get(pts, i));
+        let cur = ex_get_pt(pts, i);
+        if u == 0 {
+            ex_set_pt(pts, u, cur.lo, cur.hi);
             u = u + 1;
+        } else {
+            let prev_u = ex_get_pt(pts, u - 1);
+            if !ex_u128_eq(prev_u.lo, prev_u.hi, cur.lo, cur.hi) {
+                ex_set_pt(pts, u, cur.lo, cur.hi);
+                u = u + 1;
+            }
         }
         i = i + 1;
     }
@@ -22892,38 +22818,61 @@ fn ex_int_segments(thir: mut_view<Thir>, col: ExCol, m: ExMat, qh: ExHead, out_n
     pts
 }
 
-fn ex_useful_int(thir: mut_view<Thir>, col: ExCol, m: ExMat, tys: *mut usize, q: *mut usize, qh: ExHead, depth: u32) -> bool {
+fn ex_is_char_surrogate(col: ExCol, lo: u64, hi: u64) -> bool {
+    col.is_char && hi == 0u64 && lo >= 0xd800u64 && lo <= 0xdfffu64
+}
+
+fn ex_useful_int(
+    thir: mut_view<Thir>,
+    tv: mut_view<TypeVarTable>,
+    str_in: view<StrInterner>,
+    db: view<SourceDatabase>,
+    col: ExCol,
+    m: ExMat,
+    tys: *mut usize,
+    q: *mut usize,
+    qh: ExHead,
+    depth: u32
+) -> bool {
     let mut ns: usize = 0;
-    let pts = ex_int_segments(mut_view(*thir), col, m, qh, mut_view(ns));
+    let pts = ex_int_segments(mut_view(*thir), str_in, db, col, m, qh, mut_view(ns));
     if qh.kind == EXH_WILD {
-        // A segment no interval head covers is matched only by the wildcard rows: D(P).
+        // A valid segment that no interval head covers is matched only by the wildcard rows: D(P).
         let mut s: usize = 0;
         while (s < ns) {
-            let lo = ex_get(pts, s) as u64;
-            let mut covered = false;
-            let mut r: usize = 0;
-            while (r < m.n) {
-                let h = ex_head(mut_view(*thir), col, ex_get(m.cells, r * m.w) as *const HirPat);
-                if h.kind == EXH_RANGE && h.lo <= lo && lo <= h.hi {
-                    covered = true;
-                    break;
+            let pt = ex_get_pt(pts, s);
+            if !ex_is_char_surrogate(col, pt.lo, pt.hi) {
+                let mut covered = false;
+                let mut r: usize = 0;
+                while (r < m.n) {
+                    let h = ex_head(mut_view(*thir), str_in, db, col, ex_get(m.cells, r * m.w) as *const HirPat);
+                    if h.kind == EXH_RANGE &&
+                       ex_u128_le(h.lo_lo, h.lo_hi, pt.lo, pt.hi) &&
+                       ex_u128_le(pt.lo, pt.hi, h.hi_lo, h.hi_hi) {
+                        covered = true;
+                        break;
+                    }
+                    r = r + 1;
                 }
-                r = r + 1;
-            }
-            if !covered {
-                let dm = ex_default(mut_view(*thir), col, m);
-                return ex_useful(mut_view(*thir), dm, ex_tail(tys), ex_tail(q), depth + 1u32);
+                if !covered {
+                    let dm = ex_default(mut_view(*thir), str_in, db, col, m);
+                    return ex_useful(mut_view(*thir), mut_view(*tv), str_in, db, dm, ex_tail(tys), ex_tail(q), depth + 1u32);
+                }
             }
             s = s + 1;
         }
     }
     let mut s: usize = 0;
     while (s < ns) {
-        let lo = ex_get(pts, s) as u64;
-        if qh.kind == EXH_WILD || (qh.lo <= lo && lo <= qh.hi) {
-            let sm = ex_specialize_seg(mut_view(*thir), col, lo, m);
-            if ex_useful(mut_view(*thir), sm, ex_tail(tys), ex_tail(q), depth + 1u32) {
-                return true;
+        let pt = ex_get_pt(pts, s);
+        if !ex_is_char_surrogate(col, pt.lo, pt.hi) {
+            if qh.kind == EXH_WILD ||
+               (ex_u128_le(qh.lo_lo, qh.lo_hi, pt.lo, pt.hi) &&
+                ex_u128_le(pt.lo, pt.hi, qh.hi_lo, qh.hi_hi)) {
+                let sm = ex_specialize_seg(mut_view(*thir), str_in, db, col, pt.lo, pt.hi, m);
+                if ex_useful(mut_view(*thir), mut_view(*tv), str_in, db, sm, ex_tail(tys), ex_tail(q), depth + 1u32) {
+                    return true;
+                }
             }
         }
         s = s + 1;
@@ -22931,16 +22880,25 @@ fn ex_useful_int(thir: mut_view<Thir>, col: ExCol, m: ExMat, tys: *mut usize, q:
     false
 }
 
-fn ex_useful(thir: mut_view<Thir>, m0: ExMat, tys: *mut usize, q: *mut usize, depth: u32) -> bool {
+fn ex_useful(
+    thir: mut_view<Thir>,
+    tv: mut_view<TypeVarTable>,
+    str_in: view<StrInterner>,
+    db: view<SourceDatabase>,
+    m0: ExMat,
+    tys: *mut usize,
+    q: *mut usize,
+    depth: u32
+) -> bool {
     if m0.w == 0 {
         return m0.n == 0;
     }
     if depth > EX_MAX_DEPTH {
         return true;
     }
-    let col = ex_col(mut_view(*thir), ex_get(tys, 0));
+    let col = ex_col(mut_view(*thir), mut_view(*tv), ex_get(tys, 0));
     let qp = ex_get(q, 0) as *const HirPat;
-    let qh = ex_head(mut_view(*thir), col, qp);
+    let qh = ex_head(mut_view(*thir), str_in, db, col, qp);
     if qh.kind == EXH_OR {
         let w = m0.w;
         let mut alt = unsafe { (*qp).pats as *const HirPat };
@@ -22952,7 +22910,7 @@ fn ex_useful(thir: mut_view<Thir>, m0: ExMat, tys: *mut usize, q: *mut usize, de
                 ex_set(nq, c, ex_get(q, c));
                 c = c + 1;
             }
-            if ex_useful(mut_view(*thir), m0, tys, nq, depth + 1u32) {
+            if ex_useful(mut_view(*thir), mut_view(*tv), str_in, db, m0, tys, nq, depth + 1u32) {
                 return true;
             }
             alt = unsafe { (*alt).next as *const HirPat };
@@ -22964,18 +22922,18 @@ fn ex_useful(thir: mut_view<Thir>, m0: ExMat, tys: *mut usize, q: *mut usize, de
     }
     let m = ex_expand_or(mut_view(*thir), m0);
     if qh.kind == EXH_UNKNOWN {
-        let dm = ex_default(mut_view(*thir), col, m);
-        return ex_useful(mut_view(*thir), dm, ex_tail(tys), ex_tail(q), depth + 1u32);
+        let dm = ex_default(mut_view(*thir), str_in, db, col, m);
+        return ex_useful(mut_view(*thir), mut_view(*tv), str_in, db, dm, ex_tail(tys), ex_tail(q), depth + 1u32);
     }
     if qh.kind == EXH_CTOR {
-        return ex_useful_ctor(mut_view(*thir), col, qh.ctor, m, tys, q, depth);
+        return ex_useful_ctor(mut_view(*thir), mut_view(*tv), str_in, db, col, qh.ctor, m, tys, q, depth);
     }
     if col.cat == EXC_INT {
-        return ex_useful_int(mut_view(*thir), col, m, tys, q, qh, depth);
+        return ex_useful_int(mut_view(*thir), mut_view(*tv), str_in, db, col, m, tys, q, qh, depth);
     }
     // q's head is a wildcard.
     if col.cat == EXC_SINGLE {
-        return ex_useful_ctor(mut_view(*thir), col, 0, m, tys, q, depth);
+        return ex_useful_ctor(mut_view(*thir), mut_view(*tv), str_in, db, col, 0, m, tys, q, depth);
     }
     if col.cat == EXC_BOOL || col.cat == EXC_ENUM {
         let nctor = if col.cat == EXC_BOOL { 2 } else { unsafe { (*col.t).variant_count } };
@@ -22988,7 +22946,7 @@ fn ex_useful(thir: mut_view<Thir>, m0: ExMat, tys: *mut usize, q: *mut usize, de
         let mut nseen: usize = 0;
         let mut r: usize = 0;
         while (r < m.n) {
-            let h = ex_head(mut_view(*thir), col, ex_get(m.cells, r * m.w) as *const HirPat);
+            let h = ex_head(mut_view(*thir), str_in, db, col, ex_get(m.cells, r * m.w) as *const HirPat);
             let h_ctor = h.ctor;
             if (h.kind == EXH_CTOR && h_ctor < nctor) {
                 if (unsafe { *(seen + h.ctor) }) == 0u8 {
@@ -23001,7 +22959,7 @@ fn ex_useful(thir: mut_view<Thir>, m0: ExMat, tys: *mut usize, q: *mut usize, de
         if nseen == nctor {
             let mut c: usize = 0;
             while (c < nctor) {
-                if ex_useful_ctor(mut_view(*thir), col, c, m, tys, q, depth) {
+                if ex_useful_ctor(mut_view(*thir), mut_view(*tv), str_in, db, col, c, m, tys, q, depth) {
                     return true;
                 }
                 c = c + 1;
@@ -23009,30 +22967,32 @@ fn ex_useful(thir: mut_view<Thir>, m0: ExMat, tys: *mut usize, q: *mut usize, de
             return false;
         }
     }
-    let dm = ex_default(mut_view(*thir), col, m);
-    ex_useful(mut_view(*thir), dm, ex_tail(tys), ex_tail(q), depth + 1u32)
+    let dm = ex_default(mut_view(*thir), str_in, db, col, m);
+    ex_useful(mut_view(*thir), mut_view(*tv), str_in, db, dm, ex_tail(tys), ex_tail(q), depth + 1u32)
 }
 
-// Exhaustiveness + reachability of a `match` whose scrutinee is a tuple. Returns false (nothing reported) when
-// the scrutinee is not a tuple, so the caller falls back to the scalar/enum checker.
-pub fn match_check_tuple_exhaustiveness(
+pub fn match_check_exhaustiveness_with_tv(
     thir: mut_view<Thir>,
+    tv: mut_view<TypeVarTable>,
+    str_in: view<StrInterner>,
+    db: view<SourceDatabase>,
     sink: mut_view<DiagSink>,
     expr: *const HirExpr,
     val_ty: TypeId
-) -> bool {
+) {
     if (expr as usize) == 0 {
-        return false;
+        return;
     }
     if (unsafe { (*expr).kind }) != HIR_EXPR_MATCH {
-        return false;
+        return;
     }
-    let t = type_get(view(thir.interner), TypeId { v: val_ty.v });
+    let r_ty = type_vars_resolve(mut_view(*tv), view(thir.interner), TypeId { v: val_ty.v });
+    let t = type_get(view(thir.interner), TypeId { v: r_ty.v });
     if (t as usize) == 0 {
-        return false;
+        return;
     }
-    if (unsafe { (*t).kind }) != TY_TUPLE {
-        return false;
+    if (unsafe { (*t).kind }) == TY_ERROR {
+        return;
     }
 
     let mut total: usize = 0;
@@ -23043,7 +23003,7 @@ pub fn match_check_tuple_exhaustiveness(
     }
 
     let tys = ex_alloc(mut_view(*thir), 1);
-    ex_set(tys, 0, val_ty.v as usize);
+    ex_set(tys, 0, r_ty.v as usize);
     let rows = ex_alloc(mut_view(*thir), total);
     let leaves = ex_alloc(mut_view(*thir), total);
     let mut n_rows: usize = 0;
@@ -23061,7 +23021,7 @@ pub fn match_check_tuple_exhaustiveness(
                 let q = ex_alloc(mut_view(*thir), 1);
                 ex_set(q, 0, leaf as usize);
                 let pm = ExMat { cells: rows, n: n_rows, w: 1 };
-                if (leaf as usize) != 0 && !ex_useful(mut_view(*thir), pm, tys, q, 0u32) {
+                if (leaf as usize) != 0 && !ex_useful(mut_view(*thir), mut_view(*tv), str_in, db, pm, tys, q, 0u32) {
                     let l_fv = unsafe { (*leaf).span.file.v };
                     let l_st = unsafe { (*leaf).span.start };
                     let l_en = unsafe { (*leaf).span.end };
@@ -23080,13 +23040,37 @@ pub fn match_check_tuple_exhaustiveness(
     let wq = ex_alloc(mut_view(*thir), 1);
     ex_set(wq, 0, 0);
     let pm = ExMat { cells: rows, n: n_rows, w: 1 };
-    if ex_useful(mut_view(*thir), pm, tys, wq, 0u32) {
+    if ex_useful(mut_view(*thir), mut_view(*tv), str_in, db, pm, tys, wq, 0u32) {
         let fv = unsafe { (*expr).span.file.v };
         let st = unsafe { (*expr).span.start };
         let en = unsafe { (*expr).span.end };
         emit_pat_non_exhaustive(mut_view(*sink), fv, st, en);
     }
-    true
+}
+
+pub fn match_check_exhaustiveness(
+    thir: mut_view<Thir>,
+    str_in: view<StrInterner>,
+    db: view<SourceDatabase>,
+    sink: mut_view<DiagSink>,
+    expr: *const HirExpr,
+    val_ty: TypeId
+) {
+    let mut empty_tv = TypeVarTable {
+        items: 0 as *mut TypeVarEntry,
+        len: 0,
+        cap: 0,
+        fn_var_start: 0,
+    };
+    match_check_exhaustiveness_with_tv(
+        mut_view(*thir),
+        mut_view(empty_tv),
+        str_in,
+        db,
+        mut_view(*sink),
+        expr,
+        TypeId { v: val_ty.v }
+    );
 }
 
 // Trait obligation solver, coherence/overlap checking, method dispatch resolution,
@@ -27636,7 +27620,6 @@ use compiler.kernel.interner.interner_intern_bytes
 use compiler.source.span.Span
 use compiler.source.manager.SourceDatabase
 use compiler.source.manager.source_db_span_text
-use compiler.source.manager.source_db_text
 use compiler.diag.code.AX_ASYNC_AWAIT_IN_DROP
 use compiler.diag.code.AX_ASYNC_AWAIT_OUTSIDE_ASYNC
 use compiler.diag.code.AX_ASYNC_BLOCKING_IN_ASYNC
@@ -27658,9 +27641,7 @@ use compiler.diag.code.AX_CONST_SHIFT_RANGE
 use compiler.diag.code.AX_MOVE_USE_AFTER_MOVE
 use compiler.diag.code.AX_NAME_PRIVATE
 use compiler.diag.code.AX_NAME_UNRESOLVED
-use compiler.diag.code.AX_PAT_NON_EXHAUSTIVE
 use compiler.diag.code.AX_PAT_REFUTABLE
-use compiler.diag.code.AX_PAT_UNREACHABLE
 use compiler.diag.code.AX_TRAIT_AMBIGUOUS_METHOD
 use compiler.diag.code.AX_TRAIT_UNSATISFIED_BOUND
 use compiler.diag.code.AX_TYPE_ARG_COUNT
@@ -28016,12 +27997,7 @@ use compiler.types.types.typeid_ptr_at
 use compiler.types.types.typevar_at
 use compiler.types.types.u32_at
 use compiler.types.types.usize_at
-use compiler.types.exhaust.PatInterval
-use compiler.types.exhaust.PatInterval128
-use compiler.types.exhaust.get_pat_interval
-use compiler.types.exhaust.get_pat_interval_128
-use compiler.types.exhaust.match_check_exhaustiveness
-use compiler.types.exhaust.match_check_tuple_exhaustiveness
+use compiler.types.exhaust.match_check_exhaustiveness_with_tv
 use compiler.traits.solver.TRAIT_AMBIGUOUS
 use compiler.traits.solver.TRAIT_DISPROVEN
 use compiler.traits.solver.TRAIT_PROVEN
@@ -33609,420 +33585,16 @@ fn check_pat_path_or_compound(cx: mut_view<TypeckCtx>, pat: *const HirPat, expec
     ty
 }
 
-unsafe fn tc_pat_interval128_at(base: *const PatInterval128, idx: usize) -> *const PatInterval128 {
-    ((base as usize) + mul_usize(idx, size_of<PatInterval128>())) as *const PatInterval128
-}
-
-unsafe fn tc_pat_interval128_at_mut(base: *mut PatInterval128, idx: usize) -> *mut PatInterval128 {
-    ((base as usize) + mul_usize(idx, size_of<PatInterval128>())) as *mut PatInterval128
-}
-
-fn tc_exhaust_is_signed_kind(tk: u8) -> bool {
-    tk == TY_I8 || tk == TY_I16 || tk == TY_I32 || tk == TY_I64 || tk == TY_ISIZE || tk == TY_I128
-}
-
-fn tc_exhaust_u128_le(a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64, is_signed: bool) -> bool {
-    if a_hi != b_hi {
-        if is_signed {
-            return (a_hi as i64) < (b_hi as i64);
-        }
-        return a_hi < b_hi;
-    }
-    a_lo <= b_lo
-}
-
-fn tc_exhaust_bytes_eq(a: *const u8, b: *const u8, n: usize) -> bool {
-    if (a as usize) == (b as usize) {
-        return true;
-    }
-    if (a as usize) == 0 || (b as usize) == 0 {
-        return false;
-    }
-    let mut i: usize = 0;
-    while (i < n) {
-        let ba = unsafe { *(a + i) };
-        let bb = unsafe { *(b + i) };
-        if ba != bb {
-            return false;
-        }
-        i = i + 1;
-    }
-    true
-}
-
-fn tc_is_int_or_char_kind(tk: u8) -> bool {
-    tk == TY_I8 || tk == TY_I16 || tk == TY_I32 || tk == TY_I64 || tk == TY_I128 || tk == TY_ISIZE ||
-    tk == TY_U8 || tk == TY_U16 || tk == TY_U32 || tk == TY_U64 || tk == TY_U128 || tk == TY_USIZE ||
-    tk == TY_CHAR
-}
-
 fn tc_match_check_exhaustiveness(
     thir: mut_view<Thir>,
+    tv: mut_view<TypeVarTable>,
     str_in: view<StrInterner>,
     db: view<SourceDatabase>,
     sink: mut_view<DiagSink>,
     expr: *const HirExpr,
     val_ty: TypeId
 ) {
-    if false {
-        match_check_exhaustiveness(mut_view(*thir), str_in, db, mut_view(*sink), expr, (TypeId { v: val_ty.v }));
-    }
-    if (expr as usize) == 0 {
-        return;
-    }
-    if (unsafe { (*expr).kind }) != HIR_EXPR_MATCH {
-        return;
-    }
-    // T499b: tuple scrutinees use the column-wise usefulness checker in compiler/types/exhaust.ax.
-    if match_check_tuple_exhaustiveness(mut_view(*thir), mut_view(*sink), expr, (TypeId { v: val_ty.v })) {
-        return;
-    }
-
-    let expr_file_v = unsafe { (*expr).span.file.v };
-    let expr_start = unsafe { (*expr).span.start };
-    let expr_end = unsafe { (*expr).span.end };
-
-    let mut has_unconditional_wildcard = false;
-    let mut arm = unsafe { (*expr).arms as *const HirMatchArm };
-    while ((arm as usize) != 0) {
-        let has_guard = (unsafe { (*arm).guard as usize }) != 0;
-        let ap = unsafe { (*arm).pat as *const HirPat };
-        if !has_guard && (ap as usize) != 0 {
-            let pk = unsafe { (*ap).kind };
-            if pk == HIR_PAT_WILDCARD || pk == HIR_PAT_BINDING {
-                has_unconditional_wildcard = true;
-                let mut unreach = unsafe { (*arm).next as *const HirMatchArm };
-                while ((unreach as usize) != 0) {
-                    let up = unsafe { (*unreach).pat as *const HirPat };
-                    if (up as usize) != 0 {
-                        let u_fv = unsafe { (*up).span.file.v };
-                        let u_st = unsafe { (*up).span.start };
-                        let u_en = unsafe { (*up).span.end };
-                        report_typeck_diag(mut_view(*sink), AX_PAT_UNREACHABLE, u_fv, u_st, u_en);
-                    }
-                    unreach = unsafe { (*unreach).next as *const HirMatchArm };
-                }
-                break;
-            }
-        }
-        arm = unsafe { (*arm).next as *const HirMatchArm };
-    }
-
-    let val_ty_v = val_ty.v;
-    let t = type_get(view(thir.interner), (TypeId { v: val_ty_v }));
-    if (t as usize) == 0 {
-        return;
-    }
-    let tk = unsafe { (*t).kind };
-
-    if tc_is_int_or_char_kind(tk) {
-        let is_signed = tc_exhaust_is_signed_kind(tk);
-        let cov_bytes = mul_usize(256, size_of<PatInterval128>());
-        let cov_raw = arena_alloc_raw(mut_view(thir.interner.arena), cov_bytes, align_of<PatInterval128>());
-        let covered = cov_raw as *mut PatInterval128;
-        let mut cov_count: usize = 0;
-
-        let mut iarm = unsafe { (*expr).arms as *const HirMatchArm };
-        while ((iarm as usize) != 0) {
-            let ap = unsafe { (*iarm).pat as *const HirPat };
-            let has_guard = (unsafe { (*iarm).guard as usize }) != 0;
-            if (ap as usize) != 0 {
-                let mut iv = PatInterval128 { start_lo: 0u64, start_hi: 0u64, end_lo: 0u64, end_hi: 0u64 };
-                let got_iv = get_pat_interval_128(ap, is_signed, mut_view(iv));
-                if got_iv {
-                    let non_empty = tc_exhaust_u128_le(iv.start_lo, iv.start_hi, iv.end_lo, iv.end_hi, is_signed);
-                    let mut is_cov = !non_empty;
-                    let mut i: usize = 0;
-                    while (!is_cov && i < cov_count) {
-                        let ci = unsafe { tc_pat_interval128_at(covered as *const PatInterval128, i) };
-                        let ci_s_lo = unsafe { (*ci).start_lo };
-                        let ci_s_hi = unsafe { (*ci).start_hi };
-                        let ci_e_lo = unsafe { (*ci).end_lo };
-                        let ci_e_hi = unsafe { (*ci).end_hi };
-                        if tc_exhaust_u128_le(ci_s_lo, ci_s_hi, iv.start_lo, iv.start_hi, is_signed) &&
-                           tc_exhaust_u128_le(iv.end_lo, iv.end_hi, ci_e_lo, ci_e_hi, is_signed) {
-                            is_cov = true;
-                            break;
-                        }
-                        i = i + 1;
-                    }
-                    if is_cov {
-                        let a_fv = unsafe { (*ap).span.file.v };
-                        let a_st = unsafe { (*ap).span.start };
-                        let a_en = unsafe { (*ap).span.end };
-                        report_typeck_diag(mut_view(*sink), AX_PAT_UNREACHABLE, a_fv, a_st, a_en);
-                    } else if !has_guard && cov_count < 256 {
-                        let dst = unsafe { tc_pat_interval128_at_mut(covered, cov_count) };
-                        unsafe {
-                            (*dst).start_lo = iv.start_lo;
-                            (*dst).start_hi = iv.start_hi;
-                            (*dst).end_lo = iv.end_lo;
-                            (*dst).end_hi = iv.end_hi;
-                        }
-                        cov_count = cov_count + 1;
-                    }
-                } else if (unsafe { (*ap).kind }) == HIR_PAT_OR {
-                    let mut p = unsafe { (*ap).pats as *const HirPat };
-                    while ((p as usize) != 0) {
-                        let got_piv = get_pat_interval_128(p, is_signed, mut_view(iv));
-                        if got_piv {
-                            let non_empty = tc_exhaust_u128_le(iv.start_lo, iv.start_hi, iv.end_lo, iv.end_hi, is_signed);
-                            let mut is_cov = !non_empty;
-                            let mut i: usize = 0;
-                            while (!is_cov && i < cov_count) {
-                                let ci = unsafe { tc_pat_interval128_at(covered as *const PatInterval128, i) };
-                                let ci_s_lo = unsafe { (*ci).start_lo };
-                                let ci_s_hi = unsafe { (*ci).start_hi };
-                                let ci_e_lo = unsafe { (*ci).end_lo };
-                                let ci_e_hi = unsafe { (*ci).end_hi };
-                                if tc_exhaust_u128_le(ci_s_lo, ci_s_hi, iv.start_lo, iv.start_hi, is_signed) &&
-                                   tc_exhaust_u128_le(iv.end_lo, iv.end_hi, ci_e_lo, ci_e_hi, is_signed) {
-                                    is_cov = true;
-                                    break;
-                                }
-                                i = i + 1;
-                            }
-                            if is_cov {
-                                let p_fv = unsafe { (*p).span.file.v };
-                                let p_st = unsafe { (*p).span.start };
-                                let p_en = unsafe { (*p).span.end };
-                                report_typeck_diag(mut_view(*sink), AX_PAT_UNREACHABLE, p_fv, p_st, p_en);
-                            } else if !has_guard && cov_count < 256 {
-                                let dst = unsafe { tc_pat_interval128_at_mut(covered, cov_count) };
-                                unsafe {
-                                    (*dst).start_lo = iv.start_lo;
-                                    (*dst).start_hi = iv.start_hi;
-                                    (*dst).end_lo = iv.end_lo;
-                                    (*dst).end_hi = iv.end_hi;
-                                }
-                                cov_count = cov_count + 1;
-                            }
-                        }
-                        p = unsafe { (*p).next as *const HirPat };
-                    }
-                }
-            }
-            iarm = unsafe { (*iarm).next as *const HirMatchArm };
-        }
-
-        if has_unconditional_wildcard {
-            return;
-        }
-        if tk == TY_U8 {
-            let mut all_u8 = true;
-            let mut v: u64 = 0u64;
-            while (v <= 255u64) {
-                let mut found = false;
-                let mut i: usize = 0;
-                while (i < cov_count) {
-                    let ci = unsafe { tc_pat_interval128_at(covered as *const PatInterval128, i) };
-                    let ci_s_lo = unsafe { (*ci).start_lo };
-                    let ci_s_hi = unsafe { (*ci).start_hi };
-                    let ci_e_lo = unsafe { (*ci).end_lo };
-                    let ci_e_hi = unsafe { (*ci).end_hi };
-                    if tc_exhaust_u128_le(ci_s_lo, ci_s_hi, v, 0u64, false) &&
-                       tc_exhaust_u128_le(v, 0u64, ci_e_lo, ci_e_hi, false) {
-                        found = true;
-                        break;
-                    }
-                    i = i + 1;
-                }
-                if !found {
-                    all_u8 = false;
-                    break;
-                }
-                v = v + 1u64;
-            }
-            if all_u8 {
-                return;
-            }
-        }
-
-        report_typeck_diag(mut_view(*sink), AX_PAT_NON_EXHAUSTIVE, expr_file_v, expr_start, expr_end);
-        return;
-    }
-
-    tc_match_check_exhaust_bool_or_enum(
-        mut_view(*thir),
-        str_in,
-        db,
-        mut_view(*sink),
-        expr,
-        t,
-        tk,
-        has_unconditional_wildcard,
-        expr_file_v,
-        expr_start,
-        expr_end
-    );
-}
-
-fn tc_match_check_exhaust_bool_or_enum(
-    thir: mut_view<Thir>,
-    str_in: view<StrInterner>,
-    db: view<SourceDatabase>,
-    sink: mut_view<DiagSink>,
-    expr: *const HirExpr,
-    t: *mut AxType,
-    tk: u8,
-    has_unconditional_wildcard: bool,
-    expr_file_v: u32,
-    expr_start: u32,
-    expr_end: u32
-) {
-    if tk == TY_BOOL {
-        let mut has_true = false;
-        let mut has_false = false;
-        let mut barm = unsafe { (*expr).arms as *const HirMatchArm };
-        while ((barm as usize) != 0) {
-            let ap = unsafe { (*barm).pat as *const HirPat };
-            let has_guard = (unsafe { (*barm).guard as usize }) != 0;
-            if (ap as usize) != 0 && (unsafe { (*ap).kind }) == HIR_PAT_LITERAL {
-                let tok_k = unsafe { (*ap).tok.kind };
-                if tok_k == TOK_KW_TRUE {
-                    if has_true {
-                        let a_fv = unsafe { (*ap).span.file.v };
-                        let a_st = unsafe { (*ap).span.start };
-                        let a_en = unsafe { (*ap).span.end };
-                        report_typeck_diag(mut_view(*sink), AX_PAT_UNREACHABLE, a_fv, a_st, a_en);
-                    } else if !has_guard {
-                        has_true = true;
-                    }
-                } else if tok_k == TOK_KW_FALSE {
-                    if has_false {
-                        let a_fv = unsafe { (*ap).span.file.v };
-                        let a_st = unsafe { (*ap).span.start };
-                        let a_en = unsafe { (*ap).span.end };
-                        report_typeck_diag(mut_view(*sink), AX_PAT_UNREACHABLE, a_fv, a_st, a_en);
-                    } else if !has_guard {
-                        has_false = true;
-                    }
-                }
-            }
-            barm = unsafe { (*barm).next as *const HirMatchArm };
-        }
-        if has_unconditional_wildcard || (has_true && has_false) {
-            return;
-        }
-        report_typeck_diag(mut_view(*sink), AX_PAT_NON_EXHAUSTIVE, expr_file_v, expr_start, expr_end);
-        return;
-    }
-
-    if tk == TY_ENUM {
-        let def = unsafe { (*t).def as *const HirItem };
-        let count = unsafe { (*t).variant_count };
-        let alloc_cnt = if count > 0 { count } else { 1 };
-        let seen = arena_alloc_raw(mut_view(thir.interner.arena), alloc_cnt, 1);
-        let mut z: usize = 0;
-        while (z < count) {
-            unsafe { *(seen + z) = 0u8; }
-            z = z + 1;
-        }
-
-        let mut earm = unsafe { (*expr).arms as *const HirMatchArm };
-        while ((earm as usize) != 0) {
-            let ap = unsafe { (*earm).pat as *const HirPat };
-            let has_guard = (unsafe { (*earm).guard as usize }) != 0;
-            if (ap as usize) != 0 && (def as usize) != 0 {
-                let apk = unsafe { (*ap).kind };
-                if apk == HIR_PAT_PATH || apk == HIR_PAT_STRUCT {
-                    let p_file_v = unsafe { (*ap).path.span.file.v };
-                    let p_start = unsafe { (*ap).path.span.start };
-                    let p_end = unsafe { (*ap).path.span.end };
-                    let p_name_v = unsafe { (*ap).path.name.v };
-
-                    let mut ptext_ptr: *const u8 = 0 as *const u8;
-                    let mut ptext_len: usize = 0;
-                    if p_file_v != 0u32 && (db.files as usize) != 0 {
-                        let ftext = source_db_text(db, (FileId { v: p_file_v }));
-                        if (ftext.ptr as usize) != 0 && p_start <= p_end && (p_end as usize) <= ftext.len {
-                            ptext_ptr = ((ftext.ptr as usize) + (p_start as usize)) as *const u8;
-                            ptext_len = (p_end - p_start) as usize;
-                        }
-                    }
-
-                    let mut vname_ptr: *const u8 = ptext_ptr;
-                    let mut vname_len: usize = ptext_len;
-                    let mut ename_ptr: *const u8 = 0 as *const u8;
-                    let mut ename_len: usize = 0;
-
-                    let mut bi: usize = 0;
-                    while (bi < ptext_len) {
-                        if (unsafe { *(ptext_ptr + bi) }) == 46u8 {
-                            ename_ptr = ptext_ptr;
-                            ename_len = bi;
-                            vname_ptr = unsafe { ptext_ptr + (bi + 1) };
-                            vname_len = ptext_len - bi - 1;
-                        }
-                        bi = bi + 1;
-                    }
-
-                    if vname_len == 0 && p_name_v != 0u32 {
-                        let nv = interner_get(str_in, (StrId { v: p_name_v }));
-                        vname_ptr = nv.ptr;
-                        vname_len = nv.len;
-                    }
-
-                    let p_sym_v = unsafe { (*ap).path.symbol.v };
-                    let def_name_v = unsafe { (*def).name.v };
-                    let mut v = unsafe { (*def).variants as *const HirVariantDecl };
-                    let mut vidx: usize = 0;
-                    while ((v as usize) != 0 && vidx < count) {
-                        let v_sym_v = unsafe { (*v).symbol.v };
-                        let v_name_v = unsafe { (*v).name.v };
-                        let var_name = interner_get(str_in, (StrId { v: v_name_v }));
-                        let mut enum_matches = true;
-                        if ename_len > 0 && def_name_v != 0u32 {
-                            let def_name = interner_get(str_in, (StrId { v: def_name_v }));
-                            if def_name.len != ename_len || !tc_exhaust_bytes_eq(def_name.ptr, ename_ptr, ename_len) {
-                                enum_matches = false;
-                            }
-                        }
-                        let sym_matched = p_sym_v != 0u32 && v_sym_v != 0u32 && v_sym_v == p_sym_v;
-                        let text_matched = (p_sym_v == 0u32 || v_sym_v == 0u32) &&
-                            enum_matches && var_name.len == vname_len &&
-                            tc_exhaust_bytes_eq(var_name.ptr, vname_ptr, vname_len);
-                        if sym_matched || text_matched {
-                            if (unsafe { *(seen + vidx) }) != 0u8 {
-                                let a_fv = unsafe { (*ap).span.file.v };
-                                let a_st = unsafe { (*ap).span.start };
-                                let a_en = unsafe { (*ap).span.end };
-                                report_typeck_diag(mut_view(*sink), AX_PAT_UNREACHABLE, a_fv, a_st, a_en);
-                            } else if !has_guard {
-                                unsafe { *(seen + vidx) = 1u8; }
-                            }
-                            break;
-                        }
-                        v = unsafe { (*v).next as *const HirVariantDecl };
-                        vidx = vidx + 1;
-                    }
-                }
-            }
-            earm = unsafe { (*earm).next as *const HirMatchArm };
-        }
-
-        if has_unconditional_wildcard {
-            return;
-        }
-        let mut all_seen = true;
-        let mut si: usize = 0;
-        while (si < count) {
-            if (unsafe { *(seen + si) }) == 0u8 {
-                all_seen = false;
-                break;
-            }
-            si = si + 1;
-        }
-        if !all_seen {
-            report_typeck_diag(mut_view(*sink), AX_PAT_NON_EXHAUSTIVE, expr_file_v, expr_start, expr_end);
-        }
-        return;
-    }
-
-    if has_unconditional_wildcard {
-        return;
-    }
-    report_typeck_diag(mut_view(*sink), AX_PAT_NON_EXHAUSTIVE, expr_file_v, expr_start, expr_end);
+    match_check_exhaustiveness_with_tv(mut_view(*thir), mut_view(*tv), str_in, db, mut_view(*sink), expr, (TypeId { v: val_ty.v }));
 }
 
 fn check_literal(cx: mut_view<TypeckCtx>, expr: *const HirExpr) -> TypeId {
@@ -36536,8 +36108,17 @@ fn check_expr_match_or_view(cx: mut_view<TypeckCtx>, expr: *const HirExpr, expec
             match_ty.v = m_v;
         }
         if !has_error && !is_error(mut_view(*cx), (TypeId { v: val_ty.v })) && (cx.str_in as usize) != 0 && (cx.db as usize) != 0 && (cx.sink as usize) != 0 {
+            let fin_val_ty = resolve_ty(mut_view(*cx), (TypeId { v: val_ty.v }));
             unsafe {
-                tc_match_check_exhaustiveness(mut_view(*cx.thir), view(*cx.str_in), view(*cx.db), mut_view(*cx.sink), expr, (TypeId { v: val_ty.v }));
+                tc_match_check_exhaustiveness(
+                    mut_view(*cx.thir),
+                    mut_view(cx.type_vars),
+                    view(*cx.str_in),
+                    view(*cx.db),
+                    mut_view(*cx.sink),
+                    expr,
+                    (TypeId { v: fin_val_ty.v })
+                );
             }
         }
         return (TypeId { v: match_ty.v });
