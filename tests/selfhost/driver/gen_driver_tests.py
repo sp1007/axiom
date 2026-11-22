@@ -917,6 +917,26 @@ pub fn main() -> i32 {
     return orig_name, hdrs, main_src
 
 
+# Unified object-path encoder `--emit=mc` output for `tests/lir/const.mir`:
+# `i16` store encodes as 2-byte `66 89 08` (`mov word ptr [rax], cx`) instead of legacy `axiom0` 8-byte `48 89 08`.
+CONST_MIR_UNIFIED_MC = (
+    b"55 48 89 e5 53 56 57 41 54 41 55 41 56 41 57 48 83 ec 48 "
+    b"48 b8 2a 00 00 00 00 00 00 00 48 89 45 a8 48 8d 45 c0 48 89 45 a0 "
+    b"48 8b 45 a0 48 8b 4d a8 66 89 08 48 8b 45 c0 48 83 c4 48 "
+    b"41 5f 41 5e 41 5d 41 5c 5f 5e 5b 5d c3 \n"
+)
+
+
+def _unified_emit_mc_override(emit_flag, opt_o1, input_path):
+    if emit_flag != "--emit=mc" or opt_o1:
+        return None
+    if input_path == "tests/mc/frame/main_42.ax":
+        return read_bytes(os.path.join(ROOT, "tests", "mc", "frame", "main_42.mc")).replace(b"\r\n", b"\n")
+    if input_path == "tests/lir/const.mir":
+        return CONST_MIR_UNIFIED_MC
+    return None
+
+
 def gen_inspect_diff_member(filename, modes, axiom0, cases, merged_path, fast_std=False):
     fallback_path = os.path.join(HERE, filename)
     case_meta = []
@@ -924,10 +944,13 @@ def gen_inspect_diff_member(filename, modes, axiom0, cases, merged_path, fast_st
         blobs = bc.extract_blobs_from_member(
             merged_path, filename, "BLOBS", "BLOB_OFFS", "BLOB_LENS", fallback_path=fallback_path
         )
-        blob_bytes, offs, lens = pack_blobs(blobs)
-        for idx, (_emit_flag, opt_o1, _input_path) in enumerate(cases):
+        for idx, (emit_flag, opt_o1, input_path) in enumerate(cases):
             base = 4 + 4 * idx
+            override = _unified_emit_mc_override(emit_flag, opt_o1, input_path)
+            if override is not None:
+                blobs[base + 2] = override
             case_meta.append((base, 1 if opt_o1 else 0, base + 1, 0, base + 2, base + 3))
+        blob_bytes, offs, lens = pack_blobs(blobs)
     else:
         blobs = [b"axiom0", b"inspect", b"-O1", b"--std-root=tests/driver"]
         for emit_flag, opt_o1, input_path in cases:
@@ -942,6 +965,9 @@ def gen_inspect_diff_member(filename, modes, axiom0, cases, merged_path, fast_st
             else:
                 args = ["inspect"] + extra + [emit_flag] + (["-O1"] if opt_o1 else []) + [input_path]
             rc, out_b, err_b = run_axiom0(axiom0, args, expect_rc=0)
+            override = _unified_emit_mc_override(emit_flag, opt_o1, input_path)
+            if override is not None:
+                out_b = override
             out_idx = len(blobs)
             blobs.append(out_b)
             err_idx = len(blobs)
