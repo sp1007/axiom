@@ -8,7 +8,7 @@ model: opus
 gate_model: sonnet
 depends: [T498b, T448]
 priority: 14
-status: doing
+status: done
 attempts: 1
 timeout_min: 480
 paths: [compiler/types/typeck.ax, compiler/mir/builder.ax, tests/ui/assign_immutable_index, tests/ui/own_operand_span]
@@ -16,7 +16,7 @@ locks: []
 spec: [spec/SPEC-02-grammar.md, spec/SPEC-03-core-semantics.md, spec/SPEC-10-ownership.md]
 covers: [REQ-TST-072]
 started: 2026-11-22 13:39:56
-agent: T498f-impl
+finished: 2026-11-22 17:08:23
 ---
 # T498f — Index assignment respects binding mutability; operand spans
 
@@ -71,3 +71,4 @@ agent: T498f-impl
 ## Log
 - 2026-11-22 created by axiom-architect (triage-1122; T498b-qa follow-up 3, T498b-report follow-up 1, architect repro)
 - 2026-11-22 13:39:56 started (attempt 1) T498f-impl
+- 2026-11-22 17:08:23 accepted by QA -> done
