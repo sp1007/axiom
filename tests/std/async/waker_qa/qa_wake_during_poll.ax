@@ -2436,6 +2436,9 @@ pub const TASK_FLAGS_MASK: u32 = 0xFFFFFFF0u32
 
 pub const FLAG_CANCEL_REQUESTED: u32 = 0x100u32
 pub const FLAG_DETACHED: u32 = 0x200u32
+// Set by `std.asyn.task.task_panic` while the task is being polled; the task's poll function
+// (`tcb_poll_fn`) then ends the task as TASK_PANICKED (cooperative containment, SPEC-34 AXS-EXEC-007).
+pub const FLAG_PANIC_REQUESTED: u32 = 0x400u32
 
 @repr(C)
 pub struct TaskHeader {
@@ -2565,7 +2568,7 @@ pub fn task_request_cancel(raw: *mut TaskHeader) {
     task_wake(raw);
 }
 
-// Poll protocol for executors' poll functions (`tcb_poll_fn`, `group_poll_fn`); every transition
+// Poll protocol for executors' poll functions (`tcb_poll_fn`); every transition
 // keeps the flag bits.
 //
 // A dequeued task is NOTIFIED (it is queued only by the IDLE -> NOTIFIED transition or by the poller
@@ -2620,19 +2623,20 @@ pub fn task_dec_ref(raw: *mut TaskHeader) {
 }
 
 // -----------------------------------------------------------------------------
-// Detached wakers (reference-owning data/vtable pair with no drop glue)
+// Waker operations through the vtable
 // -----------------------------------------------------------------------------
 //
-// Wait queues (AsyncMutex, AsyncSemaphore, channels, TaskHandle join) keep wakers inside raw heap
-// nodes. A `Waker` stored there would run its Drop glue when the node memory is overwritten, so the
-// queues store the waker as two plain pointer fields (`waker_data`, `waker_vt`) that own exactly one
-// reference, and manage that reference explicitly:
+// Wait queues (AsyncMutex, AsyncSemaphore, channels, cancellation, TaskHandle join) keep a `Waker`
+// field inside raw heap nodes. A store through a raw pointer (`(*n).waker = w`) writes the bits
+// without dropping the previous value, so the queues manage the stored reference explicitly: they
+// move the old waker out first (`let old = (*n).waker;`, dropped at the end of its scope) and move it
+// out again to wake or release it.
+//
+// The helpers below are the vtable dispatch used by `Waker` itself:
 //   waker_leak             Waker -> RawWaker, transferring the reference (the Waker is neutralised)
 //   raw_waker_wake         wake the task and release the reference (consumes it)
 //   raw_waker_wake_by_ref  wake the task, keep the reference
 //   raw_waker_drop         release the reference without waking
-// The pair is deliberately not stored as a `RawWaker`/`Waker` struct field: such fields read back
-// wrong values inside `std.*` modules today (report follow-up FU-3).
 
 pub fn waker_leak(mut w: Waker) -> RawWaker {
     let rw = RawWaker {
@@ -2651,24 +2655,25 @@ fn raw_waker_is_empty(data: *const u8, vt: *const RawWakerVTable) -> bool {
 
 pub fn raw_waker_wake(data: *const u8, vt: *const RawWakerVTable) {
     if !raw_waker_is_empty(data, vt) {
-        // Bind the function pointer to a local first: calling a field expression directly is not
-        // lowered correctly by the native backend (report follow-up FU-2).
-        let f = unsafe { (*vt).wake };
-        f(data);
+        unsafe {
+            ((*vt).wake)(data);
+        }
     }
 }
 
 pub fn raw_waker_wake_by_ref(data: *const u8, vt: *const RawWakerVTable) {
     if !raw_waker_is_empty(data, vt) {
-        let f = unsafe { (*vt).wake_by_ref };
-        f(data);
+        unsafe {
+            ((*vt).wake_by_ref)(data);
+        }
     }
 }
 
 pub fn raw_waker_drop(data: *const u8, vt: *const RawWakerVTable) {
     if !raw_waker_is_empty(data, vt) {
-        let f = unsafe { (*vt).drop_waker };
-        f(data);
+        unsafe {
+            ((*vt).drop_waker)(data);
+        }
     }
 }
 
@@ -2680,8 +2685,7 @@ pub fn raw_waker_clone(data: *const u8, vt: *const RawWakerVTable) -> RawWaker {
             vtable: 0 as *const RawWakerVTable,
         };
     }
-    let f = unsafe { (*vt).clone };
-    f(data)
+    unsafe { ((*vt).clone)(data) }
 }
 
 // Every `Waker` operation dispatches through the vtable of its `RawWaker` (SPEC-33 AXS-ASY-011), so
@@ -2755,6 +2759,7 @@ pub use std.asyn.waker.TASK_STATE_MASK
 pub use std.asyn.waker.TASK_FLAGS_MASK
 pub use std.asyn.waker.FLAG_CANCEL_REQUESTED
 pub use std.asyn.waker.FLAG_DETACHED
+pub use std.asyn.waker.FLAG_PANIC_REQUESTED
 pub use std.asyn.waker.make_task_waker
 pub use std.asyn.waker.task_wake
 pub use std.asyn.waker.task_schedule
@@ -2766,16 +2771,12 @@ pub use std.asyn.waker.task_state
 pub use std.asyn.waker.task_dec_ref
 pub use std.asyn.waker.init_task_header_vtable
 pub use std.asyn.waker.new_task_waker_vtable
-pub use std.asyn.waker.waker_leak
-pub use std.asyn.waker.raw_waker_wake
-pub use std.asyn.waker.raw_waker_drop
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 @intrinsic fn align_of<T>() -> usize { 0 }
 @intrinsic fn needs_drop<T>() -> bool { false }
 @intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
 @intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
-@intrinsic unsafe fn drop_in_place<T>(p: *mut T) {}
 
 @derive(Copy)
 pub struct TaskId {
@@ -2797,18 +2798,22 @@ pub enum TaskResult<T> {
     Panicked,
 }
 
-// Join-waker slot state (`TaskSlot.join_state`). The two waker fields are owned by whoever holds
+// Join-waker slot state (`TaskSlot.join_state`). The waker field is owned by whoever holds
 // JOIN_REGISTERING (the handle, while it installs a waker) or, once JOIN_COMPLETE is set, by the side
 // that made the deciding transition:
 //   handle     REGISTERING on (only while not COMPLETE) -> replace the waker -> WAKER_SET on and
 //              REGISTERING off in one CAS. That CAS fails only when the completer set COMPLETE in
 //              between: then the handle drops its own waker and reports completion instead of waiting.
-//   completer  fetch_or(COMPLETE): if REGISTERING was set, the handle owns the fields (and will see
+//   completer  fetch_or(COMPLETE): if REGISTERING was set, the handle owns the field (and will see
 //              COMPLETE); otherwise, if WAKER_SET was set, the completer takes the waker and wakes it.
 //   release    a waker still WAKER_SET when the control block is freed is dropped there.
 // The completer publishes the terminal task state before COMPLETE, so a handle that sees COMPLETE
 // also sees the terminal state. A wake between "check done" and "register" is never lost, and every
 // registered waker is consumed exactly once (woken, replaced, or released).
+//
+// `join_waker` lives in raw task memory: it is only meaningful while JOIN_WAKER_SET is on. A store
+// through the raw pointer does not drop the previous bits, so the old waker is always moved out
+// before a new one is stored.
 pub const JOIN_REGISTERING: u32 = 1u32
 pub const JOIN_WAKER_SET: u32 = 2u32
 pub const JOIN_COMPLETE: u32 = 4u32
@@ -2818,18 +2823,17 @@ pub struct TaskSlot<T> {
     pub header: TaskHeader,
     pub has_output: bool,
     pub join_state: Atomic<u32>,
-    pub join_waker_data: *const u8,
-    pub join_waker_vt: *const RawWakerVTable,
-    // Last on purpose: the join fields above are reached through `TaskSlot<u8>` casts and must sit at
-    // the same offsets for every output type T.
+    pub join_waker: Waker,
+    // Last on purpose: the join fields above are reached through `TaskSlot<u8>` casts by type-erased
+    // code (`default_task_drop`, join protocol) and must sit at the same offsets for every output T.
     pub output: T,
 }
 
-// Task memory. Contract of the per-task poll function (`TaskHeader.poll_fn`, a thin wrapper around
-// `tcb_poll_fn<F, T>` or `std.asyn.group.group_poll_fn<F, T>`): called with a Context it polls the
-// task; called with a null Context it drops whatever payload is still stored (future, output) and
-// returns. The second form is how type-erased code (`default_task_drop`) drops a stored output whose
-// type it does not know.
+// Task memory: one allocation per spawned task holding the header, the join slot, the output and
+// the future. Contract of the per-task poll function (`TaskHeader.poll_fn` = `task_poll_fn<F, T>`):
+// called with a Context it polls the task; called with a null Context it drops whatever payload is
+// still stored (future, output) and returns. The second form is how type-erased code
+// (`default_task_drop`) drops a stored output whose type it does not know.
 @repr(C)
 pub struct TaskControlBlock<F, T> {
     pub slot: TaskSlot<T>,
@@ -2865,11 +2869,10 @@ pub unsafe fn task_take_output<T>(raw: *mut TaskHeader) -> T {
 // registers, so registrations never race each other, only the completion.
 pub unsafe fn task_register_join_waker(raw: *mut TaskHeader, w: Waker) -> bool {
     let slot = raw as *mut TaskSlot<u8>;
-    let lw = waker_leak(w);
     let mut s: u32 = (*slot).join_state.load(Ordering.Acquire);
     loop {
         if (s & JOIN_COMPLETE) != 0u32 {
-            raw_waker_drop(lw.data, lw.vtable);
+            // `w` is dropped on return.
             return false;
         }
         let cas = (*slot).join_state.compare_exchange(s, s | JOIN_REGISTERING, Ordering.AcqRel, Ordering.Acquire);
@@ -2878,18 +2881,17 @@ pub unsafe fn task_register_join_waker(raw: *mut TaskHeader, w: Waker) -> bool {
         }
         s = cas.val;
     }
-    // REGISTERING is held: the waker fields are ours.
+    // REGISTERING is held: the waker field is ours.
     if (s & JOIN_WAKER_SET) != 0u32 {
-        raw_waker_drop((*slot).join_waker_data, (*slot).join_waker_vt);
+        let replaced: Waker = (*slot).join_waker;
     }
-    (*slot).join_waker_data = lw.data;
-    (*slot).join_waker_vt = lw.vtable;
+    (*slot).join_waker = w;
     let mut cur: u32 = s | JOIN_REGISTERING;
     loop {
         if (cur & JOIN_COMPLETE) != 0u32 {
-            // Completed while we were registering; the completer left the fields to us.
+            // Completed while we were registering; the completer left the field to us.
             (*slot).join_state.store(JOIN_COMPLETE, Ordering.Release);
-            raw_waker_drop(lw.data, lw.vtable);
+            let unused: Waker = (*slot).join_waker;
             return false;
         }
         let published: u32 = (cur & (0xFFFFFFFFu32 - JOIN_REGISTERING)) | JOIN_WAKER_SET;
@@ -2910,10 +2912,9 @@ pub unsafe fn task_wake_join_waker(raw: *mut TaskHeader) {
         return;
     }
     if (prev & JOIN_WAKER_SET) != 0u32 {
-        let data = (*slot).join_waker_data;
-        let vt = (*slot).join_waker_vt;
+        let w: Waker = (*slot).join_waker;
         (*slot).join_state.store(JOIN_COMPLETE, Ordering.Release);
-        raw_waker_wake(data, vt);
+        w.wake();
     }
 }
 
@@ -2941,6 +2942,28 @@ pub unsafe fn tcb_drop_payload<F, T>(tcb: *mut TaskControlBlock<F, T>) {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Panic containment (SPEC-34 AXS-EXEC-007, ADR-0042 §2)
+// -----------------------------------------------------------------------------
+
+// Report that the task currently being polled has panicked. The calling future should return right
+// after (`Poll.Pending` or any value): the task's poll function drops the future and publishes the
+// task as `TASK_PANICKED` once the current poll returns, which handles and groups report as
+// `Panicked`. Has no effect outside a task. The runtime has no unwinding yet, so containment is
+// cooperative; T536 installs a real catch in `tcb_poll_fn`.
+pub fn task_panic(cx: mut_view<Context>) {
+    let w = cx.waker();
+    let raw = w.raw.data as *mut TaskHeader;
+    if (raw as usize) != 0 {
+        unsafe {
+            (*raw).state.fetch_or(FLAG_PANIC_REQUESTED, Ordering.Release);
+        }
+    }
+}
+
+// Poll one task. Flag bits are preserved on every transition; a cancel request is observed at the
+// start of a poll (the future is dropped); a task that called `task_panic` during the poll ends as
+// TASK_PANICKED (future dropped, an output it produced is discarded).
 pub fn tcb_poll_fn<F: Future<Output = T>, T>(tcb: *mut TaskControlBlock<F, T>, cx_raw: *mut u8) -> u32 {
     let raw = tcb as *mut TaskHeader;
     if (cx_raw as usize) == 0 {
@@ -2963,9 +2986,20 @@ pub fn tcb_poll_fn<F: Future<Output = T>, T>(tcb: *mut TaskControlBlock<F, T>, c
 
     let p_cx = cx_raw as *mut Context;
     let poll_res = unsafe { (*tcb).future.poll(mut_view(*p_cx)) };
+    let after: u32 = unsafe { (*raw).state.load(Ordering.Acquire) };
+    let panicked: bool = (after & FLAG_PANIC_REQUESTED) != 0u32;
 
     match poll_res {
         Poll.Ready(val) => {
+            if panicked {
+                // The output is discarded (dropped at the end of this arm).
+                let discarded = val;
+                unsafe {
+                    tcb_drop_future<F, T>(tcb);
+                    task_finish(raw, TASK_PANICKED);
+                }
+                return TASK_PANICKED;
+            }
             unsafe {
                 tcb_drop_future<F, T>(tcb);
                 (*tcb).slot.output = val;
@@ -2975,10 +3009,22 @@ pub fn tcb_poll_fn<F: Future<Output = T>, T>(tcb: *mut TaskControlBlock<F, T>, c
             TASK_COMPLETED
         },
         Poll.Pending => {
+            if panicked {
+                unsafe {
+                    tcb_drop_future<F, T>(tcb);
+                    task_finish(raw, TASK_PANICKED);
+                }
+                return TASK_PANICKED;
+            }
             // POLLING -> IDLE, or back to the queue when a wake (or a cancel request) arrived.
             task_end_poll_pending(raw)
         },
     }
+}
+
+// Type-erased form of `tcb_poll_fn<F, T>` stored in `TaskHeader.poll_fn` by `spawn` / `spawn_local`.
+pub fn task_poll_fn<F: Future<Output = T>, T>(raw: *mut u8, cx_raw: *mut u8) -> u32 {
+    tcb_poll_fn<F, T>(raw as *mut TaskControlBlock<F, T>, cx_raw)
 }
 
 // Release a control block whose last reference is gone. A stored output nobody took (detached task,
@@ -2991,14 +3037,15 @@ pub fn default_task_drop(raw: *mut TaskHeader) {
     }
     let slot = raw as *mut TaskSlot<u8>;
     if unsafe { (*slot).has_output } {
-        let poll_fn = unsafe { (*raw).poll_fn };
-        poll_fn(raw as *mut u8, 0 as *mut u8);
+        unsafe {
+            ((*raw).poll_fn)(raw as *mut u8, 0 as *mut u8);
+        }
     }
     let js: u32 = unsafe { (*slot).join_state.load(Ordering.Acquire) };
     if (js & JOIN_WAKER_SET) != 0u32 {
         unsafe {
             (*slot).join_state.store(JOIN_COMPLETE, Ordering.Release);
-            raw_waker_drop((*slot).join_waker_data, (*slot).join_waker_vt);
+            let released: Waker = (*slot).join_waker;
         }
     }
     let sz = unsafe { (*raw).alloc_size };
@@ -3008,7 +3055,11 @@ pub fn default_task_drop(raw: *mut TaskHeader) {
     }
 }
 
-// Shared by TaskHandle / LocalTaskHandle: the handle's reference is released by the caller.
+// -----------------------------------------------------------------------------
+// Handle operations shared by TaskHandle / LocalTaskHandle / TaskJoin
+// -----------------------------------------------------------------------------
+
+// Request cancellation unless the task is finished or detached; the caller releases its reference.
 fn handle_cancel_unless_done(raw: *mut TaskHeader) {
     let st: u32 = unsafe { (*raw).state.load(Ordering.Acquire) };
     if (st & TASK_STATE_MASK) < TASK_COMPLETED && (st & FLAG_DETACHED) == 0u32 {
@@ -3023,32 +3074,98 @@ fn handle_detach(raw: *mut TaskHeader) {
     task_dec_ref(raw);
 }
 
-// `Future` side of a handle with output i64: Ready with the result once the task is terminal (the
-// handle's reference is released then), otherwise the join waker is (re-)registered.
-fn handle_poll_i64(raw: *mut TaskHeader, cx: mut_view<Context>) -> Poll<Result<i64, TaskError>> {
+// The result of a terminal task; releases the caller's reference.
+fn handle_collect<T>(raw: *mut TaskHeader) -> TaskResult<T> {
+    let st: u32 = task_state(raw);
+    let res: TaskResult<T> = if st == TASK_COMPLETED {
+        TaskResult.Completed(unsafe { task_take_output<T>(raw) })
+    } else if st == TASK_CANCELLED {
+        TaskResult.Cancelled
+    } else {
+        TaskResult.Panicked
+    };
+    task_dec_ref(raw);
+    res
+}
+
+// Poll for the end of the task: Ready with its result once it is terminal (the reference is released
+// then), otherwise the join waker is (re-)registered and Pending is returned.
+fn handle_poll_result<T>(raw: *mut TaskHeader, cx: mut_view<Context>) -> Poll<TaskResult<T>> {
     loop {
-        let st: u32 = task_state(raw);
-        if st == TASK_COMPLETED {
-            let out: i64 = unsafe { task_take_output<i64>(raw) };
-            task_dec_ref(raw);
-            return Poll.Ready(Result.Ok(out));
+        if task_state(raw) >= TASK_COMPLETED {
+            return Poll.Ready(handle_collect<T>(raw));
         }
-        if st == TASK_CANCELLED {
-            task_dec_ref(raw);
-            return Poll.Ready(Result.Err(TaskError.Cancelled));
-        }
-        if st == TASK_PANICKED {
-            task_dec_ref(raw);
-            return Poll.Ready(Result.Err(TaskError.Panicked));
-        }
-        // `mut_view(*cx)`: a bare `cx.waker()` counts as a move of `cx` (T421 FU-6).
-        let w = mut_view(*cx).waker();
-        if unsafe { task_register_join_waker(raw, w) } {
+        if unsafe { task_register_join_waker(raw, cx.waker()) } {
             return Poll.Pending;
         }
         // Completed while registering: the state is terminal now, loop once more to collect it.
     }
 }
+
+fn result_of<T>(r: TaskResult<T>) -> Result<T, TaskError> {
+    match r {
+        TaskResult.Completed(v) => Result.Ok(v),
+        TaskResult.Cancelled => Result.Err(TaskError.Cancelled),
+        TaskResult.Panicked => Result.Err(TaskError.Panicked),
+    }
+}
+
+// Blocking join: yield the OS thread until the task is terminal. The caller must not be the thread
+// the task needs in order to make progress (use `join()` from inside a task).
+fn handle_join_blocking<T>(raw: *mut TaskHeader) -> TaskResult<T> {
+    if (raw as usize) == 0 {
+        return TaskResult.Cancelled;
+    }
+    while task_state(raw) < TASK_COMPLETED {
+        unsafe {
+            thread_yield();
+        }
+    }
+    handle_collect<T>(raw)
+}
+
+// Future returned by `TaskHandle.join()` / `LocalTaskHandle.join()` (SPEC-34 `async fn join(self)`):
+// resolves to the task's `TaskResult` without blocking the polling thread. Dropping it before it is
+// ready behaves like dropping the handle (the task is cancelled).
+pub struct TaskJoin<T> {
+    pub raw_task: *mut TaskHeader,
+}
+
+impl<T> !Copy for TaskJoin<T> {}
+
+impl<T> Future for TaskJoin<T> {
+    type Output = TaskResult<T>;
+
+    fn poll(self: mut_view<TaskJoin<T>>, cx: mut_view<Context>) -> Poll<TaskResult<T>> {
+        let raw = self.raw_task;
+        if (raw as usize) == 0 {
+            return Poll.Ready(TaskResult.Cancelled);
+        }
+        let r: Poll<TaskResult<T>> = handle_poll_result<T>(raw, cx);
+        match r {
+            Poll.Ready(v) => {
+                self.raw_task = 0 as *mut TaskHeader;
+                Poll.Ready(v)
+            },
+            Poll.Pending => Poll.Pending,
+        }
+    }
+}
+
+impl<T> Drop for TaskJoin<T> {
+    fn drop(self: mut_view<TaskJoin<T>>) {
+        let raw = self.raw_task;
+        if (raw as usize) != 0 {
+            self.raw_task = 0 as *mut TaskHeader;
+            handle_cancel_unless_done(raw);
+            task_dec_ref(raw);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// TaskHandle<T>
+// -----------------------------------------------------------------------------
 
 impl<T> TaskHandle<T> {
     pub fn id(self: view<TaskHandle<T>>) -> TaskId {
@@ -3077,46 +3194,35 @@ impl<T> TaskHandle<T> {
         }
     }
 
-    pub fn join(mut self: TaskHandle<T>) -> TaskResult<T> {
+    // Await the task's end: `exec.block_on(h.join())`, or poll it from inside another task.
+    pub fn join(mut self: TaskHandle<T>) -> TaskJoin<T> {
         let raw = self.raw_task;
         self.raw_task = 0 as *mut TaskHeader;
-        if (raw as usize) == 0 {
-            return TaskResult.Cancelled;
-        }
-        while task_state(raw) < TASK_COMPLETED {
-            unsafe {
-                thread_yield();
-            }
-        }
-        let st: u32 = task_state(raw);
-        let res = if st == TASK_COMPLETED {
-            let slot = raw as *mut TaskSlot<T>;
-            let out = unsafe { (*slot).output };
-            unsafe { (*slot).has_output = false; }
-            TaskResult.Completed(out)
-        } else if st == TASK_CANCELLED {
-            TaskResult.Cancelled
-        } else {
-            TaskResult.Panicked
-        };
-        task_dec_ref(raw);
-        res
+        TaskJoin { raw_task: raw }
+    }
+
+    // Synchronous join for code that is not running inside a task (yields the OS thread).
+    pub fn join_blocking(mut self: TaskHandle<T>) -> TaskResult<T> {
+        let raw = self.raw_task;
+        self.raw_task = 0 as *mut TaskHeader;
+        handle_join_blocking<T>(raw)
     }
 }
 
-impl Future for TaskHandle<i64> {
-    type Output = Result<i64, TaskError>;
+// `let res = handle.await` (SPEC-34 AXS-EXEC-005): Ready(Ok(output)) / Ready(Err(TaskError)).
+impl<T> Future for TaskHandle<T> {
+    type Output = Result<T, TaskError>;
 
-    fn poll(self: mut_view<TaskHandle<i64>>, cx: mut_view<Context>) -> Poll<Result<i64, TaskError>> {
+    fn poll(self: mut_view<TaskHandle<T>>, cx: mut_view<Context>) -> Poll<Result<T, TaskError>> {
         let raw = self.raw_task;
         if (raw as usize) == 0 {
             return Poll.Ready(Result.Err(TaskError.Cancelled));
         }
-        let r = handle_poll_i64(raw, mut_view(*cx));
+        let r: Poll<TaskResult<T>> = handle_poll_result<T>(raw, cx);
         match r {
             Poll.Ready(v) => {
                 self.raw_task = 0 as *mut TaskHeader;
-                Poll.Ready(v)
+                Poll.Ready(result_of<T>(v))
             },
             Poll.Pending => Poll.Pending,
         }
@@ -3133,6 +3239,10 @@ impl<T> Drop for TaskHandle<T> {
         }
     }
 }
+
+// -----------------------------------------------------------------------------
+// LocalTaskHandle<T>
+// -----------------------------------------------------------------------------
 
 impl<T> LocalTaskHandle<T> {
     pub fn id(self: view<LocalTaskHandle<T>>) -> TaskId {
@@ -3161,46 +3271,35 @@ impl<T> LocalTaskHandle<T> {
         }
     }
 
-    pub fn join(mut self: LocalTaskHandle<T>) -> TaskResult<T> {
+    // Await the task's end: `exec.run_until(h.join())`, or poll it from inside another local task.
+    pub fn join(mut self: LocalTaskHandle<T>) -> TaskJoin<T> {
         let raw = self.raw_task;
         self.raw_task = 0 as *mut TaskHeader;
-        if (raw as usize) == 0 {
-            return TaskResult.Cancelled;
-        }
-        while task_state(raw) < TASK_COMPLETED {
-            unsafe {
-                thread_yield();
-            }
-        }
-        let st: u32 = task_state(raw);
-        let res = if st == TASK_COMPLETED {
-            let slot = raw as *mut TaskSlot<T>;
-            let out = unsafe { (*slot).output };
-            unsafe { (*slot).has_output = false; }
-            TaskResult.Completed(out)
-        } else if st == TASK_CANCELLED {
-            TaskResult.Cancelled
-        } else {
-            TaskResult.Panicked
-        };
-        task_dec_ref(raw);
-        res
+        TaskJoin { raw_task: raw }
+    }
+
+    // Synchronous join; only valid once the task has finished (or when something else drives the
+    // LocalExecutor), because a local task never runs on another thread.
+    pub fn join_blocking(mut self: LocalTaskHandle<T>) -> TaskResult<T> {
+        let raw = self.raw_task;
+        self.raw_task = 0 as *mut TaskHeader;
+        handle_join_blocking<T>(raw)
     }
 }
 
-impl Future for LocalTaskHandle<i64> {
-    type Output = Result<i64, TaskError>;
+impl<T> Future for LocalTaskHandle<T> {
+    type Output = Result<T, TaskError>;
 
-    fn poll(self: mut_view<LocalTaskHandle<i64>>, cx: mut_view<Context>) -> Poll<Result<i64, TaskError>> {
+    fn poll(self: mut_view<LocalTaskHandle<T>>, cx: mut_view<Context>) -> Poll<Result<T, TaskError>> {
         let raw = self.raw_task;
         if (raw as usize) == 0 {
             return Poll.Ready(Result.Err(TaskError.Cancelled));
         }
-        let r = handle_poll_i64(raw, mut_view(*cx));
+        let r: Poll<TaskResult<T>> = handle_poll_result<T>(raw, cx);
         match r {
             Poll.Ready(v) => {
                 self.raw_task = 0 as *mut TaskHeader;
-                Poll.Ready(v)
+                Poll.Ready(result_of<T>(v))
             },
             Poll.Pending => Poll.Pending,
         }
@@ -3260,6 +3359,7 @@ use std.asyn.task.TaskHandle
 use std.asyn.task.LocalTaskHandle
 use std.asyn.task.TaskControlBlock
 use std.asyn.task.default_task_drop
+use std.asyn.task.task_poll_fn
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 @intrinsic fn align_of<T>() -> usize { 0 }
@@ -3361,7 +3461,8 @@ impl LocalExecutor {
         }
     }
 
-    pub fn spawn_local<F: Future<Output = T>, T>(self: mut_view<LocalExecutor>, fut: F, poll_fn: fn(*mut u8, *mut u8) -> u32) -> LocalTaskHandle<T> {
+    // Submit `fut` as a task pinned to this executor's thread; no `Send` requirement (AXS-EXEC-010).
+    pub fn spawn_local<F: Future<Output = T>, T>(self: mut_view<LocalExecutor>, fut: F) -> LocalTaskHandle<T> {
         let p_self = unsafe { address_of_mut(*self) as *mut LocalExecutor };
         let sz = size_of<TaskControlBlock<F, T>>();
         let al = align_of<TaskControlBlock<F, T>>();
@@ -3378,7 +3479,7 @@ impl LocalExecutor {
             (*tcb).slot.header.owner_thread_id = self.owner_thread;
             (*tcb).slot.header.queue_next = 0 as *mut TaskHeader;
             (*tcb).slot.header.schedule_fn = local_schedule;
-            (*tcb).slot.header.poll_fn = poll_fn;
+            (*tcb).slot.header.poll_fn = task_poll_fn<F, T>;
             (*tcb).slot.header.drop_fn = default_task_drop;
             (*tcb).slot.header.schedule_data = p_self as *mut u8;
             (*tcb).slot.header.alloc_size = sz;
@@ -3406,8 +3507,7 @@ impl LocalExecutor {
         }
         let w = make_task_waker(task);
         let mut cx = Context { waker_val: w };
-        let poll_fn = unsafe { (*task).poll_fn };
-        let st: u32 = poll_fn(task as *mut u8, unsafe { address_of_mut<Context>(cx) as *mut u8 });
+        let st: u32 = unsafe { ((*task).poll_fn)(task as *mut u8, address_of_mut<Context>(cx) as *mut u8) };
         if st >= TASK_COMPLETED {
             if self.active_tasks > 0 {
                 self.active_tasks = self.active_tasks - 1;
@@ -3419,7 +3519,7 @@ impl LocalExecutor {
 
     pub fn run(self: mut_view<LocalExecutor>) {
         while self.active_tasks > 0 {
-            if !mut_view(*self).try_tick() {
+            if !self.try_tick() {
                 unsafe {
                     thread_yield();
                 }
@@ -3442,7 +3542,7 @@ impl LocalExecutor {
                     return val;
                 },
                 Poll.Pending => {
-                    if !mut_view(*self).try_tick() {
+                    if !self.try_tick() {
                         unsafe {
                             thread_yield();
                         }
@@ -3476,10 +3576,8 @@ pub struct WorkerData {
     pub head: Atomic<usize>,
     pub tail: Atomic<usize>,
     pub queue: [256]*mut TaskHeader,
-    // Opaque pointer to the owning ExecutorInner. A field typed `*mut ExecutorInner` here would be a
-    // forward reference to a later-declared struct, which currently yields wrong field offsets
-    // through the pointer (see T421 report, follow-up FU-1); cast at use instead.
-    pub executor: *mut u8,
+    // The owning executor state.
+    pub executor: *mut ExecutorInner,
     // OS thread id of the worker (0 until the worker thread has started).
     pub tid: Atomic<u64>,
 }
@@ -3662,8 +3760,7 @@ fn executor_try_help_one(inner: *mut ExecutorInner) -> bool {
     }
     let w = make_task_waker(task);
     let mut cx = Context { waker_val: w };
-    let poll_fn = unsafe { (*task).poll_fn };
-    let st: u32 = poll_fn(task as *mut u8, unsafe { address_of_mut<Context>(cx) as *mut u8 });
+    let st: u32 = unsafe { ((*task).poll_fn)(task as *mut u8, address_of_mut<Context>(cx) as *mut u8) };
     if st >= TASK_COMPLETED {
         unsafe {
             (*inner).active_tasks.fetch_sub(1usize, Ordering.Release);
@@ -3675,7 +3772,7 @@ fn executor_try_help_one(inner: *mut ExecutorInner) -> bool {
 
 fn worker_thread_main(ctx: *mut u8) -> i64 {
     let w = ctx as *mut WorkerData;
-    let inner = unsafe { (*w).executor as *mut ExecutorInner };
+    let inner = unsafe { (*w).executor };
     unsafe {
         (*w).tid.store(thread_current_id(), Ordering.Release);
     }
@@ -3735,8 +3832,7 @@ fn worker_thread_main(ctx: *mut u8) -> i64 {
         if (task as usize) != 0 {
             let task_w = make_task_waker(task);
             let mut cx = Context { waker_val: task_w };
-            let poll_fn = unsafe { (*task).poll_fn };
-            let st: u32 = poll_fn(task as *mut u8, unsafe { address_of_mut<Context>(cx) as *mut u8 });
+            let st: u32 = unsafe { ((*task).poll_fn)(task as *mut u8, address_of_mut<Context>(cx) as *mut u8) };
             if st >= TASK_COMPLETED {
                 unsafe {
                     (*inner).active_tasks.fetch_sub(1usize, Ordering.Release);
@@ -3787,7 +3883,7 @@ impl Executor {
                 (*w).thread_handle = 0i64;
                 (*w).head = Atomic.new(0usize);
                 (*w).tail = Atomic.new(0usize);
-                (*w).executor = inner as *mut u8;
+                (*w).executor = inner;
                 (*w).tid = Atomic.new(0u64);
                 let mut k: usize = 0usize;
                 while k < LOCAL_QUEUE_CAP {
@@ -3810,7 +3906,9 @@ impl Executor {
         Executor { inner: inner }
     }
 
-    pub fn spawn<F: Future<Output = T> + Send, T: Send>(self: view<Executor>, fut: F, poll_fn: fn(*mut u8, *mut u8) -> u32) -> TaskHandle<T> {
+    // Submit `fut` to the worker pool. The task may migrate between worker threads at every `.await`,
+    // so the future and its output must be `Send` (AXS-EXEC-011).
+    pub fn spawn<F: Future<Output = T> + Send, T: Send>(self: view<Executor>, fut: F) -> TaskHandle<T> {
         let inner = self.inner;
         let sz = size_of<TaskControlBlock<F, T>>();
         let al = align_of<TaskControlBlock<F, T>>();
@@ -3827,7 +3925,7 @@ impl Executor {
             (*tcb).slot.header.owner_thread_id = 0u64;
             (*tcb).slot.header.queue_next = 0 as *mut TaskHeader;
             (*tcb).slot.header.schedule_fn = executor_schedule;
-            (*tcb).slot.header.poll_fn = poll_fn;
+            (*tcb).slot.header.poll_fn = task_poll_fn<F, T>;
             (*tcb).slot.header.drop_fn = default_task_drop;
             (*tcb).slot.header.schedule_data = inner as *mut u8;
             (*tcb).slot.header.alloc_size = sz;
@@ -3931,10 +4029,8 @@ use std.asyn.waker.TaskHeader
 use std.asyn.waker.task_wake
 use std.asyn.waker.task_dec_ref
 use std.asyn.executor.Executor
-use std.asyn.task.TaskControlBlock
 use std.asyn.task.TaskResult
 use std.asyn.task.TaskHandle
-use std.asyn.task.tcb_poll_fn
 
 const ITERATIONS: i64 = 200i64
 
@@ -3985,11 +4081,6 @@ impl Future for Hammered {
     }
 }
 
-fn poll_hammered(raw: *mut u8, cx: *mut u8) -> u32 {
-    let tcb = raw as *mut TaskControlBlock<Hammered, i64>;
-    tcb_poll_fn<Hammered, i64>(tcb, cx)
-}
-
 fn hammer(ctx: *mut u8) -> i64 {
     let s = ctx as *mut Shared;
     let goal: i64 = unsafe { (*s).goal };
@@ -4030,7 +4121,7 @@ pub fn main() -> i32 {
             (*s).in_poll = Atomic.new(0i64);
             (*s).hammer_done = Atomic.new(0i64);
         }
-        let h: TaskHandle<i64> = exec.spawn(Hammered { s: s, widen: i % 3i64 }, poll_hammered);
+        let h = exec.spawn(Hammered { s: s, widen: i % 3i64 });
         let raw = h.raw_task;
         // Pin the header for the hammer thread (its wakes need a live reference).
         unsafe {
@@ -4038,7 +4129,7 @@ pub fn main() -> i32 {
             (*s).raw = raw;
         }
         let th = unsafe { thread_spawn(hammer, s_raw, 0usize) };
-        check_at(131, th > 0i64);
+        check_at(124, th > 0i64);
 
         let mut stall: i64 = 0i64;
         let mut was_lost = false;
@@ -4057,12 +4148,12 @@ pub fn main() -> i32 {
         unsafe {
             thread_join(th, ret);
         }
-        match h.join() {
+        match h.join_blocking() {
             TaskResult.Completed(v) => {
-                check_at(152, v == goal);
+                check_at(145, v == goal);
             },
             _ => {
-                check_at(155, false);
+                check_at(148, false);
             },
         }
         task_dec_ref(raw);

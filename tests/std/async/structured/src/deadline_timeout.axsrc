@@ -5,16 +5,12 @@ use std.core.result.Result
 use std.core.prelude.Context
 use std.core.host.monotonic_ns
 use std.asyn.executor.LocalExecutor
-use std.asyn.task.LocalTaskHandle
-use std.asyn.task.TaskControlBlock
-use std.asyn.task.tcb_poll_fn
+use std.asyn.task.TaskError
 use std.asyn.timeout.Deadline
 use std.asyn.timeout.TimeoutError
-use std.asyn.timeout.TimeoutOutcome
-use std.asyn.timeout.LocalTimeout
-use std.asyn.timeout.local_with_deadline
-use std.asyn.timeout.local_with_timeout_ms
-use std.asyn.timeout.poll_deadline
+use std.asyn.timeout.Timeout
+use std.asyn.timeout.with_deadline
+use std.asyn.timeout.with_timeout_ms
 
 @intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
 
@@ -37,11 +33,6 @@ impl Future for ReadyAfter {
     }
 }
 
-fn poll_ready_after(raw: *mut u8, cx: *mut u8) -> u32 {
-    let tcb = raw as *mut TaskControlBlock<ReadyAfter, i64>;
-    tcb_poll_fn<ReadyAfter, i64>(tcb, cx)
-}
-
 // Never completes; counts how often it is dropped.
 struct Never {
     pub drops: *mut i64,
@@ -59,40 +50,6 @@ impl Drop for Never {
         unsafe {
             *self.drops = *self.drops + 1i64;
         }
-    }
-}
-
-fn poll_never(raw: *mut u8, cx: *mut u8) -> u32 {
-    let tcb = raw as *mut TaskControlBlock<Never, i64>;
-    tcb_poll_fn<Never, i64>(tcb, cx)
-}
-
-// A user-defined adapter built on the generic `poll_deadline`: an outer deadline around a (concrete)
-// inner timeout that already yields a `TimeoutOutcome`.
-struct OuterDeadline {
-    pub inner: LocalTimeout,
-    pub deadline: Deadline,
-}
-
-impl Future for OuterDeadline {
-    type Output = Result<TimeoutOutcome, TimeoutError>;
-    fn poll(self: mut_view<OuterDeadline>, cx: mut_view<Context>) -> Poll<Result<TimeoutOutcome, TimeoutError>> {
-        let d = self.deadline;
-        poll_deadline(mut_view(self.inner), d, mut_view(*cx))
-    }
-}
-
-// The same adapter directly around a plain future (no task involved).
-struct DirectDeadline {
-    pub inner: Never,
-    pub deadline: Deadline,
-}
-
-impl Future for DirectDeadline {
-    type Output = Result<i64, TimeoutError>;
-    fn poll(self: mut_view<DirectDeadline>, cx: mut_view<Context>) -> Poll<Result<i64, TimeoutError>> {
-        let d = self.deadline;
-        poll_deadline(mut_view(self.inner), d, mut_view(*cx))
     }
 }
 
@@ -117,36 +74,39 @@ pub fn main() -> i32 {
     check(Deadline.at_ns(0u64).is_expired());
     check(Deadline.after_ns(18446744073709551615u64).deadline_ns == Deadline.never().deadline_ns);
 
-    // 1. A task that finishes within a generous budget is passed through.
-    let h1: LocalTaskHandle<i64> = exec.spawn_local(ReadyAfter { n: 3i32, val: 41i64 }, poll_ready_after);
-    let t1 = local_with_deadline(Deadline.after_ms(3600000u64), h1);
-    let r1: TimeoutOutcome = exec.run_until(t1);
-    let v1 = match r1 {
-        TimeoutOutcome.Completed(v) => v,
-        _ => -1i64,
+    // 1. A task that finishes within a generous budget is passed through: `Timeout<F, T>` around a
+    // `LocalTaskHandle<i64>` resolves to Ok(the handle's own result).
+    let h1 = exec.spawn_local(ReadyAfter { n: 3i32, val: 41i64 });
+    let t1 = with_deadline(Deadline.after_ms(3600000u64), h1);
+    let v1 = match exec.run_until(t1) {
+        Result.Ok(inner) => match inner {
+            Result.Ok(v) => v,
+            Result.Err(e) => -2i64,
+        },
+        Result.Err(e) => -1i64,
     };
     check(v1 == 41i64);
 
-    // 2. An already expired deadline fails at once; the task is cancelled and its future dropped.
-    let h2: LocalTaskHandle<i64> = exec.spawn_local(Never { drops: p_drops }, poll_never);
-    let t2 = local_with_deadline(Deadline.after_ns(0u64), h2);
-    let r2: TimeoutOutcome = exec.run_until(t2);
-    match r2 {
-        TimeoutOutcome.TimedOut(e) => { expired = expired + 1i64; },
-        _ => { check(false); },
+    // 2. An already expired deadline fails at once. The expired `Timeout` is dropped when `run_until`
+    // returns, which drops the handle: the task is cancelled and its future dropped by the executor.
+    let h2 = exec.spawn_local(Never { drops: p_drops });
+    let t2 = with_deadline(Deadline.after_ns(0u64), h2);
+    match exec.run_until(t2) {
+        Result.Ok(inner) => { check(false); },
+        Result.Err(e) => { expired = expired + 1i64; },
     }
     exec.run();
     check(drops == 1i64);
 
     // 3. A short real deadline: expires after at least that long, and not absurdly later.
     let start = monotonic_ns();
-    let h3: LocalTaskHandle<i64> = exec.spawn_local(Never { drops: p_drops }, poll_never);
-    let t3 = local_with_timeout_ms(10u64, h3);
-    let r3: TimeoutOutcome = exec.run_until(t3);
+    let h3 = exec.spawn_local(Never { drops: p_drops });
+    let t3 = with_timeout_ms(10u64, h3);
+    let r3 = exec.run_until(t3);
     let elapsed = monotonic_ns() - start;
     match r3 {
-        TimeoutOutcome.TimedOut(e) => { expired = expired + 1i64; },
-        _ => { check(false); },
+        Result.Ok(inner) => { check(false); },
+        Result.Err(e) => { expired = expired + 1i64; },
     }
     exec.run();
     check(elapsed >= 10000000u64);
@@ -158,29 +118,28 @@ pub fn main() -> i32 {
     let own = Deadline.after_ms(5u64);
     let effective = parent.min(own);
     check(effective.deadline_ns == own.deadline_ns);
-    let h4: LocalTaskHandle<i64> = exec.spawn_local(Never { drops: p_drops }, poll_never);
-    let t4 = local_with_deadline(effective, h4);
-    let r4: TimeoutOutcome = exec.run_until(t4);
-    match r4 {
-        TimeoutOutcome.TimedOut(e) => {
+    let h4 = exec.spawn_local(Never { drops: p_drops });
+    let t4 = with_deadline(effective, h4);
+    check(t4.deadline().deadline_ns == own.deadline_ns);
+    match exec.run_until(t4) {
+        Result.Ok(inner) => { check(false); },
+        Result.Err(e) => {
             expired = expired + 1i64;
             check(e.deadline_ns == own.deadline_ns);
         },
-        _ => { check(false); },
     }
     exec.run();
     check(drops == 3i64);
 
-    // 5. Nested deadlines: the inner (tighter) one fires first and the outer one passes it on.
-    let h5: LocalTaskHandle<i64> = exec.spawn_local(Never { drops: p_drops }, poll_never);
-    let inner = local_with_timeout_ms(5u64, h5);
-    let t5 = OuterDeadline { inner: inner, deadline: Deadline.after_ms(3600000u64) };
-    let r5: Result<TimeoutOutcome, TimeoutError> = exec.run_until(t5);
-    match r5 {
-        Result.Ok(outcome) => {
-            match outcome {
-                TimeoutOutcome.TimedOut(e) => { expired = expired + 1i64; },
-                _ => { check(false); },
+    // 5. Nested deadlines: the inner (tighter) one fires first; the outer one passes its error on.
+    let h5 = exec.spawn_local(Never { drops: p_drops });
+    let inner = with_timeout_ms(5u64, h5);
+    let t5 = with_deadline(Deadline.after_ms(3600000u64), inner);
+    match exec.run_until(t5) {
+        Result.Ok(inner_res) => {
+            match inner_res {
+                Result.Ok(task_res) => { check(false); },
+                Result.Err(e) => { expired = expired + 1i64; },
             }
         },
         Result.Err(e) => { check(false); },
@@ -188,15 +147,22 @@ pub fn main() -> i32 {
     exec.run();
     check(drops == 4i64);
 
-    // 6. The generic building block directly around a plain future: expiry drops the future with
-    // the adapter (no task, no executor involvement).
-    let t6 = DirectDeadline { inner: Never { drops: p_drops }, deadline: Deadline.after_ms(5u64) };
-    let r6: Result<i64, TimeoutError> = exec.run_until(t6);
-    match r6 {
+    // 6. `Timeout<F, T>` directly around a user future (no task): expiry drops the future with the
+    // adapter.
+    let t6 = with_timeout_ms(5u64, Never { drops: p_drops });
+    match exec.run_until(t6) {
         Result.Ok(v) => { check(false); },
         Result.Err(e) => { expired = expired + 1i64; },
     }
     check(drops == 5i64);
+
+    // 7. A user future that completes within its budget is passed through unchanged.
+    let t7 = with_timeout_ms(3600000u64, ReadyAfter { n: 2i32, val: 7i64 });
+    let v7 = match exec.run_until(t7) {
+        Result.Ok(v) => v,
+        Result.Err(e) => -1i64,
+    };
+    check(v7 == 7i64);
 
     print("OK deadline_timeout ");
     print_int(expired);

@@ -1,0 +1,299 @@
+module main
+
+// T422c: the SPEC-34 API shape with non-`i64` outputs.
+//   1. Two `TaskGroup`s with different output types (`i64` and `Tracked`, a 24-byte value with a
+//      destructor) are alive at the same time on one executor; each collects its own children.
+//   2. `TaskGroup.next()` (the `GroupNext<T>` future) and `join_all()` driven by `exec.block_on`.
+//   3. `spawn(fut)` without a poll function, where the future owns a value that needs drop: the
+//      captured value is dropped exactly once whether the task completes or is cancelled.
+//   4. `TaskHandle<Tracked>` is itself a `Future<Output = Result<Tracked, TaskError>>`, polled by a
+//      hand-written parent future, and `handle.join()` is a future too (`TaskJoin<T>`).
+// Every `Tracked` counts its construction and destruction, so `live == 0` at the end proves that
+// outputs and captures were dropped exactly once. Match arms move a `Tracked` binding into a local
+// (`let owned = t;`) so it is dropped at the end of the arm: a binding left in the pattern is only
+// dropped at the end of the enclosing block today (T422c report, follow-up).
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.prelude.Context
+use std.core.host.heap_alloc
+use std.core.host.thread_yield
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.asyn.executor.Executor
+use std.asyn.task.TaskError
+use std.asyn.task.TaskId
+use std.asyn.task.TaskResult
+use std.asyn.task.TaskHandle
+use std.asyn.group.TaskGroup
+
+struct Tracked {
+    pub id: i64,
+    pub weight: i64,
+    pub live: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Tracked {}
+
+fn tracked(id: i64, live: *mut Atomic<i64>) -> Tracked {
+    unsafe {
+        (*live).fetch_add(1i64, Ordering.AcqRel);
+    }
+    Tracked { id: id, weight: id * 3i64, live: live }
+}
+
+impl Drop for Tracked {
+    fn drop(self: mut_view<Tracked>) {
+        unsafe {
+            (*self.live).fetch_sub(1i64, Ordering.AcqRel);
+        }
+    }
+}
+
+// Yields `steps` times, then returns a new `Tracked`; owns `keep` (a capture that needs drop) for
+// its whole life.
+struct MakeTracked {
+    pub id: i64,
+    pub steps: i32,
+    pub keep: Tracked,
+    pub live: *mut Atomic<i64>,
+}
+
+unsafe impl Send for MakeTracked {}
+
+impl Future for MakeTracked {
+    type Output = Tracked;
+    fn poll(self: mut_view<MakeTracked>, cx: mut_view<Context>) -> Poll<Tracked> {
+        if self.steps > 0i32 {
+            self.steps = self.steps - 1i32;
+            let w = cx.waker();
+            view(w).wake_by_ref();
+            return Poll.Pending;
+        }
+        check(self.keep.id == 1000i64 + self.id);
+        Poll.Ready(tracked(self.id, self.live))
+    }
+}
+
+fn make(id: i64, steps: i32, live: *mut Atomic<i64>) -> MakeTracked {
+    MakeTracked { id: id, steps: steps, keep: tracked(1000i64 + id, live), live: live }
+}
+
+// Returns `val` after `steps` yields.
+struct Num {
+    pub val: i64,
+    pub steps: i32,
+}
+
+unsafe impl Send for Num {}
+
+impl Future for Num {
+    type Output = i64;
+    fn poll(self: mut_view<Num>, cx: mut_view<Context>) -> Poll<i64> {
+        if self.steps > 0i32 {
+            self.steps = self.steps - 1i32;
+            let w = cx.waker();
+            view(w).wake_by_ref();
+            return Poll.Pending;
+        }
+        Poll.Ready(self.val)
+    }
+}
+
+// Never completes (cancelled from outside); owns a capture that needs drop.
+struct Forever {
+    pub keep: Tracked,
+}
+
+unsafe impl Send for Forever {}
+
+impl Future for Forever {
+    type Output = Tracked;
+    fn poll(self: mut_view<Forever>, cx: mut_view<Context>) -> Poll<Tracked> {
+        Poll.Pending
+    }
+}
+
+// A parent future that awaits a child task through the child's `TaskHandle<Tracked>` (the handle is
+// the future) and returns the child's weight.
+struct AwaitChild {
+    pub child: TaskHandle<Tracked>,
+}
+
+unsafe impl Send for AwaitChild {}
+
+impl Future for AwaitChild {
+    type Output = i64;
+    fn poll(self: mut_view<AwaitChild>, cx: mut_view<Context>) -> Poll<i64> {
+        match self.child.poll(cx) {
+            Poll.Ready(r) => {
+                match r {
+                    Result.Ok(t) => {
+                        let owned = t;
+                        Poll.Ready(owned.weight)
+                    },
+                    Result.Err(e) => Poll.Ready(-1i64),
+                }
+            },
+            Poll.Pending => Poll.Pending,
+        }
+    }
+}
+
+fn spawned<E>(r: Result<TaskId, E>) -> bool {
+    match r {
+        Result.Ok(id) => true,
+        Result.Err(e) => false,
+    }
+}
+
+fn new_counter() -> *mut Atomic<i64> {
+    let raw = unsafe { heap_alloc(8, 8) };
+    let p = raw as *mut Atomic<i64>;
+    unsafe {
+        *p = Atomic.new(0i64);
+    }
+    p
+}
+
+fn live_now(live: *mut Atomic<i64>) -> i64 {
+    unsafe { (*live).load(Ordering.Acquire) }
+}
+
+// Wait until the counter reaches `want` (cooperative cancellation completes on a worker thread).
+fn settle(live: *mut Atomic<i64>, want: i64) -> i64 {
+    let mut k: i32 = 0i32;
+    while live_now(live) != want && k < 2000000i32 {
+        unsafe {
+            thread_yield();
+        }
+        k = k + 1i32;
+    }
+    live_now(live)
+}
+
+pub fn main() -> i32 {
+    let exec = Executor.new(4);
+    let live = new_counter();
+
+    // 1 + 2. Two groups with different output types, interleaved on one executor.
+    let mut nums: TaskGroup<i64> = TaskGroup.new();
+    let mut objs: TaskGroup<Tracked> = TaskGroup.new();
+    let mut i: i64 = 1i64;
+    while i <= 4i64 {
+        check(spawned(nums.spawn(view(exec), Num { val: i * 10i64, steps: (i % 3i64) as i32 })));
+        check(spawned(objs.spawn(view(exec), make(i, (i % 2i64) as i32, live))));
+        i = i + 1i64;
+    }
+    check(nums.live_count() == 4usize);
+    check(objs.live_count() == 4usize);
+
+    // `next()` future of the Tracked group: four results, then None.
+    let mut weights: i64 = 0i64;
+    let mut got: i64 = 0i64;
+    loop {
+        match exec.block_on(objs.next()) {
+            Option.Some(r) => {
+                match r {
+                    Result.Ok(t) => {
+                        let owned = t;
+                        weights = weights + owned.weight;
+                        got = got + 1i64;
+                    },
+                    Result.Err(e) => { check(false); },
+                }
+            },
+            Option.None => { break; },
+        }
+    }
+    check(got == 4i64);
+    check(weights == 30i64);
+    // Every output was dropped by the arms above; every captured `keep` with its finished future.
+    check(settle(live, 0i64) == 0i64);
+
+    // `join_all()` future of the i64 group: outputs in spawn order.
+    let joined = exec.block_on(nums.join_all());
+    let mut sum: i64 = 0i64;
+    match joined {
+        Result.Ok(res) => {
+            check(res.len() == 4usize);
+            let mut k: usize = 0usize;
+            while k < res.len() {
+                let v = unsafe { *res.get_ptr(k) };
+                check(v == ((k as i64) + 1i64) * 10i64);
+                sum = sum + v;
+                k = k + 1usize;
+            }
+        },
+        Result.Err(e) => { check(false); },
+    }
+    check(sum == 100i64);
+
+    // A Tracked group collected by `join_all`: the results container owns the outputs and drops
+    // them with itself; `pop` moves one out.
+    let mut objs2: TaskGroup<Tracked> = TaskGroup.new();
+    check(spawned(objs2.spawn(view(exec), make(7i64, 2i32, live))));
+    check(spawned(objs2.spawn(view(exec), make(8i64, 0i32, live))));
+    let mut last_id: i64 = 0i64;
+    match exec.block_on(objs2.join_all()) {
+        Result.Ok(res) => {
+            let mut owned = res;
+            check(owned.len() == 2usize);
+            check(live_now(live) == 2i64);
+            match owned.pop() {
+                Option.Some(t) => {
+                    let owned = t;
+                    last_id = owned.id;
+                },
+                Option.None => { check(false); },
+            }
+            check(owned.len() == 1usize);
+            check(live_now(live) == 1i64);
+        },
+        Result.Err(e) => { check(false); },
+    }
+    check(last_id == 8i64);
+    check(live_now(live) == 0i64);
+
+    // 3. spawn(fut) with a capture that needs drop, cancelled before it can finish.
+    let hf = exec.spawn(Forever { keep: tracked(77i64, live) });
+    check(live_now(live) == 1i64);
+    view(hf).cancel();
+    let cancelled = match hf.join_blocking() {
+        TaskResult.Cancelled => true,
+        _ => false,
+    };
+    check(cancelled);
+    check(settle(live, 0i64) == 0i64);
+
+    // 4. TaskHandle<Tracked> as a Future inside a parent task, and handle.join() as a future.
+    let child = exec.spawn(make(5i64, 3i32, live));
+    let parent = exec.spawn(AwaitChild { child: child });
+    let pw = match exec.block_on(parent.join()) {
+        TaskResult.Completed(w) => w,
+        _ => -1i64,
+    };
+    check(pw == 15i64);
+    let h6 = exec.spawn(make(6i64, 1i32, live));
+    let w6 = match exec.block_on(h6.join()) {
+        TaskResult.Completed(t) => {
+            let owned = t;
+            owned.weight
+        },
+        _ => -1i64,
+    };
+    check(w6 == 18i64);
+    check(settle(live, 0i64) == 0i64);
+
+    exec.shutdown();
+    print("OK group_two_output_types ");
+    print_int(weights);
+    print(" ");
+    print_int(sum);
+    print(" ");
+    print_int(pw + w6);
+    print(" ");
+    print_int(live_now(live));
+    print("\n");
+    0
+}

@@ -40,6 +40,7 @@ use std.asyn.task.TaskHandle
 use std.asyn.task.LocalTaskHandle
 use std.asyn.task.TaskControlBlock
 use std.asyn.task.default_task_drop
+use std.asyn.task.task_poll_fn
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 @intrinsic fn align_of<T>() -> usize { 0 }
@@ -141,7 +142,8 @@ impl LocalExecutor {
         }
     }
 
-    pub fn spawn_local<F: Future<Output = T>, T>(self: mut_view<LocalExecutor>, fut: F, poll_fn: fn(*mut u8, *mut u8) -> u32) -> LocalTaskHandle<T> {
+    // Submit `fut` as a task pinned to this executor's thread; no `Send` requirement (AXS-EXEC-010).
+    pub fn spawn_local<F: Future<Output = T>, T>(self: mut_view<LocalExecutor>, fut: F) -> LocalTaskHandle<T> {
         let p_self = unsafe { address_of_mut(*self) as *mut LocalExecutor };
         let sz = size_of<TaskControlBlock<F, T>>();
         let al = align_of<TaskControlBlock<F, T>>();
@@ -158,7 +160,7 @@ impl LocalExecutor {
             (*tcb).slot.header.owner_thread_id = self.owner_thread;
             (*tcb).slot.header.queue_next = 0 as *mut TaskHeader;
             (*tcb).slot.header.schedule_fn = local_schedule;
-            (*tcb).slot.header.poll_fn = poll_fn;
+            (*tcb).slot.header.poll_fn = task_poll_fn<F, T>;
             (*tcb).slot.header.drop_fn = default_task_drop;
             (*tcb).slot.header.schedule_data = p_self as *mut u8;
             (*tcb).slot.header.alloc_size = sz;
@@ -186,8 +188,7 @@ impl LocalExecutor {
         }
         let w = make_task_waker(task);
         let mut cx = Context { waker_val: w };
-        let poll_fn = unsafe { (*task).poll_fn };
-        let st: u32 = poll_fn(task as *mut u8, unsafe { address_of_mut<Context>(cx) as *mut u8 });
+        let st: u32 = unsafe { ((*task).poll_fn)(task as *mut u8, address_of_mut<Context>(cx) as *mut u8) };
         if st >= TASK_COMPLETED {
             if self.active_tasks > 0 {
                 self.active_tasks = self.active_tasks - 1;
@@ -199,7 +200,7 @@ impl LocalExecutor {
 
     pub fn run(self: mut_view<LocalExecutor>) {
         while self.active_tasks > 0 {
-            if !mut_view(*self).try_tick() {
+            if !self.try_tick() {
                 unsafe {
                     thread_yield();
                 }
@@ -222,7 +223,7 @@ impl LocalExecutor {
                     return val;
                 },
                 Poll.Pending => {
-                    if !mut_view(*self).try_tick() {
+                    if !self.try_tick() {
                         unsafe {
                             thread_yield();
                         }
@@ -256,10 +257,8 @@ pub struct WorkerData {
     pub head: Atomic<usize>,
     pub tail: Atomic<usize>,
     pub queue: [256]*mut TaskHeader,
-    // Opaque pointer to the owning ExecutorInner. A field typed `*mut ExecutorInner` here would be a
-    // forward reference to a later-declared struct, which currently yields wrong field offsets
-    // through the pointer (see T421 report, follow-up FU-1); cast at use instead.
-    pub executor: *mut u8,
+    // The owning executor state.
+    pub executor: *mut ExecutorInner,
     // OS thread id of the worker (0 until the worker thread has started).
     pub tid: Atomic<u64>,
 }
@@ -442,8 +441,7 @@ fn executor_try_help_one(inner: *mut ExecutorInner) -> bool {
     }
     let w = make_task_waker(task);
     let mut cx = Context { waker_val: w };
-    let poll_fn = unsafe { (*task).poll_fn };
-    let st: u32 = poll_fn(task as *mut u8, unsafe { address_of_mut<Context>(cx) as *mut u8 });
+    let st: u32 = unsafe { ((*task).poll_fn)(task as *mut u8, address_of_mut<Context>(cx) as *mut u8) };
     if st >= TASK_COMPLETED {
         unsafe {
             (*inner).active_tasks.fetch_sub(1usize, Ordering.Release);
@@ -455,7 +453,7 @@ fn executor_try_help_one(inner: *mut ExecutorInner) -> bool {
 
 fn worker_thread_main(ctx: *mut u8) -> i64 {
     let w = ctx as *mut WorkerData;
-    let inner = unsafe { (*w).executor as *mut ExecutorInner };
+    let inner = unsafe { (*w).executor };
     unsafe {
         (*w).tid.store(thread_current_id(), Ordering.Release);
     }
@@ -515,8 +513,7 @@ fn worker_thread_main(ctx: *mut u8) -> i64 {
         if (task as usize) != 0 {
             let task_w = make_task_waker(task);
             let mut cx = Context { waker_val: task_w };
-            let poll_fn = unsafe { (*task).poll_fn };
-            let st: u32 = poll_fn(task as *mut u8, unsafe { address_of_mut<Context>(cx) as *mut u8 });
+            let st: u32 = unsafe { ((*task).poll_fn)(task as *mut u8, address_of_mut<Context>(cx) as *mut u8) };
             if st >= TASK_COMPLETED {
                 unsafe {
                     (*inner).active_tasks.fetch_sub(1usize, Ordering.Release);
@@ -567,7 +564,7 @@ impl Executor {
                 (*w).thread_handle = 0i64;
                 (*w).head = Atomic.new(0usize);
                 (*w).tail = Atomic.new(0usize);
-                (*w).executor = inner as *mut u8;
+                (*w).executor = inner;
                 (*w).tid = Atomic.new(0u64);
                 let mut k: usize = 0usize;
                 while k < LOCAL_QUEUE_CAP {
@@ -590,7 +587,9 @@ impl Executor {
         Executor { inner: inner }
     }
 
-    pub fn spawn<F: Future<Output = T> + Send, T: Send>(self: view<Executor>, fut: F, poll_fn: fn(*mut u8, *mut u8) -> u32) -> TaskHandle<T> {
+    // Submit `fut` to the worker pool. The task may migrate between worker threads at every `.await`,
+    // so the future and its output must be `Send` (AXS-EXEC-011).
+    pub fn spawn<F: Future<Output = T> + Send, T: Send>(self: view<Executor>, fut: F) -> TaskHandle<T> {
         let inner = self.inner;
         let sz = size_of<TaskControlBlock<F, T>>();
         let al = align_of<TaskControlBlock<F, T>>();
@@ -607,7 +606,7 @@ impl Executor {
             (*tcb).slot.header.owner_thread_id = 0u64;
             (*tcb).slot.header.queue_next = 0 as *mut TaskHeader;
             (*tcb).slot.header.schedule_fn = executor_schedule;
-            (*tcb).slot.header.poll_fn = poll_fn;
+            (*tcb).slot.header.poll_fn = task_poll_fn<F, T>;
             (*tcb).slot.header.drop_fn = default_task_drop;
             (*tcb).slot.header.schedule_data = inner as *mut u8;
             (*tcb).slot.header.alloc_size = sz;

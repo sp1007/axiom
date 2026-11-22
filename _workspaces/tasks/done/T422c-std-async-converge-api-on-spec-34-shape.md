@@ -8,14 +8,14 @@ model: opus
 gate_model: opus
 depends: [T421a, T444, T445, T446, T447, T448, T449, T422a, T422b]
 priority: 30
-status: doing
+status: done
 attempts: 1
 timeout_min: 900
 paths: [std/async, tests/std/async, tests/conformance/p11/e11_5_executors, tests/perf/p11_executor, tests/std/fiber]
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/SPEC-34-executors-fibers.md, spec/SPEC-33-async.md]
 covers: [REQ-CONC-040, REQ-ASY-041, REQ-ASY-109]
 started: 2026-11-22 11:42:25
-agent: T422c-impl
+finished: 2026-11-22 15:28:28
 ---
 # T422c — std/async: SPEC-34 API shape
 
@@ -49,3 +49,4 @@ compiler gaps that forced the T421/T422 deviations are fixed (ADR-0042 §2).
 ## Log
 - 2026-11-13 created by axiom-architect (ADR-0042 §2; T421/T422 API deviations)
 - 2026-11-22 11:42:25 started (attempt 1) T422c-impl
+- 2026-11-22 15:28:28 accepted by QA -> done

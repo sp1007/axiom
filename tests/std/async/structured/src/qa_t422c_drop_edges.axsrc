@@ -1,0 +1,282 @@
+module main
+
+// QA (T422c gate): drop accounting across the seams the SPEC-34 API shape introduced.
+//   A. `join_all` failure path with a `Drop` output type: two children complete with a `Tracked`,
+//      one reports a panic. `join_all` returns `Err(Panicked)` and the outputs already collected
+//      into the (discarded) `GroupResults<Tracked>` are dropped exactly once.
+//   B. `Timeout<GroupJoinAll<Tracked>, _>`: a deadline over a group whose children never finish.
+//      The timeout fires (`Err(TimeoutError)`); dropping the `Timeout` drops the `GroupJoinAll`,
+//      which drops the group, which cancels and drains the children: every captured `Tracked` is
+//      dropped.
+//   C. `Timeout<TaskHandle<Tracked>, _>` whose task finishes before the deadline: `Ok(Ok(t))`.
+//   D. `LocalExecutor.spawn_local` with a non-i64 output: `LocalTaskHandle<Tracked>.join()` as a
+//      future driven by `run_until`, and a dropped `LocalTaskHandle` cancels its task (capture
+//      dropped).
+//   E. `TaskGroup.next()` after `cancel_all`: the never-finishing child yields `Some(Err(Cancelled))`
+//      and its capture is dropped; then `None`.
+// The `live` counter must return to 0 after every section.
+
+use std.core.option.Option
+use std.core.result.Result
+use std.core.prelude.Context
+use std.core.host.heap_alloc
+use std.core.host.thread_yield
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.asyn.executor.Executor
+use std.asyn.executor.LocalExecutor
+use std.asyn.task.TaskError
+use std.asyn.task.TaskId
+use std.asyn.task.TaskResult
+use std.asyn.task.TaskHandle
+use std.asyn.task.task_panic
+use std.asyn.group.TaskGroup
+use std.asyn.group.GroupError
+use std.asyn.timeout.TimeoutError
+use std.asyn.timeout.with_timeout_ms
+
+struct Tracked {
+    pub id: i64,
+    pub live: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Tracked {}
+
+fn tracked(id: i64, live: *mut Atomic<i64>) -> Tracked {
+    unsafe {
+        (*live).fetch_add(1i64, Ordering.AcqRel);
+    }
+    Tracked { id: id, live: live }
+}
+
+impl Drop for Tracked {
+    fn drop(self: mut_view<Tracked>) {
+        unsafe {
+            (*self.live).fetch_sub(1i64, Ordering.AcqRel);
+        }
+    }
+}
+
+// Yields `steps` times, then returns `Tracked(id)`; if `panics`, reports a panic instead of
+// finishing. Owns a capture that needs drop.
+struct Child {
+    pub id: i64,
+    pub steps: i32,
+    pub panics: bool,
+    pub keep: Tracked,
+    pub live: *mut Atomic<i64>,
+}
+
+unsafe impl Send for Child {}
+
+impl Future for Child {
+    type Output = Tracked;
+    fn poll(self: mut_view<Child>, cx: mut_view<Context>) -> Poll<Tracked> {
+        if self.steps > 0i32 {
+            self.steps = self.steps - 1i32;
+            let w = cx.waker();
+            view(w).wake_by_ref();
+            return Poll.Pending;
+        }
+        if self.panics {
+            task_panic(cx);
+            return Poll.Pending;
+        }
+        Poll.Ready(tracked(self.id, self.live))
+    }
+}
+
+fn child(id: i64, steps: i32, panics: bool, live: *mut Atomic<i64>) -> Child {
+    Child { id: id, steps: steps, panics: panics, keep: tracked(500i64 + id, live), live: live }
+}
+
+// Never completes; re-schedules itself so cancellation is observed promptly.
+struct Forever {
+    pub keep: Tracked,
+}
+
+unsafe impl Send for Forever {}
+
+impl Future for Forever {
+    type Output = Tracked;
+    fn poll(self: mut_view<Forever>, cx: mut_view<Context>) -> Poll<Tracked> {
+        let w = cx.waker();
+        view(w).wake_by_ref();
+        Poll.Pending
+    }
+}
+
+fn spawned<E>(r: Result<TaskId, E>) -> bool {
+    match r {
+        Result.Ok(id) => true,
+        Result.Err(e) => false,
+    }
+}
+
+fn new_counter() -> *mut Atomic<i64> {
+    let raw = unsafe { heap_alloc(8, 8) };
+    let p = raw as *mut Atomic<i64>;
+    unsafe {
+        *p = Atomic.new(0i64);
+    }
+    p
+}
+
+fn live_now(live: *mut Atomic<i64>) -> i64 {
+    unsafe { (*live).load(Ordering.Acquire) }
+}
+
+fn settle(live: *mut Atomic<i64>, want: i64) -> i64 {
+    let mut k: i32 = 0i32;
+    while live_now(live) != want && k < 2000000i32 {
+        unsafe {
+            thread_yield();
+        }
+        k = k + 1i32;
+    }
+    live_now(live)
+}
+
+fn section_a(exec: view<Executor>, live: *mut Atomic<i64>) -> i64 {
+    let mut g: TaskGroup<Tracked> = TaskGroup.new();
+    check(spawned(g.spawn(exec, child(1i64, 0i32, false, live))));
+    check(spawned(g.spawn(exec, child(2i64, 1i32, false, live))));
+    check(spawned(g.spawn(exec, child(3i64, 3i32, true, live))));
+    let r = exec.block_on(g.join_all());
+    let code = match r {
+        Result.Ok(res) => {
+            let owned = res;
+            -1i64
+        },
+        Result.Err(e) => {
+            match e {
+                TaskError.Panicked => 1i64,
+                TaskError.Cancelled => 2i64,
+            }
+        },
+    };
+    check(code == 1i64);
+    check(settle(live, 0i64) == 0i64);
+    code
+}
+
+fn section_b(exec: view<Executor>, live: *mut Atomic<i64>) -> i64 {
+    let mut g: TaskGroup<Tracked> = TaskGroup.new();
+    check(spawned(g.spawn(exec, Forever { keep: tracked(10i64, live) })));
+    check(spawned(g.spawn(exec, Forever { keep: tracked(11i64, live) })));
+    check(spawned(g.spawn(exec, child(12i64, 0i32, false, live))));
+    let t = with_timeout_ms(20u64, g.join_all());
+    let r = exec.block_on(t);
+    let code = match r {
+        Result.Ok(inner) => {
+            let owned = inner;
+            -1i64
+        },
+        Result.Err(e) => 3i64,
+    };
+    check(code == 3i64);
+    check(settle(live, 0i64) == 0i64);
+    code
+}
+
+fn section_c(exec: view<Executor>, live: *mut Atomic<i64>) -> i64 {
+    let h = exec.spawn(child(40i64, 2i32, false, live));
+    let r = exec.block_on(with_timeout_ms(3600000u64, h));
+    let id = match r {
+        Result.Ok(inner) => {
+            match inner {
+                Result.Ok(t) => {
+                    let owned = t;
+                    owned.id
+                },
+                Result.Err(e) => -2i64,
+            }
+        },
+        Result.Err(e) => -3i64,
+    };
+    check(id == 40i64);
+    check(settle(live, 0i64) == 0i64);
+    id
+}
+
+fn section_d(live: *mut Atomic<i64>) -> i64 {
+    let mut lx = LocalExecutor.new();
+    let h1 = lx.spawn_local(child(50i64, 2i32, false, live));
+    let h2 = lx.spawn_local(Forever { keep: tracked(51i64, live) });
+    check(live_now(live) == 2i64);
+    let r = lx.run_until(h1.join());
+    let id = match r {
+        TaskResult.Completed(t) => {
+            let owned = t;
+            owned.id
+        },
+        _ => -1i64,
+    };
+    check(id == 50i64);
+    // Dropping the handle of the never-finishing local task cancels it; the executor drops its
+    // future (and the capture) on the next tick.
+    let dropped = h2;
+    {
+        let gone = dropped;
+    }
+    lx.run();
+    check(settle(live, 0i64) == 0i64);
+    check(lx.active_task_count() == 0usize);
+    id
+}
+
+fn section_e(exec: view<Executor>, live: *mut Atomic<i64>) -> i64 {
+    let mut g: TaskGroup<Tracked> = TaskGroup.new();
+    check(spawned(g.spawn(exec, Forever { keep: tracked(60i64, live) })));
+    g.cancel_all();
+    // A cancelled group refuses new children, and the refused future is dropped at once.
+    let refused = g.spawn(exec, child(61i64, 0i32, false, live));
+    check(match refused { Result.Ok(id) => false, Result.Err(e) => match e { GroupError.Cancelled => true, _ => false } });
+    let mut cancelled: i64 = 0i64;
+    loop {
+        match exec.block_on(g.next()) {
+            Option.Some(r) => {
+                match r {
+                    Result.Ok(t) => {
+                        let owned = t;
+                        check(false);
+                    },
+                    Result.Err(e) => {
+                        cancelled = cancelled + 1i64;
+                    },
+                }
+            },
+            Option.None => {
+                break;
+            },
+        }
+    }
+    check(cancelled == 1i64);
+    check(settle(live, 0i64) == 0i64);
+    cancelled
+}
+
+pub fn main() -> i32 {
+    let exec = Executor.new(4);
+    let live = new_counter();
+    let a = section_a(view(exec), live);
+    let b = section_b(view(exec), live);
+    let c = section_c(view(exec), live);
+    let d = section_d(live);
+    let e = section_e(view(exec), live);
+    exec.shutdown();
+    print("OK qa_t422c_drop_edges ");
+    print_int(a);
+    print(" ");
+    print_int(b);
+    print(" ");
+    print_int(c);
+    print(" ");
+    print_int(d);
+    print(" ");
+    print_int(e);
+    print(" ");
+    print_int(live_now(live));
+    print("\n");
+    0
+}

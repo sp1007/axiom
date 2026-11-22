@@ -7,16 +7,13 @@ use std.core.host.heap_alloc
 use std.sync.atomic.Atomic
 use std.sync.atomic.Ordering
 use std.asyn.executor.Executor
-use std.asyn.task.TaskControlBlock
 use std.asyn.task.TaskError
-use std.asyn.task.TaskResult
 use std.asyn.task.TaskHandle
 use std.asyn.cancel.CancelledFuture
 use std.asyn.cancel.CancellationToken
 use std.asyn.group.TaskGroup
 use std.asyn.group.GroupResults
-use std.asyn.group.group_poll_fn
-use std.asyn.group.task_panic
+use std.asyn.task.task_panic
 
 // Every child future counts itself in `alive` on creation and out when it is dropped, so after the
 // group is gone `alive == 0` proves that each future's destructor ran exactly once.
@@ -63,11 +60,6 @@ impl Drop for Looper {
     }
 }
 
-fn poll_looper(raw: *mut u8, cx: *mut u8) -> u32 {
-    let tcb = raw as *mut TaskControlBlock<Looper, i64>;
-    group_poll_fn<Looper, i64>(tcb, cx)
-}
-
 // Parks without ever waking itself: only the cancellation wake can make the executor drop it.
 struct Sleeper {
     pub alive: *mut Atomic<i64>,
@@ -86,11 +78,6 @@ impl Drop for Sleeper {
     fn drop(self: mut_view<Sleeper>) {
         died(self.alive);
     }
-}
-
-fn poll_sleeper(raw: *mut u8, cx: *mut u8) -> u32 {
-    let tcb = raw as *mut TaskControlBlock<Sleeper, i64>;
-    group_poll_fn<Sleeper, i64>(tcb, cx)
 }
 
 // Cooperative child: finishes with 5 as soon as the group's cancellation token fires.
@@ -115,11 +102,6 @@ impl Drop for Coop {
     fn drop(self: mut_view<Coop>) {
         died(self.alive);
     }
-}
-
-fn poll_coop(raw: *mut u8, cx: *mut u8) -> u32 {
-    let tcb = raw as *mut TaskControlBlock<Coop, i64>;
-    group_poll_fn<Coop, i64>(tcb, cx)
 }
 
 // The failing child: after two polls it reports a panic (contained, see std.asyn.group).
@@ -151,37 +133,28 @@ impl Drop for Failer {
     }
 }
 
-fn poll_failer(raw: *mut u8, cx: *mut u8) -> u32 {
-    let tcb = raw as *mut TaskControlBlock<Failer, i64>;
-    group_poll_fn<Failer, i64>(tcb, cx)
-}
-
 // Fill `group` with the mixed set of children: 3 Loopers, 1 Failer, 2 Coops, 1 Sleeper (7 in all).
-fn populate(group: mut_view<TaskGroup>, exec: view<Executor>, alive: *mut Atomic<i64>) {
+fn populate(group: mut_view<TaskGroup<i64>>, exec: view<Executor>, alive: *mut Atomic<i64>) {
     let tok = view(*group).cancellation_token();
     let mut k: i32 = 0i32;
     while k < 3i32 {
         born(alive);
-        let h: TaskHandle<i64> = exec.spawn(Looper { alive: alive }, poll_looper);
-        let r = mut_view(*group).adopt(h);
+        let r = group.spawn(exec, Looper { alive: alive });
         check(match r { Result.Ok(id) => true, Result.Err(e) => false });
         k = k + 1i32;
     }
     born(alive);
-    let hf: TaskHandle<i64> = exec.spawn(Failer { step: 0i32, alive: alive }, poll_failer);
-    let rf = mut_view(*group).adopt(hf);
+    let rf = group.spawn(exec, Failer { step: 0i32, alive: alive });
     check(match rf { Result.Ok(id) => true, Result.Err(e) => false });
     let mut c: i32 = 0i32;
     while c < 2i32 {
         born(alive);
-        let hc: TaskHandle<i64> = exec.spawn(Coop { fut: tok.cancelled(), alive: alive }, poll_coop);
-        let rc = mut_view(*group).adopt(hc);
+        let rc = group.spawn(exec, Coop { fut: tok.cancelled(), alive: alive });
         check(match rc { Result.Ok(id) => true, Result.Err(e) => false });
         c = c + 1i32;
     }
     born(alive);
-    let hs: TaskHandle<i64> = exec.spawn(Sleeper { alive: alive }, poll_sleeper);
-    let rs = mut_view(*group).adopt(hs);
+    let rs = group.spawn(exec, Sleeper { alive: alive });
     check(match rs { Result.Ok(id) => true, Result.Err(e) => false });
 }
 
@@ -195,7 +168,7 @@ pub fn main() -> i32 {
         let mut group = TaskGroup.new();
         populate(mut_view(group), view(exec), alive);
         check(group.live_count() == 7usize);
-        let joined: Result<GroupResults<i64>, TaskError> = group.join_all();
+        let joined: Result<GroupResults<i64>, TaskError> = exec.block_on(group.join_all());
         let ok = match joined {
             Result.Ok(r) => false,
             Result.Err(e) => match e {
@@ -216,17 +189,21 @@ pub fn main() -> i32 {
         let mut g2 = TaskGroup.new();
         populate(mut_view(g2), view(exec), alive);
         loop {
-            let r: Option<TaskResult<i64>> = g2.next_blocking();
+            let r: Option<Result<i64, TaskError>> = g2.next_blocking();
             match r {
                 Option.Some(res) => {
                     reaped = reaped + 1i64;
                     match res {
-                        TaskResult.Panicked => { panicked = panicked + 1i64; },
-                        TaskResult.Completed(v) => {
+                        Result.Ok(v) => {
                             check(v == 5i64);
                             other = other + 1i64;
                         },
-                        TaskResult.Cancelled => { other = other + 1i64; },
+                        Result.Err(e) => {
+                            match e {
+                                TaskError.Panicked => { panicked = panicked + 1i64; },
+                                TaskError.Cancelled => { other = other + 1i64; },
+                            }
+                        },
                     }
                 },
                 Option.None => { break; },

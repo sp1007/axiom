@@ -51,8 +51,6 @@ use std.asyn.executor.LocalExecutor
 use std.asyn.task.LocalTaskHandle
 use std.asyn.task.TaskResult
 use std.asyn.task.TaskHeader
-use std.asyn.task.TaskControlBlock
-use std.asyn.task.tcb_poll_fn
 
 fn check(cond: bool) {
     if !cond {
@@ -82,11 +80,6 @@ impl Future for WorkerAdd {
     }
 }
 
-fn poll_worker_add(raw: *mut u8, cx: *mut u8) -> u32 {
-    let tcb = raw as *mut TaskControlBlock<WorkerAdd, i64>;
-    tcb_poll_fn<WorkerAdd, i64>(tcb, cx)
-}
-
 struct WorkerRead {
     pub rc_val: Rc<i64>,
     pub step: i32,
@@ -107,11 +100,6 @@ impl Future for WorkerRead {
     }
 }
 
-fn poll_worker_read(raw: *mut u8, cx: *mut u8) -> u32 {
-    let tcb = raw as *mut TaskControlBlock<WorkerRead, i64>;
-    tcb_poll_fn<WorkerRead, i64>(tcb, cx)
-}
-
 pub fn main() -> i32 {
     let mut exec = LocalExecutor.new();
     let val_rc = Rc.new(42i64);
@@ -120,16 +108,16 @@ pub fn main() -> i32 {
 
     check(view(val_rc).strong_count() == 3usize);
 
-    let h1 = exec.spawn_local(WorkerAdd { rc_val: rc1, bonus: 16i64, step: 0i32 }, poll_worker_add);
-    let h2 = exec.spawn_local(WorkerRead { rc_val: rc2, step: 0i32 }, poll_worker_read);
+    let h1 = exec.spawn_local(WorkerAdd { rc_val: rc1, bonus: 16i64, step: 0i32 });
+    let h2 = exec.spawn_local(WorkerRead { rc_val: rc2, step: 0i32 });
 
     exec.run();
 
-    let r1 = match h1.join() {
+    let r1 = match h1.join_blocking() {
         TaskResult.Completed(v) => v,
         _ => -1i64,
     };
-    let r2 = match h2.join() {
+    let r2 = match h2.join_blocking() {
         TaskResult.Completed(v) => v,
         _ => -1i64,
     };
@@ -168,8 +156,6 @@ use std.core.result.Result
 use std.asyn.executor.Executor
 use std.asyn.task.TaskResult
 use std.asyn.task.TaskHeader
-use std.asyn.task.TaskControlBlock
-use std.asyn.task.tcb_poll_fn
 
 fn check(cond: bool) {
     if !cond {
@@ -196,48 +182,43 @@ impl Future for ComputeTask {
     }
 }
 
-fn poll_compute_task(raw: *mut u8, cx: *mut u8) -> u32 {
-    let tcb = raw as *mut TaskControlBlock<ComputeTask, i64>;
-    tcb_poll_fn<ComputeTask, i64>(tcb, cx)
-}
-
 pub fn main() -> i32 {
     let exec = Executor.new(4);
     check(exec.worker_count() == 4usize);
 
-    let h1 = exec.spawn(ComputeTask { val: 1i64, step: 0i32 }, poll_compute_task);
-    let h2 = exec.spawn(ComputeTask { val: 2i64, step: 0i32 }, poll_compute_task);
-    let h3 = exec.spawn(ComputeTask { val: 3i64, step: 0i32 }, poll_compute_task);
-    let h4 = exec.spawn(ComputeTask { val: 4i64, step: 0i32 }, poll_compute_task);
-    let h5 = exec.spawn(ComputeTask { val: 5i64, step: 0i32 }, poll_compute_task);
-    let h6 = exec.spawn(ComputeTask { val: 6i64, step: 0i32 }, poll_compute_task);
-    let h7 = exec.spawn(ComputeTask { val: 7i64, step: 0i32 }, poll_compute_task);
-    let h8 = exec.spawn(ComputeTask { val: 8i64, step: 0i32 }, poll_compute_task);
-    let h9 = exec.spawn(ComputeTask { val: 9i64, step: 0i32 }, poll_compute_task);
-    let h10 = exec.spawn(ComputeTask { val: 10i64, step: 0i32 }, poll_compute_task);
-    let h11 = exec.spawn(ComputeTask { val: 11i64, step: 0i32 }, poll_compute_task);
-    let h12 = exec.spawn(ComputeTask { val: 12i64, step: 0i32 }, poll_compute_task);
-    let h13 = exec.spawn(ComputeTask { val: 13i64, step: 0i32 }, poll_compute_task);
-    let h14 = exec.spawn(ComputeTask { val: 14i64, step: 0i32 }, poll_compute_task);
-    let h15 = exec.spawn(ComputeTask { val: 15i64, step: 0i32 }, poll_compute_task);
-    let h16 = exec.spawn(ComputeTask { val: 16i64, step: 0i32 }, poll_compute_task);
+    let h1 = exec.spawn(ComputeTask { val: 1i64, step: 0i32 });
+    let h2 = exec.spawn(ComputeTask { val: 2i64, step: 0i32 });
+    let h3 = exec.spawn(ComputeTask { val: 3i64, step: 0i32 });
+    let h4 = exec.spawn(ComputeTask { val: 4i64, step: 0i32 });
+    let h5 = exec.spawn(ComputeTask { val: 5i64, step: 0i32 });
+    let h6 = exec.spawn(ComputeTask { val: 6i64, step: 0i32 });
+    let h7 = exec.spawn(ComputeTask { val: 7i64, step: 0i32 });
+    let h8 = exec.spawn(ComputeTask { val: 8i64, step: 0i32 });
+    let h9 = exec.spawn(ComputeTask { val: 9i64, step: 0i32 });
+    let h10 = exec.spawn(ComputeTask { val: 10i64, step: 0i32 });
+    let h11 = exec.spawn(ComputeTask { val: 11i64, step: 0i32 });
+    let h12 = exec.spawn(ComputeTask { val: 12i64, step: 0i32 });
+    let h13 = exec.spawn(ComputeTask { val: 13i64, step: 0i32 });
+    let h14 = exec.spawn(ComputeTask { val: 14i64, step: 0i32 });
+    let h15 = exec.spawn(ComputeTask { val: 15i64, step: 0i32 });
+    let h16 = exec.spawn(ComputeTask { val: 16i64, step: 0i32 });
 
-    let r1 = match h1.join() { TaskResult.Completed(v) => v, _ => -1i64 };
-    let r2 = match h2.join() { TaskResult.Completed(v) => v, _ => -1i64 };
-    let r3 = match h3.join() { TaskResult.Completed(v) => v, _ => -1i64 };
-    let r4 = match h4.join() { TaskResult.Completed(v) => v, _ => -1i64 };
-    let r5 = match h5.join() { TaskResult.Completed(v) => v, _ => -1i64 };
-    let r6 = match h6.join() { TaskResult.Completed(v) => v, _ => -1i64 };
-    let r7 = match h7.join() { TaskResult.Completed(v) => v, _ => -1i64 };
-    let r8 = match h8.join() { TaskResult.Completed(v) => v, _ => -1i64 };
-    let r9 = match h9.join() { TaskResult.Completed(v) => v, _ => -1i64 };
-    let r10 = match h10.join() { TaskResult.Completed(v) => v, _ => -1i64 };
-    let r11 = match h11.join() { TaskResult.Completed(v) => v, _ => -1i64 };
-    let r12 = match h12.join() { TaskResult.Completed(v) => v, _ => -1i64 };
-    let r13 = match h13.join() { TaskResult.Completed(v) => v, _ => -1i64 };
-    let r14 = match h14.join() { TaskResult.Completed(v) => v, _ => -1i64 };
-    let r15 = match h15.join() { TaskResult.Completed(v) => v, _ => -1i64 };
-    let r16 = match h16.join() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r1 = match h1.join_blocking() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r2 = match h2.join_blocking() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r3 = match h3.join_blocking() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r4 = match h4.join_blocking() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r5 = match h5.join_blocking() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r6 = match h6.join_blocking() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r7 = match h7.join_blocking() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r8 = match h8.join_blocking() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r9 = match h9.join_blocking() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r10 = match h10.join_blocking() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r11 = match h11.join_blocking() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r12 = match h12.join_blocking() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r13 = match h13.join_blocking() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r14 = match h14.join_blocking() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r15 = match h15.join_blocking() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r16 = match h16.join_blocking() { TaskResult.Completed(v) => v, _ => -1i64 };
 
     let sum = r1 + r2 + r3 + r4 + r5 + r6 + r7 + r8 + r9 + r10 + r11 + r12 + r13 + r14 + r15 + r16;
     check(sum == 136i64);
@@ -275,8 +256,6 @@ use std.asyn.executor.Executor
 use std.asyn.task.TaskResult
 use std.asyn.task.TaskHandle
 use std.asyn.task.TaskHeader
-use std.asyn.task.TaskControlBlock
-use std.asyn.task.tcb_poll_fn
 
 fn check(cond: bool) {
     if !cond {
@@ -311,11 +290,6 @@ impl Future for Child {
     }
 }
 
-fn poll_child(raw: *mut u8, cx: *mut u8) -> u32 {
-    let tcb = raw as *mut TaskControlBlock<Child, i64>;
-    tcb_poll_fn<Child, i64>(tcb, cx)
-}
-
 struct Parent {
     pub exec: Executor,
     pub base: i64,
@@ -333,7 +307,7 @@ impl Future for Parent {
             self.spawned = true;
             let mut k: i64 = 0i64;
             while k < self.count {
-                let h: TaskHandle<i64> = self.exec.spawn(Child { val: self.base + k, step: 0i32, total: self.total }, poll_child);
+                let h = self.exec.spawn(Child { val: self.base + k, step: 0i32, total: self.total });
                 h.detach();
                 k = k + 1i64;
             }
@@ -345,11 +319,6 @@ impl Future for Parent {
     }
 }
 
-fn poll_parent(raw: *mut u8, cx: *mut u8) -> u32 {
-    let tcb = raw as *mut TaskControlBlock<Parent, i64>;
-    tcb_poll_fn<Parent, i64>(tcb, cx)
-}
-
 pub fn main() -> i32 {
     let exec = Executor.new(4);
     let raw_total = unsafe { heap_alloc(8, 8) };
@@ -358,15 +327,15 @@ pub fn main() -> i32 {
         *total = Atomic.new(0i64);
     }
 
-    let h0 = exec.spawn(Parent { exec: exec, base: 0i64, count: 32i64, spawned: false, total: total }, poll_parent);
-    let h1 = exec.spawn(Parent { exec: exec, base: 100i64, count: 32i64, spawned: false, total: total }, poll_parent);
-    let h2 = exec.spawn(Parent { exec: exec, base: 200i64, count: 32i64, spawned: false, total: total }, poll_parent);
-    let h3 = exec.spawn(Parent { exec: exec, base: 300i64, count: 32i64, spawned: false, total: total }, poll_parent);
+    let h0 = exec.spawn(Parent { exec: exec, base: 0i64, count: 32i64, spawned: false, total: total });
+    let h1 = exec.spawn(Parent { exec: exec, base: 100i64, count: 32i64, spawned: false, total: total });
+    let h2 = exec.spawn(Parent { exec: exec, base: 200i64, count: 32i64, spawned: false, total: total });
+    let h3 = exec.spawn(Parent { exec: exec, base: 300i64, count: 32i64, spawned: false, total: total });
 
-    let r0 = match h0.join() { TaskResult.Completed(v) => v, _ => -1i64 };
-    let r1 = match h1.join() { TaskResult.Completed(v) => v, _ => -1i64 };
-    let r2 = match h2.join() { TaskResult.Completed(v) => v, _ => -1i64 };
-    let r3 = match h3.join() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r0 = match h0.join_blocking() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r1 = match h1.join_blocking() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r2 = match h2.join_blocking() { TaskResult.Completed(v) => v, _ => -1i64 };
+    let r3 = match h3.join_blocking() { TaskResult.Completed(v) => v, _ => -1i64 };
     let parents = r0 + r1 + r2 + r3;
     check(parents == 128i64);
 
@@ -414,8 +383,6 @@ use std.asyn.executor.LocalExecutor
 use std.asyn.task.LocalTaskHandle
 use std.asyn.task.TaskResult
 use std.asyn.task.TaskHeader
-use std.asyn.task.TaskControlBlock
-use std.asyn.task.tcb_poll_fn
 use std.asyn.sync.AsyncSemaphore
 use std.asyn.sync.AsyncSemaphorePermit
 use std.asyn.sync.AsyncSemaphoreAcquireFuture
@@ -475,11 +442,6 @@ impl Future for SemWorker {
     }
 }
 
-fn poll_sem_worker(raw: *mut u8, cx: *mut u8) -> u32 {
-    let tcb = raw as *mut TaskControlBlock<SemWorker, i64>;
-    tcb_poll_fn<SemWorker, i64>(tcb, cx)
-}
-
 fn none_permit() -> Option<AsyncSemaphorePermit> {
     Option.None
 }
@@ -494,11 +456,11 @@ pub fn main() -> i32 {
     let p_max = unsafe { address_of_mut(max_seen) };
     let p_done = unsafe { address_of_mut(done) };
 
-    let h1: LocalTaskHandle<i64> = exec.spawn_local(SemWorker { cur: p_cur, max_seen: p_max, done: p_done, phase: 0i32, acq: sem.acquire(), permit: none_permit() }, poll_sem_worker);
-    let h2: LocalTaskHandle<i64> = exec.spawn_local(SemWorker { cur: p_cur, max_seen: p_max, done: p_done, phase: 0i32, acq: sem.acquire(), permit: none_permit() }, poll_sem_worker);
-    let h3: LocalTaskHandle<i64> = exec.spawn_local(SemWorker { cur: p_cur, max_seen: p_max, done: p_done, phase: 0i32, acq: sem.acquire(), permit: none_permit() }, poll_sem_worker);
-    let h4: LocalTaskHandle<i64> = exec.spawn_local(SemWorker { cur: p_cur, max_seen: p_max, done: p_done, phase: 0i32, acq: sem.acquire(), permit: none_permit() }, poll_sem_worker);
-    let h5: LocalTaskHandle<i64> = exec.spawn_local(SemWorker { cur: p_cur, max_seen: p_max, done: p_done, phase: 0i32, acq: sem.acquire(), permit: none_permit() }, poll_sem_worker);
+    let h1 = exec.spawn_local(SemWorker { cur: p_cur, max_seen: p_max, done: p_done, phase: 0i32, acq: sem.acquire(), permit: none_permit() });
+    let h2 = exec.spawn_local(SemWorker { cur: p_cur, max_seen: p_max, done: p_done, phase: 0i32, acq: sem.acquire(), permit: none_permit() });
+    let h3 = exec.spawn_local(SemWorker { cur: p_cur, max_seen: p_max, done: p_done, phase: 0i32, acq: sem.acquire(), permit: none_permit() });
+    let h4 = exec.spawn_local(SemWorker { cur: p_cur, max_seen: p_max, done: p_done, phase: 0i32, acq: sem.acquire(), permit: none_permit() });
+    let h5 = exec.spawn_local(SemWorker { cur: p_cur, max_seen: p_max, done: p_done, phase: 0i32, acq: sem.acquire(), permit: none_permit() });
 
     exec.run();
 
@@ -550,8 +512,6 @@ use std.asyn.waker.new_task_waker_vtable
 use std.asyn.waker.task_wake
 use std.asyn.executor.LocalExecutor
 use std.asyn.task.TaskResult
-use std.asyn.task.TaskControlBlock
-use std.asyn.task.tcb_poll_fn
 
 fn check(cond: bool) {
     if !cond {
@@ -578,11 +538,6 @@ impl Future for RacingFuture {
     }
 }
 
-fn poll_racing_task(raw: *mut u8, cx: *mut u8) -> u32 {
-    let tcb = raw as *mut TaskControlBlock<RacingFuture, usize>;
-    tcb_poll_fn<RacingFuture, usize>(tcb, cx)
-}
-
 pub fn main() -> i32 {
     let mut exec = LocalExecutor.new();
 
@@ -604,11 +559,11 @@ pub fn main() -> i32 {
     unsafe { heap_free(raw as *mut u8, sz, 8usize); }
 
     // 2. Full executor test with 50 racing poll/wake iterations
-    let h = exec.spawn_local(RacingFuture { poll_count: 0, target_count: 50 }, poll_racing_task);
+    let h = exec.spawn_local(RacingFuture { poll_count: 0, target_count: 50 });
     while !view(h).is_finished() {
         exec.try_tick();
     }
-    let res = match h.join() {
+    let res = match h.join_blocking() {
         TaskResult.Completed(v) => v,
         _ => 0usize,
     };
@@ -645,8 +600,6 @@ use std.asyn.executor.LocalExecutor
 use std.asyn.task.LocalTaskHandle
 use std.asyn.task.TaskResult
 use std.asyn.task.TaskHeader
-use std.asyn.task.TaskControlBlock
-use std.asyn.task.tcb_poll_fn
 use std.asyn.sync.AsyncMutex
 use std.asyn.sync.AsyncMutexGuard
 use std.asyn.sync.AsyncMutexLockFuture
@@ -720,11 +673,6 @@ impl Future for MutexWorker {
     }
 }
 
-fn poll_mutex_worker(raw: *mut u8, cx: *mut u8) -> u32 {
-    let tcb = raw as *mut TaskControlBlock<MutexWorker, i64>;
-    tcb_poll_fn<MutexWorker, i64>(tcb, cx)
-}
-
 fn none_guard() -> Option<AsyncMutexGuard<i64>> {
     Option.None
 }
@@ -740,10 +688,10 @@ pub fn main() -> i32 {
     let p_viol = unsafe { address_of_mut(violations) };
     let p_wait = unsafe { address_of_mut(waited) };
 
-    let h1: LocalTaskHandle<i64> = exec.spawn_local(MutexWorker { mutex_ptr: p_m, cur_iter: 0i64, target_iters: 10i64, phase: 0i32, lock_fut: unsafe { (*p_m).lock_async() }, guard: none_guard(), in_cs: p_in, violations: p_viol, waited: p_wait }, poll_mutex_worker);
-    let h2: LocalTaskHandle<i64> = exec.spawn_local(MutexWorker { mutex_ptr: p_m, cur_iter: 0i64, target_iters: 10i64, phase: 0i32, lock_fut: unsafe { (*p_m).lock_async() }, guard: none_guard(), in_cs: p_in, violations: p_viol, waited: p_wait }, poll_mutex_worker);
-    let h3: LocalTaskHandle<i64> = exec.spawn_local(MutexWorker { mutex_ptr: p_m, cur_iter: 0i64, target_iters: 10i64, phase: 0i32, lock_fut: unsafe { (*p_m).lock_async() }, guard: none_guard(), in_cs: p_in, violations: p_viol, waited: p_wait }, poll_mutex_worker);
-    let h4: LocalTaskHandle<i64> = exec.spawn_local(MutexWorker { mutex_ptr: p_m, cur_iter: 0i64, target_iters: 10i64, phase: 0i32, lock_fut: unsafe { (*p_m).lock_async() }, guard: none_guard(), in_cs: p_in, violations: p_viol, waited: p_wait }, poll_mutex_worker);
+    let h1 = exec.spawn_local(MutexWorker { mutex_ptr: p_m, cur_iter: 0i64, target_iters: 10i64, phase: 0i32, lock_fut: unsafe { (*p_m).lock_async() }, guard: none_guard(), in_cs: p_in, violations: p_viol, waited: p_wait });
+    let h2 = exec.spawn_local(MutexWorker { mutex_ptr: p_m, cur_iter: 0i64, target_iters: 10i64, phase: 0i32, lock_fut: unsafe { (*p_m).lock_async() }, guard: none_guard(), in_cs: p_in, violations: p_viol, waited: p_wait });
+    let h3 = exec.spawn_local(MutexWorker { mutex_ptr: p_m, cur_iter: 0i64, target_iters: 10i64, phase: 0i32, lock_fut: unsafe { (*p_m).lock_async() }, guard: none_guard(), in_cs: p_in, violations: p_viol, waited: p_wait });
+    let h4 = exec.spawn_local(MutexWorker { mutex_ptr: p_m, cur_iter: 0i64, target_iters: 10i64, phase: 0i32, lock_fut: unsafe { (*p_m).lock_async() }, guard: none_guard(), in_cs: p_in, violations: p_viol, waited: p_wait });
 
     exec.run();
 
@@ -794,8 +742,6 @@ use std.asyn.channel.TrySendError
 use std.asyn.channel.TryRecvError
 use std.asyn.task.TaskResult
 use std.asyn.task.TaskHeader
-use std.asyn.task.TaskControlBlock
-use std.asyn.task.tcb_poll_fn
 
 fn check(cond: bool) {
     if !cond {
@@ -833,11 +779,6 @@ impl Future for ProducerTask {
     }
 }
 
-fn poll_producer(raw: *mut u8, cx: *mut u8) -> u32 {
-    let tcb = raw as *mut TaskControlBlock<ProducerTask, i64>;
-    tcb_poll_fn<ProducerTask, i64>(tcb, cx)
-}
-
 struct ConsumerTask {
     pub rx: AsyncReceiver<i64>,
     pub sum: i64,
@@ -869,23 +810,18 @@ impl Future for ConsumerTask {
     }
 }
 
-fn poll_consumer(raw: *mut u8, cx: *mut u8) -> u32 {
-    let tcb = raw as *mut TaskControlBlock<ConsumerTask, i64>;
-    tcb_poll_fn<ConsumerTask, i64>(tcb, cx)
-}
-
 pub fn main() -> i32 {
     let mut exec = LocalExecutor.new();
     let pair = async_channel_bounded<i64>(2usize);
     let tx = pair.tx;
     let rx = pair.rx;
 
-    let hp: LocalTaskHandle<i64> = exec.spawn_local(ProducerTask { tx: tx, cur: 1i64, total: 10i64 }, poll_producer);
-    let hc: LocalTaskHandle<i64> = exec.spawn_local(ConsumerTask { rx: rx, sum: 0i64 }, poll_consumer);
+    let hp = exec.spawn_local(ProducerTask { tx: tx, cur: 1i64, total: 10i64 });
+    let hc = exec.spawn_local(ConsumerTask { rx: rx, sum: 0i64 });
 
     exec.run();
 
-    let res_c = match hc.join() {
+    let res_c = match hc.join_blocking() {
         TaskResult.Completed(v) => v,
         _ => -1i64,
     };
@@ -1140,8 +1076,6 @@ use std.asyn.executor.LocalExecutor
 use std.asyn.task.LocalTaskHandle
 use std.asyn.task.TaskResult
 use std.asyn.task.TaskError
-use std.asyn.task.TaskControlBlock
-use std.asyn.task.tcb_poll_fn
 
 @intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
 
@@ -1169,11 +1103,6 @@ impl Drop for DropProbe {
     }
 }
 
-fn poll_probe(raw: *mut u8, cx: *mut u8) -> u32 {
-    let tcb = raw as *mut TaskControlBlock<DropProbe, i64>;
-    tcb_poll_fn<DropProbe, i64>(tcb, cx)
-}
-
 struct Yielder {
     pub step: i32,
 }
@@ -1190,11 +1119,6 @@ impl Future for Yielder {
         }
         Poll.Ready(7i64)
     }
-}
-
-fn poll_yielder(raw: *mut u8, cx: *mut u8) -> u32 {
-    let tcb = raw as *mut TaskControlBlock<Yielder, i64>;
-    tcb_poll_fn<Yielder, i64>(tcb, cx)
 }
 
 // Awaits another task's handle (the TaskHandle Future impl + join-waker path).
@@ -1217,41 +1141,36 @@ impl Future for Awaiter {
     }
 }
 
-fn poll_awaiter(raw: *mut u8, cx: *mut u8) -> u32 {
-    let tcb = raw as *mut TaskControlBlock<Awaiter, i64>;
-    tcb_poll_fn<Awaiter, i64>(tcb, cx)
-}
-
 pub fn main() -> i32 {
     let mut drops: i64 = 0i64;
     let p_drops = unsafe { address_of_mut(drops) };
     let mut exec = LocalExecutor.new();
 
     // Cancel before the first poll, and cancel after one poll (task idle): each future is dropped once.
-    let hc1: LocalTaskHandle<i64> = exec.spawn_local(DropProbe { counter: p_drops }, poll_probe);
+    let hc1 = exec.spawn_local(DropProbe { counter: p_drops });
     view(hc1).cancel();
-    let hc2: LocalTaskHandle<i64> = exec.spawn_local(DropProbe { counter: p_drops }, poll_probe);
+    let hc2 = exec.spawn_local(DropProbe { counter: p_drops });
     exec.try_tick();
     exec.try_tick();
     view(hc2).cancel();
 
     // Await-a-handle: inner yields 3 times and returns 7; the awaiter returns 7 + 1.
-    let hin = exec.spawn_local(Yielder { step: 0i32 }, poll_yielder);
-    let hout = exec.spawn_local(Awaiter { h: hin }, poll_awaiter);
+    let hin = exec.spawn_local(Yielder { step: 0i32 });
+    let hout = exec.spawn_local(Awaiter { h: hin });
 
     exec.run();
 
-    let c1 = match hc1.join() {
+    let c1 = match hc1.join_blocking() {
         TaskResult.Cancelled => 1i64,
         _ => 0i64,
     };
-    let c2 = match hc2.join() {
+    let c2 = match hc2.join_blocking() {
         TaskResult.Cancelled => 1i64,
         _ => 0i64,
     };
     check(c1 == 1i64);
     check(c2 == 1i64);
-    let out = match hout.join() {
+    let out = match hout.join_blocking() {
         TaskResult.Completed(v) => v,
         _ => -100i64,
     };

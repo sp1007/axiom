@@ -11,7 +11,7 @@ priority: 25
 status: doing
 attempts: 1
 timeout_min: 480
-paths: [compiler/driver/pipeline.ax, compiler/driver/opts.ax, tests/modules/std_on_demand, tests/run/host, compiler/diag/code.ax, compiler/diag/explain/mod.ax]
+paths: [compiler/driver/pipeline.ax, compiler/driver/opts.ax, tests/modules/std_on_demand, tests/run/host, compiler/diag/code.ax, compiler/diag/explain/mod.ax, tests/std/core/qa_driver_std_discovery.ax]
 locks: []
 spec: [spec/decisions/ADR-0048-std-module-loading-host-providers.md, spec/decisions/ADR-0002-oracle-host-interface.md, spec/decisions/ADR-0006-bootstrap-forms-manifest-std-root.md, spec/decisions/ADR-0041-complete-suite-baseline-and-test-cache.md]
 covers: [REQ-TST-072]
