@@ -8,14 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T422c]
 priority: 15
-status: blocked
-attempts: 1
+status: todo
+attempts: 0
 timeout_min: 480
-paths: [compiler/mir/builder.ax, compiler/types/typeck.ax, tests/run/await_generic_future]
+paths: [compiler/mir/builder.ax, compiler/mir/async_lower.ax, compiler/own_mir_verify/session.ax, compiler/types/typeck.ax, compiler/traits/mono.ax, compiler/traits/solver.ax, tests/run/await_generic_future, tests/std/async/structured]
 locks: []
 spec: [spec/SPEC-34-executors-fibers.md]
 covers: [REQ-TST-072]
 started: 2026-11-22 17:09:49
+unblocks: 1
 ---
 # T422d — native `.await` on a generic `Future` impl
 
@@ -49,6 +50,15 @@ natively; T422c marks the native legs of the affected spec-example tests `// nat
 ## Acceptance
 - All new tests pass in three modes; the previously marked SPEC-34 example tests pass natively; taskgate clean.
 
+## Resume after unblock (architect, 2026-11-22)
+Attempt 1 (`_workspaces/reports/T422d-report.md`) made no source or test edits and diagnosed the complete root cause across async lowering, monomorphisation, trait/type resolution, and the `SPEC-34` structured-concurrency test generator. `paths:` is now widened with all five required entries (no ADR needed — TYPE A implementation fix):
+- `compiler/mir/async_lower.ax`, `compiler/own_mir_verify/session.ax`, `compiler/mir/builder.ax`: resolve synthesized `Future.poll` calls to concrete monomorphised `MonoInstance`s (deducing the `impl`'s type arguments from the awaited receiver type), drain transitive generic callees and coroutine `Drop` glue on `MonoEngine`, and run `mb_dedup_mono_names` after async lowering.
+- `compiler/types/typeck.ax`, `compiler/traits/mono.ax`, `compiler/traits/solver.ax`, `compiler/mir/async_lower.ax`, `compiler/own_mir_verify/session.ax`: preserve generic `args` on `TY_COROUTINE` (checking `fields` for coroutine auto-traits in `solver.ax`), handle `TY_COROUTINE` in `mono.ax` (`type_contains_param`, `subst_ty_self`, `deduce_args`), lower concrete `MonoInstance` clones of generic `async fn`s in a fixpoint loop with `MonoEngine` (registering synthesized `poll_it` items in `MonoEngine` so `pipe_is_mono_clone` includes them), and structurally match/deduce nested generic self-types (`impl<T> Future for Wrap<Wrap2<T>>`) in `solver.ax` and `resolve_future_output_ty` in `typeck.ax`.
+- `tests/run/await_generic_future/`: add all four required three-mode tests (`interp`, `native`, `native-O1`, exact `stdout:`).
+- `tests/std/async/structured`: remove `"native-after: T422d"` in `tests/std/async/structured/gen_tests.py`, regenerate `tests/std/async/structured/spec34_task_group_example.ax` (list both modified files under `## Files changed`), and confirm it passes in all three modes.
+- Scheduling note: `T422e` (currently in `doing/`) holds `compiler/types/typeck.ax` and `tests/std/async/structured`; `taskctl next` serialises `T422d` after `T422e` automatically via `paths:`.
+
 ## Log
 - 2026-11-22 17:09:49 started (attempt 1) t422d-impl
 - 2026-11-22 17:33:16 block: needs paths widened: compiler/mir/async_lower.ax, compiler/own_mir_verify/session.ax, compiler/traits/mono.ax, compiler/traits/solver.ax, tests/std/async/structured
+- 2026-11-22 17:40:12 unblocked (cycle 1) 
