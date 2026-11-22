@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T423]
 priority: 45
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 480
-paths: [tests/run/impl_generic_in_method_bound, tests/ui/impl_generic_in_method_bound, tests/std/fiber/impl_generic_in_method_bound_xfail.ax]
+paths: [tests/run/impl_generic_in_method_bound, tests/ui/impl_generic_in_method_bound, tests/std/fiber, tests/conformance/p11/e11_5_executors, tests/perf/p11_executor]
 locks: [compiler/resolve/resolver.ax, compiler/hir/lower.ax, compiler/types/typeck.ax, compiler/traits/mono.ax, std/fiber/mod.ax, tests/std/fiber/gen_tests.py]
 spec: [spec/SPEC-02-grammar.md, spec/SPEC-03-core-semantics.md, spec/SPEC-34-executors-fibers.md, spec/decisions/ADR-0046-t423-fiber-followups-and-tracked-xfail.md]
 covers: [REQ-TST-072]
+started: 2026-11-23 04:03:04
+agent: t423d-impl
 ---
 # T423d — Impl-level generics in method bounds
 
@@ -50,3 +52,5 @@ the method's parameter and return types. Because of this `std.fiber` declares `F
 
 ## Log
 - 2026-11-21 created by axiom-architect (triage-t423, ADR-0046 D1; T423 QA F4 / report F3)
+- 2026-11-23 04:20 orchestrator: widened `paths:` with `tests/std/fiber`, `tests/conformance/p11/e11_5_executors`, `tests/perf/p11_executor` to regenerate bundles inlining `std/fiber/mod.ax` after restoring `F: FnOnce<R>` bounds; disjoint from active task `T498h`.
+- 2026-11-23 04:03:04 started (attempt 1) t423d-impl

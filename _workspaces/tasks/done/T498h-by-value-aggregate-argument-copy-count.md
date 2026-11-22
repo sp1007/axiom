@@ -8,15 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T498c, T498a, T448]
 priority: 60
-status: doing
+status: done
 attempts: 1
 timeout_min: 480
-paths: [compiler/mir/builder.ax, compiler/lir/builder.ax, compiler/abi/win64.ax, compiler/target/x64/frame.ax, tests/run/agg_arg_copies, tests/run/array_copy/large_and_edge.ax]
+paths: [compiler/mir/builder.ax, compiler/lir/builder.ax, compiler/abi/win64.ax, compiler/target/x64/frame.ax, tests/run/agg_arg_copies, tests/run/array_copy/large_and_edge.ax, tests/selfhost/backend/harness_backend_diff_mi_mc.ax.in]
 locks: []
 spec: [spec/decisions/ADR-0003-backend-pipeline-robustness.md, spec/SPEC-03-core-semantics.md, spec/SPEC-10-ownership.md]
 covers: [REQ-TST-072]
 started: 2026-11-23 02:31:24
-agent: t498h-impl
+finished: 2026-11-23 06:53:35
 ---
 # T498h — Copies of by-value aggregate arguments
 
@@ -53,4 +53,6 @@ when the source is a dead temporary or a moved value).
 
 ## Log
 - 2026-11-22 created by axiom-architect (triage-1122; T498c-qa FU-QA-T498c-1 reclassified: overflow is by-spec, copy count is the defect; T498c-report follow-up comment)
+- 2026-11-23 06:09 orchestrator: widened `paths:` with `tests/selfhost/backend/harness_backend_diff_mi_mc.ax.in` (hand-written template, same precedent as T453b `2dbbd763`, because frozen `axiom0` cached MI blobs still emit the old callee aggregate copy removed by T498h); disjoint from active task `T423d`.
 - 2026-11-23 02:31:24 started (attempt 1) t498h-impl
+- 2026-11-23 06:53:35 accepted by QA -> done

@@ -19626,6 +19626,7 @@ use compiler.hir.hir.HirFile
 use compiler.hir.hir.HirItem
 use compiler.hir.hir.HirType
 use compiler.hir.hir.HIR_EXPR_LITERAL
+use compiler.hir.hir.HIR_EXPR_PATH
 use compiler.hir.hir.HIR_ITEM_CONST
 use compiler.hir.hir.HIR_ITEM_STATIC
 use compiler.hir.hir.HIR_ITEM_FN
@@ -19633,11 +19634,16 @@ use compiler.hir.hir.HIR_ITEM_IMPL
 use compiler.hir.hir.HIR_ITEM_TRAIT
 use compiler.hir.hir.HIR_TYPE_PATH
 use compiler.types.types.AxType
+use compiler.types.types.CAP_MOVE
+use compiler.types.types.CAP_MUT_VIEW
 use compiler.types.types.ClosureCapture
 use compiler.types.types.Thir
 use compiler.types.types.TypeInterner
 use compiler.types.types.TY_ARRAY
 use compiler.types.types.TY_BOOL
+use compiler.types.types.TY_ERROR
+use compiler.types.types.TY_INT_VAR
+use compiler.types.types.TY_UNIT
 use compiler.types.types.TY_BUILTIN_ALIGN_OF
 use compiler.types.types.TY_BUILTIN_DROP_IN_PLACE
 use compiler.types.types.TY_BUILTIN_FORGET
@@ -19718,8 +19724,11 @@ use compiler.mir.mir.MIR_BINOP_WRAPPING_MUL
 use compiler.mir.mir.MIR_BINOP_SAT_ADD
 use compiler.mir.mir.MIR_BINOP_SAT_SUB
 use compiler.mir.mir.MIR_BINOP_SAT_MUL
+use compiler.mir.mir.MIR_BB_NONE
 use compiler.mir.mir.MIR_CONST_STR
+use compiler.mir.mir.MIR_LOCAL_ARG
 use compiler.mir.mir.MIR_LOCAL_CONST
+use compiler.mir.mir.MIR_LOCAL_TEMP
 use compiler.mir.mir.MIR_LOCAL_TLS
 use compiler.mir.mir.MIR_OP_CONST
 use compiler.mir.mir.MIR_OP_COPY
@@ -19741,6 +19750,7 @@ use compiler.mir.mir.MIR_RVALUE_UNARY_OP
 use compiler.mir.mir.MIR_RVALUE_USE
 use compiler.mir.mir.MIR_STMT_ASSIGN
 use compiler.mir.mir.MIR_STMT_ATOMIC
+use compiler.mir.mir.MIR_STMT_DROP
 use compiler.mir.mir.MIR_ATOMIC_LOAD
 use compiler.mir.mir.MIR_ATOMIC_STORE
 use compiler.mir.mir.MIR_ATOMIC_SWAP
@@ -19756,8 +19766,10 @@ use compiler.mir.mir.MIR_ATOMIC_COMPILER_FENCE
 use compiler.mir.mir.MIR_ATOMIC_SPIN_HINT
 use compiler.mir.mir.MIR_TERM_ASSERT
 use compiler.mir.mir.MIR_TERM_CALL
+use compiler.mir.mir.MIR_TERM_DROP
 use compiler.mir.mir.MIR_TERM_GOTO
 use compiler.mir.mir.MIR_TERM_RETURN
+use compiler.mir.mir.MIR_TERM_SUSPEND
 use compiler.mir.mir.MIR_TERM_SWITCH_INT
 use compiler.mir.mir.MIR_UNOP_BITNOT
 use compiler.mir.mir.MIR_UNOP_NEG
@@ -19934,9 +19946,26 @@ pub struct LirBuilder {
     pub bbs: *mut LirBb,
     pub bb_count: usize,
     pub bb_cap: usize,
+    pub cur_bb: usize,
     pub cur_insts: *mut LirInst,
     pub cur_inst_count: usize,
     pub cur_inst_cap: usize,
+    pub is_opt: bool,
+    pub has_fn_ty: bool,
+    pub param_is_indirect_ptr: *mut u8,
+    pub param_ptr_count: usize,
+    pub local_addr_taken: *mut u8,
+    pub local_addr_count: usize,
+    pub slot_remap: *mut u32,
+    pub slot_remap_count: usize,
+    pub copy_slot_tys: *mut u32,
+    pub copy_slot_ids: *mut u32,
+    pub copy_slot_used: *mut u8,
+    pub copy_slot_count: usize,
+    pub copy_slot_cap: usize,
+    pub bfs_visited: *mut u8,
+    pub bfs_queue: *mut u32,
+    pub bfs_cap: usize,
     pub has_ice: bool,
 }
 
@@ -21116,6 +21145,24 @@ fn get_place_type(b: mut_view<LirBuilder>, place: view<MirPlace>) -> u32 {
     ty_v
 }
 
+fn lb_local_is_indirect_param(b: view<LirBuilder>, loc_v: u32) -> bool {
+    let lu = loc_v as usize;
+    let pcnt = b.param_ptr_count;
+    if (b.param_is_indirect_ptr as usize) == 0 || lu >= pcnt {
+        return false;
+    }
+    (unsafe { *(((b.param_is_indirect_ptr as usize) + lu) as *const u8) }) != 0u8
+}
+
+fn lb_mapped_slot(b: view<LirBuilder>, loc_v: u32) -> u32 {
+    let lu = loc_v as usize;
+    let rcnt = b.slot_remap_count;
+    if (b.slot_remap as usize) == 0 || lu >= rcnt {
+        return loc_v;
+    }
+    unsafe { *(((b.slot_remap as usize) + (lu << 2)) as *const u32) }
+}
+
 fn lower_place_addr(
     b: mut_view<LirBuilder>,
     place: view<MirPlace>,
@@ -21136,8 +21183,12 @@ fn lower_place_addr(
         let sym = get_const_table_sym_name(view(*b), sym_v);
         addr = make_vreg(mut_view(*b), usize_ty);
         emit_fn_addr_inst(mut_view(*b), addr, sym.ptr, sym.len);
+    } else if lb_local_is_indirect_param(view(*b), place.local.v) {
+        let slot_addr = emit_stack_addr(mut_view(*b), place.local.v);
+        addr = emit_load(mut_view(*b), slot_addr, usize_ty);
     } else {
-        addr = emit_stack_addr(mut_view(*b), place.local.v);
+        let mslot = lb_mapped_slot(view(*b), place.local.v);
+        addr = emit_stack_addr(mut_view(*b), mslot);
     }
     let mut ty_v: u32 = unsafe { (*local_decl).ty.v };
     let mut current_variant: u32 = 0xFFFFFFFFu32;
@@ -21958,8 +22009,18 @@ fn lower_assign_stmt(b: mut_view<LirBuilder>, stmt: view<MirStmt>) {
             let field_addr = emit_offset(mut_view(*b), addr, off_reg);
 
             let op_ptr = unsafe { mir_op_at(ops, k) };
+            let op_kind = unsafe { (*op_ptr).kind };
+            if b.has_fn_ty && (op_kind == MIR_OP_COPY || op_kind == MIR_OP_MOVE) && lb_is_indirect_agg_ty(view(*b), field_ty_v) {
+                let f_sz = unsafe { type_size(TypeId { v: field_ty_v }, view(*b.interner)) };
+                if f_sz > 8u32 {
+                    let f_src = unsafe { lower_place_addr(mut_view(*b), view((*op_ptr).place), 0 as *mut u32) };
+                    emit_memcpy_bytes(mut_view(*b), field_addr, f_src, f_sz);
+                    k = k + 1;
+                    continue;
+                }
+            }
             let mut field_val: u32 = 0u32;
-            if (ty as usize) != 0 && ty_k == TY_CLOSURE && k == 0 && (unsafe { (*op_ptr).kind }) == MIR_OP_CONST {
+            if (ty as usize) != 0 && ty_k == TY_CLOSURE && k == 0 && op_kind == MIR_OP_CONST {
                 let sym_v = unsafe { const_sym_v(view(*op_ptr)) };
                 let fn_sym = get_fn_sym_name(view(*b), sym_v);
                 field_val = make_vreg(mut_view(*b), usize_ty);
@@ -21989,9 +22050,42 @@ fn lower_assign_stmt(b: mut_view<LirBuilder>, stmt: view<MirStmt>) {
             let elem_ty_v: u32 = unsafe { (*ty).elem.v };
             let fa = unsafe { type_align(TypeId { v: elem_ty_v }, view(*b.interner)) };
             let fs = unsafe { type_size(TypeId { v: elem_ty_v }, view(*b.interner)) };
-            let mask = fa - 1u32;
+            let mask = if fa > 0u32 { fa - 1u32 } else { 0u32 };
             let stride = (fs + mask) & (0xFFFFFFFFu32 ^ mask);
             let count = unsafe { (*ty).array_len };
+            let elem_is_ind_agg = b.has_fn_ty && lb_is_indirect_agg_ty(view(*b), elem_ty_v) && fs > 8u32;
+            let op_k = stmt.rvalue.use_op.kind;
+            if elem_is_ind_agg && (op_k == MIR_OP_COPY || op_k == MIR_OP_MOVE) {
+                let elem_src = lower_place_addr(mut_view(*b), view(stmt.rvalue.use_op.place), 0 as *mut u32);
+                if count > 0u64 && stride > 0u32 {
+                    let bool_ty = unsafe { (*b.interner).t_bool.v };
+                    let total_bytes = count * (stride as u64);
+                    let idx = make_vreg(mut_view(*b), usize_ty);
+                    let zero = emit_const(mut_view(*b), 0u64, usize_ty);
+                    emit_bin_inst(mut_view(*b), LIR_INST_ADD, idx, zero, zero);
+                    let limit = emit_const(mut_view(*b), total_bytes, usize_ty);
+                    let step_v = emit_const(mut_view(*b), stride as u64, usize_ty);
+                    let head_bb = add_lir_bb(mut_view(*b));
+                    let body_bb = add_lir_bb(mut_view(*b));
+                    let after_bb = add_lir_bb(mut_view(*b));
+                    finish_jmp_bb(mut_view(*b), b.cur_bb, head_bb as u32);
+
+                    let cmp = make_vreg(mut_view(*b), bool_ty);
+                    emit_bin_inst(mut_view(*b), LIR_INST_ICMP_ULT, cmp, idx, limit);
+                    finish_switch1_bb(mut_view(*b), head_bb, cmp, 1u64, body_bb as u32, after_bb as u32);
+
+                    b.cur_bb = body_bb;
+                    b.cur_inst_count = 0;
+                    let elem_dst = emit_offset(mut_view(*b), addr, idx);
+                    emit_memcpy_bytes(mut_view(*b), elem_dst, elem_src, fs);
+                    emit_bin_inst(mut_view(*b), LIR_INST_ADD, idx, idx, step_v);
+                    finish_jmp_bb(mut_view(*b), b.cur_bb, head_bb as u32);
+
+                    b.cur_bb = after_bb;
+                    b.cur_inst_count = 0;
+                }
+                return;
+            }
             let elem_val = if ty_is_int128(view(*b), elem_ty_v) {
                 lower_operand_128(mut_view(*b), view(stmt.rvalue.use_op), elem_ty_v)
             } else {
@@ -22000,6 +22094,76 @@ fn lower_assign_stmt(b: mut_view<LirBuilder>, stmt: view<MirStmt>) {
             if elem_ty_v != 0u32 {
                 let vp = unsafe { lir_vreg_at(b.vregs, elem_val as usize) };
                 unsafe { (*vp).ty.v = elem_ty_v; }
+            }
+            if b.has_fn_ty && count > 16u64 && stride > 0u32 {
+                let bool_ty = unsafe { (*b.interner).t_bool.v };
+                let u64_ty = unsafe { (*b.interner).t_u64.v };
+                if fs == 1u32 && stride == 1u32 && count >= 64u64 {
+                    // T498h: Broadcast 1-byte repeat value into a 64-bit word and fill 8 bytes/iter.
+                    let mask_ff = emit_const(mut_view(*b), 0xFFu64, u64_ty);
+                    let b8 = make_vreg(mut_view(*b), u64_ty);
+                    emit_bin_inst(mut_view(*b), LIR_INST_BIT_AND, b8, elem_val, mask_ff);
+                    let rep_mul = emit_const(mut_view(*b), 0x0101010101010101u64, u64_ty);
+                    let word64 = make_vreg(mut_view(*b), u64_ty);
+                    emit_bin_inst(mut_view(*b), LIR_INST_MUL, word64, b8, rep_mul);
+
+                    let bulk = count & 0xFFFFFFFFFFFFFFF8u64;
+                    let idx = make_vreg(mut_view(*b), usize_ty);
+                    let zero = emit_const(mut_view(*b), 0u64, usize_ty);
+                    emit_bin_inst(mut_view(*b), LIR_INST_ADD, idx, zero, zero);
+                    let limit = emit_const(mut_view(*b), bulk, usize_ty);
+                    let step8 = emit_const(mut_view(*b), 8u64, usize_ty);
+
+                    let head_bb = add_lir_bb(mut_view(*b));
+                    let body_bb = add_lir_bb(mut_view(*b));
+                    let after_bb = add_lir_bb(mut_view(*b));
+                    finish_jmp_bb(mut_view(*b), b.cur_bb, head_bb as u32);
+
+                    let cmp = make_vreg(mut_view(*b), bool_ty);
+                    emit_bin_inst(mut_view(*b), LIR_INST_ICMP_ULT, cmp, idx, limit);
+                    finish_switch1_bb(mut_view(*b), head_bb, cmp, 1u64, body_bb as u32, after_bb as u32);
+
+                    let d_ptr = emit_offset(mut_view(*b), addr, idx);
+                    emit_store(mut_view(*b), d_ptr, word64);
+                    emit_bin_inst(mut_view(*b), LIR_INST_ADD, idx, idx, step8);
+                    finish_jmp_bb(mut_view(*b), body_bb, head_bb as u32);
+
+                    b.cur_bb = after_bb;
+                    b.cur_inst_count = 0;
+
+                    let mut rem = bulk;
+                    while rem < count {
+                        let off_v = emit_const(mut_view(*b), rem, usize_ty);
+                        let tail_ptr = emit_offset(mut_view(*b), addr, off_v);
+                        emit_store(mut_view(*b), tail_ptr, elem_val);
+                        rem = rem + 1u64;
+                    }
+                    return;
+                }
+                let total_bytes = count * (stride as u64);
+                let idx = make_vreg(mut_view(*b), usize_ty);
+                let zero = emit_const(mut_view(*b), 0u64, usize_ty);
+                emit_bin_inst(mut_view(*b), LIR_INST_ADD, idx, zero, zero);
+                let limit = emit_const(mut_view(*b), total_bytes, usize_ty);
+                let step_v = emit_const(mut_view(*b), stride as u64, usize_ty);
+
+                let head_bb = add_lir_bb(mut_view(*b));
+                let body_bb = add_lir_bb(mut_view(*b));
+                let after_bb = add_lir_bb(mut_view(*b));
+                finish_jmp_bb(mut_view(*b), b.cur_bb, head_bb as u32);
+
+                let cmp = make_vreg(mut_view(*b), bool_ty);
+                emit_bin_inst(mut_view(*b), LIR_INST_ICMP_ULT, cmp, idx, limit);
+                finish_switch1_bb(mut_view(*b), head_bb, cmp, 1u64, body_bb as u32, after_bb as u32);
+
+                let elem_dst = emit_offset(mut_view(*b), addr, idx);
+                emit_store(mut_view(*b), elem_dst, elem_val);
+                emit_bin_inst(mut_view(*b), LIR_INST_ADD, idx, idx, step_v);
+                finish_jmp_bb(mut_view(*b), body_bb, head_bb as u32);
+
+                b.cur_bb = after_bb;
+                b.cur_inst_count = 0;
+                return;
             }
             let off_reg = make_vreg(mut_view(*b), usize_ty);
             let elem_addr = make_vreg(mut_view(*b), usize_ty);
@@ -22111,6 +22275,24 @@ fn lower_assign_stmt(b: mut_view<LirBuilder>, stmt: view<MirStmt>) {
     } else {
         dest_ty_v
     };
+    if b.has_fn_ty && rvk == MIR_RVALUE_USE {
+        let uok = stmt.rvalue.use_op.kind;
+        if (uok == MIR_OP_COPY || uok == MIR_OP_MOVE) && lb_is_indirect_agg_ty(view(*b), target_ty_v) {
+            let t_sz = unsafe { type_size(TypeId { v: target_ty_v }, view(*b.interner)) };
+            if t_sz > 8u32 {
+                if stmt.place.proj_count == 0 && stmt.rvalue.use_op.place.proj_count == 0 &&
+                   lb_mapped_slot(view(*b), stmt.place.local.v) == lb_mapped_slot(view(*b), stmt.rvalue.use_op.place.local.v) &&
+                   !lb_local_is_indirect_param(view(*b), stmt.place.local.v) &&
+                   !lb_local_is_indirect_param(view(*b), stmt.rvalue.use_op.place.local.v) {
+                    return;
+                }
+                let src_addr = lower_place_addr(mut_view(*b), view(stmt.rvalue.use_op.place), 0 as *mut u32);
+                let dst_addr = lower_place_addr(mut_view(*b), view(stmt.place), 0 as *mut u32);
+                emit_memcpy_bytes(mut_view(*b), dst_addr, src_addr, t_sz);
+                return;
+            }
+        }
+    }
     let val = lower_rvalue(mut_view(*b), view(stmt.rvalue), target_ty_v);
     if target_ty_v != 0u32 {
         let vp = unsafe { lir_vreg_at(b.vregs, val as usize) };
@@ -22310,6 +22492,842 @@ fn lower_arg_at(b: mut_view<LirBuilder>, args: *mut MirOperand, idx: usize) -> u
     unsafe { lower_operand(mut_view(*b), view(*op_ptr)) }
 }
 
+// --- T498h: Indirect Aggregate Copy & Caller Argument Copy Elision Helpers ---
+
+fn lb_needs_indirect_size(size: u32) -> bool {
+    size != 0u32 && size != 1u32 && size != 2u32 && size != 4u32 && size != 8u32
+}
+
+fn lb_is_indirect_agg_ty(b: view<LirBuilder>, ty_v: u32) -> bool {
+    if ty_v == 0u32 || (b.interner as usize) == 0 {
+        return false;
+    }
+    if ty_is_int128(b, ty_v) {
+        return false;
+    }
+    let t = unsafe { type_get(view(*b.interner), TypeId { v: ty_v }) };
+    if (t as usize) == 0 {
+        return false;
+    }
+    let tk = unsafe { (*t).kind };
+    if tk != TY_ARRAY && tk != TY_STRUCT && tk != TY_TUPLE &&
+       tk != TY_ENUM && tk != TY_CLOSURE && tk != TY_COROUTINE {
+        return false;
+    }
+    let sz = unsafe { type_size(TypeId { v: ty_v }, view(*b.interner)) };
+    lb_needs_indirect_size(sz)
+}
+
+fn lb_callee_is_sret(b: view<LirBuilder>, callee_ty_v: u32) -> bool {
+    if callee_ty_v == 0u32 || (b.interner as usize) == 0 {
+        return false;
+    }
+    let cty = unsafe { type_get(view(*b.interner), TypeId { v: callee_ty_v }) };
+    if (cty as usize) == 0 {
+        return false;
+    }
+    let mut ret_v: u32 = unsafe { (*cty).ret_type.v };
+    let ck = unsafe { (*cty).kind };
+    if ret_v == 0u32 && ck == TY_CLOSURE && (unsafe { (*cty).fn_type.v }) != 0u32 {
+        let fty = unsafe { type_get(view(*b.interner), TypeId { v: (*cty).fn_type.v }) };
+        if (fty as usize) != 0 {
+            ret_v = unsafe { (*fty).ret_type.v };
+        }
+    } else if ck != TY_FN && ck != TY_CLOSURE {
+        return false;
+    }
+    if ret_v == 0u32 {
+        return false;
+    }
+    let rsz = unsafe { type_size(TypeId { v: ret_v }, view(*b.interner)) };
+    lb_needs_indirect_size(rsz)
+}
+
+fn emit_memcpy_scalar_range(
+    b: mut_view<LirBuilder>,
+    dst_addr: u32,
+    src_addr: u32,
+    start_off: u32,
+    end_off: u32
+) {
+    let usize_ty = unsafe { (*b.interner).t_usize.v };
+    let u64_ty = unsafe { (*b.interner).t_u64.v };
+    let u32_ty = unsafe { (*b.interner).t_u32.v };
+    let u16_ty = unsafe { (*b.interner).t_u16.v };
+    let u8_ty = unsafe { (*b.interner).t_u8.v };
+    let mut off: u32 = start_off;
+    while off < end_off {
+        let rem = end_off - off;
+        let mut chunk: u32 = 1u32;
+        let mut cty: u32 = u8_ty;
+        if rem >= 8u32 {
+            chunk = 8u32;
+            cty = u64_ty;
+        } else if rem >= 4u32 {
+            chunk = 4u32;
+            cty = u32_ty;
+        } else if rem >= 2u32 {
+            chunk = 2u32;
+            cty = u16_ty;
+        }
+        let mut s_ptr = src_addr;
+        let mut d_ptr = dst_addr;
+        if off != 0u32 {
+            let off_v = emit_const(mut_view(*b), off as u64, usize_ty);
+            s_ptr = emit_offset(mut_view(*b), src_addr, off_v);
+            d_ptr = emit_offset(mut_view(*b), dst_addr, off_v);
+        }
+        let val = emit_load(mut_view(*b), s_ptr, cty);
+        emit_store(mut_view(*b), d_ptr, val);
+        off = off + chunk;
+    }
+}
+
+fn emit_memcpy_bytes(b: mut_view<LirBuilder>, dst_addr: u32, src_addr: u32, byte_size: u32) {
+    if byte_size == 0u32 {
+        return;
+    }
+    if byte_size <= 64u32 {
+        emit_memcpy_scalar_range(mut_view(*b), dst_addr, src_addr, 0u32, byte_size);
+        return;
+    }
+    let usize_ty = unsafe { (*b.interner).t_usize.v };
+    let bool_ty = unsafe { (*b.interner).t_bool.v };
+    let u64_ty = unsafe { (*b.interner).t_u64.v };
+    let bulk = byte_size & 0xFFFFFFF8u32;
+
+    let idx = make_vreg(mut_view(*b), usize_ty);
+    let zero = emit_const(mut_view(*b), 0u64, usize_ty);
+    emit_bin_inst(mut_view(*b), LIR_INST_ADD, idx, zero, zero);
+    let limit = emit_const(mut_view(*b), bulk as u64, usize_ty);
+    let step8 = emit_const(mut_view(*b), 8u64, usize_ty);
+
+    let head_bb = add_lir_bb(mut_view(*b));
+    let body_bb = add_lir_bb(mut_view(*b));
+    let after_bb = add_lir_bb(mut_view(*b));
+    finish_jmp_bb(mut_view(*b), b.cur_bb, head_bb as u32);
+
+    let cmp = make_vreg(mut_view(*b), bool_ty);
+    emit_bin_inst(mut_view(*b), LIR_INST_ICMP_ULT, cmp, idx, limit);
+    finish_switch1_bb(mut_view(*b), head_bb, cmp, 1u64, body_bb as u32, after_bb as u32);
+
+    let s_ptr = emit_offset(mut_view(*b), src_addr, idx);
+    let word = emit_load(mut_view(*b), s_ptr, u64_ty);
+    let d_ptr = emit_offset(mut_view(*b), dst_addr, idx);
+    emit_store(mut_view(*b), d_ptr, word);
+    emit_bin_inst(mut_view(*b), LIR_INST_ADD, idx, idx, step8);
+    finish_jmp_bb(mut_view(*b), body_bb, head_bb as u32);
+
+    b.cur_bb = after_bb;
+    b.cur_inst_count = 0;
+
+    if bulk < byte_size {
+        emit_memcpy_scalar_range(mut_view(*b), dst_addr, src_addr, bulk, byte_size);
+    }
+}
+
+fn lb_reset_call_copy_slots(b: mut_view<LirBuilder>) {
+    let mut i: usize = 0;
+    while i < b.copy_slot_count {
+        unsafe {
+            *(((b.copy_slot_used as usize) + i) as *mut u8) = 0u8;
+        }
+        i = i + 1;
+    }
+}
+
+fn lb_acquire_call_copy_slot(b: mut_view<LirBuilder>, ty_v: u32) -> u32 {
+    let mut i: usize = 0;
+    while i < b.copy_slot_count {
+        let cur_ty = unsafe { *(((b.copy_slot_tys as usize) + (i << 2)) as *const u32) };
+        let cur_used = unsafe { *(((b.copy_slot_used as usize) + i) as *const u8) };
+        if cur_ty == ty_v && cur_used == 0u8 {
+            unsafe {
+                *(((b.copy_slot_used as usize) + i) as *mut u8) = 1u8;
+            }
+            return unsafe { *(((b.copy_slot_ids as usize) + (i << 2)) as *const u32) };
+        }
+        i = i + 1;
+    }
+    if b.copy_slot_count == b.copy_slot_cap {
+        let new_cap: usize = if b.copy_slot_cap == 0 { 8 } else { b.copy_slot_cap * 2 };
+        let new_tys = unsafe { arena_alloc_raw(mut_view(*b.arena), new_cap << 2, 4) as *mut u32 };
+        let new_ids = unsafe { arena_alloc_raw(mut_view(*b.arena), new_cap << 2, 4) as *mut u32 };
+        let new_used = unsafe { arena_alloc_raw(mut_view(*b.arena), new_cap, 1) as *mut u8 };
+        if b.copy_slot_count > 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(b.copy_slot_tys as *const u8, new_tys as *mut u8, b.copy_slot_count << 2);
+                ptr_copy_nonoverlapping<u8>(b.copy_slot_ids as *const u8, new_ids as *mut u8, b.copy_slot_count << 2);
+                ptr_copy_nonoverlapping<u8>(b.copy_slot_used as *const u8, new_used as *mut u8, b.copy_slot_count);
+            }
+        }
+        b.copy_slot_tys = new_tys;
+        b.copy_slot_ids = new_ids;
+        b.copy_slot_used = new_used;
+        b.copy_slot_cap = new_cap;
+    }
+    let sid = add_lir_slot(mut_view(*b), ty_v);
+    let idx = b.copy_slot_count;
+    unsafe {
+        *(((b.copy_slot_tys as usize) + (idx << 2)) as *mut u32) = ty_v;
+        *(((b.copy_slot_ids as usize) + (idx << 2)) as *mut u32) = sid;
+        *(((b.copy_slot_used as usize) + idx) as *mut u8) = 1u8;
+    }
+    b.copy_slot_count = idx + 1;
+    sid
+}
+
+fn lb_place_mentions_local(place: view<MirPlace>, loc_v: u32) -> bool {
+    if place.local.v == loc_v {
+        return true;
+    }
+    let mut i: usize = 0;
+    while i < place.proj_count {
+        let proj = unsafe { mir_proj_at(place.projs, i) };
+        let pk = unsafe { (*proj).kind };
+        if pk == MIR_PROJ_INDEX {
+            if (unsafe { (*proj).index_local.v }) == loc_v {
+                return true;
+            }
+        } else if pk == MIR_PROJ_SUB_SLICE {
+            if (unsafe { (*proj).has_from }) && (unsafe { (*proj).from_local.v }) == loc_v {
+                return true;
+            }
+            if (unsafe { (*proj).has_to }) && (unsafe { (*proj).to_local.v }) == loc_v {
+                return true;
+            }
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn lb_operand_mentions_local(op: view<MirOperand>, loc_v: u32) -> bool {
+    if op.kind == MIR_OP_COPY || op.kind == MIR_OP_MOVE {
+        return lb_place_mentions_local(view(op.place), loc_v);
+    }
+    false
+}
+
+fn lb_rvalue_mentions_local(rv: view<MirRvalue>, loc_v: u32) -> bool {
+    let rvk = rv.kind;
+    if rvk == MIR_RVALUE_USE || rvk == MIR_RVALUE_CAST || rvk == MIR_RVALUE_UNARY_OP {
+        return lb_operand_mentions_local(view(rv.use_op), loc_v);
+    }
+    if rvk == MIR_RVALUE_REPEAT {
+        if lb_operand_mentions_local(view(rv.use_op), loc_v) {
+            return true;
+        }
+        if (rv.repeat_count_op as usize) != 0 {
+            if unsafe { lb_operand_mentions_local(view(*rv.repeat_count_op), loc_v) } {
+                return true;
+            }
+        }
+        return false;
+    }
+    if rvk == MIR_RVALUE_REF || rvk == MIR_RVALUE_LEN || rvk == MIR_RVALUE_DISCRIMINANT {
+        return lb_place_mentions_local(view(rv.place), loc_v);
+    }
+    if rvk == MIR_RVALUE_BINARY_OP || rvk == MIR_RVALUE_OVERFLOWS_BINARY_OP {
+        return lb_operand_mentions_local(view(rv.lhs), loc_v) ||
+               lb_operand_mentions_local(view(rv.rhs), loc_v);
+    }
+    if rvk == MIR_RVALUE_AGGREGATE {
+        let mut i: usize = 0;
+        while i < rv.operand_count {
+            let op_i = unsafe { mir_op_at(rv.operands, i) };
+            if unsafe { lb_operand_mentions_local(view(*op_i), loc_v) } {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+    false
+}
+
+fn lb_sv_is_derive(sv: view<StrView>) -> bool {
+    if sv.len != 6 || (sv.ptr as usize) == 0 {
+        return false;
+    }
+    (unsafe { *(sv.ptr + 0) }) == 100u8 &&
+    (unsafe { *(sv.ptr + 1) }) == 101u8 &&
+    (unsafe { *(sv.ptr + 2) }) == 114u8 &&
+    (unsafe { *(sv.ptr + 3) }) == 105u8 &&
+    (unsafe { *(sv.ptr + 4) }) == 118u8 &&
+    (unsafe { *(sv.ptr + 5) }) == 101u8
+}
+
+fn lb_sv_is_copy(sv: view<StrView>) -> bool {
+    if sv.len != 4 || (sv.ptr as usize) == 0 {
+        return false;
+    }
+    (unsafe { *(sv.ptr + 0) }) == 67u8 &&
+    (unsafe { *(sv.ptr + 1) }) == 111u8 &&
+    (unsafe { *(sv.ptr + 2) }) == 112u8 &&
+    (unsafe { *(sv.ptr + 3) }) == 121u8
+}
+
+fn lb_type_is_copy_rec(b: view<LirBuilder>, ty_v: u32, depth: usize) -> bool {
+    if ty_v == 0u32 || depth > 16 || (b.interner as usize) == 0 {
+        return true;
+    }
+    let ty = unsafe { type_get(view(*b.interner), TypeId { v: ty_v }) };
+    if (ty as usize) == 0 {
+        return true;
+    }
+    let k = unsafe { (*ty).kind };
+    if k == TY_ERROR || k == TY_STR {
+        return false;
+    }
+    if (k >= TY_UNIT && k <= TY_FN) || k == TY_I128 || k == TY_U128 || k == TY_PTR || k == TY_INT_VAR || k == TY_VIEW {
+        return true;
+    }
+    if k == TY_ARRAY {
+        let elem_v = unsafe { (*ty).elem.v };
+        return lb_type_is_copy_rec(b, elem_v, depth + 1);
+    }
+    if k == TY_TUPLE {
+        let count = unsafe { (*ty).field_count };
+        let fields = unsafe { (*ty).fields };
+        let mut i: usize = 0;
+        while i < count {
+            let f_v = unsafe { (*typeid_at(fields, i)).v };
+            if !lb_type_is_copy_rec(b, f_v, depth + 1) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+    if k == TY_CLOSURE {
+        let count = unsafe { (*ty).capture_count };
+        let caps = unsafe { (*ty).captures };
+        let mut i: usize = 0;
+        while i < count {
+            let cap = unsafe { capture_at(caps, i) };
+            let mode = unsafe { (*cap).mode };
+            if mode == CAP_MUT_VIEW || mode == CAP_MOVE {
+                return false;
+            }
+            let cty_v = unsafe { (*cap).ty.v };
+            if !lb_type_is_copy_rec(b, cty_v, depth + 1) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+    if k == TY_STRUCT || k == TY_ENUM {
+        if (b.str_in as usize) == 0 {
+            return true;
+        }
+        let def = unsafe { (*ty).def };
+        if (def as usize) == 0 {
+            return false;
+        }
+        let mut attr: *mut HirAttr = unsafe { (*def).attrs };
+        while (attr as usize) != 0 {
+            let aname_v = unsafe { (*attr).name.v };
+            if aname_v != 0u32 {
+                let sv = unsafe { interner_get(view(*b.str_in), StrId { v: aname_v }) };
+                if lb_sv_is_derive(view(sv)) {
+                    let mut arg: *mut HirAttrArg = unsafe { (*attr).args };
+                    while (arg as usize) != 0 {
+                        let mut arg_name_v = unsafe { (*arg).name.v };
+                        if arg_name_v == 0u32 {
+                            let aexpr: *mut HirExpr = unsafe { (*arg).expr };
+                            if (aexpr as usize) != 0 && (unsafe { (*aexpr).kind }) == HIR_EXPR_PATH {
+                                arg_name_v = unsafe { (*aexpr).path.name.v };
+                            }
+                        }
+                        if arg_name_v != 0u32 {
+                            let asv = unsafe { interner_get(view(*b.str_in), StrId { v: arg_name_v }) };
+                            if lb_sv_is_copy(view(asv)) {
+                                return true;
+                            }
+                        }
+                        arg = unsafe { (*arg).next };
+                    }
+                }
+            }
+            attr = unsafe { (*attr).next };
+        }
+        return false;
+    }
+    false
+}
+
+fn lb_enqueue_succ(visited: *mut u8, queue: *mut u32, q_tail: mut_view<usize>, tgt: u32, bb_cnt: usize) {
+    let tu = tgt as usize;
+    if tgt != MIR_BB_NONE && tu < bb_cnt {
+        let vp = ((visited as usize) + tu) as *mut u8;
+        if (unsafe { *vp }) == 0u8 {
+            unsafe {
+                *vp = 1u8;
+                *(((queue as usize) + (*q_tail << 2)) as *mut u32) = tgt;
+            }
+            *q_tail = *q_tail + 1;
+        }
+    }
+}
+
+fn lb_ensure_bfs_bufs(b: mut_view<LirBuilder>, bb_cnt: usize) {
+    let cur_bfs_cap: usize = b.bfs_cap;
+    if cur_bfs_cap < bb_cnt {
+        let cap = if bb_cnt < 16 { 16 } else { bb_cnt };
+        b.bfs_visited = unsafe { arena_alloc_raw(mut_view(*b.arena), cap, 1) as *mut u8 };
+        b.bfs_queue = unsafe { arena_alloc_raw(mut_view(*b.arena), cap << 2, 4) as *mut u32 };
+        b.bfs_cap = cap;
+    }
+}
+
+fn lb_enqueue_all_mbb_succs(mbb: *const MirBb, visited: *mut u8, queue: *mut u32, q_tail: mut_view<usize>, bb_cnt: usize) {
+    if !(unsafe { (*mbb).has_terminator }) {
+        return;
+    }
+    let tk = unsafe { (*mbb).terminator.kind };
+    if tk == MIR_TERM_GOTO {
+        lb_enqueue_succ(visited, queue, mut_view(*q_tail), unsafe { (*mbb).terminator.goto_target.v }, bb_cnt);
+    } else if tk == MIR_TERM_SWITCH_INT {
+        let sc = unsafe { (*mbb).terminator.switch_count };
+        let tgts = unsafe { (*mbb).terminator.targets };
+        let mut k: usize = 0;
+        while k < sc {
+            let tv = unsafe { (*mir_bb_id_at(tgts, k)).v };
+            lb_enqueue_succ(visited, queue, mut_view(*q_tail), tv, bb_cnt);
+            k = k + 1;
+        }
+        lb_enqueue_succ(visited, queue, mut_view(*q_tail), unsafe { (*mbb).terminator.otherwise.v }, bb_cnt);
+    } else if tk == MIR_TERM_DROP {
+        lb_enqueue_succ(visited, queue, mut_view(*q_tail), unsafe { (*mbb).terminator.drop_target.v }, bb_cnt);
+        let du = unsafe { (*mbb).terminator.drop_unwind.v };
+        if du != 0u32 {
+            lb_enqueue_succ(visited, queue, mut_view(*q_tail), du, bb_cnt);
+        }
+    } else if tk == MIR_TERM_CALL {
+        lb_enqueue_succ(visited, queue, mut_view(*q_tail), unsafe { (*mbb).terminator.call_target.v }, bb_cnt);
+        let cu = unsafe { (*mbb).terminator.call_unwind.v };
+        if cu != 0u32 {
+            lb_enqueue_succ(visited, queue, mut_view(*q_tail), cu, bb_cnt);
+        }
+    } else if tk == MIR_TERM_ASSERT {
+        lb_enqueue_succ(visited, queue, mut_view(*q_tail), unsafe { (*mbb).terminator.assert_target.v }, bb_cnt);
+        let au = unsafe { (*mbb).terminator.assert_unwind.v };
+        if au != 0u32 {
+            lb_enqueue_succ(visited, queue, mut_view(*q_tail), au, bb_cnt);
+        }
+    }
+}
+
+// Returns `true` if any `MIR_RVALUE_REF` of `loc_v` occurs in `call_bb_idx` or in any block
+// from which `call_bb_idx` is reachable in the CFG. Drop-glue `&mut loc_v` blocks that only
+// branch to `return` cannot reach `call_bb_idx` and therefore cannot hold a live borrow at the call.
+fn lb_local_addr_taken_reaching_bb(b: mut_view<LirBuilder>, call_bb_idx: usize, loc_v: u32) -> bool {
+    let lu = loc_v as usize;
+    let acnt = b.local_addr_count;
+    if (b.local_addr_taken as usize) == 0 || lu >= acnt {
+        return false;
+    }
+    if (unsafe { *(((b.local_addr_taken as usize) + lu) as *const u8) }) == 0u8 {
+        return false;
+    }
+    let bb_cnt = unsafe { (*b.mir).bb_count };
+    if call_bb_idx >= bb_cnt {
+        return true;
+    }
+    lb_ensure_bfs_bufs(mut_view(*b), bb_cnt);
+    let visited = b.bfs_visited;
+    let queue = b.bfs_queue;
+    let mut z: usize = 0;
+    while z < bb_cnt {
+        unsafe { *(((visited as usize) + z) as *mut u8) = 0u8; }
+        z = z + 1;
+    }
+    let bbs = unsafe { (*b.mir).bbs };
+    let mut q_head: usize = 0;
+    let mut q_tail: usize = 0;
+    let mut bi: usize = 0;
+    while bi < bb_cnt {
+        let mbb_s = unsafe { mir_bb_at(bbs, bi) };
+        let scnt_s = unsafe { (*mbb_s).stmt_count };
+        let stmts_s = unsafe { (*mbb_s).stmts };
+        let mut si_s: usize = 0;
+        let mut has_ref = false;
+        while si_s < scnt_s {
+            let st_s = unsafe { mir_stmt_at(stmts_s, si_s) };
+            if (unsafe { (*st_s).kind }) == MIR_STMT_ASSIGN &&
+               (unsafe { (*st_s).rvalue.kind }) == MIR_RVALUE_REF &&
+               (unsafe { (*st_s).rvalue.place.local.v }) == loc_v {
+                has_ref = true;
+                break;
+            }
+            si_s = si_s + 1;
+        }
+        if has_ref {
+            if bi == call_bb_idx {
+                return true;
+            }
+            lb_enqueue_all_mbb_succs(mbb_s as *const MirBb, visited, queue, mut_view(q_tail), bb_cnt);
+        }
+        bi = bi + 1;
+    }
+    while q_head < q_tail {
+        let cur_v = unsafe { *(((queue as usize) + (q_head << 2)) as *const u32) };
+        q_head = q_head + 1;
+        if (cur_v as usize) == call_bb_idx {
+            return true;
+        }
+        let mbb_c = unsafe { mir_bb_at(bbs, cur_v as usize) };
+        lb_enqueue_all_mbb_succs(mbb_c as *const MirBb, visited, queue, mut_view(q_tail), bb_cnt);
+    }
+    false
+}
+
+// Checks that temporary drop-flag local `flag_v` (set to `const 0` in the call block right before
+// the call) is never assigned a non-zero value anywhere syntactically reachable from `start_bb`.
+fn lb_flag_stays_zero_from(b: mut_view<LirBuilder>, start_bb: u32, flag_v: u32) -> bool {
+    let bb_cnt = unsafe { (*b.mir).bb_count };
+    if start_bb == MIR_BB_NONE || (start_bb as usize) >= bb_cnt {
+        return true;
+    }
+    lb_ensure_bfs_bufs(mut_view(*b), bb_cnt);
+    let visited = b.bfs_visited;
+    let queue = b.bfs_queue;
+    let mut z: usize = 0;
+    while z < bb_cnt {
+        unsafe { *(((visited as usize) + z) as *mut u8) = 0u8; }
+        z = z + 1;
+    }
+    let mut q_head: usize = 0;
+    let mut q_tail: usize = 0;
+    lb_enqueue_succ(visited, queue, mut_view(q_tail), start_bb, bb_cnt);
+    let bbs = unsafe { (*b.mir).bbs };
+    while q_head < q_tail {
+        let cur_v = unsafe { *(((queue as usize) + (q_head << 2)) as *const u32) };
+        q_head = q_head + 1;
+        let mbb = unsafe { mir_bb_at(bbs, cur_v as usize) };
+        let stmts = unsafe { (*mbb).stmts };
+        let scnt = unsafe { (*mbb).stmt_count };
+        let mut j: usize = 0;
+        while j < scnt {
+            let st = unsafe { mir_stmt_at(stmts, j) };
+            let sk = unsafe { (*st).kind };
+            if sk == MIR_STMT_ASSIGN && (unsafe { (*st).place.local.v }) == flag_v {
+                let is_const_zero = (unsafe { (*st).place.proj_count }) == 0 &&
+                                    (unsafe { (*st).rvalue.kind }) == MIR_RVALUE_USE &&
+                                    (unsafe { (*st).rvalue.use_op.kind }) == MIR_OP_CONST &&
+                                    (unsafe { (*st).rvalue.use_op.constant.val }) == 0u64;
+                if !is_const_zero {
+                    return false;
+                }
+            } else if sk == MIR_STMT_ATOMIC && (unsafe { (*st).place.local.v }) == flag_v {
+                return false;
+            }
+            j = j + 1;
+        }
+        if (unsafe { (*mbb).has_terminator }) && (unsafe { (*mbb).terminator.kind }) == MIR_TERM_CALL {
+            if (unsafe { (*mbb).terminator.has_destination }) &&
+               (unsafe { (*mbb).terminator.destination.local.v }) == flag_v {
+                return false;
+            }
+        }
+        lb_enqueue_all_mbb_succs(mbb as *const MirBb, visited, queue, mut_view(q_tail), bb_cnt);
+    }
+    true
+}
+
+// Conservative CFG liveness check starting at `start_bb`: returns `true` only when `loc_v`
+// cannot be read or dropped on any execution path from `start_bb` before being overwritten
+// as a whole local (`loc_v = ...` with `proj_count == 0`). When `zero_flag != 0xFFFFFFFF`,
+// `zero_flag` is proven invariant `0` on all paths from `start_bb`, pruning dead drop-flag arms.
+fn lb_local_dead_after_call(b: mut_view<LirBuilder>, start_bb: u32, loc_v: u32, zero_flag: u32) -> bool {
+    let bb_cnt = unsafe { (*b.mir).bb_count };
+    if start_bb == MIR_BB_NONE || (start_bb as usize) >= bb_cnt {
+        return true;
+    }
+    lb_ensure_bfs_bufs(mut_view(*b), bb_cnt);
+    let visited = b.bfs_visited;
+    let queue = b.bfs_queue;
+    let mut z: usize = 0;
+    while z < bb_cnt {
+        unsafe { *(((visited as usize) + z) as *mut u8) = 0u8; }
+        z = z + 1;
+    }
+
+    let mut q_head: usize = 0;
+    let mut q_tail: usize = 0;
+    lb_enqueue_succ(visited, queue, mut_view(q_tail), start_bb, bb_cnt);
+
+    let bbs = unsafe { (*b.mir).bbs };
+    while q_head < q_tail {
+        let cur_v = unsafe { *(((queue as usize) + (q_head << 2)) as *const u32) };
+        q_head = q_head + 1;
+        let mbb = unsafe { mir_bb_at(bbs, cur_v as usize) };
+        let stmts = unsafe { (*mbb).stmts };
+        let stmt_cnt = unsafe { (*mbb).stmt_count };
+        let mut killed = false;
+        let mut j: usize = 0;
+        while j < stmt_cnt {
+            let stmt = unsafe { mir_stmt_at(stmts, j) };
+            let sk = unsafe { (*stmt).kind };
+            if sk == MIR_STMT_ASSIGN {
+                if unsafe { lb_rvalue_mentions_local(view((*stmt).rvalue), loc_v) } {
+                    return false;
+                }
+                let p_cnt = unsafe { (*stmt).place.proj_count };
+                if p_cnt > 0 {
+                    if unsafe { lb_place_mentions_local(view((*stmt).place), loc_v) } {
+                        return false;
+                    }
+                } else if (unsafe { (*stmt).place.local.v }) == loc_v {
+                    killed = true;
+                    break;
+                }
+            } else if sk == MIR_STMT_DROP {
+                if unsafe { lb_place_mentions_local(view((*stmt).place), loc_v) } {
+                    return false;
+                }
+            } else if sk == MIR_STMT_ATOMIC {
+                if unsafe { lb_place_mentions_local(view((*stmt).place), loc_v) } ||
+                   unsafe { lb_rvalue_mentions_local(view((*stmt).rvalue), loc_v) } {
+                    return false;
+                }
+            }
+            j = j + 1;
+        }
+        if killed {
+            continue;
+        }
+        if !(unsafe { (*mbb).has_terminator }) {
+            continue;
+        }
+        let tk = unsafe { (*mbb).terminator.kind };
+        if tk == MIR_TERM_GOTO {
+            let gt = unsafe { (*mbb).terminator.goto_target.v };
+            lb_enqueue_succ(visited, queue, mut_view(q_tail), gt, bb_cnt);
+        } else if tk == MIR_TERM_SWITCH_INT {
+            if unsafe { lb_operand_mentions_local(view((*mbb).terminator.discr), loc_v) } {
+                return false;
+            }
+            let sc = unsafe { (*mbb).terminator.switch_count };
+            let tgts = unsafe { (*mbb).terminator.targets };
+            let dk = unsafe { (*mbb).terminator.discr.kind };
+            let is_known_zero = zero_flag != 0xFFFFFFFFu32 &&
+                                (dk == MIR_OP_COPY || dk == MIR_OP_MOVE) &&
+                                (unsafe { (*mbb).terminator.discr.place.proj_count }) == 0 &&
+                                (unsafe { (*mbb).terminator.discr.place.local.v }) == zero_flag;
+            if is_known_zero {
+                let mvals = unsafe { (*mbb).terminator.values };
+                let mut matched = false;
+                let mut k: usize = 0;
+                while k < sc {
+                    if (unsafe { *mir_u64_at(mvals, k) }) == 0u64 {
+                        let tv = unsafe { (*mir_bb_id_at(tgts, k)).v };
+                        lb_enqueue_succ(visited, queue, mut_view(q_tail), tv, bb_cnt);
+                        matched = true;
+                        break;
+                    }
+                    k = k + 1;
+                }
+                if !matched {
+                    let ow = unsafe { (*mbb).terminator.otherwise.v };
+                    lb_enqueue_succ(visited, queue, mut_view(q_tail), ow, bb_cnt);
+                }
+            } else {
+                let mut k: usize = 0;
+                while k < sc {
+                    let tv = unsafe { (*mir_bb_id_at(tgts, k)).v };
+                    lb_enqueue_succ(visited, queue, mut_view(q_tail), tv, bb_cnt);
+                    k = k + 1;
+                }
+                let ow = unsafe { (*mbb).terminator.otherwise.v };
+                lb_enqueue_succ(visited, queue, mut_view(q_tail), ow, bb_cnt);
+            }
+        } else if tk == MIR_TERM_DROP {
+            if unsafe { lb_place_mentions_local(view((*mbb).terminator.drop_place), loc_v) } {
+                return false;
+            }
+            let dt = unsafe { (*mbb).terminator.drop_target.v };
+            lb_enqueue_succ(visited, queue, mut_view(q_tail), dt, bb_cnt);
+            let du = unsafe { (*mbb).terminator.drop_unwind.v };
+            if du != 0u32 {
+                lb_enqueue_succ(visited, queue, mut_view(q_tail), du, bb_cnt);
+            }
+        } else if tk == MIR_TERM_CALL {
+            if unsafe { lb_operand_mentions_local(view((*mbb).terminator.func), loc_v) } {
+                return false;
+            }
+            let argc = unsafe { (*mbb).terminator.arg_count };
+            let cargs = unsafe { (*mbb).terminator.args };
+            let mut k: usize = 0;
+            while k < argc {
+                let aop = unsafe { mir_op_at(cargs, k) };
+                if unsafe { lb_operand_mentions_local(view(*aop), loc_v) } {
+                    return false;
+                }
+                k = k + 1;
+            }
+            let mut call_kills = false;
+            if unsafe { (*mbb).terminator.has_destination } {
+                let dp_cnt = unsafe { (*mbb).terminator.destination.proj_count };
+                if dp_cnt > 0 {
+                    if unsafe { lb_place_mentions_local(view((*mbb).terminator.destination), loc_v) } {
+                        return false;
+                    }
+                } else if (unsafe { (*mbb).terminator.destination.local.v }) == loc_v {
+                    call_kills = true;
+                }
+            }
+            if !call_kills {
+                let ct = unsafe { (*mbb).terminator.call_target.v };
+                lb_enqueue_succ(visited, queue, mut_view(q_tail), ct, bb_cnt);
+            }
+            let cu = unsafe { (*mbb).terminator.call_unwind.v };
+            if cu != 0u32 {
+                lb_enqueue_succ(visited, queue, mut_view(q_tail), cu, bb_cnt);
+            }
+        } else if tk == MIR_TERM_ASSERT {
+            if unsafe { lb_operand_mentions_local(view((*mbb).terminator.cond), loc_v) } {
+                return false;
+            }
+            let at = unsafe { (*mbb).terminator.assert_target.v };
+            lb_enqueue_succ(visited, queue, mut_view(q_tail), at, bb_cnt);
+            let au = unsafe { (*mbb).terminator.assert_unwind.v };
+            if au != 0u32 {
+                lb_enqueue_succ(visited, queue, mut_view(q_tail), au, bb_cnt);
+            }
+        } else if tk == MIR_TERM_SUSPEND {
+            return false;
+        }
+    }
+    true
+}
+
+fn lb_find_call_zero_drop_flag(b: view<LirBuilder>, mbb: *const MirBb, loc_v: u32) -> u32 {
+    let scnt = unsafe { (*mbb).stmt_count };
+    let stmts = unsafe { (*mbb).stmts };
+    let lcnt = unsafe { (*b.mir).local_count };
+    let acnt = b.local_addr_count;
+    let mut idx: usize = scnt;
+    while idx > 0 {
+        idx = idx - 1;
+        let st = unsafe { mir_stmt_at(stmts, idx) };
+        if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN &&
+           (unsafe { (*st).place.proj_count }) == 0 &&
+           (unsafe { (*st).rvalue.kind }) == MIR_RVALUE_USE &&
+           (unsafe { (*st).rvalue.use_op.kind }) == MIR_OP_CONST &&
+           (unsafe { (*st).rvalue.use_op.constant.val }) == 0u64 {
+            let fv = unsafe { (*st).place.local.v };
+            let fu = fv as usize;
+            if fv != loc_v && fu < lcnt {
+                let fdecl = unsafe { mir_local_at((*b.mir).locals, fu) };
+                let addr_taken = (b.local_addr_taken as usize) != 0 && fu < acnt &&
+                                 (unsafe { *(((b.local_addr_taken as usize) + fu) as *const u8) }) != 0u8;
+                let written_by_dest = (unsafe { (*mbb).terminator.has_destination }) &&
+                                      (unsafe { (*mbb).terminator.destination.local.v }) == fv;
+                if (unsafe { (*fdecl).kind }) == MIR_LOCAL_TEMP && !addr_taken && !written_by_dest {
+                    let mut overwritten = false;
+                    let mut after: usize = idx + 1;
+                    while after < scnt {
+                        let st2 = unsafe { mir_stmt_at(stmts, after) };
+                        if ((unsafe { (*st2).kind }) == MIR_STMT_ASSIGN || (unsafe { (*st2).kind }) == MIR_STMT_ATOMIC) &&
+                           (unsafe { (*st2).place.local.v }) == fv {
+                            overwritten = true;
+                            break;
+                        }
+                        after = after + 1;
+                    }
+                    if !overwritten {
+                        return fv;
+                    }
+                }
+            }
+        }
+    }
+    0xFFFFFFFFu32
+}
+
+fn lb_can_elide_caller_copy(
+    b: mut_view<LirBuilder>,
+    mbb: *const MirBb,
+    mir_bb_idx: usize,
+    args: *mut MirOperand,
+    arg_count: usize,
+    arg_idx: usize,
+    param_ty_v: u32
+) -> bool {
+    let op_ptr = unsafe { mir_op_at(args, arg_idx) };
+    let op_k = unsafe { (*op_ptr).kind };
+    if op_k != MIR_OP_MOVE && op_k != MIR_OP_COPY {
+        return false;
+    }
+    if (unsafe { (*op_ptr).place.proj_count }) != 0 {
+        return false;
+    }
+    let loc_v = unsafe { (*op_ptr).place.local.v };
+    let lu = loc_v as usize;
+    if lu >= (unsafe { (*b.mir).local_count }) {
+        return false;
+    }
+    let ldecl = unsafe { mir_local_at((*b.mir).locals, lu) };
+    let lk = unsafe { (*ldecl).kind };
+    if lk == MIR_LOCAL_CONST || lk == MIR_LOCAL_TLS {
+        return false;
+    }
+    // At `-O0`, elide for moves (explicit `MIR_OP_MOVE` or non-Copy types) and unnamed temporaries;
+    // last-use `Copy` elision on named bindings/parameters is enabled at `-O1`.
+    let is_move_sem = op_k == MIR_OP_MOVE || lk == MIR_LOCAL_TEMP || !lb_type_is_copy_rec(view(*b), param_ty_v, 0);
+    if !b.is_opt && !is_move_sem {
+        return false;
+    }
+    // Never elide if a borrow/pointer to `loc_v` (or its aliased slot) could be live at `mir_bb_idx`.
+    let mapped_v = lb_mapped_slot(view(*b), loc_v);
+    if lb_local_addr_taken_reaching_bb(mut_view(*b), mir_bb_idx, loc_v) {
+        return false;
+    }
+    if mapped_v != loc_v && lb_local_addr_taken_reaching_bb(mut_view(*b), mir_bb_idx, mapped_v) {
+        return false;
+    }
+    // Never alias the call's `sret` destination place or indirect callee operand or later arguments.
+    if unsafe { (*mbb).terminator.has_destination } {
+        if unsafe { lb_place_mentions_local(view((*mbb).terminator.destination), loc_v) } {
+            return false;
+        }
+        if mapped_v != loc_v && unsafe { lb_place_mentions_local(view((*mbb).terminator.destination), mapped_v) } {
+            return false;
+        }
+    }
+    if unsafe { lb_operand_mentions_local(view((*mbb).terminator.func), loc_v) } {
+        return false;
+    }
+    let mut m: usize = arg_idx + 1;
+    while m < arg_count {
+        let other = unsafe { mir_op_at(args, m) };
+        if unsafe { lb_operand_mentions_local(view(*other), loc_v) } {
+            return false;
+        }
+        if mapped_v != loc_v && unsafe { lb_operand_mentions_local(view(*other), mapped_v) } {
+            return false;
+        }
+        m = m + 1;
+    }
+    let call_target_v = unsafe { (*mbb).terminator.call_target.v };
+    let mut zero_flag: u32 = lb_find_call_zero_drop_flag(view(*b), mbb, loc_v);
+    if zero_flag != 0xFFFFFFFFu32 {
+        if !lb_flag_stays_zero_from(mut_view(*b), call_target_v, zero_flag) {
+            zero_flag = 0xFFFFFFFFu32;
+        }
+    }
+    let call_unwind_v = unsafe { (*mbb).terminator.call_unwind.v };
+    if call_unwind_v != 0u32 && call_unwind_v != MIR_BB_NONE {
+        if !lb_local_dead_after_call(mut_view(*b), call_unwind_v, loc_v, 0xFFFFFFFFu32) {
+            return false;
+        }
+    }
+    lb_local_dead_after_call(mut_view(*b), call_target_v, loc_v, zero_flag)
+}
+
 fn lower_print_int128_call(
     b: mut_view<LirBuilder>,
     args: *mut MirOperand,
@@ -22485,7 +23503,7 @@ fn lower_print_int128_call(
     finish_jmp_bb(mut_view(*b), emit_bb, call_target_v);
 }
 
-fn lower_call_terminator(b: mut_view<LirBuilder>, mbb: *const MirBb, bb_idx: usize) {
+fn lower_call_terminator(b: mut_view<LirBuilder>, mbb: *const MirBb, mir_bb_idx: usize, bb_idx: usize) {
     let usize_ty: u32 = unsafe { (*b.interner).t_usize.v };
     let bool_ty: u32 = unsafe { (*b.interner).t_bool.v };
     let u8_ty: u32 = unsafe { (*b.interner).t_u8.v };
@@ -22796,11 +23814,29 @@ fn lower_call_terminator(b: mut_view<LirBuilder>, mbb: *const MirBb, bb_idx: usi
     if (cty as usize) != 0 && cty_k == TY_CLOSURE {
         cap_count = unsafe { (*cty).capture_count };
     }
+    let max_caps = if cap_count < 64 { cap_count } else { 64 };
+    let total_args = max_caps + arg_count;
+
+    let mut eff_callee_ty_v = callee_ty_v;
+    if (cty as usize) != 0 && cty_k == TY_CLOSURE && (unsafe { (*cty).fn_type.v }) != 0u32 {
+        eff_callee_ty_v = unsafe { (*cty).fn_type.v };
+    }
+    let need_synth_callee_ty = if eff_callee_ty_v == 0u32 {
+        true
+    } else if (cty as usize) != 0 && cty_k == TY_FN {
+        let pcnt = unsafe { (*cty).param_count };
+        pcnt == 0 && total_args > 0
+    } else {
+        false
+    };
+
+    lb_reset_call_copy_slots(mut_view(*b));
 
     let mut cap_vals: *mut LirVRegId = 0 as *mut LirVRegId;
+    let mut cap_cslots: *mut u32 = 0 as *mut u32;
     if cap_count > 0 && func_op.kind != MIR_OP_CONST {
-        let max_caps = if cap_count < 64 { cap_count } else { 64 };
         cap_vals = unsafe { arena_alloc_raw(mut_view(*b.arena), lir_mul_usize(max_caps, size_of<LirVRegId>()), align_of<LirVRegId>()) as *mut LirVRegId };
+        cap_cslots = unsafe { arena_alloc_raw(mut_view(*b.arena), max_caps << 2, 4) as *mut u32 };
         let closure_base = lower_place_addr(mut_view(*b), view(func_op.place), 0 as *mut u32);
         let mut c: usize = 0;
         while c < max_caps {
@@ -22809,25 +23845,69 @@ fn lower_call_terminator(b: mut_view<LirBuilder>, mbb: *const MirBb, bb_idx: usi
             let cap_addr = emit_offset(mut_view(*b), closure_base, cap_off);
             let cap_ptr = unsafe { capture_at((*cty).captures, c) };
             let cap_ty_v = unsafe { (*cap_ptr).ty.v };
-            let cv = emit_load(mut_view(*b), cap_addr, cap_ty_v);
+            let mut cv: u32 = 0u32;
+            let mut ccslot: u32 = LIR_VREG_NONE;
+            if b.has_fn_ty && !need_synth_callee_ty && lb_is_indirect_agg_ty(view(*b), cap_ty_v) {
+                let cap_sz = unsafe { type_size(TypeId { v: cap_ty_v }, view(*b.interner)) };
+                let cslot = lb_acquire_call_copy_slot(mut_view(*b), cap_ty_v);
+                let cslot_dst = emit_stack_addr(mut_view(*b), cslot);
+                emit_memcpy_bytes(mut_view(*b), cslot_dst, cap_addr, cap_sz);
+                ccslot = cslot;
+            } else {
+                cv = emit_load(mut_view(*b), cap_addr, cap_ty_v);
+            }
             let cv_dst = unsafe { vreg_id_at(cap_vals, c) };
-            unsafe { (*cv_dst).v = cv; }
+            unsafe {
+                (*cv_dst).v = cv;
+                *(((cap_cslots as usize) + (c << 2)) as *mut u32) = ccslot;
+            }
             c = c + 1;
         }
     }
 
-    if (cty as usize) != 0 && cty_k == TY_CLOSURE && (unsafe { (*cty).fn_type.v }) != 0u32 {
-        callee_ty_v = unsafe { (*cty).fn_type.v };
-    }
+    callee_ty_v = eff_callee_ty_v;
+    let fn_ax = if !need_synth_callee_ty && callee_ty_v != 0u32 {
+        unsafe { type_get(view(*b.interner), TypeId { v: callee_ty_v }) }
+    } else {
+        0 as *mut AxType
+    };
 
     let mut arg_vals: *mut LirVRegId = 0 as *mut LirVRegId;
+    let mut arg_cslots: *mut u32 = 0 as *mut u32;
     if arg_count > 0 {
         arg_vals = unsafe { arena_alloc_raw(mut_view(*b.arena), lir_mul_usize(arg_count, size_of<LirVRegId>()), align_of<LirVRegId>()) as *mut LirVRegId };
+        arg_cslots = unsafe { arena_alloc_raw(mut_view(*b.arena), arg_count << 2, 4) as *mut u32 };
         let mut k: usize = 0;
         while k < arg_count {
-            let av = lower_arg_at(mut_view(*b), args, k);
+            let mut param_ty_v: u32 = 0u32;
+            if (fn_ax as usize) != 0 && (unsafe { (*fn_ax).kind }) == TY_FN &&
+               (cap_count + k) < (unsafe { (*fn_ax).param_count }) {
+                param_ty_v = unsafe { (*typeid_at((*fn_ax).param_types, cap_count + k)).v };
+            }
+            let op_ptr = unsafe { mir_op_at(args, k) };
+            let op_k = unsafe { (*op_ptr).kind };
+            let mut av: u32 = 0u32;
+            let mut acslot: u32 = LIR_VREG_NONE;
+            if b.has_fn_ty && !need_synth_callee_ty && lb_is_indirect_agg_ty(view(*b), param_ty_v) &&
+               (op_k == MIR_OP_COPY || op_k == MIR_OP_MOVE) {
+                let src_addr = unsafe { lower_place_addr(mut_view(*b), view((*op_ptr).place), 0 as *mut u32) };
+                if lb_can_elide_caller_copy(mut_view(*b), mbb, mir_bb_idx, args, arg_count, k, param_ty_v) {
+                    av = src_addr;
+                } else {
+                    let arg_sz = unsafe { type_size(TypeId { v: param_ty_v }, view(*b.interner)) };
+                    let cslot = lb_acquire_call_copy_slot(mut_view(*b), param_ty_v);
+                    let cslot_dst = emit_stack_addr(mut_view(*b), cslot);
+                    emit_memcpy_bytes(mut_view(*b), cslot_dst, src_addr, arg_sz);
+                    acslot = cslot;
+                }
+            } else {
+                av = lower_arg_at(mut_view(*b), args, k);
+            }
             let av_dst = unsafe { vreg_id_at(arg_vals, k) };
-            unsafe { (*av_dst).v = av; }
+            unsafe {
+                (*av_dst).v = av;
+                *(((arg_cslots as usize) + (k << 2)) as *mut u32) = acslot;
+            }
             k = k + 1;
         }
     }
@@ -22861,16 +23941,6 @@ fn lower_call_terminator(b: mut_view<LirBuilder>, mbb: *const MirBb, bb_idx: usi
         dst_ty_v = unsafe { (*dest_ldecl).ty.v };
     }
 
-    let max_caps = if cap_count < 64 { cap_count } else { 64 };
-    let total_args = max_caps + arg_count;
-    let need_synth_callee_ty = if callee_ty_v == 0u32 {
-        true
-    } else if (cty as usize) != 0 && cty_k == TY_FN {
-        let pcnt = unsafe { (*cty).param_count };
-        pcnt == 0 && total_args > 0
-    } else {
-        false
-    };
     if need_synth_callee_ty {
         let mut param_types: *mut TypeId = 0 as *mut TypeId;
         if total_args > 0 {
@@ -22909,7 +23979,12 @@ fn lower_call_terminator(b: mut_view<LirBuilder>, mbb: *const MirBb, bb_idx: usi
     if (cap_vals as usize) != 0 {
         let mut c: usize = 0;
         while c < max_caps {
-            let cv = unsafe { (*vreg_id_at(cap_vals, c)).v };
+            let ccslot = unsafe { *(((cap_cslots as usize) + (c << 2)) as *const u32) };
+            let cv = if ccslot != LIR_VREG_NONE {
+                emit_stack_addr(mut_view(*b), ccslot)
+            } else {
+                unsafe { (*vreg_id_at(cap_vals, c)).v }
+            };
             let ainst = push_new_inst(mut_view(*b), LIR_INST_ABI_ARG);
             unsafe {
                 (*ainst).dest.v = LIR_VREG_NONE;
@@ -22921,7 +23996,12 @@ fn lower_call_terminator(b: mut_view<LirBuilder>, mbb: *const MirBb, bb_idx: usi
     }
     let mut k: usize = 0;
     while k < arg_count {
-        let av = unsafe { (*vreg_id_at(arg_vals, k)).v };
+        let acslot = unsafe { *(((arg_cslots as usize) + (k << 2)) as *const u32) };
+        let av = if acslot != LIR_VREG_NONE {
+            emit_stack_addr(mut_view(*b), acslot)
+        } else {
+            unsafe { (*vreg_id_at(arg_vals, k)).v }
+        };
         let ainst = push_new_inst(mut_view(*b), LIR_INST_ABI_ARG);
         unsafe {
             (*ainst).dest.v = LIR_VREG_NONE;
@@ -22940,18 +24020,301 @@ fn lower_call_terminator(b: mut_view<LirBuilder>, mbb: *const MirBb, bb_idx: usi
         (*call_inst).callee_vreg.v = callee_vreg;
     }
 
-    let res = make_vreg(mut_view(*b), dst_ty_v);
-    let rinst = push_new_inst(mut_view(*b), LIR_INST_ABI_RESULT);
-    unsafe {
-        (*rinst).dest.v = res;
-        (*rinst).index = 0u32;
+    if !(b.has_fn_ty && lb_callee_is_sret(view(*b), callee_ty_v) && lb_is_indirect_agg_ty(view(*b), dst_ty_v)) {
+        let res = make_vreg(mut_view(*b), dst_ty_v);
+        let rinst = push_new_inst(mut_view(*b), LIR_INST_ABI_RESULT);
+        unsafe {
+            (*rinst).dest.v = res;
+            (*rinst).index = 0u32;
+        }
+        emit_store(mut_view(*b), dst_addr, res);
     }
-    emit_store(mut_view(*b), dst_addr, res);
 
-    finish_jmp_bb(mut_view(*b), bb_idx, call_target_v);
+    finish_jmp_bb(mut_view(*b), b.cur_bb, call_target_v);
 }
 
 // --- Top-Level MIR-to-LIR Lowering Entrypoints ---
+
+fn lb_bump_u32(counts: *mut u32, cap: usize, idx: u32) {
+    let iu = idx as usize;
+    if iu < cap {
+        let p = ((counts as usize) + (iu << 2)) as *mut u32;
+        unsafe {
+            let cur = *p;
+            if cur < 0xFFFFFFFEu32 {
+                *p = cur + 1u32;
+            }
+        }
+    }
+}
+
+fn lb_count_place_mentions(place: view<MirPlace>, counts: *mut u32, lcnt: usize) {
+    lb_bump_u32(counts, lcnt, place.local.v);
+    let pcnt = place.proj_count;
+    let mut i: usize = 0;
+    while i < pcnt {
+        let proj = unsafe { mir_proj_at(place.projs, i) };
+        if (unsafe { (*proj).kind }) == MIR_PROJ_INDEX {
+            lb_bump_u32(counts, lcnt, unsafe { (*proj).index_local.v });
+        }
+        i = i + 1;
+    }
+}
+
+fn lb_count_op_mentions(op: view<MirOperand>, counts: *mut u32, lcnt: usize) {
+    if op.kind == MIR_OP_COPY || op.kind == MIR_OP_MOVE {
+        lb_count_place_mentions(view(op.place), counts, lcnt);
+    }
+}
+
+fn lb_count_rv_mentions(rv: view<MirRvalue>, counts: *mut u32, lcnt: usize) {
+    let rk = rv.kind;
+    if rk == MIR_RVALUE_USE || rk == MIR_RVALUE_REPEAT || rk == MIR_RVALUE_CAST || rk == MIR_RVALUE_UNARY_OP {
+        lb_count_op_mentions(view(rv.use_op), counts, lcnt);
+    } else if rk == MIR_RVALUE_REF || rk == MIR_RVALUE_LEN || rk == MIR_RVALUE_DISCRIMINANT {
+        lb_count_place_mentions(view(rv.place), counts, lcnt);
+    } else if rk == MIR_RVALUE_BINARY_OP || rk == MIR_RVALUE_OVERFLOWS_BINARY_OP {
+        lb_count_op_mentions(view(rv.lhs), counts, lcnt);
+        lb_count_op_mentions(view(rv.rhs), counts, lcnt);
+    } else if rk == MIR_RVALUE_AGGREGATE {
+        let ocnt = rv.operand_count;
+        let mut i: usize = 0;
+        while i < ocnt {
+            let op_i = unsafe { mir_op_at(rv.operands, i) };
+            unsafe { lb_count_op_mentions(view(*op_i), counts, lcnt); }
+            i = i + 1;
+        }
+    }
+}
+
+// Coalesces single-use indirect-aggregate `MIR_LOCAL_TEMP`s (`_t = rvalue; _d = copy/move _t`
+// or `_t = sret_call(...) -> bb_next; bb_next: { _d = copy/move _t; ... }`) directly into `_d`'s
+// `LirStackSlot` so `_t` allocates 0 stack bytes and `_d = _t` becomes a zero-instruction no-op.
+fn lb_compute_slot_remaps(b: mut_view<LirBuilder>) {
+    let lcnt = unsafe { (*b.mir).local_count };
+    let bb_cnt = unsafe { (*b.mir).bb_count };
+    if lcnt == 0 || bb_cnt == 0 || (b.slot_remap as usize) == 0 {
+        return;
+    }
+    let locals = unsafe { (*b.mir).locals };
+    let bbs = unsafe { (*b.mir).bbs };
+    let mention_cnt = unsafe { arena_alloc_raw(mut_view(*b.arena), lcnt << 2, 4) as *mut u32 };
+    let is_alias_dst = unsafe { arena_alloc_raw(mut_view(*b.arena), lcnt, 1) as *mut u8 };
+    let bb_preds = unsafe { arena_alloc_raw(mut_view(*b.arena), bb_cnt << 2, 4) as *mut u32 };
+    let mut z: usize = 0;
+    while z < lcnt {
+        unsafe {
+            *(((mention_cnt as usize) + (z << 2)) as *mut u32) = 0u32;
+            *(((is_alias_dst as usize) + z) as *mut u8) = 0u8;
+        }
+        z = z + 1;
+    }
+    let mut zb: usize = 0;
+    while zb < bb_cnt {
+        unsafe { *(((bb_preds as usize) + (zb << 2)) as *mut u32) = 0u32; }
+        zb = zb + 1;
+    }
+    if bb_cnt > 0 {
+        lb_bump_u32(bb_preds, bb_cnt, 0u32);
+    }
+
+    let mut bi: usize = 0;
+    while bi < bb_cnt {
+        let mbb = unsafe { mir_bb_at(bbs, bi) };
+        let scnt = unsafe { (*mbb).stmt_count };
+        let stmts = unsafe { (*mbb).stmts };
+        let mut si: usize = 0;
+        while si < scnt {
+            let st = unsafe { mir_stmt_at(stmts, si) };
+            let sk = unsafe { (*st).kind };
+            if sk == MIR_STMT_ASSIGN {
+                unsafe {
+                    lb_count_place_mentions(view((*st).place), mention_cnt, lcnt);
+                    lb_count_rv_mentions(view((*st).rvalue), mention_cnt, lcnt);
+                }
+            } else if sk == MIR_STMT_DROP {
+                unsafe { lb_count_place_mentions(view((*st).place), mention_cnt, lcnt); }
+            } else if sk == MIR_STMT_ATOMIC {
+                unsafe {
+                    lb_count_place_mentions(view((*st).place), mention_cnt, lcnt);
+                    lb_count_rv_mentions(view((*st).rvalue), mention_cnt, lcnt);
+                }
+            }
+            si = si + 1;
+        }
+        if unsafe { (*mbb).has_terminator } {
+            let tk = unsafe { (*mbb).terminator.kind };
+            if tk == MIR_TERM_SUSPEND {
+                return;
+            }
+            if tk == MIR_TERM_GOTO {
+                lb_bump_u32(bb_preds, bb_cnt, unsafe { (*mbb).terminator.goto_target.v });
+            } else if tk == MIR_TERM_SWITCH_INT {
+                unsafe { lb_count_op_mentions(view((*mbb).terminator.discr), mention_cnt, lcnt); }
+                let swc = unsafe { (*mbb).terminator.switch_count };
+                let tgts = unsafe { (*mbb).terminator.targets };
+                let mut k: usize = 0;
+                while k < swc {
+                    lb_bump_u32(bb_preds, bb_cnt, unsafe { (*mir_bb_id_at(tgts, k)).v });
+                    k = k + 1;
+                }
+                lb_bump_u32(bb_preds, bb_cnt, unsafe { (*mbb).terminator.otherwise.v });
+            } else if tk == MIR_TERM_DROP {
+                unsafe { lb_count_place_mentions(view((*mbb).terminator.drop_place), mention_cnt, lcnt); }
+                lb_bump_u32(bb_preds, bb_cnt, unsafe { (*mbb).terminator.drop_target.v });
+                let du = unsafe { (*mbb).terminator.drop_unwind.v };
+                if du != 0u32 {
+                    lb_bump_u32(bb_preds, bb_cnt, du);
+                }
+            } else if tk == MIR_TERM_CALL {
+                unsafe { lb_count_op_mentions(view((*mbb).terminator.func), mention_cnt, lcnt); }
+                let argc = unsafe { (*mbb).terminator.arg_count };
+                let cargs = unsafe { (*mbb).terminator.args };
+                let mut k: usize = 0;
+                while k < argc {
+                    let aop = unsafe { mir_op_at(cargs, k) };
+                    unsafe { lb_count_op_mentions(view(*aop), mention_cnt, lcnt); }
+                    k = k + 1;
+                }
+                if unsafe { (*mbb).terminator.has_destination } {
+                    unsafe { lb_count_place_mentions(view((*mbb).terminator.destination), mention_cnt, lcnt); }
+                }
+                lb_bump_u32(bb_preds, bb_cnt, unsafe { (*mbb).terminator.call_target.v });
+                let cu = unsafe { (*mbb).terminator.call_unwind.v };
+                if cu != 0u32 {
+                    lb_bump_u32(bb_preds, bb_cnt, cu);
+                }
+            } else if tk == MIR_TERM_ASSERT {
+                unsafe { lb_count_op_mentions(view((*mbb).terminator.cond), mention_cnt, lcnt); }
+                lb_bump_u32(bb_preds, bb_cnt, unsafe { (*mbb).terminator.assert_target.v });
+                let au = unsafe { (*mbb).terminator.assert_unwind.v };
+                if au != 0u32 {
+                    lb_bump_u32(bb_preds, bb_cnt, au);
+                }
+            }
+        }
+        bi = bi + 1;
+    }
+
+    let mut bi2: usize = 0;
+    while bi2 < bb_cnt {
+        let mbb = unsafe { mir_bb_at(bbs, bi2) };
+        let scnt = unsafe { (*mbb).stmt_count };
+        let stmts = unsafe { (*mbb).stmts };
+        let mut si: usize = 0;
+        while si + 1 < scnt {
+            let st0 = unsafe { mir_stmt_at(stmts, si) };
+            let st1 = unsafe { mir_stmt_at(stmts, si + 1) };
+            if (unsafe { (*st0).kind }) == MIR_STMT_ASSIGN &&
+               (unsafe { (*st1).kind }) == MIR_STMT_ASSIGN &&
+               (unsafe { (*st0).place.proj_count }) == 0 &&
+               (unsafe { (*st1).place.proj_count }) == 0 &&
+               (unsafe { (*st1).rvalue.kind }) == MIR_RVALUE_USE {
+                let uok = unsafe { (*st1).rvalue.use_op.kind };
+                let tv = unsafe { (*st0).place.local.v };
+                let dv = unsafe { (*st1).place.local.v };
+                if (uok == MIR_OP_COPY || uok == MIR_OP_MOVE) &&
+                   (unsafe { (*st1).rvalue.use_op.place.proj_count }) == 0 &&
+                   (unsafe { (*st1).rvalue.use_op.place.local.v }) == tv &&
+                   tv > 0u32 && dv > 0u32 && tv != dv &&
+                   (tv as usize) < lcnt && (dv as usize) < lcnt {
+                    let tu = tv as usize;
+                    let du = dv as usize;
+                    let tdecl = unsafe { mir_local_at(locals, tu) };
+                    let ddecl = unsafe { mir_local_at(locals, du) };
+                    let tty_v = unsafe { (*tdecl).ty.v };
+                    let dk = unsafe { (*ddecl).kind };
+                    let mcnt_t = unsafe { *(((mention_cnt as usize) + (tu << 2)) as *const u32) };
+                    let cur_map_t = unsafe { *(((b.slot_remap as usize) + (tu << 2)) as *const u32) };
+                    let cur_map_d = unsafe { *(((b.slot_remap as usize) + (du << 2)) as *const u32) };
+                    let t_is_dst = unsafe { *(((is_alias_dst as usize) + tu) as *const u8) };
+                    if (unsafe { (*tdecl).kind }) == MIR_LOCAL_TEMP &&
+                       mcnt_t == 2u32 &&
+                       tty_v == (unsafe { (*ddecl).ty.v }) &&
+                       dk != MIR_LOCAL_CONST && dk != MIR_LOCAL_TLS &&
+                       !lb_local_is_indirect_param(view(*b), dv) &&
+                       lb_is_indirect_agg_ty(view(*b), tty_v) &&
+                       cur_map_t == tv && t_is_dst == 0u8 && cur_map_d == dv &&
+                       !(unsafe { lb_rvalue_mentions_local(view((*st0).rvalue), dv) }) {
+                        unsafe {
+                            *(((b.slot_remap as usize) + (tu << 2)) as *mut u32) = dv;
+                            *(((is_alias_dst as usize) + du) as *mut u8) = 1u8;
+                            (*lir_slot_at(b.slots, tu)).is_const = true;
+                        }
+                    }
+                }
+            }
+            si = si + 1;
+        }
+
+        if (unsafe { (*mbb).has_terminator }) &&
+           (unsafe { (*mbb).terminator.kind }) == MIR_TERM_CALL &&
+           (unsafe { (*mbb).terminator.has_destination }) &&
+           (unsafe { (*mbb).terminator.destination.proj_count }) == 0 {
+            let tv = unsafe { (*mbb).terminator.destination.local.v };
+            let ct = unsafe { (*mbb).terminator.call_target.v };
+            if tv > 0u32 && (tv as usize) < lcnt && ct != MIR_BB_NONE && (ct as usize) < bb_cnt {
+                let tu = tv as usize;
+                let preds = unsafe { *(((bb_preds as usize) + ((ct as usize) << 2)) as *const u32) };
+                let mcnt_t = unsafe { *(((mention_cnt as usize) + (tu << 2)) as *const u32) };
+                let next_bb = unsafe { mir_bb_at(bbs, ct as usize) };
+                if preds == 1u32 && mcnt_t == 2u32 && (unsafe { (*next_bb).stmt_count }) > 0 {
+                    let st0 = unsafe { mir_stmt_at((*next_bb).stmts, 0) };
+                    if (unsafe { (*st0).kind }) == MIR_STMT_ASSIGN &&
+                       (unsafe { (*st0).place.proj_count }) == 0 &&
+                       (unsafe { (*st0).rvalue.kind }) == MIR_RVALUE_USE {
+                        let uok = unsafe { (*st0).rvalue.use_op.kind };
+                        let dv = unsafe { (*st0).place.local.v };
+                        if (uok == MIR_OP_COPY || uok == MIR_OP_MOVE) &&
+                           (unsafe { (*st0).rvalue.use_op.place.proj_count }) == 0 &&
+                           (unsafe { (*st0).rvalue.use_op.place.local.v }) == tv &&
+                           dv > 0u32 && dv != tv && (dv as usize) < lcnt {
+                            let du = dv as usize;
+                            let tdecl = unsafe { mir_local_at(locals, tu) };
+                            let ddecl = unsafe { mir_local_at(locals, du) };
+                            let tty_v = unsafe { (*tdecl).ty.v };
+                            let dk = unsafe { (*ddecl).kind };
+                            let cur_map_t = unsafe { *(((b.slot_remap as usize) + (tu << 2)) as *const u32) };
+                            let cur_map_d = unsafe { *(((b.slot_remap as usize) + (du << 2)) as *const u32) };
+                            let t_is_dst = unsafe { *(((is_alias_dst as usize) + tu) as *const u8) };
+                            let d_addr_taken = (b.local_addr_taken as usize) != 0 &&
+                                               (unsafe { *(((b.local_addr_taken as usize) + du) as *const u8) }) != 0u8;
+                            if (unsafe { (*tdecl).kind }) == MIR_LOCAL_TEMP &&
+                               tty_v == (unsafe { (*ddecl).ty.v }) &&
+                               dk != MIR_LOCAL_CONST && dk != MIR_LOCAL_TLS &&
+                               !lb_local_is_indirect_param(view(*b), dv) &&
+                               lb_is_indirect_agg_ty(view(*b), tty_v) &&
+                               cur_map_t == tv && t_is_dst == 0u8 && cur_map_d == dv &&
+                               !d_addr_taken &&
+                               !(unsafe { lb_operand_mentions_local(view((*mbb).terminator.func), dv) }) {
+                                let argc = unsafe { (*mbb).terminator.arg_count };
+                                let cargs = unsafe { (*mbb).terminator.args };
+                                let mut arg_uses_d = false;
+                                let mut ak: usize = 0;
+                                while ak < argc {
+                                    let aop = unsafe { mir_op_at(cargs, ak) };
+                                    if unsafe { lb_operand_mentions_local(view(*aop), dv) } {
+                                        arg_uses_d = true;
+                                        break;
+                                    }
+                                    ak = ak + 1;
+                                }
+                                if !arg_uses_d {
+                                    unsafe {
+                                        *(((b.slot_remap as usize) + (tu << 2)) as *mut u32) = dv;
+                                        *(((is_alias_dst as usize) + du) as *mut u8) = 1u8;
+                                        (*lir_slot_at(b.slots, tu)).is_const = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bi2 = bi2 + 1;
+    }
+}
 
 pub fn lir_lower_ext_opt(
     arena: mut_view<Arena>,
@@ -22975,9 +24338,15 @@ pub fn lir_lower_ext_opt(
     let local_count = unsafe { (*mir).local_count };
     let locals = unsafe { (*mir).locals };
     let mut slots: *mut LirStackSlot = 0 as *mut LirStackSlot;
+    let mut param_is_indirect_ptr: *mut u8 = 0 as *mut u8;
+    let mut local_addr_taken: *mut u8 = 0 as *mut u8;
+    let mut slot_remap: *mut u32 = 0 as *mut u32;
     if local_count > 0 {
         let slot_bytes = lir_mul_usize(local_count, size_of<LirStackSlot>());
         slots = unsafe { arena_alloc_raw(mut_view(*arena_ptr), slot_bytes, align_of<LirStackSlot>()) as *mut LirStackSlot };
+        param_is_indirect_ptr = unsafe { arena_alloc_raw(mut_view(*arena_ptr), local_count, 1) as *mut u8 };
+        local_addr_taken = unsafe { arena_alloc_raw(mut_view(*arena_ptr), local_count, 1) as *mut u8 };
+        slot_remap = unsafe { arena_alloc_raw(mut_view(*arena_ptr), local_count << 2, 4) as *mut u32 };
         let mut i: usize = 0;
         while i < local_count {
             let ldecl = unsafe { mir_local_at(locals, i) };
@@ -22985,12 +24354,39 @@ pub fn lir_lower_ext_opt(
             unsafe {
                 (*sp).ty.v = (*ldecl).ty.v;
                 (*sp).is_const = ((*ldecl).kind == MIR_LOCAL_CONST || (*ldecl).kind == MIR_LOCAL_TLS);
+                *(((param_is_indirect_ptr as usize) + i) as *mut u8) = 0u8;
+                *(((local_addr_taken as usize) + i) as *mut u8) = 0u8;
+                *(((slot_remap as usize) + (i << 2)) as *mut u32) = i as u32;
             }
             i = i + 1;
         }
     }
 
     let mir_bb_count = unsafe { (*mir).bb_count };
+    if local_count > 0 && mir_bb_count > 0 {
+        let mut bi_scan: usize = 0;
+        while bi_scan < mir_bb_count {
+            let mbb_s = unsafe { mir_bb_at((*mir).bbs, bi_scan) };
+            let scnt_s = unsafe { (*mbb_s).stmt_count };
+            let stmts_s = unsafe { (*mbb_s).stmts };
+            let mut si_s: usize = 0;
+            while si_s < scnt_s {
+                let st_s = unsafe { mir_stmt_at(stmts_s, si_s) };
+                if (unsafe { (*st_s).kind }) == MIR_STMT_ASSIGN &&
+                   (unsafe { (*st_s).rvalue.kind }) == MIR_RVALUE_REF {
+                    let ref_lv = (unsafe { (*st_s).rvalue.place.local.v }) as usize;
+                    if ref_lv < local_count {
+                        unsafe {
+                            *(((local_addr_taken as usize) + ref_lv) as *mut u8) = 1u8;
+                        }
+                    }
+                }
+                si_s = si_s + 1;
+            }
+            bi_scan = bi_scan + 1;
+        }
+    }
+
     let init_bb_cap = mir_bb_count + 64;
     let init_bb_bytes = lir_mul_usize(init_bb_cap, size_of<LirBb>());
     let bbs_buf = arena_alloc_raw(mut_view(*arena), init_bb_bytes, align_of<LirBb>()) as *mut LirBb;
@@ -23017,15 +24413,63 @@ pub fn lir_lower_ext_opt(
         bbs: bbs_buf,
         bb_count: mir_bb_count,
         bb_cap: init_bb_cap,
+        cur_bb: 0,
         cur_insts: 0 as *mut LirInst,
         cur_inst_count: 0,
         cur_inst_cap: 0,
+        is_opt: is_opt,
+        has_fn_ty: (fn_ty as usize) != 0,
+        param_is_indirect_ptr: param_is_indirect_ptr,
+        param_ptr_count: local_count,
+        local_addr_taken: local_addr_taken,
+        local_addr_count: local_count,
+        slot_remap: slot_remap,
+        slot_remap_count: local_count,
+        copy_slot_tys: 0 as *mut u32,
+        copy_slot_ids: 0 as *mut u32,
+        copy_slot_used: 0 as *mut u8,
+        copy_slot_count: 0,
+        copy_slot_cap: 0,
+        bfs_visited: 0 as *mut u8,
+        bfs_queue: 0 as *mut u32,
+        bfs_cap: 0,
         has_ice: false,
     };
+
+    if local_count > 0 && (fn_ty as usize) != 0 {
+        let mut fty0 = fn_ty;
+        if (unsafe { (*fty0).kind }) == TY_CLOSURE && (unsafe { (*fty0).fn_type.v }) != 0u32 {
+            fty0 = unsafe { type_get(view(*b.interner), TypeId { v: (*fty0).fn_type.v }) as *const AxType };
+        }
+        if (fty0 as usize) != 0 && (unsafe { (*fty0).kind }) == TY_FN {
+            let usize_ty = unsafe { (*interner).t_usize.v };
+            let pcnt0 = unsafe { (*fty0).param_count };
+            let ptypes0 = unsafe { (*fty0).param_types };
+            let mut p0: usize = 0;
+            while p0 < pcnt0 {
+                let s_idx = p0 + 1;
+                if s_idx < local_count && (ptypes0 as usize) != 0 {
+                    let pty_v0 = unsafe { (*typeid_at(ptypes0, p0)).v };
+                    let ldecl0 = unsafe { mir_local_at(locals, s_idx) };
+                    if (unsafe { (*ldecl0).kind }) == MIR_LOCAL_ARG &&
+                       (unsafe { (*ldecl0).ty.v }) == pty_v0 &&
+                       lb_is_indirect_agg_ty(view(b), pty_v0) {
+                        unsafe {
+                            *(((param_is_indirect_ptr as usize) + s_idx) as *mut u8) = 1u8;
+                            (*lir_slot_at(slots, s_idx)).ty.v = usize_ty;
+                        }
+                    }
+                }
+                p0 = p0 + 1;
+            }
+        }
+        lb_compute_slot_remaps(mut_view(b));
+    }
 
     let mut i: usize = 0;
     while i < mir_bb_count {
         let mbb = unsafe { mir_bb_at((*mir).bbs, i) };
+        b.cur_bb = i;
         b.cur_inst_count = 0;
 
         if i == 0 && (fn_ty as usize) != 0 {
@@ -23034,18 +24478,25 @@ pub fn lir_lower_ext_opt(
                 fty = unsafe { type_get(view(*b.interner), TypeId { v: (*fty).fn_type.v }) as *const AxType };
             }
             if (fty as usize) != 0 && (unsafe { (*fty).kind }) == TY_FN {
+                let usize_ty = unsafe { (*b.interner).t_usize.v };
                 let pcnt = unsafe { (*fty).param_count };
                 let ptypes = unsafe { (*fty).param_types };
                 let mut p: usize = 0;
                 while p < pcnt {
                     let pty_v = unsafe { (*typeid_at(ptypes, p)).v };
-                    let dest = make_vreg(mut_view(b), pty_v);
+                    let slot_idx = (p + 1) as u32;
+                    let vty_v = if lb_local_is_indirect_param(view(b), slot_idx) {
+                        usize_ty
+                    } else {
+                        pty_v
+                    };
+                    let dest = make_vreg(mut_view(b), vty_v);
                     let ainst = push_new_inst(mut_view(b), LIR_INST_ABI_ARG);
                     unsafe {
                         (*ainst).dest.v = dest;
                         (*ainst).index = p as u32;
                     }
-                    let addr = emit_stack_addr(mut_view(b), (p + 1) as u32);
+                    let addr = emit_stack_addr(mut_view(b), slot_idx);
                     emit_store(mut_view(b), addr, dest);
                     p = p + 1;
                 }
@@ -23084,13 +24535,15 @@ pub fn lir_lower_ext_opt(
 
         let tk = unsafe { (*mbb).terminator.kind };
         if tk == MIR_TERM_CALL {
-            lower_call_terminator(mut_view(b), mbb as *const MirBb, i);
+            let call_bb = b.cur_bb;
+            lower_call_terminator(mut_view(b), mbb as *const MirBb, i, call_bb);
             i = i + 1;
             continue;
         }
 
         if tk == MIR_TERM_GOTO {
-            let bb_ptr = finish_bb_insts(mut_view(b), i);
+            let fin_bb = b.cur_bb;
+            let bb_ptr = finish_bb_insts(mut_view(b), fin_bb);
             unsafe {
                 lir_term_reset(mut_view((*bb_ptr).term), LIR_TERM_JMP);
                 (*bb_ptr).term.jmp_target.v = (*mbb).terminator.goto_target.v;
@@ -23114,7 +24567,8 @@ pub fn lir_lower_ext_opt(
                     k = k + 1;
                 }
             }
-            let bb_ptr = finish_bb_insts(mut_view(b), i);
+            let fin_bb = b.cur_bb;
+            let bb_ptr = finish_bb_insts(mut_view(b), fin_bb);
             unsafe {
                 lir_term_reset(mut_view((*bb_ptr).term), LIR_TERM_SWITCH);
                 (*bb_ptr).term.cond.v = cond;
@@ -23123,7 +24577,8 @@ pub fn lir_lower_ext_opt(
                 (*bb_ptr).term.otherwise.v = (*mbb).terminator.otherwise.v;
             }
         } else if tk == MIR_TERM_RETURN {
-            let bb_ptr = finish_bb_insts(mut_view(b), i);
+            let fin_bb = b.cur_bb;
+            let bb_ptr = finish_bb_insts(mut_view(b), fin_bb);
             unsafe {
                 lir_term_reset(mut_view((*bb_ptr).term), LIR_TERM_RETURN);
             }
@@ -23136,7 +24591,8 @@ pub fn lir_lower_ext_opt(
                 emit_bin_inst(mut_view(b), LIR_INST_BIT_XOR, xor_res, cond_vreg, one);
                 cond_vreg = xor_res;
             }
-            let bb_ptr = finish_bb_insts(mut_view(b), i);
+            let fin_bb = b.cur_bb;
+            let bb_ptr = finish_bb_insts(mut_view(b), fin_bb);
             unsafe {
                 lir_term_reset(mut_view((*bb_ptr).term), LIR_TERM_ASSERT);
                 (*bb_ptr).term.cond.v = cond_vreg;
@@ -23145,7 +24601,8 @@ pub fn lir_lower_ext_opt(
                 (*bb_ptr).term.msg_len = (*mbb).terminator.msg_len;
             }
         } else {
-            let bb_ptr = finish_bb_insts(mut_view(b), i);
+            let fin_bb = b.cur_bb;
+            let bb_ptr = finish_bb_insts(mut_view(b), fin_bb);
             unsafe {
                 lir_term_reset(mut_view((*bb_ptr).term), LIR_TERM_UNREACHABLE);
             }
@@ -23385,6 +24842,7 @@ use compiler.lir.lir.LirBody
 use compiler.lir.lir.lir_bb_at
 use compiler.lir.lir.lir_inst_at
 use compiler.lir.lir.lir_mul_usize
+use compiler.lir.lir.lir_vreg_at
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 @intrinsic fn align_of<T>() -> usize { 0 }
@@ -23858,8 +25316,27 @@ pub fn lir_lower_abi_in_arena(
                 if dest_v != LIR_VREG_NONE {
                     if idx < sig.arg_count {
                         let arg_p = unsafe { abi_arg_at(sig.args, idx) };
-                        let loc_k = unsafe { (*arg_p).loc.kind };
+                        let mut loc_k = unsafe { (*arg_p).loc.kind };
                         let loc_ro = unsafe { abi_loc_reg_or_offset(view((*arg_p).loc)) };
+                        // T498h: When LIR requests the incoming hidden pointer directly into a
+                        // `usize` vreg, pass the register/stack location of that pointer rather
+                        // than dereferencing and copying the aggregate into the callee's frame.
+                        if loc_k == ABI_LOC_INDIRECT && (interner as usize) != 0 {
+                            let vcnt = unsafe { (*body).vreg_count };
+                            let vregs = unsafe { (*body).vregs };
+                            if (vregs as usize) != 0 && (dest_v as usize) < vcnt {
+                                let vp = unsafe { lir_vreg_at(vregs, dest_v as usize) };
+                                let vty = unsafe { (*vp).ty.v };
+                                let t_usize_v = unsafe { (*interner).t_usize.v };
+                                if vty != 0u32 && vty == t_usize_v {
+                                    loc_k = if unsafe { abi_loc_is_indirect_in_reg(view((*arg_p).loc)) } {
+                                        ABI_LOC_REG
+                                    } else {
+                                        ABI_LOC_STACK
+                                    };
+                                }
+                            }
+                        }
                         unsafe {
                             (*inst).loc_kind = loc_k;
                             (*inst).loc_reg_or_offset = loc_ro;
@@ -23884,8 +25361,27 @@ pub fn lir_lower_abi_in_arena(
                             let call_sig = abi_classify(abi, callee, interner, mut_view(*arena));
                             if idx < call_sig.arg_count {
                                 let carg_p = unsafe { abi_arg_at(call_sig.args, idx) };
-                                let loc_k = unsafe { (*carg_p).loc.kind };
+                                let mut loc_k = unsafe { (*carg_p).loc.kind };
                                 let loc_ro = unsafe { abi_loc_reg_or_offset(view((*carg_p).loc)) };
+                                // T498h: When LIR already prepared the caller-side indirect pointer
+                                // as a `usize` vreg, pass that pointer directly in its ABI reg/stack slot.
+                                let val_v = unsafe { (*inst).val.v };
+                                if loc_k == ABI_LOC_INDIRECT {
+                                    let vcnt = unsafe { (*body).vreg_count };
+                                    let vregs = unsafe { (*body).vregs };
+                                    if (vregs as usize) != 0 && (val_v as usize) < vcnt {
+                                        let vp = unsafe { lir_vreg_at(vregs, val_v as usize) };
+                                        let vty = unsafe { (*vp).ty.v };
+                                        let t_usize_v = unsafe { (*interner).t_usize.v };
+                                        if vty != 0u32 && vty == t_usize_v {
+                                            loc_k = if unsafe { abi_loc_is_indirect_in_reg(view((*carg_p).loc)) } {
+                                                ABI_LOC_REG
+                                            } else {
+                                                ABI_LOC_STACK
+                                            };
+                                        }
+                                    }
+                                }
                                 unsafe {
                                     (*inst).loc_kind = loc_k;
                                     (*inst).loc_reg_or_offset = loc_ro;

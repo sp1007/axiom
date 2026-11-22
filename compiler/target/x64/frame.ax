@@ -3325,34 +3325,77 @@ pub fn x64_regalloc_with_pgo_in_arena(
                 }
             } else {
                 // Spill / eviction heuristic: compare `cur_iv.spill_weight` against the lowest-weight
-                // conflicting active interval whose register is legal for `cur_iv` (`AXS-RA-018`, `AXS-RA-022`).
+                // register in `allowed_for_cur` summed across all overlapping active intervals that
+                // currently hold that register (`AXS-RA-018`, `AXS-RA-022`). Non-overlapping active
+                // intervals (currently in a lifetime hole) do not conflict with `cur_iv` and must not
+                // be evicted or mask an overlapping interval holding the same register.
                 let cur_weight = unsafe { (*cur_iv).spill_weight };
-                let mut min_weight: u64 = 0xFFFFFFFFFFFFFFFFu64;
-                let mut victim_pos: usize = active_len;
+                let mut reg_weights: [32]u64 = [0u64; 32];
+                let mut cand_mask: u32 = 0u32;
                 let mut v_i: usize = 0;
                 while v_i < active_len {
                     let act_v = unsafe { *(((active as usize) + (v_i << 2)) as *mut u32) };
                     let act_iv = (iv_base + ((act_v as usize) * iv_stride)) as *mut X64LiveInterval;
                     let act_reg = unsafe { (*act_iv).assigned_reg };
-                    let act_w = unsafe { (*act_iv).spill_weight };
-                    if act_reg >= 0 && act_reg < 32 &&
-                       (allowed_for_cur & (1u32 << (act_reg as u32))) != 0u32 &&
-                       act_w < min_weight {
-                        min_weight = act_w;
-                        victim_pos = v_i;
+                    if act_reg >= 0 && act_reg < 32 {
+                        let rbit = 1u32 << (act_reg as u32);
+                        if (allowed_for_cur & rbit) != 0u32 &&
+                           unsafe { x64_intervals_overlap(view(*act_iv), view(*cur_iv)) } {
+                            let act_w = unsafe { (*act_iv).spill_weight };
+                            let prev_w = reg_weights[act_reg as usize];
+                            let sum_w = if 0xFFFFFFFFFFFFFFFFu64 - prev_w < act_w {
+                                0xFFFFFFFFFFFFFFFFu64
+                            } else {
+                                prev_w + act_w
+                            };
+                            reg_weights[act_reg as usize] = sum_w;
+                            cand_mask = cand_mask | rbit;
+                        }
                     }
                     v_i = v_i + 1;
                 }
 
-                if victim_pos < active_len && min_weight < cur_weight {
-                    let vic_v = unsafe { *(((active as usize) + (victim_pos << 2)) as *mut u32) };
-                    let vic_iv = (iv_base + ((vic_v as usize) * iv_stride)) as *mut X64LiveInterval;
-                    let stolen_reg = unsafe { (*vic_iv).assigned_reg };
+                let mut min_weight: u64 = 0xFFFFFFFFFFFFFFFFu64;
+                let mut stolen_reg: i32 = REG_NONE;
+                let mut cm: u32 = cand_mask;
+                while cm != 0u32 {
+                    let rbit_idx = frame_ctz_u32(cm);
+                    let rw = reg_weights[rbit_idx as usize];
+                    if rw < min_weight {
+                        min_weight = rw;
+                        stolen_reg = rbit_idx as i32;
+                    }
+                    cm = cm & (cm - 1u32);
+                }
+
+                if stolen_reg != REG_NONE && min_weight < cur_weight {
+                    let mut w_ev: usize = 0;
+                    let mut r_ev: usize = 0;
+                    while r_ev < active_len {
+                        let act_v = unsafe { *(((active as usize) + (r_ev << 2)) as *mut u32) };
+                        let act_iv = (iv_base + ((act_v as usize) * iv_stride)) as *mut X64LiveInterval;
+                        if (unsafe { (*act_iv).assigned_reg }) == stolen_reg &&
+                           (unsafe { x64_intervals_overlap(view(*act_iv), view(*cur_iv)) }) {
+                            unsafe {
+                                (*act_iv).assigned_reg = REG_NONE;
+                                (*act_iv).is_spilled = true;
+                            }
+                        } else {
+                            if w_ev != r_ev {
+                                unsafe { *(((active as usize) + (w_ev << 2)) as *mut u32) = act_v; }
+                            }
+                            w_ev = w_ev + 1;
+                        }
+                        r_ev = r_ev + 1;
+                    }
                     unsafe {
-                        (*vic_iv).assigned_reg = REG_NONE;
-                        (*vic_iv).is_spilled = true;
                         (*cur_iv).assigned_reg = stolen_reg;
-                        *(((active as usize) + (victim_pos << 2)) as *mut u32) = cur_v;
+                        *(((active as usize) + (w_ev << 2)) as *mut u32) = cur_v;
+                    }
+                    active_len = w_ev + 1;
+                    let sbit = 1u32 << (stolen_reg as u32);
+                    if (sbit & X64_ALL_CALLEE_SAVED_MASK) != 0u32 {
+                        used_callee_mask = used_callee_mask | sbit;
                     }
                 } else {
                     unsafe {
@@ -3552,6 +3595,36 @@ fn frame_align_up_i32(val: i32, align: i32) -> i32 {
     (val + mask) & (0 - align)
 }
 
+fn frame_size_is_ret_in_mem(ret_size: u32) -> bool {
+    ret_size > 8u32 || (ret_size != 1u32 && ret_size != 2u32 && ret_size != 4u32 && ret_size != 8u32 && ret_size != 0u32)
+}
+
+fn frame_mark_used_slots(body: view<X64MIBody>, slot_count: usize, used: *mut u8) {
+    let mut b: usize = 0;
+    while b < body.bb_count {
+        let mbb = unsafe { x64_mi_bb_at(body.bbs, b) };
+        let mut inst = unsafe { (*mbb).first_inst };
+        while (inst as usize) != 0 {
+            let op_count = unsafe { (*inst).op_count };
+            let mut k: u8 = 0u8;
+            while k < op_count {
+                let ku = k as usize;
+                if (unsafe { (*inst).ops[ku].kind }) == X64_OP_FRAME {
+                    let sid = (unsafe { (*inst).ops[ku].frame.slot_id }) as usize;
+                    if sid < slot_count {
+                        unsafe {
+                            *(((used as usize) + sid) as *mut u8) = 1u8;
+                        }
+                    }
+                }
+                k = k + 1u8;
+            }
+            inst = unsafe { (*inst).next };
+        }
+        b = b + 1;
+    }
+}
+
 pub fn x64_frame_rewrite_ops(body: mut_view<X64MIBody>, layout: view<X64FrameLayout>) {
     let slot_cnt = layout.slot_count;
     let offsets_base = layout.slot_offsets as usize;
@@ -3623,6 +3696,10 @@ pub fn x64_frame_lower_baseline_in_arena(
             let sty_v = unsafe { (*slot).ty.v };
             let mut size = x64_cached_type_size(TypeId { v: sty_v }, interner);
             let mut align = x64_cached_type_align(TypeId { v: sty_v }, interner);
+            if i == 0 && lir.bb_count > 0 && frame_size_is_ret_in_mem(size) {
+                size = 8u32;
+                align = 8u32;
+            }
             if size < 8u32 { size = 8u32; }
             if align < 8u32 { align = 8u32; }
             current_offset = frame_align_up_i32(current_offset + (size as i32), align as i32);
@@ -4780,6 +4857,19 @@ pub fn x64_frame_lower_opt_in_arena(
         body.shadow_space = 32u32;
     }
 
+    let mut slot_used: *mut u8 = 0 as *mut u8;
+    if opt_level > 0u8 && lir.slot_count > 0 && body.bb_count > 0 {
+        slot_used = arena_alloc_raw(mut_view(*arena), lir.slot_count, 1) as *mut u8;
+        let mut zi: usize = 0;
+        while zi < lir.slot_count {
+            unsafe {
+                *(((slot_used as usize) + zi) as *mut u8) = 0u8;
+            }
+            zi = zi + 1;
+        }
+        frame_mark_used_slots(view(*body), lir.slot_count, slot_used);
+    }
+
     let mut i: usize = 0;
     while i < lir.slot_count {
         let slot = unsafe { lir_slot_at(lir.slots, i) };
@@ -4790,13 +4880,26 @@ pub fn x64_frame_lower_opt_in_arena(
         } else {
             let sty_v = unsafe { (*slot).ty.v };
             let mut size = x64_cached_type_size(TypeId { v: sty_v }, interner);
-            let mut align = x64_cached_type_align(TypeId { v: sty_v }, interner);
-            if size < 8u32 { size = 8u32; }
-            size = size + 8u32;
-            if align < 8u32 { align = 8u32; }
-            current_offset = frame_align_up_i32(current_offset + (size as i32), align as i32);
-            unsafe {
-                *(((offsets_ptr as usize) + (i << 2)) as *mut i32) = 0 - current_offset;
+            let is_unused_agg = (slot_used as usize) != 0 && i > 0 &&
+                                frame_size_is_ret_in_mem(size) &&
+                                (unsafe { *(((slot_used as usize) + i) as *const u8) }) == 0u8;
+            if is_unused_agg {
+                unsafe {
+                    *(((offsets_ptr as usize) + (i << 2)) as *mut i32) = 0;
+                }
+            } else {
+                let mut align = x64_cached_type_align(TypeId { v: sty_v }, interner);
+                if i == 0 && lir.bb_count > 0 && frame_size_is_ret_in_mem(size) {
+                    size = 8u32;
+                    align = 8u32;
+                }
+                if size < 8u32 { size = 8u32; }
+                size = size + 8u32;
+                if align < 8u32 { align = 8u32; }
+                current_offset = frame_align_up_i32(current_offset + (size as i32), align as i32);
+                unsafe {
+                    *(((offsets_ptr as usize) + (i << 2)) as *mut i32) = 0 - current_offset;
+                }
             }
         }
         i = i + 1;
