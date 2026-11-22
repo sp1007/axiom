@@ -3,12 +3,14 @@
 drop elaboration, verifier) must scale linearly with the size of the input file.
 
 Generates the same program shape at N and 4*N units, runs `<compiler> check --time-passes` on both
-and requires own(4N) / own(N) <= LIMIT (linear = 4; the default LIMIT 8 absorbs machine noise and the
-remaining mildly superlinear parts; HEAD before T485 measured 13.4).
+(`--samples 3` sequential compiles per size, taking the minimum of `own` to reject host-load jitter
+while also printing the median and all samples on stderr) and requires own(4N) / own(N) <= LIMIT
+(linear = 4; the default LIMIT 8 absorbs machine noise and the remaining mildly superlinear parts;
+HEAD before T485 measured 13.4).
 Before T485 the unsafe/concurrency checker rescanned every item of the file for every path and call
 expression (quadratic in file size).
 
-usage: own_scaling.py --compiler PATH --tmp DIR [--units N] [--limit X] [--print]
+usage: own_scaling.py --compiler PATH --tmp DIR [--units N] [--limit X] [--samples K] [--print]
 Prints `OK own scaling` on success, `SKIP ...` (exit 0) when a compile exceeds the step timeout,
 `FAIL ...` (exit 1) otherwise.
 """
@@ -16,6 +18,7 @@ Prints `OK own scaling` on success, `SKIP ...` (exit 0) when a compile exceeds t
 import argparse
 import os
 import re
+import statistics
 import subprocess
 import sys
 import time
@@ -115,27 +118,45 @@ def main():
     ap.add_argument("--tmp", required=True)
     ap.add_argument("--units", type=int, default=300)
     ap.add_argument("--limit", type=float, default=8.0)
+    ap.add_argument("--samples", type=int, default=3,
+                    help="sequential compiles per size; min of own timer is used (default: 3)")
     ap.add_argument("--timeout", type=float, default=240.0)
     ap.add_argument("--print", action="store_true", help="print the timings")
     a = ap.parse_args()
+    if a.samples < 1:
+        raise ValueError("--samples must be >= 1")
     os.makedirs(a.tmp, exist_ok=True)
     res = []
     for n in (a.units, 4 * a.units):
         path = os.path.join(a.tmp, "own_scaling_%d.ax" % n)
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(gen_program(n))
-        try:
-            own, wall = own_time(a.compiler, path, a.timeout)
-        except subprocess.TimeoutExpired:
-            print("SKIP own scaling: compile of %d units exceeded %ss" % (n, a.timeout))
-            return 0
-        res.append((n, own, wall))
-        if a.print:
-            sys.stderr.write("units=%d own=%.3fs wall=%.3fs\n" % (n, own, wall))
-    (n1, o1, _), (n4, o4, _) = res
+        own_samples = []
+        wall_samples = []
+        for _ in range(a.samples):
+            try:
+                own, wall = own_time(a.compiler, path, a.timeout)
+            except subprocess.TimeoutExpired:
+                print("SKIP own scaling: compile of %d units exceeded %ss" % (n, a.timeout))
+                return 0
+            own_samples.append(own)
+            wall_samples.append(wall)
+        own_min = min(own_samples)
+        own_med = statistics.median(own_samples)
+        wall_total = sum(wall_samples)
+        sys.stderr.write(
+            "units=%d own samples=[%s] min=%.3fs med=%.3fs wall_total=%.3fs\n"
+            % (n, ", ".join("%.3f" % x for x in own_samples), own_min, own_med, wall_total)
+        )
+        res.append((n, own_min, own_med, wall_total))
+    (n1, o1, o1_med, _), (n4, o4, o4_med, _) = res
     # Sub-0.05 s timings are noise: compare against a floor so a tiny N cannot fail the ratio.
     ratio = o4 / max(o1, 0.05)
-    sys.stderr.write("own(%d)=%.3fs own(%d)=%.3fs ratio %.2f limit %.2f\n" % (n1, o1, n4, o4, ratio, a.limit))
+    med_ratio = o4_med / max(o1_med, 0.05)
+    sys.stderr.write(
+        "own(%d)=min %.3fs (med %.3fs) own(%d)=min %.3fs (med %.3fs) ratio %.2f (med %.2f) limit %.2f\n"
+        % (n1, o1, o1_med, n4, o4, o4_med, ratio, med_ratio, a.limit)
+    )
     if ratio > a.limit:
         print("FAIL own scaling: own(%d)=%.3fs own(%d)=%.3fs ratio %.2f > %.2f" % (n1, o1, n4, o4, ratio, a.limit))
         return 1

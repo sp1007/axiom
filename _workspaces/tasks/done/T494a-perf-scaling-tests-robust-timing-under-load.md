@@ -8,14 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T494]
 priority: 46
-status: doing
+status: done
 attempts: 1
 paths: [tests/perf/build_scaling/build_scaling.py, tests/perf/own_scaling/own_scaling.py, tests/perf/own_scaling/own_wave2_subtimers_and_scaling.py, tests/perf/build_scaling/build_scaling.test, tests/perf/build_scaling/build_scaling_o1.test, tests/perf/own_scaling/own_scaling.test, tests/perf/own_scaling/own_wave2_subtimers_and_scaling.test]
 locks: []
 spec: [spec/decisions/ADR-0041-complete-suite-baseline-and-test-cache.md]
 covers: [REQ-TST-072]
 started: 2026-11-22 16:46:37
-agent: t494a-impl
+finished: 2026-11-22 17:39:38
 ---
 # T494a — Robust scaling ratios
 
@@ -47,3 +47,4 @@ sample on the shared 4-core host decides the result.
 - 2026-11-22 16:27:36 started (attempt 1) T494a-impl
 - 2026-11-22 16:45:57 requeue: restart (not charged: attempt refunded)
 - 2026-11-22 16:46:37 started (attempt 1) t494a-impl
+- 2026-11-22 17:39:38 accepted by QA -> done

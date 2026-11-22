@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import os
 import re
+import statistics
 import subprocess
 import sys
 
@@ -124,31 +125,58 @@ def main():
     ap.add_argument("--tmp", required=True)
     ap.add_argument("--small", type=int, default=40)
     ap.add_argument("--large", type=int, default=160)
+    ap.add_argument("--samples", type=int, default=3,
+                    help="sequential compiles per size; min of each timer is used (default: 3)")
+    ap.add_argument("--limit", type=float, default=2.0,
+                    help="max own_cap+own_init seconds at --large (default: 2.0)")
     a = ap.parse_args()
+    if a.samples < 1:
+        raise ValueError("--samples must be >= 1")
     os.makedirs(a.tmp, exist_ok=True)
     env = dict(os.environ)
     env["SOURCE_DATE_EPOCH"] = "0"
 
     # 1. Intra-procedural scaling check (`check --time-passes` at small vs large single function)
     own_core = {}
+    own_core_med = {}
     for n in (a.small, a.large):
         src = os.path.join(a.tmp, "big_fn_%d.ax" % n)
         with open(src, "w", encoding="utf-8", newline="\n") as f:
             f.write(gen_big_fn_program(n))
-        p = subprocess.run([os.path.abspath(a.compiler), "check", "--time-passes", src],
-                           capture_output=True, env=env, timeout=240)
-        txt = (p.stdout + p.stderr).decode("utf-8", "replace")
-        if p.returncode != 0:
-            raise RuntimeError("check failed on n=%d:\n%s" % (n, txt[-2000:]))
-        top_v, sub_v = parse_own_timers(txt, expect_full_build=False)
-        core = sub_v["own_cap"] + sub_v["own_init"]
-        own_core[n] = core
-        sys.stderr.write("n=%d own=%.4fs own_cap=%.4fs own_init=%.4fs\n" % (
-            n, top_v["own"], sub_v["own_cap"], sub_v["own_init"]))
+        own_samples = []
+        cap_samples = []
+        init_samples = []
+        for _ in range(a.samples):
+            p = subprocess.run([os.path.abspath(a.compiler), "check", "--time-passes", src],
+                               capture_output=True, env=env, timeout=240)
+            txt = (p.stdout + p.stderr).decode("utf-8", "replace")
+            if p.returncode != 0:
+                raise RuntimeError("check failed on n=%d:\n%s" % (n, txt[-2000:]))
+            top_v, sub_v = parse_own_timers(txt, expect_full_build=False)
+            own_samples.append(top_v["own"])
+            cap_samples.append(sub_v["own_cap"])
+            init_samples.append(sub_v["own_init"])
+        own_min, own_med = min(own_samples), statistics.median(own_samples)
+        cap_min, cap_med = min(cap_samples), statistics.median(cap_samples)
+        init_min, init_med = min(init_samples), statistics.median(init_samples)
+        own_core[n] = cap_min + init_min
+        own_core_med[n] = cap_med + init_med
+        sys.stderr.write(
+            "n=%d own samples=[%s] min=%.4fs med=%.4fs\n"
+            "n=%d own_cap samples=[%s] min=%.4fs med=%.4fs\n"
+            "n=%d own_init samples=[%s] min=%.4fs med=%.4fs\n"
+            "n=%d own_cap+own_init min=%.4fs (med %.4fs)\n"
+            % (
+                n, ", ".join("%.4f" % x for x in own_samples), own_min, own_med,
+                n, ", ".join("%.4f" % x for x in cap_samples), cap_min, cap_med,
+                n, ", ".join("%.4f" % x for x in init_samples), init_min, init_med,
+                n, own_core[n], own_core_med[n],
+            )
+        )
 
     # With bitset rows, even n=160 (~600 locals, ~300 blocks) completes own_cap + own_init in < 1.0s.
-    if own_core[a.large] > 2.0:
-        print("FAIL intra-fn own_cap+own_init too slow: %.4fs > 2.0s" % own_core[a.large])
+    if own_core[a.large] > a.limit:
+        print("FAIL intra-fn own_cap+own_init too slow: %.4fs > %.4fs" % (own_core[a.large], a.limit))
         return 1
 
     # 2. Full `build --time-passes` sub-timer hygiene & byte-identical determinism at -O0 and -O1

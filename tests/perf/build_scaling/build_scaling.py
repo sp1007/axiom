@@ -3,13 +3,15 @@
 frame/regalloc, machine-IR verify, encode, object model, PE link) must scale linearly with the size of
 the input file.
 
-Generates the same program shape at N and 4*N units, runs `<compiler> build --time-passes` on both and
-requires build(4N) / build(N) <= LIMIT (linear = 4; the default LIMIT 5 absorbs machine noise).
+Generates the same program shape at N and 4*N units, runs `<compiler> build --time-passes` on both
+(`--samples 3` sequential compiles per size, taking the minimum of each timer to reject host-load
+jitter while also printing the median and all samples on stderr) and requires
+build(4N) / build(N) <= LIMIT (linear = 4; the default LIMIT 5 absorbs machine noise).
 Before T486 several parts of the build phase did a whole-program scan per call site / per symbol
 reference (symbol-name lookup over all HIR items per call, object symbol lookup by linear search per
 `lea`, linker global lookup by linear search, ...), i.e. quadratic in the file size.
 
-usage: build_scaling.py --compiler PATH --tmp DIR [--units N] [--limit X] [--opt O0|O1] [--print]
+usage: build_scaling.py --compiler PATH --tmp DIR [--units N] [--limit X] [--samples K] [--opt O0|O1] [--print]
 Prints `OK build scaling` on success, `SKIP ...` (exit 0) when a compile exceeds the step timeout,
 `FAIL ...` (exit 1) otherwise. The produced executables are run and must exit 0.
 """
@@ -17,6 +19,7 @@ Prints `OK build scaling` on success, `SKIP ...` (exit 0) when a compile exceeds
 import argparse
 import os
 import re
+import statistics
 import subprocess
 import sys
 import time
@@ -132,9 +135,13 @@ def main():
     ap.add_argument("--build-budget", type=float, default=None,
                     help="optional absolute upper bound on build(4N) in seconds")
     ap.add_argument("--opt", default="O0", choices=["O0", "O1"])
+    ap.add_argument("--samples", type=int, default=3,
+                    help="sequential compiles per size; min of each timer is used (default: 3)")
     ap.add_argument("--timeout", type=float, default=300.0)
     ap.add_argument("--print", action="store_true", help="print the timings")
     a = ap.parse_args()
+    if a.samples < 1:
+        raise ValueError("--samples must be >= 1")
     os.makedirs(a.tmp, exist_ok=True)
     res = []
     for n in (a.units, 4 * a.units):
@@ -142,21 +149,44 @@ def main():
         exe = os.path.join(a.tmp, "build_scaling_%d.exe" % n)
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(gen_program(n))
-        try:
-            bt, subs, wall = build_time(a.compiler, path, exe, a.opt, a.timeout)
-        except subprocess.TimeoutExpired:
-            print("SKIP build scaling: compile of %d units exceeded %ss" % (n, a.timeout))
-            return 0
-        res.append((n, bt, subs, wall))
-        if a.print:
-            sys.stderr.write(
-                "units=%d build=%.3fs frame=%.3fs isel=%.3fs mir_drop=%.3fs wall=%.3fs\n"
-                % (n, bt, subs.get("frame", -1.0), subs.get("isel", -1.0), subs.get("mir_drop", -1.0), wall)
-            )
-    (n1, b1, s1, _), (n4, b4, s4, _) = res
+        bt_samples = []
+        wall_samples = []
+        sub_samples = {}
+        for _ in range(a.samples):
+            try:
+                bt, subs, wall = build_time(a.compiler, path, exe, a.opt, a.timeout)
+            except subprocess.TimeoutExpired:
+                print("SKIP build scaling: compile of %d units exceeded %ss" % (n, a.timeout))
+                return 0
+            bt_samples.append(bt)
+            wall_samples.append(wall)
+            for k, v in subs.items():
+                sub_samples.setdefault(k, []).append(v)
+        bt_min = min(bt_samples)
+        bt_med = statistics.median(bt_samples)
+        subs_min = {k: min(vs) for k, vs in sub_samples.items()}
+        subs_med = {k: statistics.median(vs) for k, vs in sub_samples.items()}
+        wall_total = sum(wall_samples)
+        sys.stderr.write(
+            "units=%d build samples=[%s] min=%.3fs med=%.3fs wall_total=%.3fs\n"
+            % (n, ", ".join("%.3f" % x for x in bt_samples), bt_min, bt_med, wall_total)
+        )
+        for key in ("frame", "isel", "mir_build", "lir", "mir_drop"):
+            if key in sub_samples:
+                vs = sub_samples[key]
+                sys.stderr.write(
+                    "units=%d %s samples=[%s] min=%.3fs med=%.3fs\n"
+                    % (n, key, ", ".join("%.3f" % x for x in vs), subs_min[key], subs_med[key])
+                )
+        res.append((n, bt_min, bt_med, subs_min, subs_med, wall_total))
+    (n1, b1, b1_med, s1, s1_med, _), (n4, b4, b4_med, s4, s4_med, _) = res
     # Sub-0.05 s timings are noise: compare against a floor so a tiny N cannot fail the ratio.
     ratio = b4 / max(b1, 0.05)
-    sys.stderr.write("build(%d)=%.3fs build(%d)=%.3fs ratio %.2f limit %.2f\n" % (n1, b1, n4, b4, ratio, a.limit))
+    med_ratio = b4_med / max(b1_med, 0.05)
+    sys.stderr.write(
+        "build(%d)=min %.3fs (med %.3fs) build(%d)=min %.3fs (med %.3fs) ratio %.2f (med %.2f) limit %.2f\n"
+        % (n1, b1, b1_med, n4, b4, b4_med, ratio, med_ratio, a.limit)
+    )
     if ratio > a.limit:
         print("FAIL build scaling: build(%d)=%.3fs build(%d)=%.3fs ratio %.2f > %.2f" % (n1, b1, n4, b4, ratio, a.limit))
         return 1
@@ -165,14 +195,21 @@ def main():
         return 1
     if "frame" in s1 and "frame" in s4:
         f1, f4 = s1["frame"], s4["frame"]
+        f1_med, f4_med = s1_med["frame"], s4_med["frame"]
         fratio = f4 / max(f1, 0.05)
+        f_med_ratio = f4_med / max(f1_med, 0.05)
         ir4 = s4.get("mir_build", 0.0) + s4.get("lir", 0.0)
+        ir4_med = s4_med.get("mir_build", 0.0) + s4_med.get("lir", 0.0)
         f_to_ir = f4 / max(ir4, 0.05)
+        f_to_ir_med = f4_med / max(ir4_med, 0.05)
         hot4 = f4 + s4.get("isel", 0.0)
+        hot4_med = f4_med + s4_med.get("isel", 0.0)
         hot_to_ir = hot4 / max(ir4, 0.05)
+        hot_to_ir_med = hot4_med / max(ir4_med, 0.05)
         sys.stderr.write(
-            "frame(%d)=%.3fs frame(%d)=%.3fs ratio %.2f frame/ir=%.2f (frame+isel)/ir=%.2f\n"
-            % (n1, f1, n4, f4, fratio, f_to_ir, hot_to_ir)
+            "frame(%d)=min %.3fs (med %.3fs) frame(%d)=min %.3fs (med %.3fs) ratio %.2f (med %.2f) "
+            "frame/ir=%.2f (med %.2f) (frame+isel)/ir=%.2f (med %.2f)\n"
+            % (n1, f1, f1_med, n4, f4, f4_med, fratio, f_med_ratio, f_to_ir, f_to_ir_med, hot_to_ir, hot_to_ir_med)
         )
         if a.frame_limit is not None and fratio > a.frame_limit:
             print("FAIL build scaling: frame(%d)=%.3fs frame(%d)=%.3fs ratio %.2f > %.2f"

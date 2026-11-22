@@ -8,13 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T422c]
 priority: 15
-status: todo
-attempts: 0
+status: blocked
+attempts: 1
 timeout_min: 480
 paths: [compiler/mir/builder.ax, compiler/types/typeck.ax, tests/run/await_generic_future]
 locks: []
 spec: [spec/SPEC-34-executors-fibers.md]
 covers: [REQ-TST-072]
+started: 2026-11-22 17:09:49
 ---
 # T422d — native `.await` on a generic `Future` impl
 
@@ -47,3 +48,7 @@ natively; T422c marks the native legs of the affected spec-example tests `// nat
 
 ## Acceptance
 - All new tests pass in three modes; the previously marked SPEC-34 example tests pass natively; taskgate clean.
+
+## Log
+- 2026-11-22 17:09:49 started (attempt 1) t422d-impl
+- 2026-11-22 17:33:16 block: needs paths widened: compiler/mir/async_lower.ax, compiler/own_mir_verify/session.ax, compiler/traits/mono.ax, compiler/traits/solver.ax, tests/std/async/structured
