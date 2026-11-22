@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T446]
 priority: 23
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 900
-paths: [tests/run/generic_explicit_args, tests/typeck/infer_from_bounds]
-locks: [compiler/types/typeck.ax, compiler/traits, compiler/mir/builder.ax]
+paths: [tests/run/generic_explicit_args, tests/typeck/infer_from_bounds, compiler/types/typeck.ax, compiler/traits, compiler/mir/builder.ax]
+locks: []
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/SPEC-03-core-semantics.md, spec/SPEC-02-grammar.md]
 covers: [REQ-TST-072, REQ-TST-051]
+started: 2026-11-22 08:47:59
+agent: T448-impl
 ---
 # T448 — Fix: explicit type arguments and inference from bounds
 
@@ -43,3 +45,4 @@ determined by trait bounds or by the receiver are inferred (T422 FU-D, FU-H; T42
 
 ## Log
 - 2026-11-13 created by axiom-architect (ADR-0042 §2; T422 FU-D, FU-H; T421 FU-5)
+- 2026-11-22 08:47:59 started (attempt 1) T448-impl
