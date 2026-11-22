@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T496a]
 priority: 48
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/syntax/parse.ax, compiler/hir/lower.ax, tests/ui/slice_inclusive, tests/run/slice_inclusive_str, tests/parse/range_inclusive]
 locks: []
 spec: [spec/decisions/ADR-0045-inclusive-sub-range-slicing.md, spec/SPEC-02-grammar.md]
 covers: [REQ-TST-072]
+started: 2026-11-22 18:12:19
+finished: 2026-11-22 19:25:12
 ---
 # T496b — `..=` without end is a parse error; `str` inclusive sub-ranges tested
 
@@ -47,3 +49,5 @@ the LSP accept it (`_workspaces/reports/T496a-report.md`, `T496a-qa.md` follow-u
 
 ## Log
 - 2026-11-22 created by axiom-architect (triage-1122; T496a report/QA follow-ups)
+- 2026-11-22 18:12:19 started (attempt 1) t496b-impl
+- 2026-11-22 19:25:12 accepted by QA -> done
