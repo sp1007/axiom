@@ -11,7 +11,7 @@ priority: 16
 status: doing
 attempts: 1
 timeout_min: 480
-paths: [compiler/verify/verifier.ax, compiler/types/typeck.ax, compiler/own/unsafe.ax, std/sync/mutex.ax, std/sync/rwlock.ax, tests/run/async_guard_across_await, tests/ui/async_guard_across_await, tests/ui/async/lock_guard_await, tests/std/sync, tests/conformance/p11/e11_3_threads_sync, tests/std/async/structured]
+paths: [compiler/verify/verifier.ax, compiler/types/typeck.ax, compiler/own/unsafe.ax, std/sync/mutex.ax, std/sync/rwlock.ax, tests/run/async_guard_across_await, tests/ui/async_guard_across_await, tests/ui/async/lock_guard_await, tests/std/sync, tests/conformance/p11/e11_3_threads_sync, tests/std/async/structured, tests/conformance/p11/e11_4_async/async_ui_guard_across_await.ax, tests/conformance/p11/e11_1_concurrency/ui_lock_guard_escape.ax, tests/ui/concurrency/data_race/guard_escape_and_atomic_mut_view.ax, tests/ui/concurrency/data_race/qa_arc_and_boundary_races.ax]
 locks: []
 spec: [spec/SPEC-34-executors-fibers.md]
 covers: [REQ-TST-072]
@@ -72,5 +72,6 @@ Remaining, per SPEC-34 (marker @no_suspend_hold; AsyncMutexGuard unmarked, std.s
 - compiler/own/unsafe.ax: the .lock()/read()/write() name-keyed guard-escape rule (AX_CONC_GUARD_ESCAPE on AsyncMutex.lock()) — make it type/attribute based.
 - Remove xfail: T422e from tests/std/async/structured/spec34_local_executor_example.ax (regenerate) and confirm §6.1 passes.
 Depends on T498f (holds typeck.ax); T499b also needs typeck.ax — the board serialises them.
-- 2026-11-22 15:55:48 unblocked (cycle 1) 
+- 2026-11-22 15:55:48 unblocked (cycle 1)
+- 2026-11-22 17:50 orchestrator: widened paths with 4 legacy mock-guard UI tests (`e11_4_async/async_ui_guard_across_await.ax`, `e11_1_concurrency/ui_lock_guard_escape.ax`, `data_race/guard_escape_and_atomic_mut_view.ax`, `data_race/qa_arc_and_boundary_races.ax`) so guard checks stay purely attribute-based (`@no_suspend_hold`, zero name heuristics); disjoint from all active tasks.
 - 2026-11-22 17:33:31 started (attempt 1) t422e-impl

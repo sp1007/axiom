@@ -2925,6 +2925,7 @@ pub const AX_CONC_TLS_ESCAPE: u32 = 166u32;
 pub const AX_TYPE_INVALID_TLS_DECL: u32 = 167u32;
 pub const AX_CONST_SHIFT_RANGE: u32 = 168u32;
 pub const AX_TYPE_INDEX_NOT_INT: u32 = 169u32;
+pub const AX_DRIVER_DUPLICATE_STD_MODULE: u32 = 170u32;
 
 pub fn diag_code_name(c: DiagCode) -> Str {
     match c.v {
@@ -2975,6 +2976,7 @@ pub fn diag_code_name(c: DiagCode) -> Str {
         164u32 => "AX_ASYNC_POLL_AFTER_COMPLETE", 165u32 => "AX_ASYNC_BLOCKING_IN_ASYNC",
         166u32 => "AX_CONC_TLS_ESCAPE", 167u32 => "AX_TYPE_INVALID_TLS_DECL",
         168u32 => "AX_CONST_SHIFT_RANGE", 169u32 => "AX_TYPE_INDEX_NOT_INT",
+        170u32 => "AX_DRIVER_DUPLICATE_STD_MODULE",
         _ => "<unknown>",
     }
 }
@@ -3076,6 +3078,7 @@ pub fn diag_code_default_message(c: DiagCode) -> Str {
         167u32 => "@thread_local attribute is only valid on static items with constant initializers",
         168u32 => "shift count is negative or not below the bit width of the shifted type during constant evaluation",
         169u32 => "index must be an integer",
+        170u32 => "two std files declare the same module path",
         _ => "",
     }
 }
@@ -5458,6 +5461,39 @@ pub fn emit_driver_diag(sink: mut_view<DiagSink>, code_v: u32, msg_off: usize, m
     diag_sink_report(mut_view(*sink), view(d));
 }
 
+// A driver error whose message is built at run time (T423h: it names a module path and two files).
+pub fn emit_driver_diag_text(sink: mut_view<DiagSink>, code_v: u32, msg: view<StrView>) {
+    let msg_len: usize = msg.len;
+    let buf = arena_alloc_raw(mut_view(sink.arena), msg_len + 1, 1);
+    let mut i: usize = 0;
+    while i < msg_len {
+        unsafe {
+            *(buf + i) = *(msg.ptr + i);
+        }
+        i = i + 1;
+    }
+    unsafe {
+        *(buf + msg_len) = 0u8;
+    }
+    let d = Diagnostic {
+        code: DiagCode { v: code_v },
+        severity: DiagSeverity.Error,
+        message: StrView { ptr: buf as *const u8, len: msg_len },
+        primary: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 },
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: 0 as *mut DiagDataEntry,
+        data_count: 0,
+    };
+    diag_sink_report(mut_view(*sink), view(d));
+}
+
 // =============================================================================
 // 4. Usage, Version, Features, and Emitter Registry Formatting
 // =============================================================================
@@ -7241,6 +7277,293 @@ pub fn project_append_std_host_if_needed(proj: mut_view<Project>, uses_host: boo
     let host_disp = arena_table_sv(mut_view(proj.arena), 437, 18);
     let host_mod = arena_table_sv(mut_view(proj.arena), 455, 13);
     project_add_file(mut_view(*proj), host_disk, host_disp, host_mod, sv_empty(), false, true);
+}
+
+// =============================================================================
+// 9b. Std module index (ADR-0048 §1, T423h)
+// =============================================================================
+//
+// The module header (`module a.b.c`, the first line that is not blank or a `//` comment) of every `.ax` file under the
+// std root, collected by a sorted directory walk. The header is authoritative, not the path (`std/async/*.ax` declare
+// `std.asyn.*`, `std/io/io.ax` declares `std.io`). Every listed directory is recorded as a `PROBE_DIR` input
+// (`--dep-file`, ADR-0041 §4); a file read only for its header is not a loaded file. The text read for the header is
+// kept, so a module loaded from the index is never read twice, and a std file already in the project is not re-read.
+
+pub struct StdIndexEntry {
+    pub module_path: StrView,
+    pub disk_path: StrView,
+    pub rel_path: StrView,
+    pub text: StrView,
+}
+
+pub struct StdIndex {
+    pub entries: *mut StdIndexEntry,
+    pub count: usize,
+    pub cap: usize,
+    pub scanned: bool,
+}
+
+pub fn std_index_new() -> StdIndex {
+    StdIndex {
+        entries: 0 as *mut StdIndexEntry,
+        count: 0,
+        cap: 0,
+        scanned: false,
+    }
+}
+
+pub unsafe fn std_index_entry_at(base: *mut StdIndexEntry, idx: usize) -> *mut StdIndexEntry {
+    ((base as *mut u8) + opts_mul_usize(idx, size_of<StdIndexEntry>())) as *mut StdIndexEntry
+}
+
+fn std_index_push(
+    arena: mut_view<Arena>,
+    index: mut_view<StdIndex>,
+    module_path: StrView,
+    disk_path: StrView,
+    rel_path: StrView,
+    text: StrView
+) {
+    if index.count >= index.cap {
+        let new_cap: usize = if index.cap == 0 { 128 } else { opts_mul_usize(index.cap, 2) };
+        let new_arr = arena_alloc_raw(
+            mut_view(*arena),
+            opts_mul_usize(new_cap, size_of<StdIndexEntry>()),
+            align_of<StdIndexEntry>()
+        ) as *mut StdIndexEntry;
+        if index.count > 0 && (index.entries as usize) != 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(
+                    index.entries as *const u8,
+                    new_arr as *mut u8,
+                    opts_mul_usize(index.count, size_of<StdIndexEntry>())
+                );
+            }
+        }
+        index.entries = new_arr;
+        index.cap = new_cap;
+    }
+    let slot = unsafe { std_index_entry_at(index.entries, index.count) };
+    unsafe {
+        (*slot).module_path.ptr = module_path.ptr;
+        (*slot).module_path.len = module_path.len;
+        (*slot).disk_path.ptr = disk_path.ptr;
+        (*slot).disk_path.len = disk_path.len;
+        (*slot).rel_path.ptr = rel_path.ptr;
+        (*slot).rel_path.len = rel_path.len;
+        (*slot).text.ptr = text.ptr;
+        (*slot).text.len = text.len;
+    }
+    index.count = index.count + 1;
+}
+
+fn opts_is_path_byte(b: u8) -> bool {
+    (b >= 97u8 && b <= 122u8) || (b >= 65u8 && b <= 90u8) || (b >= 48u8 && b <= 57u8) || b == 95u8 || b == 46u8
+}
+
+// The module path of the first line of `text` that is neither blank nor a `//` comment when that line is
+// `module <path>`; empty otherwise.
+pub fn ax_text_module_header(text: view<StrView>) -> StrView {
+    let n: usize = text.len;
+    if n == 0 || (text.ptr as usize) == 0 {
+        return sv_empty();
+    }
+    let p = text.ptr;
+    let mut i: usize = 0;
+    while i < n {
+        let mut b = unsafe { *(p + i) };
+        while i < n && (b == 32u8 || b == 9u8 || b == 13u8) {
+            i = i + 1;
+            if i < n {
+                b = unsafe { *(p + i) };
+            }
+        }
+        if i >= n {
+            break;
+        }
+        if b == 10u8 {
+            i = i + 1;
+            continue;
+        }
+        if b == 47u8 && i + 1 < n && (unsafe { *(p + i + 1) }) == 47u8 {
+            while i < n && (unsafe { *(p + i) }) != 10u8 {
+                i = i + 1;
+            }
+            continue;
+        }
+        if i + 7 <= n &&
+           (unsafe { *(p + i) }) == 109u8 &&
+           (unsafe { *(p + i + 1) }) == 111u8 &&
+           (unsafe { *(p + i + 2) }) == 100u8 &&
+           (unsafe { *(p + i + 3) }) == 117u8 &&
+           (unsafe { *(p + i + 4) }) == 108u8 &&
+           (unsafe { *(p + i + 5) }) == 101u8 &&
+           ((unsafe { *(p + i + 6) }) == 32u8 || (unsafe { *(p + i + 6) }) == 9u8) {
+            let mut s: usize = i + 7;
+            while s < n && ((unsafe { *(p + s) }) == 32u8 || (unsafe { *(p + s) }) == 9u8) {
+                s = s + 1;
+            }
+            let start = s;
+            while s < n && opts_is_path_byte(unsafe { *(p + s) }) {
+                s = s + 1;
+            }
+            return StrView { ptr: unsafe { p + start }, len: s - start };
+        }
+        return sv_empty();
+    }
+    sv_empty()
+}
+
+unsafe fn opts_sv_slot_at(base: *mut StrView, idx: usize) -> *mut StrView {
+    ((base as *mut u8) + opts_mul_usize(idx, size_of<StrView>())) as *mut StrView
+}
+
+fn std_index_scan_dir(proj: mut_view<Project>, index: mut_view<StdIndex>, rel_prefix: view<StrView>) {
+    let cur_dir = if rel_prefix.len > 0 {
+        arena_join_path(mut_view(proj.arena), view(proj.std_root), rel_prefix)
+    } else {
+        StrView { ptr: proj.std_root.ptr, len: proj.std_root.len }
+    };
+    project_record_probe(mut_view(*proj), view(cur_dir), PROBE_DIR);
+    let dhid = unsafe { dir_open(cur_dir.ptr, cur_dir.len) };
+    if dhid <= 0i64 {
+        return;
+    }
+    // Collect the listing, then sort it by bytes: the host listing order is not part of the contract.
+    let mut names: *mut StrView = 0 as *mut StrView;
+    let mut name_count: usize = 0;
+    let mut name_cap: usize = 0;
+    loop {
+        let nlen = unsafe { dir_next(dhid, 0 as *mut u8, 0) };
+        if nlen <= 0i64 {
+            break;
+        }
+        let ulen = nlen as usize;
+        let ebuf = arena_alloc_raw(mut_view(proj.arena), ulen + 1, 1);
+        let got = unsafe { dir_next(dhid, ebuf, ulen) };
+        if got <= 0i64 {
+            break;
+        }
+        unsafe { *(ebuf + ulen) = 0u8; }
+        if name_count >= name_cap {
+            let new_cap: usize = if name_cap == 0 { 32 } else { opts_mul_usize(name_cap, 2) };
+            let new_arr = arena_alloc_raw(
+                mut_view(proj.arena),
+                opts_mul_usize(new_cap, size_of<StrView>()),
+                align_of<StrView>()
+            ) as *mut StrView;
+            if name_count > 0 {
+                unsafe {
+                    ptr_copy_nonoverlapping<u8>(
+                        names as *const u8,
+                        new_arr as *mut u8,
+                        opts_mul_usize(name_count, size_of<StrView>())
+                    );
+                }
+            }
+            names = new_arr;
+            name_cap = new_cap;
+        }
+        let slot = unsafe { opts_sv_slot_at(names, name_count) };
+        unsafe {
+            (*slot).ptr = ebuf as *const u8;
+            (*slot).len = ulen;
+        }
+        name_count = name_count + 1;
+    }
+    let _ = dir_close(dhid);
+
+    // Insertion sort (a std directory holds a few dozen entries).
+    let mut si: usize = 1;
+    while si < name_count {
+        let mut sj: usize = si;
+        while sj > 0 {
+            let a = unsafe { opts_sv_slot_at(names, sj - 1) };
+            let b = unsafe { opts_sv_slot_at(names, sj) };
+            let av = StrView { ptr: unsafe { (*a).ptr }, len: unsafe { (*a).len } };
+            let bv = StrView { ptr: unsafe { (*b).ptr }, len: unsafe { (*b).len } };
+            if sv_cmp(view(av), view(bv)) <= 0 {
+                break;
+            }
+            unsafe {
+                (*a).ptr = bv.ptr;
+                (*a).len = bv.len;
+                (*b).ptr = av.ptr;
+                (*b).len = av.len;
+            }
+            sj = sj - 1;
+        }
+        si = si + 1;
+    }
+
+    let mut k: usize = 0;
+    while k < name_count {
+        let ns = unsafe { opts_sv_slot_at(names, k) };
+        let entry_sv = StrView { ptr: unsafe { (*ns).ptr }, len: unsafe { (*ns).len } };
+        let next_rel = if rel_prefix.len > 0 {
+            arena_join_path(mut_view(proj.arena), rel_prefix, view(entry_sv))
+        } else {
+            arena_normalize_path(mut_view(proj.arena), view(entry_sv))
+        };
+        let full_path = arena_join_path(mut_view(proj.arena), view(proj.std_root), view(next_rel));
+        if host_is_dir(view(full_path)) {
+            std_index_scan_dir(mut_view(*proj), mut_view(*index), view(next_rel));
+        } else if sv_ends_with_ax(view(entry_sv)) {
+            // A std file already in the project keeps (or receives) its one read.
+            let mut text = sv_empty();
+            let mut have: bool = false;
+            let mut fi: usize = 0;
+            while fi < proj.file_count {
+                let pf = unsafe { project_file_at(proj.files, fi) };
+                let pdisk = pf_get_disk_path(pf as *const ProjectFile);
+                if sv_eq(view(pdisk), view(full_path)) {
+                    let ptxt = pf_get_text(pf as *const ProjectFile);
+                    if (ptxt.ptr as usize) != 0 {
+                        text = ptxt;
+                        have = true;
+                    } else {
+                        let mut ok: bool = false;
+                        let rtxt = host_read_file_in_arena(view(full_path), mut_view(proj.arena), unsafe { address_of_mut(ok) });
+                        if ok {
+                            pf_set_text(pf, view(rtxt));
+                            text = rtxt;
+                            have = true;
+                        }
+                    }
+                    break;
+                }
+                fi = fi + 1;
+            }
+            if !have {
+                let mut ok2: bool = false;
+                let rtxt2 = host_read_file_in_arena(view(full_path), mut_view(proj.arena), unsafe { address_of_mut(ok2) });
+                if ok2 {
+                    text = rtxt2;
+                    have = true;
+                }
+            }
+            if have {
+                let header = ax_text_module_header(view(text));
+                if header.len > 0 {
+                    std_index_push(mut_view(proj.arena), mut_view(*index), header, full_path, next_rel, text);
+                }
+            }
+        }
+        k = k + 1;
+    }
+}
+
+// Builds the index once per compilation (no-op when already scanned or when there is no std root).
+pub fn project_std_index_scan(proj: mut_view<Project>, index: mut_view<StdIndex>) {
+    if index.scanned {
+        return;
+    }
+    index.scanned = true;
+    if proj.std_root.len == 0 {
+        return;
+    }
+    let empty_rel = sv_empty();
+    std_index_scan_dir(mut_view(*proj), mut_view(*index), view(empty_rel));
 }
 
 pub fn project_discover(

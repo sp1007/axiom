@@ -400,6 +400,13 @@ use compiler.driver.opts.project_add_file
 use compiler.driver.opts.project_record_probe
 use compiler.driver.opts.project_write_dep_file
 use compiler.driver.opts.PROBE_FILE
+use compiler.driver.opts.StdIndex
+use compiler.driver.opts.StdIndexEntry
+use compiler.driver.opts.std_index_new
+use compiler.driver.opts.std_index_entry_at
+use compiler.driver.opts.project_std_index_scan
+use compiler.driver.opts.emit_driver_diag_text
+use compiler.diag.code.AX_DRIVER_DUPLICATE_STD_MODULE
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 @intrinsic fn align_of<T>() -> usize { 0 }
@@ -926,6 +933,10 @@ const PIPE_CMP_REL_DATA: [11]u8 = [
 const PIPE_CMP_DISP_DATA: [17]u8 = [
     60u8, 115u8, 116u8, 100u8, 62u8, 47u8, 99u8, 111u8, 114u8, 101u8, 47u8, 99u8, 109u8, 112u8, 46u8, 97u8, 120u8
 ];
+// "std.core.host"
+const PIPE_HOST_MOD_DATA: [13]u8 = [
+    115u8, 116u8, 100u8, 46u8, 99u8, 111u8, 114u8, 101u8, 46u8, 104u8, 111u8, 115u8, 116u8
+];
 const PIPE_CMP_MOD_DATA: [12]u8 = [
     115u8, 116u8, 100u8, 46u8, 99u8, 111u8, 114u8, 101u8, 46u8, 99u8, 109u8, 112u8
 ];
@@ -1131,6 +1142,1189 @@ fn pipe_append_std_future_files_if_needed(proj: mut_view<Project>, load_files: b
     }
 }
 
+// =============================================================================
+// On-demand std modules and host provider modules (ADR-0048, T423h)
+// =============================================================================
+//
+// After the user files are read, every `use std.<path>` line of every loaded file (user files, std files, and the
+// std files loaded here, transitively) is resolved against the modules the program already has ("provided": the
+// `module_path` of each project file plus every `module <path>` line in its text, so a bundle that declares
+// `module std.x` inline wins) and, only when that does not answer it, against the std index (`opts.ax` 9b): the
+// longest module path that is a prefix of the use path at a `.` boundary is loaded, unless a provided module is at
+// least as long. A use path matching nothing loads nothing (the resolver reports `AX_NAME_UNRESOLVED_IMPORT`).
+// For a linked native image (`build` of an exe/dll for Windows), every host intrinsic `X` named as `host.X` in a
+// non-provider file whose `__ax_host_X` the program does not define adds the `std.sys.windows.*` module of the index
+// that defines `fn __ax_host_X` (ADR-0002 §3), unless the program already defines one of that module's
+// `__ax_host_*` functions itself (legacy in-file definitions keep linking). The interpreter never loads providers.
+
+struct PipeSvList {
+    items: *mut StrView,
+    count: usize,
+    cap: usize,
+}
+
+fn pipe_svl_new() -> PipeSvList {
+    PipeSvList { items: 0 as *mut StrView, count: 0, cap: 0 }
+}
+
+fn pipe_svl_get(l: view<PipeSvList>, idx: usize) -> StrView {
+    sv_slot_get(l.items as *const StrView, idx)
+}
+
+fn pipe_svl_has(l: view<PipeSvList>, sv: view<StrView>) -> bool {
+    let mut i: usize = 0;
+    while i < l.count {
+        let it = pipe_svl_get(l, i);
+        if sv_eq(view(it), sv) {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn pipe_svl_push(arena: mut_view<Arena>, l: mut_view<PipeSvList>, sv: view<StrView>) {
+    if l.count >= l.cap {
+        let new_cap: usize = if l.cap == 0 { 64 } else { opts_mul_usize(l.cap, 2) };
+        let new_arr = arena_alloc_raw(
+            mut_view(*arena),
+            opts_mul_usize(new_cap, size_of<StrView>()),
+            align_of<StrView>()
+        ) as *mut StrView;
+        let mut i: usize = 0;
+        while i < l.count {
+            let it = sv_slot_get(l.items as *const StrView, i);
+            sv_slot_set(new_arr, i, view(it));
+            i = i + 1;
+        }
+        l.items = new_arr;
+        l.cap = new_cap;
+    }
+    sv_slot_set(l.items, l.count, sv);
+    l.count = l.count + 1;
+}
+
+fn pipe_svl_add_unique(arena: mut_view<Arena>, l: mut_view<PipeSvList>, sv: view<StrView>) {
+    if sv.len > 0 && !pipe_svl_has(view(*l), sv) {
+        pipe_svl_push(mut_view(*arena), mut_view(*l), sv);
+    }
+}
+
+// A `str` literal copied into `arena` (the bytes are read through the slice view, as `diag/format.ax` does).
+fn pipe_lit(arena: mut_view<Arena>, s: str) -> StrView {
+    let raw: StrView = unsafe { *(address_of(s) as *const StrView) };
+    let bytes: view<[u8]> = unsafe { *(address_of(s) as *const view<[u8]>) };
+    let n: usize = raw.len;
+    let buf = arena_alloc_raw(mut_view(*arena), n + 1, 1);
+    let mut i: usize = 0;
+    while i < n {
+        unsafe { *(buf + i) = bytes[i]; }
+        i = i + 1;
+    }
+    unsafe { *(buf + n) = 0u8; }
+    StrView { ptr: buf as *const u8, len: n }
+}
+
+fn pipe_sv_at_is(text: view<StrView>, pos: usize, lit: view<StrView>) -> bool {
+    if pos + lit.len > text.len {
+        return false;
+    }
+    let mut k: usize = 0;
+    while k < lit.len {
+        if (unsafe { *(text.ptr + pos + k) }) != (unsafe { *(lit.ptr + k) }) {
+            return false;
+        }
+        k = k + 1;
+    }
+    true
+}
+
+fn pipe_sv_starts_with(sv: view<StrView>, lit: view<StrView>) -> bool {
+    pipe_sv_at_is(sv, 0, lit)
+}
+
+fn pipe_is_path_byte(b: u8) -> bool {
+    pipe_is_ident_byte(b) || b == 46u8
+}
+
+fn pipe_is_blank_byte(b: u8) -> bool {
+    b == 32u8 || b == 9u8
+}
+
+// `prefix` names `path` itself or a module that contains it (`std.a` is a prefix of `std.a.b`, not of `std.ab`).
+fn pipe_is_path_prefix(prefix: view<StrView>, path: view<StrView>) -> bool {
+    if prefix.len == 0 || prefix.len > path.len || !pipe_sv_at_is(path, 0, prefix) {
+        return false;
+    }
+    prefix.len == path.len || (unsafe { *(path.ptr + prefix.len) }) == 46u8
+}
+
+// Matches the keyword `kw` at `pos` followed by a blank; returns the position after the blanks, or 0.
+fn pipe_kw_at(text: view<StrView>, pos: usize, kw: view<StrView>) -> usize {
+    if !pipe_sv_at_is(text, pos, kw) {
+        return 0;
+    }
+    let mut i: usize = pos + kw.len;
+    if i >= text.len || !pipe_is_blank_byte(unsafe { *(text.ptr + i) }) {
+        return 0;
+    }
+    while i < text.len && pipe_is_blank_byte(unsafe { *(text.ptr + i) }) {
+        i = i + 1;
+    }
+    i
+}
+
+fn pipe_path_at(text: view<StrView>, pos: usize) -> StrView {
+    let mut i: usize = pos;
+    while i < text.len && pipe_is_path_byte(unsafe { *(text.ptr + i) }) {
+        i = i + 1;
+    }
+    let mut end: usize = i;
+    while end > pos && (unsafe { *(text.ptr + end - 1) }) == 46u8 {
+        end = end - 1;
+    }
+    StrView { ptr: unsafe { text.ptr + pos }, len: end - pos }
+}
+
+struct PipeStdLits {
+    kw_module: StrView,
+    kw_use: StrView,
+    kw_pub: StrView,
+    kw_as: StrView,
+    kw_fn: StrView,
+    kw_struct: StrView,
+    kw_enum: StrView,
+    kw_trait: StrView,
+    kw_type: StrView,
+    kw_const: StrView,
+    kw_static: StrView,
+    kw_mut: StrView,
+    kw_extern: StrView,
+    std_dot: StrView,
+    std_disp: StrView,
+    host_mod: StrView,
+    sys_prefix: StrView,
+    win_prefix: StrView,
+    host_def: StrView,
+    host_dot: StrView,
+    windows: StrView,
+}
+
+fn pipe_std_lits(arena: mut_view<Arena>) -> PipeStdLits {
+    PipeStdLits {
+        kw_module: pipe_lit(mut_view(*arena), "module"),
+        kw_use: pipe_lit(mut_view(*arena), "use"),
+        kw_pub: pipe_lit(mut_view(*arena), "pub"),
+        kw_as: pipe_lit(mut_view(*arena), "as"),
+        kw_fn: pipe_lit(mut_view(*arena), "fn"),
+        kw_struct: pipe_lit(mut_view(*arena), "struct"),
+        kw_enum: pipe_lit(mut_view(*arena), "enum"),
+        kw_trait: pipe_lit(mut_view(*arena), "trait"),
+        kw_type: pipe_lit(mut_view(*arena), "type"),
+        kw_const: pipe_lit(mut_view(*arena), "const"),
+        kw_static: pipe_lit(mut_view(*arena), "static"),
+        kw_mut: pipe_lit(mut_view(*arena), "mut"),
+        kw_extern: pipe_lit(mut_view(*arena), "extern"),
+        std_dot: pipe_lit(mut_view(*arena), "std."),
+        std_disp: pipe_lit(mut_view(*arena), "<std>/"),
+        host_mod: pipe_lit(mut_view(*arena), "std.core.host"),
+        sys_prefix: pipe_lit(mut_view(*arena), "std.sys."),
+        win_prefix: pipe_lit(mut_view(*arena), "std.sys.windows."),
+        host_def: pipe_lit(mut_view(*arena), "fn __ax_host_"),
+        host_dot: pipe_lit(mut_view(*arena), "host."),
+        windows: pipe_lit(mut_view(*arena), "windows"),
+    }
+}
+
+// Start of the line after `pos` (or `text.len`).
+fn pipe_next_line(text: view<StrView>, pos: usize) -> usize {
+    let mut i: usize = pos;
+    while i < text.len && (unsafe { *(text.ptr + i) }) != 10u8 {
+        i = i + 1;
+    }
+    if i < text.len { i + 1 } else { i }
+}
+
+fn pipe_skip_blanks(text: view<StrView>, pos: usize) -> usize {
+    let mut i: usize = pos;
+    while i < text.len && pipe_is_blank_byte(unsafe { *(text.ptr + i) }) {
+        i = i + 1;
+    }
+    i
+}
+
+// Adds the path of every `module <path>` line of `text` to `out`.
+fn pipe_collect_module_headers(
+    arena: mut_view<Arena>,
+    lits: view<PipeStdLits>,
+    out: mut_view<PipeSvList>,
+    text: view<StrView>
+) {
+    if text.len == 0 || (text.ptr as usize) == 0 {
+        return;
+    }
+    let mut ls: usize = 0;
+    while ls < text.len {
+        let i = pipe_skip_blanks(text, ls);
+        let after = pipe_kw_at(text, i, view(lits.kw_module));
+        if after > 0 {
+            let p = pipe_path_at(text, after);
+            pipe_svl_add_unique(mut_view(*arena), mut_view(*out), view(p));
+        }
+        ls = pipe_next_line(text, ls);
+    }
+}
+
+// Skips `pub` or `pub(...)` followed by blanks at `pos`; returns the position after blanks, or `pos` when absent.
+fn pipe_skip_pub_vis(text: view<StrView>, pos: usize, kw_pub: view<StrView>) -> usize {
+    if !pipe_sv_at_is(text, pos, kw_pub) {
+        return pos;
+    }
+    let mut i: usize = pos + kw_pub.len;
+    if i < text.len && (unsafe { *(text.ptr + i) }) == 40u8 {
+        i = i + 1;
+        while i < text.len && (unsafe { *(text.ptr + i) }) != 41u8 && (unsafe { *(text.ptr + i) }) != 10u8 {
+            i = i + 1;
+        }
+        if i >= text.len || (unsafe { *(text.ptr + i) }) != 41u8 {
+            return pos;
+        }
+        i = i + 1;
+    }
+    if i >= text.len || !pipe_is_blank_byte(unsafe { *(text.ptr + i) }) {
+        return pos;
+    }
+    pipe_skip_blanks(text, i)
+}
+
+// The next `[pub[...]] use std.<path>` line at or after `*pos` (the imported path, trailing `.` removed); empty at end.
+fn pipe_next_std_use(lits: view<PipeStdLits>, text: view<StrView>, pos: mut_view<usize>) -> StrView {
+    if (text.ptr as usize) == 0 {
+        return sv_empty();
+    }
+    while *pos < text.len {
+        let ls: usize = *pos;
+        *pos = pipe_next_line(text, ls);
+        let i0 = pipe_skip_blanks(text, ls);
+        let i = pipe_skip_pub_vis(text, i0, view(lits.kw_pub));
+        let after_use = pipe_kw_at(text, i, view(lits.kw_use));
+        if after_use > 0 && pipe_sv_at_is(text, after_use, view(lits.std_dot)) {
+            let p = pipe_path_at(text, after_use);
+            if p.len > lits.std_dot.len {
+                return p;
+            }
+        }
+    }
+    sv_empty()
+}
+
+// Adds every `<name>` of a `fn __ax_host_<name>` definition in `text` to `out`.
+fn pipe_collect_host_defs(
+    arena: mut_view<Arena>,
+    lits: view<PipeStdLits>,
+    out: mut_view<PipeSvList>,
+    text: view<StrView>
+) {
+    if text.len == 0 || (text.ptr as usize) == 0 {
+        return;
+    }
+    let pat = StrView { ptr: lits.host_def.ptr, len: lits.host_def.len };
+    let mut i: usize = 0;
+    while i + pat.len <= text.len {
+        if (unsafe { *(text.ptr + i) }) == 102u8 && pipe_sv_at_is(text, i, view(pat)) &&
+           (i == 0 || !pipe_is_ident_byte(unsafe { *(text.ptr + i - 1) })) {
+            let s: usize = i + pat.len;
+            let mut e: usize = s;
+            while e < text.len && pipe_is_ident_byte(unsafe { *(text.ptr + e) }) {
+                e = e + 1;
+            }
+            if e > s {
+                let name = StrView { ptr: unsafe { text.ptr + s }, len: e - s };
+                pipe_svl_add_unique(mut_view(*arena), mut_view(*out), view(name));
+            }
+            i = e;
+        } else {
+            i = i + 1;
+        }
+    }
+}
+
+// Adds every `<name>` of a `host.<name>` reference in `text` (`use std.core.host.<name>`, `host.<name>(...)`).
+fn pipe_collect_host_uses(
+    arena: mut_view<Arena>,
+    lits: view<PipeStdLits>,
+    out: mut_view<PipeSvList>,
+    text: view<StrView>
+) {
+    if text.len == 0 || (text.ptr as usize) == 0 {
+        return;
+    }
+    let pat = StrView { ptr: lits.host_dot.ptr, len: lits.host_dot.len };
+    let mut i: usize = 0;
+    while i + pat.len <= text.len {
+        if (unsafe { *(text.ptr + i) }) == 104u8 && pipe_sv_at_is(text, i, view(pat)) &&
+           (i == 0 || !pipe_is_ident_byte(unsafe { *(text.ptr + i - 1) })) {
+            let s: usize = i + pat.len;
+            let mut e: usize = s;
+            while e < text.len && pipe_is_ident_byte(unsafe { *(text.ptr + e) }) {
+                e = e + 1;
+            }
+            if e > s {
+                let name = StrView { ptr: unsafe { text.ptr + s }, len: e - s };
+                pipe_svl_add_unique(mut_view(*arena), mut_view(*out), view(name));
+            }
+            i = e;
+        } else {
+            i = i + 1;
+        }
+    }
+}
+
+fn pipe_std_file_text(proj: mut_view<Project>, idx: usize) -> StrView {
+    let pf = unsafe { project_file_at(proj.files, idx) };
+    let txt = pf_get_text(pf as *const ProjectFile);
+    if (txt.ptr as usize) != 0 {
+        return txt;
+    }
+    let mut ok: bool = false;
+    let ok_ptr = unsafe { ptr_from_mut(mut_view(ok)) };
+    let disk = pf_get_disk_path(pf as *const ProjectFile);
+    let rtxt = host_read_file_in_arena(view(disk), mut_view(proj.arena), ok_ptr);
+    if !ok {
+        // The loading loop of the source stage reports the unreadable file.
+        return sv_empty();
+    }
+    let pf2 = unsafe { project_file_at(proj.files, idx) };
+    pf_set_text(pf2, view(rtxt));
+    rtxt
+}
+
+// Appends the std file of index entry `ei` to the project (its text is the one the index read).
+fn pipe_std_load_entry(
+    proj: mut_view<Project>,
+    lits: view<PipeStdLits>,
+    provided: mut_view<PipeSvList>,
+    index: view<StdIndex>,
+    ei: usize
+) {
+    let e = unsafe { std_index_entry_at(index.entries, ei) };
+    let mpath = StrView { ptr: unsafe { (*e).module_path.ptr }, len: unsafe { (*e).module_path.len } };
+    let disk = StrView { ptr: unsafe { (*e).disk_path.ptr }, len: unsafe { (*e).disk_path.len } };
+    let rel = StrView { ptr: unsafe { (*e).rel_path.ptr }, len: unsafe { (*e).rel_path.len } };
+    let text = StrView { ptr: unsafe { (*e).text.ptr }, len: unsafe { (*e).text.len } };
+    pipe_svl_add_unique(mut_view(proj.arena), mut_view(*provided), view(mpath));
+    pipe_collect_module_headers(mut_view(proj.arena), lits, mut_view(*provided), view(text));
+    let mut i: usize = 0;
+    while i < proj.file_count {
+        let pf = unsafe { project_file_const_at(proj.files as *const ProjectFile, i) };
+        let pdisk = pf_get_disk_path(pf);
+        if sv_eq(view(pdisk), view(disk)) {
+            return;
+        }
+        i = i + 1;
+    }
+    let dn: usize = lits.std_disp.len + rel.len;
+    let dbuf = arena_alloc_raw(mut_view(proj.arena), dn + 1, 1);
+    let mut k: usize = 0;
+    while k < lits.std_disp.len {
+        unsafe { *(dbuf + k) = *(lits.std_disp.ptr + k); }
+        k = k + 1;
+    }
+    let mut r: usize = 0;
+    while r < rel.len {
+        unsafe { *(dbuf + lits.std_disp.len + r) = *(rel.ptr + r); }
+        r = r + 1;
+    }
+    unsafe { *(dbuf + dn) = 0u8; }
+    let disp = StrView { ptr: dbuf as *const u8, len: dn };
+    project_add_file(mut_view(*proj), disk, disp, mpath, text, false, true);
+}
+
+fn pipe_push_sv_bytes(dst: *mut u8, at: usize, sv: view<StrView>) -> usize {
+    let mut i: usize = 0;
+    while i < sv.len {
+        unsafe { *(dst + at + i) = *(sv.ptr + i); }
+        i = i + 1;
+    }
+    at + sv.len
+}
+
+// `AX_DRIVER_DUPLICATE_STD_MODULE`: "std module `<path>` is declared by both `<a>` and `<b>`".
+fn pipe_report_duplicate_std(ctx: mut_view<PipelineCtx>, mpath: view<StrView>, a: view<StrView>, b: view<StrView>) {
+    let p1 = pipe_lit(mut_view(ctx.proj.arena), "std module `");
+    let p2 = pipe_lit(mut_view(ctx.proj.arena), "` is declared by both `");
+    let p3 = pipe_lit(mut_view(ctx.proj.arena), "` and `");
+    let p4 = pipe_lit(mut_view(ctx.proj.arena), "`");
+    let n: usize = p1.len + mpath.len + p2.len + a.len + p3.len + b.len + p4.len;
+    let buf = arena_alloc_raw(mut_view(ctx.proj.arena), n + 1, 1);
+    let mut at: usize = 0;
+    at = pipe_push_sv_bytes(buf, at, view(p1));
+    at = pipe_push_sv_bytes(buf, at, mpath);
+    at = pipe_push_sv_bytes(buf, at, view(p2));
+    at = pipe_push_sv_bytes(buf, at, a);
+    at = pipe_push_sv_bytes(buf, at, view(p3));
+    at = pipe_push_sv_bytes(buf, at, b);
+    at = pipe_push_sv_bytes(buf, at, view(p4));
+    let msg = StrView { ptr: buf as *const u8, len: at };
+    emit_driver_diag_text(mut_view(ctx.sess.diag_sink), AX_DRIVER_DUPLICATE_STD_MODULE, view(msg));
+}
+
+const PIPE_TOK_EOF: u8 = 0u8;
+const PIPE_TOK_IDENT: u8 = 1u8;
+const PIPE_TOK_DOT: u8 = 2u8;
+const PIPE_TOK_OPEN: u8 = 3u8;
+const PIPE_TOK_CLOSE: u8 = 4u8;
+const PIPE_TOK_LBRACE: u8 = 5u8;
+const PIPE_TOK_RBRACE: u8 = 6u8;
+const PIPE_TOK_SEMI: u8 = 7u8;
+const PIPE_TOK_STAR: u8 = 8u8;
+const PIPE_TOK_OTHER: u8 = 9u8;
+
+// Minimal lexical step used by `pipe_text_mod_declares_item`: skips whitespace, `//` and nested `/* */` comments, and
+// string/char/numeric literals, returning identifiers and delimiter tokens without allocating.
+fn pipe_scan_next_tok(text: view<StrView>, pos: mut_view<usize>, kind_out: mut_view<u8>) -> StrView {
+    let n: usize = text.len;
+    if n == 0 || (text.ptr as usize) == 0 {
+        *kind_out = PIPE_TOK_EOF;
+        return sv_empty();
+    }
+    let p = text.ptr;
+    while *pos < n {
+        let b = unsafe { *(p + *pos) };
+        if b == 32u8 || b == 9u8 || b == 10u8 || b == 13u8 {
+            *pos = *pos + 1;
+            continue;
+        }
+        if b == 47u8 && *pos + 1 < n && (unsafe { *(p + *pos + 1) }) == 47u8 {
+            *pos = *pos + 2;
+            while *pos < n && (unsafe { *(p + *pos) }) != 10u8 {
+                *pos = *pos + 1;
+            }
+            continue;
+        }
+        if b == 47u8 && *pos + 1 < n && (unsafe { *(p + *pos + 1) }) == 42u8 {
+            *pos = *pos + 2;
+            let mut cdepth: usize = 1;
+            while *pos < n && cdepth > 0 {
+                let cb = unsafe { *(p + *pos) };
+                if cb == 47u8 && *pos + 1 < n && (unsafe { *(p + *pos + 1) }) == 42u8 {
+                    cdepth = cdepth + 1;
+                    *pos = *pos + 2;
+                } else if cb == 42u8 && *pos + 1 < n && (unsafe { *(p + *pos + 1) }) == 47u8 {
+                    cdepth = cdepth - 1;
+                    *pos = *pos + 2;
+                } else {
+                    *pos = *pos + 1;
+                }
+            }
+            continue;
+        }
+        break;
+    }
+    if *pos >= n {
+        *kind_out = PIPE_TOK_EOF;
+        return sv_empty();
+    }
+    let b = unsafe { *(p + *pos) };
+    // Raw string `r"..."`
+    if b == 114u8 && *pos + 1 < n && (unsafe { *(p + *pos + 1) }) == 34u8 {
+        *pos = *pos + 2;
+        while *pos < n && (unsafe { *(p + *pos) }) != 34u8 {
+            *pos = *pos + 1;
+        }
+        if *pos < n {
+            *pos = *pos + 1;
+        }
+        *kind_out = PIPE_TOK_OTHER;
+        return sv_empty();
+    }
+    // String `"..."` or byte string `b"..."`
+    if b == 34u8 || (b == 98u8 && *pos + 1 < n && (unsafe { *(p + *pos + 1) }) == 34u8) {
+        *pos = *pos + (if b == 98u8 { 2 } else { 1 });
+        while *pos < n {
+            let sb = unsafe { *(p + *pos) };
+            *pos = *pos + 1;
+            if sb == 92u8 {
+                if *pos < n {
+                    *pos = *pos + 1;
+                }
+            } else if sb == 34u8 {
+                break;
+            }
+        }
+        *kind_out = PIPE_TOK_OTHER;
+        return sv_empty();
+    }
+    // Byte char literal `b'...'`
+    if b == 98u8 && *pos + 1 < n && (unsafe { *(p + *pos + 1) }) == 39u8 {
+        *pos = *pos + 2;
+        if *pos < n && (unsafe { *(p + *pos) }) == 92u8 {
+            *pos = *pos + 1;
+            if *pos < n {
+                *pos = *pos + 1;
+            }
+        } else if *pos < n {
+            *pos = *pos + 1;
+        }
+        if *pos < n && (unsafe { *(p + *pos) }) == 39u8 {
+            *pos = *pos + 1;
+        }
+        *kind_out = PIPE_TOK_OTHER;
+        return sv_empty();
+    }
+    // Char literal `'...'` vs loop label `'outer`
+    if b == 39u8 {
+        if *pos + 1 < n && (unsafe { *(p + *pos + 1) }) == 92u8 {
+            *pos = *pos + 2;
+            if *pos < n {
+                *pos = *pos + 1;
+            }
+            while *pos < n && (unsafe { *(p + *pos) }) != 39u8 && (unsafe { *(p + *pos) }) != 10u8 {
+                *pos = *pos + 1;
+            }
+            if *pos < n && (unsafe { *(p + *pos) }) == 39u8 {
+                *pos = *pos + 1;
+            }
+        } else if *pos + 1 < n {
+            let c0 = unsafe { *(p + *pos + 1) };
+            let clen: usize = if c0 < 128u8 {
+                1
+            } else if (c0 & 224u8) == 192u8 {
+                2
+            } else if (c0 & 240u8) == 224u8 {
+                3
+            } else if (c0 & 248u8) == 240u8 {
+                4
+            } else {
+                1
+            };
+            if c0 != 39u8 && c0 != 10u8 && *pos + 1 + clen < n && (unsafe { *(p + *pos + 1 + clen) }) == 39u8 {
+                *pos = *pos + 2 + clen;
+            } else {
+                *pos = *pos + 1;
+            }
+        } else {
+            *pos = *pos + 1;
+        }
+        *kind_out = PIPE_TOK_OTHER;
+        return sv_empty();
+    }
+    // Identifier `[A-Za-z_][A-Za-z0-9_]*`
+    if (b >= 97u8 && b <= 122u8) || (b >= 65u8 && b <= 90u8) || b == 95u8 {
+        let s = *pos;
+        *pos = *pos + 1;
+        while *pos < n && pipe_is_ident_byte(unsafe { *(p + *pos) }) {
+            *pos = *pos + 1;
+        }
+        *kind_out = PIPE_TOK_IDENT;
+        return StrView { ptr: unsafe { p + s }, len: *pos - s };
+    }
+    // Numeric literal (consume trailing suffix like `u32` so it is not read as an identifier)
+    if b >= 48u8 && b <= 57u8 {
+        *pos = *pos + 1;
+        while *pos < n && pipe_is_ident_byte(unsafe { *(p + *pos) }) {
+            *pos = *pos + 1;
+        }
+        *kind_out = PIPE_TOK_OTHER;
+        return sv_empty();
+    }
+    *pos = *pos + 1;
+    if b == 46u8 {
+        if *pos < n && (unsafe { *(p + *pos) }) == 46u8 {
+            *pos = *pos + 1;
+            *kind_out = PIPE_TOK_OTHER;
+        } else {
+            *kind_out = PIPE_TOK_DOT;
+        }
+    } else if b == 123u8 {
+        *kind_out = PIPE_TOK_LBRACE;
+    } else if b == 125u8 {
+        *kind_out = PIPE_TOK_RBRACE;
+    } else if b == 40u8 || b == 91u8 {
+        *kind_out = PIPE_TOK_OPEN;
+    } else if b == 41u8 || b == 93u8 {
+        *kind_out = PIPE_TOK_CLOSE;
+    } else if b == 59u8 {
+        *kind_out = PIPE_TOK_SEMI;
+    } else if b == 42u8 {
+        *kind_out = PIPE_TOK_STAR;
+    } else {
+        *kind_out = PIPE_TOK_OTHER;
+    }
+    sv_empty()
+}
+
+fn pipe_svl_has_join(l: view<PipeSvList>, a: view<StrView>, b: view<StrView>) -> bool {
+    let want_len: usize = a.len + 1 + b.len;
+    let mut i: usize = 0;
+    while i < l.count {
+        let it = pipe_svl_get(l, i);
+        if it.len == want_len &&
+           pipe_sv_at_is(view(it), 0, a) &&
+           (unsafe { *(it.ptr + a.len) }) == 46u8 &&
+           pipe_sv_at_is(view(it), a.len + 1, b) {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+// True when `text` (whose default module path is `fmod`) declares top-level item `item` inside `module <mod_path>`.
+// When `enum_only` is true, only `enum <item>` counts (for `use std.x.Enum.Variant`).
+fn pipe_text_mod_declares_item(
+    text: view<StrView>,
+    fmod: view<StrView>,
+    lits: view<PipeStdLits>,
+    provided: view<PipeSvList>,
+    mod_path: view<StrView>,
+    item: view<StrView>,
+    enum_only: bool
+) -> bool {
+    if !pipe_sv_contains_ident(text, item.ptr, item.len, false) {
+        return false;
+    }
+    let mut in_mod: bool = sv_eq(fmod, mod_path);
+    let mut brace_depth: usize = 0;
+    let mut paren_depth: usize = 0;
+    let mut extern_brace: bool = false;
+    let mut pending_extern: bool = false;
+    let mut prev_star: bool = false;
+    let mut pos: usize = 0;
+    loop {
+        let mut tk: u8 = 0u8;
+        let tv = pipe_scan_next_tok(text, mut_view(pos), mut_view(tk));
+        let was_star: bool = prev_star;
+        prev_star = tk == PIPE_TOK_STAR;
+        if tk == PIPE_TOK_EOF {
+            break;
+        }
+        if tk == PIPE_TOK_OPEN {
+            paren_depth = paren_depth + 1;
+            continue;
+        }
+        if tk == PIPE_TOK_CLOSE {
+            if paren_depth > 0 {
+                paren_depth = paren_depth - 1;
+            }
+            continue;
+        }
+        if tk == PIPE_TOK_LBRACE {
+            if brace_depth == 0 && paren_depth == 0 && pending_extern {
+                extern_brace = true;
+            }
+            pending_extern = false;
+            brace_depth = brace_depth + 1;
+            continue;
+        }
+        if tk == PIPE_TOK_RBRACE {
+            if brace_depth > 0 {
+                brace_depth = brace_depth - 1;
+            }
+            if brace_depth == 0 {
+                extern_brace = false;
+            }
+            pending_extern = false;
+            continue;
+        }
+        if tk == PIPE_TOK_SEMI {
+            pending_extern = false;
+            continue;
+        }
+        if tk != PIPE_TOK_IDENT {
+            continue;
+        }
+        let at_root: bool = brace_depth == 0 && paren_depth == 0;
+        let at_item: bool = paren_depth == 0 && (brace_depth == 0 || (brace_depth == 1 && extern_brace));
+        if at_root && sv_eq(view(tv), view(lits.kw_module)) {
+            pending_extern = false;
+            let mut sub_tk: u8 = 0u8;
+            let s0 = pipe_scan_next_tok(text, mut_view(pos), mut_view(sub_tk));
+            if sub_tk != PIPE_TOK_IDENT {
+                in_mod = false;
+                continue;
+            }
+            let mut matched: bool = s0.len <= mod_path.len && pipe_sv_at_is(mod_path, 0, view(s0));
+            let mut off: usize = s0.len;
+            loop {
+                let save_dot = pos;
+                let mut dtk: u8 = 0u8;
+                let _ = pipe_scan_next_tok(text, mut_view(pos), mut_view(dtk));
+                if dtk != PIPE_TOK_DOT {
+                    pos = save_dot;
+                    break;
+                }
+                let mut stk: u8 = 0u8;
+                let sk = pipe_scan_next_tok(text, mut_view(pos), mut_view(stk));
+                if stk != PIPE_TOK_IDENT {
+                    pos = save_dot;
+                    break;
+                }
+                if matched {
+                    if off < mod_path.len &&
+                       (unsafe { *(mod_path.ptr + off) }) == 46u8 &&
+                       off + 1 + sk.len <= mod_path.len &&
+                       pipe_sv_at_is(mod_path, off + 1, view(sk)) {
+                        off = off + 1 + sk.len;
+                    } else {
+                        matched = false;
+                    }
+                }
+            }
+            in_mod = matched && off == mod_path.len;
+            continue;
+        }
+        if !in_mod || !at_item {
+            continue;
+        }
+        if at_root && sv_eq(view(tv), view(lits.kw_extern)) {
+            pending_extern = true;
+            continue;
+        }
+        if sv_eq(view(tv), view(lits.kw_enum)) {
+            pending_extern = false;
+            let save_n = pos;
+            let mut ntk: u8 = 0u8;
+            let nm = pipe_scan_next_tok(text, mut_view(pos), mut_view(ntk));
+            if ntk == PIPE_TOK_IDENT {
+                if sv_eq(view(nm), item) {
+                    return true;
+                }
+            } else {
+                pos = save_n;
+            }
+            continue;
+        }
+        if enum_only {
+            continue;
+        }
+        if sv_eq(view(tv), view(lits.kw_fn)) ||
+           sv_eq(view(tv), view(lits.kw_struct)) ||
+           sv_eq(view(tv), view(lits.kw_trait)) ||
+           sv_eq(view(tv), view(lits.kw_type)) ||
+           (!was_star && sv_eq(view(tv), view(lits.kw_const))) {
+            pending_extern = false;
+            let save_n = pos;
+            let mut ntk: u8 = 0u8;
+            let nm = pipe_scan_next_tok(text, mut_view(pos), mut_view(ntk));
+            if ntk == PIPE_TOK_IDENT {
+                if sv_eq(view(nm), item) {
+                    return true;
+                }
+            } else {
+                pos = save_n;
+            }
+            continue;
+        }
+        if sv_eq(view(tv), view(lits.kw_static)) {
+            pending_extern = false;
+            let save_n = pos;
+            let mut ntk: u8 = 0u8;
+            let mut nm = pipe_scan_next_tok(text, mut_view(pos), mut_view(ntk));
+            if ntk == PIPE_TOK_IDENT && sv_eq(view(nm), view(lits.kw_mut)) {
+                nm = pipe_scan_next_tok(text, mut_view(pos), mut_view(ntk));
+            }
+            if ntk == PIPE_TOK_IDENT {
+                if sv_eq(view(nm), item) {
+                    return true;
+                }
+            } else {
+                pos = save_n;
+            }
+            continue;
+        }
+        if at_root && sv_eq(view(tv), view(lits.kw_pub)) {
+            let save_after_pub = pos;
+            let mut ptk: u8 = 0u8;
+            let mut ptv = pipe_scan_next_tok(text, mut_view(pos), mut_view(ptk));
+            if ptk == PIPE_TOK_OPEN {
+                let mut pd: usize = 1;
+                while pd > 0 {
+                    let _ = pipe_scan_next_tok(text, mut_view(pos), mut_view(ptk));
+                    if ptk == PIPE_TOK_EOF {
+                        break;
+                    }
+                    if ptk == PIPE_TOK_OPEN {
+                        pd = pd + 1;
+                    } else if ptk == PIPE_TOK_CLOSE {
+                        pd = pd - 1;
+                    }
+                }
+                ptv = pipe_scan_next_tok(text, mut_view(pos), mut_view(ptk));
+            }
+            if ptk != PIPE_TOK_IDENT || !sv_eq(view(ptv), view(lits.kw_use)) {
+                pos = save_after_pub;
+                continue;
+            }
+            let mut utk: u8 = 0u8;
+            let u0 = pipe_scan_next_tok(text, mut_view(pos), mut_view(utk));
+            if utk != PIPE_TOK_IDENT {
+                continue;
+            }
+            let mut last_seg = u0;
+            let mut cstate: u8 = 0u8;
+            let mut moff: usize = 0;
+            if u0.len <= mod_path.len && pipe_sv_at_is(mod_path, 0, view(u0)) {
+                moff = u0.len;
+                if moff == mod_path.len {
+                    cstate = 1u8;
+                }
+            } else {
+                cstate = 3u8;
+            }
+            let mut has_child_prefix: bool = false;
+            loop {
+                let save_udot = pos;
+                let mut dtk: u8 = 0u8;
+                let _ = pipe_scan_next_tok(text, mut_view(pos), mut_view(dtk));
+                if dtk != PIPE_TOK_DOT {
+                    pos = save_udot;
+                    break;
+                }
+                let mut stk: u8 = 0u8;
+                let sk = pipe_scan_next_tok(text, mut_view(pos), mut_view(stk));
+                if stk != PIPE_TOK_IDENT {
+                    pos = save_udot;
+                    break;
+                }
+                last_seg = sk;
+                if cstate == 0u8 {
+                    if moff < mod_path.len &&
+                       (unsafe { *(mod_path.ptr + moff) }) == 46u8 &&
+                       moff + 1 + sk.len <= mod_path.len &&
+                       pipe_sv_at_is(mod_path, moff + 1, view(sk)) {
+                        moff = moff + 1 + sk.len;
+                        if moff == mod_path.len {
+                            cstate = 1u8;
+                        }
+                    } else {
+                        cstate = 3u8;
+                    }
+                } else if cstate == 1u8 {
+                    if sv_eq(view(sk), item) {
+                        cstate = 2u8;
+                    } else {
+                        cstate = 3u8;
+                    }
+                } else if cstate == 2u8 {
+                    has_child_prefix = true;
+                    cstate = 3u8;
+                }
+            }
+            let mut bound_name = last_seg;
+            let save_as = pos;
+            let mut atk: u8 = 0u8;
+            let atv = pipe_scan_next_tok(text, mut_view(pos), mut_view(atk));
+            if atk == PIPE_TOK_IDENT && sv_eq(view(atv), view(lits.kw_as)) {
+                let mut altk: u8 = 0u8;
+                let altv = pipe_scan_next_tok(text, mut_view(pos), mut_view(altk));
+                if altk == PIPE_TOK_IDENT {
+                    bound_name = altv;
+                }
+            } else {
+                pos = save_as;
+            }
+            if sv_eq(view(bound_name), item) {
+                if !has_child_prefix || pipe_svl_has_join(provided, mod_path, item) {
+                    return true;
+                }
+            }
+            continue;
+        }
+    }
+    false
+}
+
+fn pipe_proj_mod_declares_item(
+    proj: mut_view<Project>,
+    lits: view<PipeStdLits>,
+    provided: view<PipeSvList>,
+    mod_path: view<StrView>,
+    item: view<StrView>,
+    enum_only: bool
+) -> bool {
+    let mut fi: usize = 0;
+    while fi < proj.file_count {
+        let pf = unsafe { project_file_const_at(proj.files as *const ProjectFile, fi) };
+        let fmod = pf_get_module_path(pf);
+        let is_std = pf_is_std(pf);
+        let fmod_eq = sv_eq(view(fmod), mod_path);
+        if is_std {
+            if fmod_eq {
+                let stxt = pipe_std_file_text(mut_view(*proj), fi);
+                if pipe_text_mod_declares_item(view(stxt), view(fmod), lits, provided, mod_path, item, enum_only) {
+                    return true;
+                }
+            }
+        } else {
+            let utxt = pf_get_text(pf);
+            if fmod_eq || pipe_sv_contains_bytes(view(utxt), mod_path.ptr, mod_path.len) {
+                if pipe_text_mod_declares_item(view(utxt), view(fmod), lits, provided, mod_path, item, enum_only) {
+                    return true;
+                }
+            }
+        }
+        fi = fi + 1;
+    }
+    false
+}
+
+// Resolves one `use std.<path>`; false after a duplicate-header error.
+fn pipe_std_resolve_use(
+    ctx: mut_view<PipelineCtx>,
+    lits: view<PipeStdLits>,
+    provided: mut_view<PipeSvList>,
+    index: mut_view<StdIndex>,
+    path: view<StrView>
+) -> bool {
+    // Exact module match: already provided, no index scan needed.
+    if pipe_svl_has(view(*provided), path) {
+        return true;
+    }
+    let mut prov_mod = sv_empty();
+    let mut prov_len: usize = 0;
+    let mut pi: usize = 0;
+    while pi < provided.count {
+        let it = pipe_svl_get(view(*provided), pi);
+        if it.len > prov_len && pipe_is_path_prefix(view(it), path) {
+            prov_mod = it;
+            prov_len = it.len;
+        }
+        pi = pi + 1;
+    }
+    // Before scanning `<std-root>` (which walks std directories and records `dir` probes in `--dep-file`), check
+    // whether the longest provided module prefix `prov_mod` already declares the imported item (or enum variant).
+    // When `prov_mod` does not declare that name (e.g. `use std.sync.once` under an inline `module std.sync` that
+    // only defines `marker`, T423h QA F1), fall through to the std index so child std modules are loaded (ADR-0048 §2).
+    if !index.scanned && prov_len > 0 && prov_len + 1 < path.len {
+        let rest_pos: usize = prov_len + 1;
+        let mut seg_end: usize = rest_pos;
+        while seg_end < path.len && (unsafe { *(path.ptr + seg_end) }) != 46u8 {
+            seg_end = seg_end + 1;
+        }
+        let seg = StrView { ptr: unsafe { path.ptr + rest_pos }, len: seg_end - rest_pos };
+        if seg.len > 0 {
+            if seg_end == path.len {
+                if pipe_proj_mod_declares_item(
+                    mut_view(ctx.proj),
+                    lits,
+                    view(*provided),
+                    view(prov_mod),
+                    view(seg),
+                    false
+                ) {
+                    return true;
+                }
+            } else if seg_end + 1 < path.len {
+                let mut tail_dot: bool = false;
+                let mut ti: usize = seg_end + 1;
+                while ti < path.len {
+                    if (unsafe { *(path.ptr + ti) }) == 46u8 {
+                        tail_dot = true;
+                        break;
+                    }
+                    ti = ti + 1;
+                }
+                if !tail_dot && pipe_proj_mod_declares_item(
+                    mut_view(ctx.proj),
+                    lits,
+                    view(*provided),
+                    view(prov_mod),
+                    view(seg),
+                    true
+                ) {
+                    return true;
+                }
+            }
+        }
+    }
+    project_std_index_scan(mut_view(ctx.proj), mut_view(*index));
+    let mut best: usize = 0;
+    let mut best_len: usize = 0;
+    let mut ei: usize = 0;
+    while ei < index.count {
+        let e = unsafe { std_index_entry_at(index.entries, ei) };
+        let mp = StrView { ptr: unsafe { (*e).module_path.ptr }, len: unsafe { (*e).module_path.len } };
+        if mp.len > best_len && pipe_is_path_prefix(view(mp), path) {
+            best = ei + 1;
+            best_len = mp.len;
+        }
+        ei = ei + 1;
+    }
+    if best == 0 || best_len <= prov_len {
+        return true;
+    }
+    let be = unsafe { std_index_entry_at(index.entries, best - 1) };
+    let bmp = StrView { ptr: unsafe { (*be).module_path.ptr }, len: unsafe { (*be).module_path.len } };
+    let bdisk = StrView { ptr: unsafe { (*be).disk_path.ptr }, len: unsafe { (*be).disk_path.len } };
+    let mut di: usize = 0;
+    while di < index.count {
+        if di + 1 != best {
+            let e2 = unsafe { std_index_entry_at(index.entries, di) };
+            let mp2 = StrView { ptr: unsafe { (*e2).module_path.ptr }, len: unsafe { (*e2).module_path.len } };
+            if sv_eq(view(mp2), view(bmp)) {
+                let d2 = StrView { ptr: unsafe { (*e2).disk_path.ptr }, len: unsafe { (*e2).disk_path.len } };
+                // Name the two files in index (path) order.
+                if di + 1 < best {
+                    pipe_report_duplicate_std(mut_view(*ctx), view(bmp), view(d2), view(bdisk));
+                } else {
+                    pipe_report_duplicate_std(mut_view(*ctx), view(bmp), view(bdisk), view(d2));
+                }
+                return false;
+            }
+        }
+        di = di + 1;
+    }
+    pipe_std_load_entry(mut_view(ctx.proj), lits, mut_view(*provided), view(*index), best - 1);
+    true
+}
+
+// A linked Windows image is being built (`build` of an exe or dll): host intrinsics need their provider modules.
+fn pipe_wants_host_providers(ctx: view<PipelineCtx>, dopts: view<DriverOptions>, lits: view<PipeStdLits>) -> bool {
+    if dopts.cmd != CMD_BUILD || dopts.emit_kind == EMIT_OBJ {
+        return false;
+    }
+    let mut kind: u32 = dopts.artifact_kind;
+    if !dopts.has_explicit_kind && ctx.proj.has_manifest && ctx.proj.manifest.kind.len > 0 {
+        let mut mk: u32 = ARTIFACT_EXE;
+        if driver_parse_artifact_kind(view(ctx.proj.manifest.kind), mut_view(mk)) {
+            kind = mk;
+        }
+    }
+    if kind != ARTIFACT_EXE && kind != ARTIFACT_DLL {
+        return false;
+    }
+    if dopts.target.len > 0 && (dopts.target.ptr as usize) != 0 {
+        return pipe_sv_contains_bytes(view(dopts.target), lits.windows.ptr, lits.windows.len);
+    }
+    true
+}
+
+// One round of provider inclusion; returns the number of modules added, or -1 after an error.
+fn pipe_add_host_providers(
+    ctx: mut_view<PipelineCtx>,
+    lits: view<PipeStdLits>,
+    provided: mut_view<PipeSvList>,
+    index: mut_view<StdIndex>,
+    handled: mut_view<PipeSvList>
+) -> i32 {
+    let mut defined = pipe_svl_new();
+    let mut used = pipe_svl_new();
+    let n0: usize = ctx.proj.file_count;
+    let mut fi: usize = 0;
+    while fi < n0 {
+        let txt = pipe_std_file_text(mut_view(ctx.proj), fi);
+        pipe_collect_host_defs(mut_view(ctx.proj.arena), lits, mut_view(defined), view(txt));
+        let pf = unsafe { project_file_const_at(ctx.proj.files as *const ProjectFile, fi) };
+        let mp = pf_get_module_path(pf);
+        if !sv_eq(view(mp), view(lits.host_mod)) && !pipe_sv_starts_with(view(mp), view(lits.sys_prefix)) {
+            pipe_collect_host_uses(mut_view(ctx.proj.arena), lits, mut_view(used), view(txt));
+        }
+        fi = fi + 1;
+    }
+    let mut added: i32 = 0;
+    let mut ui: usize = 0;
+    while ui < used.count {
+        let name = pipe_svl_get(view(used), ui);
+        ui = ui + 1;
+        if pipe_svl_has(view(*handled), view(name)) {
+            continue;
+        }
+        pipe_svl_push(mut_view(ctx.proj.arena), mut_view(*handled), view(name));
+        if pipe_svl_has(view(defined), view(name)) {
+            continue;
+        }
+        project_std_index_scan(mut_view(ctx.proj), mut_view(*index));
+        let mut ei: usize = 0;
+        while ei < index.count {
+            let e = unsafe { std_index_entry_at(index.entries, ei) };
+            let mp = StrView { ptr: unsafe { (*e).module_path.ptr }, len: unsafe { (*e).module_path.len } };
+            if pipe_sv_starts_with(view(mp), view(lits.win_prefix)) {
+                let etext = StrView { ptr: unsafe { (*e).text.ptr }, len: unsafe { (*e).text.len } };
+                let mut edefs = pipe_svl_new();
+                pipe_collect_host_defs(mut_view(ctx.proj.arena), lits, mut_view(edefs), view(etext));
+                if pipe_svl_has(view(edefs), view(name)) {
+                    // The provider of `name`: skip it when the program provides the module or any of its symbols.
+                    let mut clash: bool = pipe_svl_has(view(*provided), view(mp));
+                    let mut k: usize = 0;
+                    while !clash && k < edefs.count {
+                        let dn = pipe_svl_get(view(edefs), k);
+                        if pipe_svl_has(view(defined), view(dn)) {
+                            clash = true;
+                        }
+                        k = k + 1;
+                    }
+                    if !clash {
+                        if !pipe_std_resolve_use(mut_view(*ctx), lits, mut_view(*provided), mut_view(*index), view(mp)) {
+                            return -1;
+                        }
+                        let mut k2: usize = 0;
+                        while k2 < edefs.count {
+                            let dn2 = pipe_svl_get(view(edefs), k2);
+                            pipe_svl_add_unique(mut_view(ctx.proj.arena), mut_view(defined), view(dn2));
+                            k2 = k2 + 1;
+                        }
+                        added = added + 1;
+                    }
+                    break;
+                }
+            }
+            ei = ei + 1;
+        }
+    }
+    added
+}
+
+// ADR-0048: loads the std modules named by `use std.…` lines (transitively) and, for a linked Windows image, the
+// host provider modules. False after an error diagnostic.
+fn pipe_std_on_demand(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptions>) -> bool {
+    if ctx.proj.std_root.len == 0 {
+        return true;
+    }
+    let lits = pipe_std_lits(mut_view(ctx.proj.arena));
+    let mut provided = pipe_svl_new();
+    let mut index = std_index_new();
+    let mut handled = pipe_svl_new();
+    let mut pi: usize = 0;
+    while pi < ctx.proj.file_count {
+        let pf = unsafe { project_file_const_at(ctx.proj.files as *const ProjectFile, pi) };
+        let mp = pf_get_module_path(pf);
+        pipe_svl_add_unique(mut_view(ctx.proj.arena), mut_view(provided), view(mp));
+        let txt = pf_get_text(pf);
+        pipe_collect_module_headers(mut_view(ctx.proj.arena), view(lits), mut_view(provided), view(txt));
+        pi = pi + 1;
+    }
+    let native = pipe_wants_host_providers(view(*ctx), dopts, view(lits));
+    let mut fi: usize = 0;
+    loop {
+        while fi < ctx.proj.file_count {
+            let txt = pipe_std_file_text(mut_view(ctx.proj), fi);
+            let mut pos: usize = 0;
+            loop {
+                let up = pipe_next_std_use(view(lits), view(txt), mut_view(pos));
+                if up.len == 0 {
+                    break;
+                }
+                if !pipe_std_resolve_use(mut_view(*ctx), view(lits), mut_view(provided), mut_view(index), view(up)) {
+                    return false;
+                }
+            }
+            fi = fi + 1;
+        }
+        if !native {
+            break;
+        }
+        let added = pipe_add_host_providers(mut_view(*ctx), view(lits), mut_view(provided), mut_view(index), mut_view(handled));
+        if added < 0 {
+            return false;
+        }
+        if added == 0 {
+            break;
+        }
+    }
+    true
+}
+
 // `--dep-file=<path>` (T437b, ADR-0041 §4 S2): the project's loaded files and probes
 // (`project_write_dep_file`) plus the further files the command reads: a `.mir` input, the object/archive
 // inputs of `build` (positional arguments that are not `.ax` files) and `--rt-obj`.
@@ -1261,11 +2455,9 @@ pub fn pipeline_stage_source(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptio
     }
 
     ctx.uses_host = uses_host;
-    let pre_host_count = ctx.proj.file_count;
     if uses_host {
         project_append_std_host_if_needed(mut_view(ctx.proj), true);
     }
-    let post_host_count = ctx.proj.file_count;
     let mut prelude_has_poll: bool = true;
     let prel_mod_sv = StrView { ptr: unsafe { address_of(PIPE_PREL_MOD_DATA[0]) }, len: 16 };
     let poll_ident_ptr = unsafe { address_of(PIPE_POLL_IDENT_DATA[0]) };
@@ -1308,6 +2500,29 @@ pub fn pipeline_stage_source(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptio
         pipe_append_std_extra_mod_if_needed(mut_view(ctx.proj), view(atom_rel), view(atom_disp), view(atom_mod));
     }
 
+    // ADR-0048 (T423h): std modules named by `use std.…` (transitively) and, for a linked native image, the host
+    // provider modules.
+    if !pipe_std_on_demand(mut_view(*ctx), dopts) {
+        return false;
+    }
+    // `std.core.host` may also arrive through a loaded std module (`std.process` imports it): the intrinsic bodies
+    // of that file are dropped for native code wherever it came from.
+    let host_mod_sv = StrView { ptr: unsafe { address_of(PIPE_HOST_MOD_DATA[0]) }, len: 13 };
+    let mut host_idx: usize = ctx.proj.file_count;
+    let mut hi: usize = 0;
+    while hi < ctx.proj.file_count {
+        let pfh = unsafe { project_file_const_at(ctx.proj.files as *const ProjectFile, hi) };
+        let pfh_mod = pf_get_module_path(pfh);
+        if pf_is_std(pfh) && sv_eq(view(pfh_mod), view(host_mod_sv)) {
+            host_idx = hi;
+            break;
+        }
+        hi = hi + 1;
+    }
+    if host_idx < ctx.proj.file_count {
+        ctx.uses_host = true;
+    }
+
     // Load all files (user + std) into `ctx.sess.source_db` in project order
     let mut j: usize = 0;
     while j < ctx.proj.file_count {
@@ -1331,7 +2546,7 @@ pub fn pipeline_stage_source(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptio
         if session_has_errors(view(ctx.sess)) {
             return false;
         }
-        if uses_host && j >= pre_host_count && j < post_host_count {
+        if j == host_idx {
             ctx.host_fid.v = fid_v;
         }
         pf_set_fid_v(pf, fid_v);
@@ -5596,6 +6811,44 @@ fn pipe_mark_body_std_refs(cap: usize, keys: *mut u32, hit: *mut u8, body: *cons
     }
 }
 
+// Fills `host_link[i]` (for the `n` std candidates) with 1 + the index of the `std.core.host` candidate `X` when
+// candidate `i` is a provider function `__ax_host_X` outside the host file, else 0 (T423h).
+fn pipe_link_host_providers(ctx: mut_view<PipelineCtx>, cands: *mut *mut HirItem, n: usize, host_link: *mut usize) {
+    let mut z: usize = 0;
+    while z < n {
+        unsafe { *pipe_usize_at(host_link, z) = 0; }
+        z = z + 1;
+    }
+    let host_v: u32 = ctx.host_fid.v;
+    if host_v == 0u32 {
+        return;
+    }
+    let pfx = pipe_lit(mut_view(ctx.backend_arena), "__ax_host_");
+    let mut i: usize = 0;
+    while i < n {
+        let it = unsafe { *pipe_hir_item_ptr_at(cands, i) };
+        if (it as usize) != 0 && (unsafe { (*it).span.file.v }) != host_v {
+            let nm = interner_get(view(ctx.sess.interner), unsafe { (*it).name });
+            if nm.len > pfx.len && pipe_sv_starts_with(view(nm), view(pfx)) {
+                let rest = StrView { ptr: unsafe { nm.ptr + pfx.len }, len: nm.len - pfx.len };
+                let mut j: usize = 0;
+                while j < n {
+                    let hj = unsafe { *pipe_hir_item_ptr_at(cands, j) };
+                    if (hj as usize) != 0 && (unsafe { (*hj).span.file.v }) == host_v {
+                        let hn = interner_get(view(ctx.sess.interner), unsafe { (*hj).name });
+                        if sv_eq(view(hn), view(rest)) {
+                            unsafe { *pipe_usize_at(host_link, i) = j + 1; }
+                            break;
+                        }
+                    }
+                    j = j + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
 fn driver_emit_objmodel_filtered_ex(
     ctx: mut_view<PipelineCtx>,
     run_drop_elab: bool,
@@ -5831,16 +7084,30 @@ fn driver_emit_objmodel_filtered_ex(
                 pipe_mark_body_std_refs(std_sym_cap, std_sym_keys, std_sym_hit, b_ptr as *const MirBody);
                 bi = bi + 1;
             }
+            // ADR-0048 / ADR-0002 §3 (T423h): a call of the host intrinsic `X` (a `std.core.host` item, its body
+            // dropped for native code) is lowered to the symbol `__ax_host_X`, so the std provider function of that
+            // name is reached through the intrinsic: `host_link[ci]` = 1 + the candidate index of the intrinsic.
+            let host_link = arena_alloc_raw(
+                mut_view(ctx.backend_arena),
+                opts_mul_usize(std_cand_n, size_of<usize>()),
+                align_of<usize>()
+            ) as *mut usize;
+            pipe_link_host_providers(mut_view(*ctx), std_cands, std_cand_n, host_link);
             let mut added_std: bool = true;
             while added_std {
                 added_std = false;
                 let mut ci: usize = 0;
                 while ci < std_cand_n {
                     let sit = unsafe { *pipe_hir_item_ptr_at(std_cands, ci) };
+                    let hl: usize = unsafe { *pipe_usize_at(host_link, ci) };
+                    let via_host: bool = hl > 0 && pipe_std_sym_is_hit(
+                        std_sym_cap, std_sym_keys, std_sym_hit,
+                        unsafe { (*(*pipe_hir_item_ptr_at(std_cands, hl - 1))).symbol.v }
+                    );
                     if (sit as usize) != 0 &&
                        fn_count < fn_cap &&
                        pipe_items_tab_find(items_tab_cap, items_tab_keys, items_tab_vals, sit as *const HirItem) == 0u32 &&
-                       pipe_std_sym_is_hit(std_sym_cap, std_sym_keys, std_sym_hit, unsafe { (*sit).symbol.v }) {
+                       (via_host || pipe_std_sym_is_hit(std_sym_cap, std_sym_keys, std_sym_hit, unsafe { (*sit).symbol.v })) {
                         let sbody = pipe_build_item_body(
                             mut_view(*ctx), run_drop_elab, run_opt, sit, thir_ptr, hir_ptr, str_in_ptr, db_ptr
                         );
