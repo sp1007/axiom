@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T498b]
 priority: 10
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 480
 paths: [compiler/own/init.ax, compiler/own/move.ax, compiler/own/mod.ax, tests/ui/own_index_moved, tests/run/own_index_moved]
 locks: []
 spec: [spec/SPEC-10-ownership.md]
 covers: [REQ-TST-072]
+started: 2026-11-22 09:49:24
+agent: T498e-impl
 ---
 # T498e — An indexed write never re-initialises a moved array
 
@@ -75,3 +77,4 @@ index never re-initialises anything and requires the array place to be definitel
 
 ## Log
 - 2026-11-22 created by axiom-architect (triage-1122; T498b-qa follow-ups 1 and 2)
+- 2026-11-22 09:49:24 started (attempt 1) T498e-impl

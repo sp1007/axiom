@@ -36445,6 +36445,17 @@ fn check_expr_method_call(cx: mut_view<TypeckCtx>, expr: *const HirExpr, expecte
             let msp_f = unsafe { (*expr).span.file.v };
             let msp_s = unsafe { (*expr).span.start };
             let msp_e = unsafe { (*expr).span.end };
+            // T448 (T421 FU-5): `exec.spawn(Child {..}, f)` with `spawn<F: Future<Output = T>, T>` infers `T`
+            // from `Child`'s `Future` impl, as a free-function call does. `method_substs` holds the method's own
+            // parameters only, which is what the callee's bounds index when its impl has no generics.
+            if tc_enclosing_impl_generic_count(cx.hir, method_item as *const HirItem) == 0 {
+                check_future_bound_outputs_for_call(
+                    mut_view(*cx),
+                    method_item,
+                    method_substs,
+                    Span { file: (FileId { v: msp_f }), start: msp_s, end: msp_e }
+                );
+            }
             check_callable_bound_outputs_for_call(
                 mut_view(*cx),
                 method_item,
@@ -42157,16 +42168,33 @@ fn check_future_bound_outputs_for_call(
     if (gps as usize) == 0 || !fn_item_has_any_future_bound(view(*cx), fn_def) {
         return;
     }
+    // T448 (T422 FU-D): the type arguments belong to the caller. When one is a generic parameter of the
+    // caller (`F` with `F: Future<Output = i64>`), its output comes from the caller's bounds, so resolve every
+    // argument's `Future` output before switching to the callee's generic scope below.
+    let outs_bytes = mul_usize(cnt, size_of<TypeId>());
+    let outs = unsafe { arena_alloc_raw(mut_view((*cx.thir).interner.arena), outs_bytes, align_of<TypeId>()) as *mut TypeId };
+    let mut oi: usize = 0;
+    while oi < cnt {
+        let arg_ty0 = resolve_ty(mut_view(*cx), unsafe { *typeid_at(args, oi) });
+        let out0 = resolve_future_output_ty(mut_view(*cx), arg_ty0);
+        unsafe { (*typeid_at(outs, oi)).v = out0.v; }
+        oi = oi + 1;
+    }
     let save_fn = cx.current_fn;
+    let save_impl = cx.current_impl;
     let mut dummy_cnt: usize = 0;
     let _ = build_item_generic_param_args(mut_view(*cx), fn_def, mut_view(dummy_cnt));
     cx.current_fn = fn_def;
+    // The callee's parameters are numbered from 0 in `substs` (a free function, or a method of an impl without
+    // generics); the caller's generic impl must not shift them (`impl_n + i`) while its bounds are read.
+    if tc_enclosing_impl_generic_count(cx.hir, fn_def) == 0 {
+        cx.current_impl = 0 as *const HirItem;
+    }
 
     let mut idx: usize = 0;
     let mut gp: *mut HirGenericParam = unsafe { (*gps).params };
     while ((gp as usize) != 0) && idx < cnt {
-        let arg_ty = resolve_ty(mut_view(*cx), unsafe { *typeid_at(args, idx) });
-        let actual_out = resolve_future_output_ty(mut_view(*cx), arg_ty);
+        let actual_out = TypeId { v: unsafe { (*typeid_at(outs, idx)).v } };
         if actual_out.v != 0u32 {
             let mut b: *mut HirType = unsafe { (*gp).bounds };
             while ((b as usize) != 0) {
@@ -42221,6 +42249,7 @@ fn check_future_bound_outputs_for_call(
     }
 
     cx.current_fn = save_fn;
+    cx.current_impl = save_impl;
     if (save_fn as usize) != 0 {
         let mut restore_cnt: usize = 0;
         let _ = build_item_generic_param_args(mut_view(*cx), save_fn, mut_view(restore_cnt));
@@ -58935,6 +58964,12 @@ fn mb_build_control_or_call_expr(
         if mb_try_build_atomic_method_call(mut_view(*b), expr, method_item, mut_view(*dest), has_dest, view(sp)) {
             return;
         }
+        if (method_item as usize) != 0 {
+            let st_m = mb_static_trait_call_target(mut_view(*b), expr, method_item);
+            if (st_m as usize) != 0 {
+                method_item = st_m;
+            }
+        }
         if (method_item as usize) == 0 {
             let mvp = unsafe { thir_get_expr_variant(view(*b.thir), expr as *const HirExpr) };
             if (mvp as usize) != 0 && (unsafe { *mvp }) >= 256u32 {
@@ -60855,6 +60890,58 @@ fn mb_subst_self_op(thir: *mut Thir, op: *mut MirOperand, subst_args: view<Gener
 }
 
 // The trait that declares the fn symbol `sym_v` (its member in out_member), or null.
+// T448 (T422 FU-H): `T.tag()` — a trait member without `self` called through a type name. Typeck binds it to the
+// trait member (or, for a concrete-looking receiver, to the first impl member of that name); once the receiver
+// type is known (a concrete type, or a type parameter after substitution in a monomorphised body) the call
+// belongs to that type's impl member. Returns null when nothing has to change.
+fn mb_static_trait_call_target(b: mut_view<MirBuilder>, expr: *mut HirExpr, method_item: *mut HirItem) -> *mut HirItem {
+    if (method_item as usize) == 0 || (b.hir as usize) == 0 || (b.str_in as usize) == 0 || (b.db as usize) == 0 {
+        return 0 as *mut HirItem;
+    }
+    let recv: *mut HirExpr = unsafe { (*expr).receiver };
+    if (recv as usize) == 0 || (unsafe { (*recv).kind }) != HIR_EXPR_PATH {
+        return 0 as *mut HirItem;
+    }
+    if (unsafe { (*method_item).kind }) != HIR_ITEM_FN || mb_tm_has_self(view(*b), method_item as *const HirItem) {
+        return 0 as *mut HirItem;
+    }
+    let mut tr = mb_owner_trait_of_member(b.thir as *const Thir, b.hir, b.str_in as *const StrInterner, method_item);
+    if (tr as usize) == 0 {
+        let mut it: *mut HirItem = unsafe { (*b.hir).items };
+        while (it as usize) != 0 && (tr as usize) == 0 {
+            let tp: *mut HirType = unsafe { (*it).trait_path };
+            if (unsafe { (*it).kind }) == HIR_ITEM_IMPL && (tp as usize) != 0 {
+                let mut m: *mut HirItem = unsafe { (*it).members };
+                while (m as usize) != 0 {
+                    if (m as usize) == (method_item as usize) {
+                        tr = unsafe { find_trait_by_type_path(view(*b.hir), tp, view(*b.str_in), view(*b.db)) };
+                        break;
+                    }
+                    m = unsafe { (*m).next };
+                }
+            }
+            it = unsafe { (*it).next };
+        }
+    }
+    if (tr as usize) == 0 {
+        return 0 as *mut HirItem;
+    }
+    let recv_ty = mb_expr_ty(mut_view(*b), recv);
+    if recv_ty.v == 0u32 {
+        return 0 as *mut HirItem;
+    }
+    let probe = TypeId { v: recv_ty.v };
+    if unsafe { type_contains_param(view((*b.thir).interner), probe) } {
+        return 0 as *mut HirItem;
+    }
+    let name_v = mb_orig_fn_name_v(b.thir as *const Thir, method_item as *const HirItem);
+    let m = mb_impl_member_for(view(*b), tr, name_v, recv_ty.v);
+    if (m as usize) == 0 || (m as usize) == (method_item as usize) {
+        return 0 as *mut HirItem;
+    }
+    m
+}
+
 fn mb_trait_of_member(hir: *const HirFile, sym_v: u32, out_member: mut_view<*mut HirItem>) -> *mut HirItem {
     let mut it: *mut HirItem = unsafe { (*hir).items };
     while (it as usize) != 0 {
