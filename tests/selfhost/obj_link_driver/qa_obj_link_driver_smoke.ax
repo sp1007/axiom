@@ -26651,6 +26651,38 @@ pub fn type_contains_param(ti: view<TypeInterner>, ty: TypeId) -> bool {
         }
         return false;
     }
+    if tk == TY_CLOSURE {
+        let ccount = unsafe { (*t).capture_count };
+        let caps = unsafe { (*t).captures };
+        if (caps as usize) != 0 {
+            let mut c: usize = 0;
+            while (c < ccount) {
+                let cap = unsafe { capture_at(caps, c) };
+                let cty_v = unsafe { (*cap).ty.v };
+                if type_contains_param(ti, (TypeId { v: cty_v })) {
+                    return true;
+                }
+                c = c + 1;
+            }
+        }
+        let pcount = unsafe { (*t).param_count };
+        let params = unsafe { (*t).param_types };
+        if (params as usize) != 0 {
+            let mut i: usize = 0;
+            while (i < pcount) {
+                let pv = unsafe { (*typeid_at(params, i)).v };
+                if type_contains_param(ti, (TypeId { v: pv })) {
+                    return true;
+                }
+                i = i + 1;
+            }
+        }
+        let rv = unsafe { (*t).ret_type.v };
+        if rv != 0u32 && type_contains_param(ti, (TypeId { v: rv })) {
+            return true;
+        }
+        return false;
+    }
     false
 }
 
@@ -26934,6 +26966,10 @@ fn subst_ty_adt(
     subst_ty_enum_or_closure(mut_view(*ti), ty_v, t, tk, args, self_v)
 }
 
+fn mono_cid_mix(h: u32, v: u32) -> u32 {
+    ((((h as u64) * 31u64) & 0xFFFFFFFFu64) as u32) ^ v
+}
+
 fn subst_ty_enum_or_closure(
     ti: mut_view<TypeInterner>,
     ty_v: u32,
@@ -27063,7 +27099,7 @@ fn subst_ty_enum_or_closure(
                 if sub_cty.v != orig_cty_v {
                     changed = true;
                 }
-                cid_mix = (cid_mix * 31u32) ^ sub_cty.v;
+                cid_mix = mono_cid_mix(cid_mix, sub_cty.v);
                 unsafe {
                     (*dst_cap).sym.v = (*src_cap).sym.v;
                     (*dst_cap).mode = (*src_cap).mode;
@@ -27086,7 +27122,7 @@ fn subst_ty_enum_or_closure(
                 if sub_p.v != orig_pv {
                     changed = true;
                 }
-                cid_mix = (cid_mix * 31u32) ^ sub_p.v;
+                cid_mix = mono_cid_mix(cid_mix, sub_p.v);
                 unsafe {
                     (*typeid_at(new_params, i)).v = sub_p.v;
                 }
@@ -27096,7 +27132,7 @@ fn subst_ty_enum_or_closure(
         let new_ret = subst_ty_self(mut_view(*ti), TypeId { v: orig_ret_v }, args, self_v);
         if new_ret.v != orig_ret_v {
             changed = true;
-            cid_mix = (cid_mix * 31u32) ^ new_ret.v;
+            cid_mix = mono_cid_mix(cid_mix, new_ret.v);
         }
         let new_fn = subst_ty_self(mut_view(*ti), TypeId { v: orig_fn_v }, args, self_v);
         if new_fn.v != orig_fn_v {
@@ -59535,6 +59571,140 @@ fn mb_redirect_generic_fn_const(
     }
 }
 
+// T423a (SPEC-12 AXS-DROP-005): lowers `drop_in_place<T>(p)` for any concrete `T` that needs drop
+// into `_ptr = p; drop(*_ptr) -> next_bb` so `mir_drop_elaborate` emits the full recursive drop glue
+// (own `Drop` impl first, then fields/captures/elements/variants) for both interp and native.
+// Returns false when `T` still contains generic parameters or does not need drop (keeping the no-op builtin).
+fn mb_try_build_drop_in_place(
+    b: mut_view<MirBuilder>,
+    expr: *mut HirExpr,
+    callee_expr: *mut HirExpr,
+    dest: mut_view<MirPlace>,
+    has_dest: bool,
+    sp: view<Span>
+) -> bool {
+    let substs = unsafe { ptr_substmap_get(view((*b.thir).expr_substs), callee_expr as usize) };
+    let mut t_id = if (substs as usize) != 0 && (unsafe { (*substs).count }) > 0 {
+        mb_resolve_ty(mut_view(*b), TypeId { v: unsafe { (*typeid_at((*substs).args, 0)).v } })
+    } else {
+        TypeId { v: 0u32 }
+    };
+    let arg0: *mut HirExpr = unsafe { (*expr).args };
+    if t_id.v == 0u32 && (arg0 as usize) != 0 {
+        let a0_ty = mb_expr_ty(mut_view(*b), arg0);
+        let at0 = unsafe { type_get(view((*b.thir).interner), a0_ty) };
+        if (at0 as usize) != 0 && (unsafe { (*at0).kind }) == TY_PTR {
+            t_id = mb_resolve_ty(mut_view(*b), TypeId { v: unsafe { (*at0).pointee.v } });
+        }
+    }
+    if t_id.v == 0u32 || (arg0 as usize) == 0 {
+        return false;
+    }
+    let has_param = unsafe { type_contains_param(view((*b.thir).interner), (TypeId { v: t_id.v })) };
+    if has_param {
+        return false;
+    }
+    let needs_d = unsafe { mir_type_needs_drop_in((TypeId { v: t_id.v }), view(*b.thir), view(*b.hir), b.db, view(*b.str_in)) };
+    if !needs_d {
+        return false;
+    }
+
+    let mut op_a = mb_intr_copy_op(mir_local_place(0u32));
+    mb_build_expr_as_operand(mut_view(*b), arg0, mut_view(op_a));
+    if b.is_diverged {
+        return true;
+    }
+
+    let ptr_ty = unsafe { intern_ptr_ty(mut_view((*b.thir).interner), TypeId { v: t_id.v }, true) };
+    let ptr_loc = mb_new_temp(mut_view(*b), TypeId { v: ptr_ty.v }, view(*sp));
+    let ptr_pl = mir_local_place(ptr_loc.v);
+
+    let op_ty = if op_a.kind == MIR_OP_CONST {
+        TypeId { v: op_a.constant.ty.v }
+    } else {
+        unsafe { mir_drop_place_type(view(*b.body), view(*b.thir), view(op_a.place)) }
+    };
+    if op_ty.v == 0u32 || op_ty.v == ptr_ty.v {
+        mb_emit_assign_use(mut_view(*b), view(ptr_pl), view(op_a), view(*sp));
+    } else {
+        let mut cast_rv = MirRvalue {
+            kind: MIR_RVALUE_CAST,
+            use_op: mb_intr_copy_op(mir_local_place(0u32)),
+            repeat_count: 0u64,
+            repeat_count_op: 0 as *mut MirOperand,
+            borrow_kind: MIR_BORROW_SHARED,
+            place: mir_local_place(0u32),
+            cast_kind: MIR_CAST_PTR_TO_PTR,
+            target_ty: TypeId { v: ptr_ty.v },
+            bin_op: MIR_BINOP_ADD,
+            lhs: mb_intr_copy_op(mir_local_place(0u32)),
+            rhs: mb_intr_copy_op(mir_local_place(0u32)),
+            un_op: MIR_UNOP_NOT,
+            variant_idx: 0u32,
+            operands: 0 as *mut MirOperand,
+            operand_count: 0,
+        };
+        mir_copy_operand(mut_view(cast_rv.use_op), view(op_a));
+        mb_emit_assign(mut_view(*b), view(ptr_pl), view(cast_rv), view(*sp));
+    }
+
+    let deref_proj = MirProjection {
+        kind: MIR_PROJ_DEREF,
+        field_idx: 0u32,
+        index_local: MirLocalId { v: 0u32 },
+        from_local: MirLocalId { v: 0u32 },
+        to_local: MirLocalId { v: 0u32 },
+        has_from: false,
+        has_to: false,
+        variant_idx: 0u32,
+    };
+    let mut deref_pl = mir_local_place(0u32);
+    unsafe {
+        mir_place_append_proj(mut_view(*b.arena), view(ptr_pl), view(deref_proj), mut_view(deref_pl));
+    }
+
+    let next_bb = mb_new_bb(mut_view(*b), false);
+    let bb = unsafe { mir_bb_at((*b.body).bbs, b.curr_bb.v as usize) };
+    unsafe {
+        mir_term_zero(mut_view((*bb).terminator), MIR_TERM_DROP);
+        (*bb).terminator.span.file.v = sp.file.v;
+        (*bb).terminator.span.start = sp.start;
+        (*bb).terminator.span.end = sp.end;
+        (*bb).terminator.location.file.v = sp.file.v;
+        (*bb).terminator.location.start = sp.start;
+        (*bb).terminator.location.end = sp.end;
+        mir_copy_place(mut_view((*bb).terminator.drop_place), view(deref_pl));
+        (*bb).terminator.drop_place.drop_flag = MIR_DROP_FLAG_NONE;
+        (*bb).terminator.drop_target.v = next_bb.v;
+        (*bb).terminator.drop_unwind.v = 0u32;
+        (*bb).terminator.drop_is_explicit = false;
+        (*bb).has_terminator = true;
+    }
+    b.curr_bb.v = next_bb.v;
+    b.is_diverged = false;
+    if has_dest {
+        let unit_rv = MirRvalue {
+            kind: MIR_RVALUE_AGGREGATE,
+            use_op: mb_intr_copy_op(mir_local_place(0u32)),
+            repeat_count: 0u64,
+            repeat_count_op: 0 as *mut MirOperand,
+            borrow_kind: MIR_BORROW_SHARED,
+            place: mir_local_place(0u32),
+            cast_kind: MIR_CAST_INT_TO_INT,
+            target_ty: TypeId { v: 0u32 },
+            bin_op: MIR_BINOP_ADD,
+            lhs: mb_intr_copy_op(mir_local_place(0u32)),
+            rhs: mb_intr_copy_op(mir_local_place(0u32)),
+            un_op: MIR_UNOP_NOT,
+            variant_idx: 0u32,
+            operands: 0 as *mut MirOperand,
+            operand_count: 0,
+        };
+        mb_emit_assign(mut_view(*b), view(*dest), view(unit_rv), view(*sp));
+    }
+    true
+}
+
 fn mb_build_control_or_call_expr(
     b: mut_view<MirBuilder>,
     expr: *mut HirExpr,
@@ -59933,6 +60103,11 @@ fn mb_build_control_or_call_expr(
                         mb_emit_assign(mut_view(*b), view(*dest), view(rv), view(sp));
                     }
                     return;
+                }
+                if ck == TY_BUILTIN_DROP_IN_PLACE {
+                    if mb_try_build_drop_in_place(mut_view(*b), expr, callee_expr, mut_view(*dest), has_dest, view(sp)) {
+                        return;
+                    }
                 }
             }
         }
@@ -95048,7 +95223,7 @@ fn resolve_or_build_mir_body(ctx: mut_view<InterpCtx>, func: *mut HirItem) -> *m
             let msym = unsafe { (*inst).mangled_sym.v };
             if nitem == func || (sym_v != 0u32 && msym == sym_v) {
                 let mb_ptr = unsafe { (*inst).mir_body as *mut MirBody };
-                if (mb_ptr as usize) != 0 {
+                if (mb_ptr as usize) > 1 {
                     body = mb_ptr;
                 } else {
                     let target_fn = if (nitem as usize) != 0 { nitem } else { oitem };

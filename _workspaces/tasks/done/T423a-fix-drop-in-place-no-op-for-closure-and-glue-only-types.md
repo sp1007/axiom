@@ -8,7 +8,7 @@ model: opus
 gate_model: sonnet
 depends: [T423]
 priority: 30
-status: doing
+status: done
 attempts: 1
 timeout_min: 480
 paths: [tests/run/drop_in_place_glue]
@@ -16,7 +16,7 @@ locks: [compiler/mir/builder.ax, compiler/interp/interp.ax, compiler/lir/builder
 spec: [spec/SPEC-12-drop.md, spec/SPEC-10-ownership.md, spec/SPEC-34-executors-fibers.md, spec/decisions/ADR-0046-t423-fiber-followups-and-tracked-xfail.md]
 covers: [REQ-TST-072]
 started: 2026-11-22 17:39:55
-agent: t423a-impl
+finished: 2026-11-22 19:59:15
 ---
 # T423a — `drop_in_place<T>` runs the full drop glue
 
@@ -59,3 +59,4 @@ pointers (boxed closures in `std.fiber`, `std.thread`, containers holding tuples
 ## Log
 - 2026-11-21 created by axiom-architect (triage-t423, ADR-0046; T423 QA F1 / follow-up 1)
 - 2026-11-22 17:39:55 started (attempt 1) t423a-impl
+- 2026-11-22 19:59:15 accepted by QA -> done

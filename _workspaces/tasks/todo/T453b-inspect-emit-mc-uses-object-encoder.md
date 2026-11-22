@@ -8,12 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T453, T498a]
 priority: 50
-status: todo
-attempts: 0
+status: blocked
+attempts: 1
 paths: [compiler/target/x64/frame.ax, tests/mc]
 locks: []
 spec: [spec/SPEC-26-windows-artifact-kinds.md]
 covers: [REQ-TST-072]
+started: 2026-11-22 19:25:46
 ---
 # T453b — One encoder for `--emit=mc` and object code
 
@@ -46,3 +47,5 @@ miscompiles.
 
 ## Log
 - 2026-11-22 created by axiom-architect (triage-1122; T498a and T453 follow-ups)
+- 2026-11-22 19:25:46 started (attempt 1) t453b-impl
+- 2026-11-22 19:56:24 block: needs paths widened: 5 selfhost template/generator inputs hardcode legacy axiom0 emit_mc.c bytes
