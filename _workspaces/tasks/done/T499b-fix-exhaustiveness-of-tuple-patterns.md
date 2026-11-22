@@ -8,7 +8,7 @@ model: opus
 gate_model: sonnet
 depends: [T499a, T498g]
 priority: 18
-status: doing
+status: done
 attempts: 1
 timeout_min: 480
 paths: [compiler/types/exhaust.ax, compiler/types/typeck.ax, tests/ui/exhaust_tuple, tests/run/exhaust_tuple, tests/run/tuple_expr_names/match_and_destructure.ax, tests/std/num/static_dispatch_xfail.ax]
@@ -17,7 +17,7 @@ spec: [spec/SPEC-02-grammar.md, spec/SPEC-03-core-semantics.md]
 covers: [REQ-TST-072]
 started: 2026-11-22 20:33:29
 unblocks: 1
-agent: t499b-impl
+finished: 2026-11-22 22:24:49
 ---
 # T499b — Tuple patterns in the exhaustiveness checker
 
@@ -78,3 +78,4 @@ only referenced under `if false {}`. So:
 - 2026-11-22 11:35:28 block: needs 5-line change in compiler/types/typeck.ax (live checker tc_match_check_exhaustiveness bypasses exhaust.ax); typeck.ax held by T498g; patch ready at _workspaces/T499b-typeck.patch
 - 2026-11-22 11:37:00 unblocked (cycle 1) 
 - 2026-11-22 20:33:29 started (attempt 1) t499b-impl
+- 2026-11-22 22:24:49 accepted by QA -> done

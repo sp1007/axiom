@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T445, T444b, T423]
 priority: 25
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 480
 paths: [tests/run/drop_arm_scope]
-locks: [compiler/mir/builder.ax, compiler/own, compiler/interp/interp.ax, tests/std/async/structured/gen_tests.py, tests/std/async/structured/src/resource_governor_limits.axsrc, tests/std/async/structured/resource_governor_limits.ax, tests/std/fiber/gen_tests.py]
+locks: [compiler/mir/builder.ax, compiler/mir/drop.ax, compiler/own, compiler/interp/interp.ax, tests/std/async/structured/gen_tests.py, tests/std/async/structured/src/resource_governor_limits.axsrc, tests/std/async/structured/resource_governor_limits.ax, tests/std/fiber/gen_tests.py, tests/run/own_mut_view_fields/match_field_reinit_drop.ax, tests/run/pattern_multi_binding/qa_adv_drop_paths.ax, tests/ui/own_mut_view_receiver/qa_guard_arm_view_place_move.ax]
 spec: [spec/SPEC-12-drop.md, spec/SPEC-10-ownership.md, spec/decisions/ADR-0047-match-arm-binding-drop-scope.md]
 covers: [REQ-TST-072]
+started: 2026-11-22 21:56:23
+agent: t445a-impl
 ---
 # T445a — Drop pattern bindings at the end of their arm
 
@@ -58,3 +60,5 @@ deviation 2; T423 QA). Interp, native and native-O1 agree, so the fix is in MIR 
 
 ## Log
 - 2026-11-21 created by axiom-architect (triage-t423 item 5, ADR-0047; T445 report deviation 2, T444b F2, T423 QA)
+- 2026-11-22 22:18 orchestrator: widened `locks:` with `compiler/mir/drop.ax` (partial-move drop flags per AXS-DROP-009 §5) and 3 existing tests pinning pre-ADR-0047 drop/guard-move behavior (`match_field_reinit_drop.ax`, `qa_adv_drop_paths.ax`, `qa_guard_arm_view_place_move.ax`); disjoint from all active tasks.
+- 2026-11-22 21:56:23 started (attempt 1) t445a-impl

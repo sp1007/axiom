@@ -10723,8 +10723,11 @@ use compiler.hir.hir.HIR_PAT_OR
 use compiler.hir.hir.HIR_PAT_PATH
 use compiler.hir.hir.HIR_PAT_RANGE
 use compiler.hir.hir.HIR_PAT_STRUCT
+use compiler.hir.hir.HIR_PAT_TUPLE
 use compiler.hir.hir.HIR_PAT_WILDCARD
 use compiler.hir.hir.HirExpr
+use compiler.hir.hir.HirFieldDecl
+use compiler.hir.hir.HirPatField
 use compiler.hir.hir.HirItem
 use compiler.hir.hir.HirMatchArm
 use compiler.hir.hir.HirPat
@@ -10744,9 +10747,16 @@ use compiler.types.types.TY_U64
 use compiler.types.types.TY_USIZE
 use compiler.types.types.TY_I128
 use compiler.types.types.TY_U128
+use compiler.types.types.TY_STRUCT
+use compiler.types.types.TY_TUPLE
+use compiler.types.types.AxType
 use compiler.types.types.Thir
 use compiler.types.types.mul_usize
+use compiler.types.types.thir_get_pat_variant
 use compiler.types.types.type_get
+use compiler.types.types.typeid_at
+use compiler.types.types.typeid_ptr_at
+use compiler.types.types.usize_at
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 @intrinsic fn align_of<T>() -> usize { 0 }
@@ -11026,6 +11036,11 @@ pub fn match_check_exhaustiveness(
         return;
     }
     if (unsafe { (*expr).kind }) != HIR_EXPR_MATCH {
+        return;
+    }
+
+    // T499b: tuple scrutinees go through the column-wise usefulness algorithm below.
+    if match_check_tuple_exhaustiveness(mut_view(*thir), mut_view(*sink), expr, (TypeId { v: val_ty.v })) {
         return;
     }
 
@@ -11357,6 +11372,742 @@ fn match_check_exhaust_bool_or_enum(
         return;
     }
     emit_pat_non_exhaustive(mut_view(*sink), expr_file_v, expr_start, expr_end);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// T499b: column-wise usefulness (Maranget, "Warnings for pattern matching") for tuple scrutinees.
+//
+// A matrix row is a vector of patterns, one per column; a null pattern pointer is a wildcard (fields introduced
+// by specialisation). Each column has a type that decides its constructor family:
+//   SINGLE  tuple / struct      one constructor, one field per element / declared field
+//   BOOL    bool                constructors `false` (0) and `true` (1)
+//   ENUM    enum                one constructor per variant (index from thir pat_variants), fields = payload
+//   INT     <= 64-bit ints/char literal and range patterns as intervals, split into disjoint segments
+//   OPAQUE  anything else       (i128/u128, unresolved, pointers, ...) only wildcards/bindings cover it
+// `useful(P, q)` is true when some value matches q and no row of P. A match is non-exhaustive iff `[_]` is
+// useful against its unguarded arms; an arm alternative is unreachable iff it is not useful against the
+// unguarded alternatives before it. Anything the checker cannot classify is treated conservatively: an unknown
+// pattern in P covers nothing, an unknown pattern in q is assumed useful (no false unreachable warning).
+// ---------------------------------------------------------------------------------------------------------------
+
+const EXC_OPAQUE: u8 = 0u8;
+const EXC_SINGLE: u8 = 1u8;
+const EXC_BOOL: u8 = 2u8;
+const EXC_ENUM: u8 = 3u8;
+const EXC_INT: u8 = 4u8;
+
+const EXH_WILD: u8 = 0u8;
+const EXH_CTOR: u8 = 1u8;
+const EXH_RANGE: u8 = 2u8;
+const EXH_UNKNOWN: u8 = 3u8;
+const EXH_OR: u8 = 4u8;
+const EXH_EMPTY: u8 = 5u8;
+
+const EX_MAX_DEPTH: u32 = 200u32;
+
+@derive(Copy)
+struct ExHead {
+    kind: u8,
+    ctor: usize,
+    lo: u64,
+    hi: u64,
+}
+
+@derive(Copy)
+struct ExCol {
+    cat: u8,
+    t: *mut AxType,
+    dom_lo: u64,
+    dom_hi: u64,
+    is_signed: bool,
+}
+
+@derive(Copy)
+struct ExMat {
+    cells: *mut usize,
+    n: usize,
+    w: usize,
+}
+
+fn ex_alloc(thir: mut_view<Thir>, count: usize) -> *mut usize {
+    let c = if count > 0 { count } else { 1 };
+    arena_alloc_raw(mut_view(thir.interner.arena), mul_usize(c, size_of<usize>()), align_of<usize>()) as *mut usize
+}
+
+fn ex_get(base: *mut usize, idx: usize) -> usize {
+    unsafe { *usize_at(base, idx) }
+}
+
+fn ex_set(base: *mut usize, idx: usize, v: usize) {
+    unsafe { *usize_at(base, idx) = v; }
+}
+
+// Integer domain in the biased (order-preserving unsigned) encoding: signed values are XORed with the sign bit.
+fn ex_int_width(tk: u8) -> u32 {
+    if tk == TY_I8 || tk == TY_U8 { return 8u32; }
+    if tk == TY_I16 || tk == TY_U16 { return 16u32; }
+    if tk == TY_I32 || tk == TY_U32 { return 32u32; }
+    if tk == TY_I64 || tk == TY_U64 || tk == TY_ISIZE || tk == TY_USIZE { return 64u32; }
+    0u32
+}
+
+fn ex_half(w: u32) -> u64 {
+    if w == 8u32 { return 0x80u64; }
+    if w == 16u32 { return 0x8000u64; }
+    if w == 32u32 { return 0x80000000u64; }
+    0x8000000000000000u64
+}
+
+fn ex_col(thir: mut_view<Thir>, ty_v: usize) -> ExCol {
+    let mut c = ExCol { cat: EXC_OPAQUE, t: 0 as *mut AxType, dom_lo: 0u64, dom_hi: 0u64, is_signed: false };
+    if ty_v == 0 {
+        return c;
+    }
+    let t = type_get(view(thir.interner), TypeId { v: ty_v as u32 });
+    if (t as usize) == 0 {
+        return c;
+    }
+    c.t = t;
+    let tk = unsafe { (*t).kind };
+    if tk == TY_TUPLE || tk == TY_STRUCT {
+        c.cat = EXC_SINGLE;
+    } else if tk == TY_BOOL {
+        c.cat = EXC_BOOL;
+    } else if tk == TY_ENUM {
+        c.cat = EXC_ENUM;
+    } else if tk == TY_CHAR {
+        c.cat = EXC_INT;
+        c.dom_lo = 0u64;
+        c.dom_hi = 0x10ffffu64;
+    } else {
+        let w = ex_int_width(tk);
+        if w != 0u32 {
+            c.cat = EXC_INT;
+            let half = ex_half(w);
+            if exhaust_is_signed_kind(tk) {
+                c.is_signed = true;
+                c.dom_lo = 0x8000000000000000u64 - half;
+                c.dom_hi = 0x7fffffffffffffffu64 + half;
+            } else {
+                c.dom_lo = 0u64;
+                c.dom_hi = if w == 64u32 { 0xffffffffffffffffu64 } else { half + half - 1u64 };
+            }
+        }
+    }
+    c
+}
+
+fn ex_head(thir: mut_view<Thir>, col: ExCol, pat: *const HirPat) -> ExHead {
+    let mut h = ExHead { kind: EXH_UNKNOWN, ctor: 0, lo: 0u64, hi: 0u64 };
+    if (pat as usize) == 0 {
+        h.kind = EXH_WILD;
+        return h;
+    }
+    let pk = unsafe { (*pat).kind };
+    if pk == HIR_PAT_WILDCARD || pk == HIR_PAT_BINDING {
+        h.kind = EXH_WILD;
+        return h;
+    }
+    if pk == HIR_PAT_OR {
+        h.kind = EXH_OR;
+        return h;
+    }
+    if col.cat == EXC_SINGLE {
+        let tk = unsafe { (*col.t).kind };
+        if (tk == TY_TUPLE && pk == HIR_PAT_TUPLE) || (tk == TY_STRUCT && (pk == HIR_PAT_STRUCT || pk == HIR_PAT_PATH)) {
+            h.kind = EXH_CTOR;
+        }
+        return h;
+    }
+    if col.cat == EXC_BOOL {
+        if pk == HIR_PAT_LITERAL {
+            let tok_k = unsafe { (*pat).tok.kind };
+            if tok_k == TOK_KW_TRUE {
+                h.kind = EXH_CTOR;
+                h.ctor = 1;
+            } else if tok_k == TOK_KW_FALSE {
+                h.kind = EXH_CTOR;
+                h.ctor = 0;
+            }
+        }
+        return h;
+    }
+    if col.cat == EXC_ENUM {
+        if pk == HIR_PAT_PATH || pk == HIR_PAT_STRUCT {
+            let vp = thir_get_pat_variant(view(*thir), pat);
+            if (vp as usize) != 0 {
+                let vi = (unsafe { *vp }) as usize;
+                if (vi < unsafe { (*col.t).variant_count }) {
+                    h.kind = EXH_CTOR;
+                    h.ctor = vi;
+                }
+            }
+        }
+        return h;
+    }
+    if col.cat == EXC_INT {
+        let mut iv = PatInterval128 { start_lo: 0u64, start_hi: 0u64, end_lo: 0u64, end_hi: 0u64 };
+        if get_pat_interval_128(pat, col.is_signed, mut_view(iv)) {
+            let mut lo = iv.start_lo;
+            let mut hi = iv.end_lo;
+            let empty128 = !exhaust_u128_le(iv.start_lo, iv.start_hi, iv.end_lo, iv.end_hi, col.is_signed);
+            if col.is_signed {
+                lo = lo ^ 0x8000000000000000u64;
+                hi = hi ^ 0x8000000000000000u64;
+            }
+            if (lo < col.dom_lo) { lo = col.dom_lo; }
+            if hi > col.dom_hi { hi = col.dom_hi; }
+            if empty128 || lo > hi {
+                h.kind = EXH_EMPTY;
+            } else {
+                h.kind = EXH_RANGE;
+                h.lo = lo;
+                h.hi = hi;
+            }
+        }
+        return h;
+    }
+    h
+}
+
+fn ex_arity(col: ExCol, ctor: usize) -> usize {
+    if col.cat == EXC_SINGLE {
+        return unsafe { (*col.t).field_count };
+    }
+    if col.cat == EXC_ENUM {
+        let counts = unsafe { (*col.t).variant_field_counts };
+        if (counts as usize) == 0 { return 0; }
+        return unsafe { *usize_at(counts, ctor) };
+    }
+    0
+}
+
+fn ex_field_ty(col: ExCol, ctor: usize, i: usize) -> usize {
+    if col.cat == EXC_SINGLE {
+        let f = unsafe { (*col.t).fields };
+        if (f as usize) == 0 { return 0; }
+        return (unsafe { (*typeid_at(f, i)).v }) as usize;
+    }
+    if col.cat == EXC_ENUM {
+        let vf = unsafe { (*col.t).variant_fields };
+        if (vf as usize) == 0 { return 0; }
+        let row = unsafe { *typeid_ptr_at(vf, ctor) };
+        if (row as usize) == 0 { return 0; }
+        return (unsafe { (*typeid_at(row, i)).v }) as usize;
+    }
+    0
+}
+
+fn ex_nth_pat(first: *const HirPat, i: usize) -> *const HirPat {
+    let mut p = first;
+    let mut k: usize = 0;
+    while ((p as usize) != 0 && k < i) {
+        p = unsafe { (*p).next as *const HirPat };
+        k = k + 1;
+    }
+    p
+}
+
+fn ex_nth_field_decl(first: *const HirFieldDecl, i: usize) -> *const HirFieldDecl {
+    let mut f = first;
+    let mut k: usize = 0;
+    while ((f as usize) != 0 && k < i) {
+        f = unsafe { (*f).next as *const HirFieldDecl };
+        k = k + 1;
+    }
+    f
+}
+
+// The sub-pattern a struct-like pattern gives the declared field `decl`; null (wildcard) when it is not named.
+fn ex_named_field_pat(pat: *const HirPat, decl: *const HirFieldDecl) -> *const HirPat {
+    if (decl as usize) == 0 {
+        return 0 as *const HirPat;
+    }
+    let want = unsafe { (*decl).name.v };
+    let mut pf = unsafe { (*pat).fields as *const HirPatField };
+    while ((pf as usize) != 0) {
+        if (unsafe { (*pf).name.v }) == want {
+            return unsafe { (*pf).pat as *const HirPat };
+        }
+        pf = unsafe { (*pf).next as *const HirPatField };
+    }
+    0 as *const HirPat
+}
+
+// Sub-pattern of `pat` for field `i` of the constructor `ctor`; null means wildcard.
+fn ex_sub_pat(col: ExCol, ctor: usize, pat: *const HirPat, i: usize) -> *const HirPat {
+    if (pat as usize) == 0 {
+        return 0 as *const HirPat;
+    }
+    let pk = unsafe { (*pat).kind };
+    if pk == HIR_PAT_WILDCARD || pk == HIR_PAT_BINDING {
+        return 0 as *const HirPat;
+    }
+    if pk == HIR_PAT_TUPLE {
+        return ex_nth_pat(unsafe { (*pat).elems as *const HirPat }, i);
+    }
+    if col.cat == EXC_SINGLE && pk == HIR_PAT_STRUCT {
+        let def = unsafe { (*col.t).def as *const HirItem };
+        if (def as usize) == 0 { return 0 as *const HirPat; }
+        let fd = ex_nth_field_decl(unsafe { (*def).struct_fields as *const HirFieldDecl }, i);
+        return ex_named_field_pat(pat, fd);
+    }
+    if col.cat == EXC_ENUM {
+        if pk == HIR_PAT_PATH {
+            let payload = unsafe { (*pat).payload as *const HirPat };
+            if (payload as usize) == 0 { return 0 as *const HirPat; }
+            if (unsafe { (*payload).kind }) == HIR_PAT_TUPLE {
+                return ex_nth_pat(unsafe { (*payload).elems as *const HirPat }, i);
+            }
+            if i == 0 { return payload; }
+            return 0 as *const HirPat;
+        }
+        if pk == HIR_PAT_STRUCT {
+            let def = unsafe { (*col.t).def as *const HirItem };
+            if (def as usize) == 0 { return 0 as *const HirPat; }
+            let mut v = unsafe { (*def).variants as *const HirVariantDecl };
+            let mut k: usize = 0;
+            while ((v as usize) != 0 && k < ctor) {
+                v = unsafe { (*v).next as *const HirVariantDecl };
+                k = k + 1;
+            }
+            if (v as usize) == 0 { return 0 as *const HirPat; }
+            let fd = ex_nth_field_decl(unsafe { (*v).struct_fields as *const HirFieldDecl }, i);
+            return ex_named_field_pat(pat, fd);
+        }
+    }
+    0 as *const HirPat
+}
+
+fn ex_is_or(pat: *const HirPat) -> bool {
+    (pat as usize) != 0 && (unsafe { (*pat).kind }) == HIR_PAT_OR
+}
+
+// Number of leaf alternatives of a (possibly nested) or-pattern.
+fn ex_or_count(pat: *const HirPat) -> usize {
+    if !ex_is_or(pat) {
+        return 1;
+    }
+    let mut n: usize = 0;
+    let mut p = unsafe { (*pat).pats as *const HirPat };
+    while ((p as usize) != 0) {
+        n = n + ex_or_count(p);
+        p = unsafe { (*p).next as *const HirPat };
+    }
+    n
+}
+
+fn ex_or_fill(pat: *const HirPat, out: *mut usize, idx: mut_view<usize>) {
+    if !ex_is_or(pat) {
+        ex_set(out, *idx, pat as usize);
+        *idx = *idx + 1;
+        return;
+    }
+    let mut p = unsafe { (*pat).pats as *const HirPat };
+    while ((p as usize) != 0) {
+        ex_or_fill(p, out, mut_view(*idx));
+        p = unsafe { (*p).next as *const HirPat };
+    }
+}
+
+// Expand or-patterns in column 0 into one row per alternative.
+fn ex_expand_or(thir: mut_view<Thir>, m: ExMat) -> ExMat {
+    let mut total: usize = 0;
+    let mut has_or = false;
+    let mut r: usize = 0;
+    while (r < m.n) {
+        let p = ex_get(m.cells, r * m.w) as *const HirPat;
+        if ex_is_or(p) { has_or = true; }
+        total = total + ex_or_count(p);
+        r = r + 1;
+    }
+    if !has_or {
+        return m;
+    }
+    let cells = ex_alloc(mut_view(*thir), total * m.w);
+    let leaves = ex_alloc(mut_view(*thir), total);
+    let mut out_r: usize = 0;
+    r = 0;
+    while (r < m.n) {
+        let p = ex_get(m.cells, r * m.w) as *const HirPat;
+        let mut nl: usize = 0;
+        ex_or_fill(p, leaves, mut_view(nl));
+        let mut l: usize = 0;
+        while (l < nl) {
+            ex_set(cells, out_r * m.w, ex_get(leaves, l));
+            let mut c: usize = 1;
+            while (c < m.w) {
+                ex_set(cells, out_r * m.w + c, ex_get(m.cells, r * m.w + c));
+                c = c + 1;
+            }
+            out_r = out_r + 1;
+            l = l + 1;
+        }
+        r = r + 1;
+    }
+    ExMat { cells: cells, n: out_r, w: m.w }
+}
+
+// Row tails (columns 1..w) of the rows whose head is a wildcard: the default matrix D(P).
+fn ex_default(thir: mut_view<Thir>, col: ExCol, m: ExMat) -> ExMat {
+    let nw = m.w - 1;
+    let cells = ex_alloc(mut_view(*thir), m.n * nw);
+    let mut n: usize = 0;
+    let mut r: usize = 0;
+    while (r < m.n) {
+        let h = ex_head(mut_view(*thir), col, ex_get(m.cells, r * m.w) as *const HirPat);
+        if h.kind == EXH_WILD {
+            let mut c: usize = 0;
+            while (c < nw) {
+                ex_set(cells, n * nw + c, ex_get(m.cells, r * m.w + 1 + c));
+                c = c + 1;
+            }
+            n = n + 1;
+        }
+        r = r + 1;
+    }
+    ExMat { cells: cells, n: n, w: nw }
+}
+
+// Specialisation S(ctor, P) for SINGLE/BOOL/ENUM columns: rows headed by `ctor` or a wildcard, with the head
+// replaced by its `arity` fields.
+fn ex_specialize(thir: mut_view<Thir>, col: ExCol, ctor: usize, arity: usize, m: ExMat) -> ExMat {
+    let nw = arity + m.w - 1;
+    let cells = ex_alloc(mut_view(*thir), m.n * nw);
+    let mut n: usize = 0;
+    let mut r: usize = 0;
+    while (r < m.n) {
+        let p = ex_get(m.cells, r * m.w) as *const HirPat;
+        let h = ex_head(mut_view(*thir), col, p);
+        if h.kind == EXH_WILD || (h.kind == EXH_CTOR && h.ctor == ctor) {
+            let mut i: usize = 0;
+            while (i < arity) {
+                let sp = if h.kind == EXH_WILD { 0 as *const HirPat } else { ex_sub_pat(col, ctor, p, i) };
+                ex_set(cells, n * nw + i, sp as usize);
+                i = i + 1;
+            }
+            let mut c: usize = 1;
+            while (c < m.w) {
+                ex_set(cells, n * nw + arity + c - 1, ex_get(m.cells, r * m.w + c));
+                c = c + 1;
+            }
+            n = n + 1;
+        }
+        r = r + 1;
+    }
+    ExMat { cells: cells, n: n, w: nw }
+}
+
+// Specialisation for the integer segment starting at `seg_lo`: rows whose head is a wildcard or an interval
+// containing the segment (segments never straddle an interval boundary).
+fn ex_specialize_seg(thir: mut_view<Thir>, col: ExCol, seg_lo: u64, m: ExMat) -> ExMat {
+    let nw = m.w - 1;
+    let cells = ex_alloc(mut_view(*thir), m.n * nw);
+    let mut n: usize = 0;
+    let mut r: usize = 0;
+    while (r < m.n) {
+        let h = ex_head(mut_view(*thir), col, ex_get(m.cells, r * m.w) as *const HirPat);
+        if h.kind == EXH_WILD || (h.kind == EXH_RANGE && h.lo <= seg_lo && seg_lo <= h.hi) {
+            let mut c: usize = 0;
+            while (c < nw) {
+                ex_set(cells, n * nw + c, ex_get(m.cells, r * m.w + 1 + c));
+                c = c + 1;
+            }
+            n = n + 1;
+        }
+        r = r + 1;
+    }
+    ExMat { cells: cells, n: n, w: nw }
+}
+
+// q with its head replaced by the `arity` fields of `ctor`.
+fn ex_specialize_q(thir: mut_view<Thir>, col: ExCol, ctor: usize, arity: usize, q: *mut usize, w: usize) -> *mut usize {
+    let nq = ex_alloc(mut_view(*thir), arity + w - 1);
+    let p = ex_get(q, 0) as *const HirPat;
+    let mut i: usize = 0;
+    while (i < arity) {
+        ex_set(nq, i, ex_sub_pat(col, ctor, p, i) as usize);
+        i = i + 1;
+    }
+    let mut c: usize = 1;
+    while (c < w) {
+        ex_set(nq, arity + c - 1, ex_get(q, c));
+        c = c + 1;
+    }
+    nq
+}
+
+fn ex_tys_for_ctor(thir: mut_view<Thir>, col: ExCol, ctor: usize, arity: usize, tys: *mut usize, w: usize) -> *mut usize {
+    let nt = ex_alloc(mut_view(*thir), arity + w - 1);
+    let mut i: usize = 0;
+    while (i < arity) {
+        ex_set(nt, i, ex_field_ty(col, ctor, i));
+        i = i + 1;
+    }
+    let mut c: usize = 1;
+    while (c < w) {
+        ex_set(nt, arity + c - 1, ex_get(tys, c));
+        c = c + 1;
+    }
+    nt
+}
+
+fn ex_useful_ctor(thir: mut_view<Thir>, col: ExCol, ctor: usize, m: ExMat, tys: *mut usize, q: *mut usize, depth: u32) -> bool {
+    let arity = ex_arity(col, ctor);
+    let sm = ex_specialize(mut_view(*thir), col, ctor, arity, m);
+    let sq = ex_specialize_q(mut_view(*thir), col, ctor, arity, q, m.w);
+    let st = ex_tys_for_ctor(mut_view(*thir), col, ctor, arity, tys, m.w);
+    ex_useful(mut_view(*thir), sm, st, sq, depth + 1u32)
+}
+
+fn ex_tail(q: *mut usize) -> *mut usize {
+    unsafe { usize_at(q, 1) }
+}
+
+// Sorted, de-duplicated segment start points of an integer column: dom_lo, every interval start and every
+// interval end + 1 (clamped to the domain), over the rows of `m` and the head of q.
+fn ex_int_segments(thir: mut_view<Thir>, col: ExCol, m: ExMat, qh: ExHead, out_n: mut_view<usize>) -> *mut usize {
+    let cap = 2 * m.n + 3;
+    let pts = ex_alloc(mut_view(*thir), cap);
+    let mut n: usize = 0;
+    ex_set(pts, n, col.dom_lo as usize);
+    n = n + 1;
+    let mut r: usize = 0;
+    while (r <= m.n) {
+        let mut h = qh;
+        if (r < m.n) {
+            h = ex_head(mut_view(*thir), col, ex_get(m.cells, r * m.w) as *const HirPat);
+        }
+        if h.kind == EXH_RANGE {
+            ex_set(pts, n, h.lo as usize);
+            n = n + 1;
+            let h_hi = h.hi;
+            if (h_hi < col.dom_hi) {
+                ex_set(pts, n, (h.hi + 1u64) as usize);
+                n = n + 1;
+            }
+        }
+        r = r + 1;
+    }
+    let mut i: usize = 1;
+    while (i < n) {
+        let key = ex_get(pts, i);
+        let mut j = i;
+        while (j > 0 && ex_get(pts, j - 1) > key) {
+            ex_set(pts, j, ex_get(pts, j - 1));
+            j = j - 1;
+        }
+        ex_set(pts, j, key);
+        i = i + 1;
+    }
+    let mut u: usize = 0;
+    i = 0;
+    while (i < n) {
+        if u == 0 || ex_get(pts, u - 1) != ex_get(pts, i) {
+            ex_set(pts, u, ex_get(pts, i));
+            u = u + 1;
+        }
+        i = i + 1;
+    }
+    *out_n = u;
+    pts
+}
+
+fn ex_useful_int(thir: mut_view<Thir>, col: ExCol, m: ExMat, tys: *mut usize, q: *mut usize, qh: ExHead, depth: u32) -> bool {
+    let mut ns: usize = 0;
+    let pts = ex_int_segments(mut_view(*thir), col, m, qh, mut_view(ns));
+    if qh.kind == EXH_WILD {
+        // A segment no interval head covers is matched only by the wildcard rows: D(P).
+        let mut s: usize = 0;
+        while (s < ns) {
+            let lo = ex_get(pts, s) as u64;
+            let mut covered = false;
+            let mut r: usize = 0;
+            while (r < m.n) {
+                let h = ex_head(mut_view(*thir), col, ex_get(m.cells, r * m.w) as *const HirPat);
+                if h.kind == EXH_RANGE && h.lo <= lo && lo <= h.hi {
+                    covered = true;
+                    break;
+                }
+                r = r + 1;
+            }
+            if !covered {
+                let dm = ex_default(mut_view(*thir), col, m);
+                return ex_useful(mut_view(*thir), dm, ex_tail(tys), ex_tail(q), depth + 1u32);
+            }
+            s = s + 1;
+        }
+    }
+    let mut s: usize = 0;
+    while (s < ns) {
+        let lo = ex_get(pts, s) as u64;
+        if qh.kind == EXH_WILD || (qh.lo <= lo && lo <= qh.hi) {
+            let sm = ex_specialize_seg(mut_view(*thir), col, lo, m);
+            if ex_useful(mut_view(*thir), sm, ex_tail(tys), ex_tail(q), depth + 1u32) {
+                return true;
+            }
+        }
+        s = s + 1;
+    }
+    false
+}
+
+fn ex_useful(thir: mut_view<Thir>, m0: ExMat, tys: *mut usize, q: *mut usize, depth: u32) -> bool {
+    if m0.w == 0 {
+        return m0.n == 0;
+    }
+    if depth > EX_MAX_DEPTH {
+        return true;
+    }
+    let col = ex_col(mut_view(*thir), ex_get(tys, 0));
+    let qp = ex_get(q, 0) as *const HirPat;
+    let qh = ex_head(mut_view(*thir), col, qp);
+    if qh.kind == EXH_OR {
+        let w = m0.w;
+        let mut alt = unsafe { (*qp).pats as *const HirPat };
+        while ((alt as usize) != 0) {
+            let nq = ex_alloc(mut_view(*thir), w);
+            ex_set(nq, 0, alt as usize);
+            let mut c: usize = 1;
+            while (c < w) {
+                ex_set(nq, c, ex_get(q, c));
+                c = c + 1;
+            }
+            if ex_useful(mut_view(*thir), m0, tys, nq, depth + 1u32) {
+                return true;
+            }
+            alt = unsafe { (*alt).next as *const HirPat };
+        }
+        return false;
+    }
+    if qh.kind == EXH_EMPTY {
+        return false;
+    }
+    let m = ex_expand_or(mut_view(*thir), m0);
+    if qh.kind == EXH_UNKNOWN {
+        let dm = ex_default(mut_view(*thir), col, m);
+        return ex_useful(mut_view(*thir), dm, ex_tail(tys), ex_tail(q), depth + 1u32);
+    }
+    if qh.kind == EXH_CTOR {
+        return ex_useful_ctor(mut_view(*thir), col, qh.ctor, m, tys, q, depth);
+    }
+    if col.cat == EXC_INT {
+        return ex_useful_int(mut_view(*thir), col, m, tys, q, qh, depth);
+    }
+    // q's head is a wildcard.
+    if col.cat == EXC_SINGLE {
+        return ex_useful_ctor(mut_view(*thir), col, 0, m, tys, q, depth);
+    }
+    if col.cat == EXC_BOOL || col.cat == EXC_ENUM {
+        let nctor = if col.cat == EXC_BOOL { 2 } else { unsafe { (*col.t).variant_count } };
+        let seen = arena_alloc_raw(mut_view(thir.interner.arena), if nctor > 0 { nctor } else { 1 }, 1);
+        let mut z: usize = 0;
+        while (z < nctor) {
+            unsafe { *(seen + z) = 0u8; }
+            z = z + 1;
+        }
+        let mut nseen: usize = 0;
+        let mut r: usize = 0;
+        while (r < m.n) {
+            let h = ex_head(mut_view(*thir), col, ex_get(m.cells, r * m.w) as *const HirPat);
+            let h_ctor = h.ctor;
+            if (h.kind == EXH_CTOR && h_ctor < nctor) {
+                if (unsafe { *(seen + h.ctor) }) == 0u8 {
+                    unsafe { *(seen + h.ctor) = 1u8; }
+                    nseen = nseen + 1;
+                }
+            }
+            r = r + 1;
+        }
+        if nseen == nctor {
+            let mut c: usize = 0;
+            while (c < nctor) {
+                if ex_useful_ctor(mut_view(*thir), col, c, m, tys, q, depth) {
+                    return true;
+                }
+                c = c + 1;
+            }
+            return false;
+        }
+    }
+    let dm = ex_default(mut_view(*thir), col, m);
+    ex_useful(mut_view(*thir), dm, ex_tail(tys), ex_tail(q), depth + 1u32)
+}
+
+// Exhaustiveness + reachability of a `match` whose scrutinee is a tuple. Returns false (nothing reported) when
+// the scrutinee is not a tuple, so the caller falls back to the scalar/enum checker.
+pub fn match_check_tuple_exhaustiveness(
+    thir: mut_view<Thir>,
+    sink: mut_view<DiagSink>,
+    expr: *const HirExpr,
+    val_ty: TypeId
+) -> bool {
+    if (expr as usize) == 0 {
+        return false;
+    }
+    if (unsafe { (*expr).kind }) != HIR_EXPR_MATCH {
+        return false;
+    }
+    let t = type_get(view(thir.interner), TypeId { v: val_ty.v });
+    if (t as usize) == 0 {
+        return false;
+    }
+    if (unsafe { (*t).kind }) != TY_TUPLE {
+        return false;
+    }
+
+    let mut total: usize = 0;
+    let mut arm = unsafe { (*expr).arms as *const HirMatchArm };
+    while ((arm as usize) != 0) {
+        total = total + ex_or_count(unsafe { (*arm).pat as *const HirPat });
+        arm = unsafe { (*arm).next as *const HirMatchArm };
+    }
+
+    let tys = ex_alloc(mut_view(*thir), 1);
+    ex_set(tys, 0, val_ty.v as usize);
+    let rows = ex_alloc(mut_view(*thir), total);
+    let leaves = ex_alloc(mut_view(*thir), total);
+    let mut n_rows: usize = 0;
+
+    arm = unsafe { (*expr).arms as *const HirMatchArm };
+    while ((arm as usize) != 0) {
+        let ap = unsafe { (*arm).pat as *const HirPat };
+        let has_guard = (unsafe { (*arm).guard as usize }) != 0;
+        if (ap as usize) != 0 {
+            let mut nl: usize = 0;
+            ex_or_fill(ap, leaves, mut_view(nl));
+            let mut l: usize = 0;
+            while (l < nl) {
+                let leaf = ex_get(leaves, l) as *const HirPat;
+                let q = ex_alloc(mut_view(*thir), 1);
+                ex_set(q, 0, leaf as usize);
+                let pm = ExMat { cells: rows, n: n_rows, w: 1 };
+                if (leaf as usize) != 0 && !ex_useful(mut_view(*thir), pm, tys, q, 0u32) {
+                    let l_fv = unsafe { (*leaf).span.file.v };
+                    let l_st = unsafe { (*leaf).span.start };
+                    let l_en = unsafe { (*leaf).span.end };
+                    emit_pat_unreachable(mut_view(*sink), l_fv, l_st, l_en);
+                }
+                if !has_guard {
+                    ex_set(rows, n_rows, leaf as usize);
+                    n_rows = n_rows + 1;
+                }
+                l = l + 1;
+            }
+        }
+        arm = unsafe { (*arm).next as *const HirMatchArm };
+    }
+
+    let wq = ex_alloc(mut_view(*thir), 1);
+    ex_set(wq, 0, 0);
+    let pm = ExMat { cells: rows, n: n_rows, w: 1 };
+    if ex_useful(mut_view(*thir), pm, tys, wq, 0u32) {
+        let fv = unsafe { (*expr).span.file.v };
+        let st = unsafe { (*expr).span.start };
+        let en = unsafe { (*expr).span.end };
+        emit_pat_non_exhaustive(mut_view(*sink), fv, st, en);
+    }
+    true
 }
 
 
