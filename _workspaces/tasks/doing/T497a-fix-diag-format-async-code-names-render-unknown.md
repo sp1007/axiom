@@ -8,13 +8,15 @@ model: sonnet
 gate_model: sonnet
 depends: [T497]
 priority: 40
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 300
-paths: [compiler/diag/format.ax, tests/run/diag_ux2/qa_t497_probe.ax.in, tests/run/diag_code_names]
-locks: [compiler/diag/code.ax]
+paths: [compiler/diag/format.ax, tests/run/diag_ux2/qa_t497_probe.ax.in, tests/run/diag_code_names, compiler/diag/code.ax]
+locks: []
 spec: [spec/diagnostics.md]
 covers: [REQ-TST-072]
+started: 2026-11-22 05:19:15
+agent: T497a-impl
 ---
 # T497a — every registered code renders with its name
 
@@ -41,3 +43,4 @@ Two hand-maintained name tables drift; the fix removes the duplicate.
 
 ## Log
 - 2026-11-21 created by axiom-architect (triage-2026-11-21; T497 QA N1)
+- 2026-11-22 05:19:15 started (attempt 1) T497a-impl

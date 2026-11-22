@@ -8,7 +8,7 @@ model: opus
 gate_model: sonnet
 depends: [T498]
 priority: 12
-status: doing
+status: done
 attempts: 1
 timeout_min: 480
 paths: [tests/run/slice_inclusive, tests/ui/slice_inclusive, compiler/mir/builder.ax, compiler/hir/lower.ax, compiler/types/typeck.ax]
@@ -16,7 +16,7 @@ locks: []
 spec: [spec/decisions/ADR-0045-inclusive-sub-range-slicing.md, spec/decisions/ADR-0044-t455-integer-model-gaps.md, spec/SPEC-02-grammar.md, spec/SPEC-40-integers.md]
 covers: [REQ-TST-072, REQ-OWNER-007]
 started: 2026-11-22 04:05:15
-agent: T496a-impl
+finished: 2026-11-22 08:12:59
 ---
 # T496a — `s[a..=b]` includes `b`
 
@@ -47,3 +47,4 @@ only after `b < len`, so it cannot overflow.
 ## Log
 - 2026-11-21 created by axiom-architect (triage-2026-11-21; T496 QA follow-up 1; ADR-0045)
 - 2026-11-22 04:05:15 started (attempt 1) T496a-impl
+- 2026-11-22 08:12:59 accepted by QA -> done

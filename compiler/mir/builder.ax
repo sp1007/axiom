@@ -4024,6 +4024,49 @@ fn mb_emit_range_cmp_assert(
     mb_emit_assert(mut_view(*b), view(cond_op), true, MB_ASSERT_MSG_BOUNDS, sp);
 }
 
+// True when a sub-range of a base of this type gets a bounds check (arrays, views, slices, str).
+fn mb_range_base_is_checked(ax: *mut AxType) -> bool {
+    if (ax as usize) == 0 {
+        return false;
+    }
+    let bk = unsafe { (*ax).kind };
+    bk == TY_ARRAY || bk == TY_VIEW || bk == TY_MUT_VIEW || bk == TY_SLICE || bk == TY_STR
+}
+
+// dst = lhs + 1usize.  Used only for the exclusive end of an inclusive sub-range after `lhs < len` has been
+// asserted, so it cannot overflow (ADR-0045).
+fn mb_emit_usize_add_one(b: mut_view<MirBuilder>, dst_loc_v: u32, lhs_loc_v: u32, usize_ty_v: u32, sp: view<Span>) {
+    let dst_pl = mir_local_place(dst_loc_v);
+    let add_rv = MirRvalue {
+        kind: MIR_RVALUE_BINARY_OP,
+        use_op: MirOperand { kind: MIR_OP_COPY, location: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 }, place: mir_local_place(0u32), constant: MirConst { ty: TypeId { v: 0u32 }, kind: MIR_CONST_INT, val: 0u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId { v: 0u32 } } },
+        repeat_count: 0u64,
+        repeat_count_op: 0 as *mut MirOperand,
+        borrow_kind: MIR_BORROW_SHARED,
+        place: mir_local_place(0u32),
+        cast_kind: MIR_CAST_INT_TO_INT,
+        target_ty: TypeId { v: 0u32 },
+        bin_op: MIR_BINOP_ADD,
+        lhs: MirOperand {
+            kind: MIR_OP_COPY,
+            location: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 },
+            place: mir_local_place(lhs_loc_v),
+            constant: MirConst { ty: TypeId { v: 0u32 }, kind: MIR_CONST_INT, val: 0u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId { v: 0u32 } },
+        },
+        rhs: MirOperand {
+            kind: MIR_OP_CONST,
+            location: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 },
+            place: mir_local_place(0u32),
+            constant: MirConst { ty: TypeId { v: usize_ty_v }, kind: MIR_CONST_INT, val: 1u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId { v: 0u32 } },
+        },
+        un_op: MIR_UNOP_NOT,
+        variant_idx: 0u32,
+        operands: 0 as *mut MirOperand,
+        operand_count: 0,
+    };
+    mb_emit_assign(mut_view(*b), view(dst_pl), view(add_rv), sp);
+}
+
 fn mb_emit_range_bounds_check(
     b: mut_view<MirBuilder>,
     base_pl: view<MirPlace>,
@@ -4034,12 +4077,13 @@ fn mb_emit_range_bounds_check(
     end_wide_v: u32,
     has_start: bool,
     has_end: bool,
+    end_inclusive: bool,
     sp: view<Span>
 ) {
-    let bk = unsafe { (*ax).kind };
-    if bk != TY_ARRAY && bk != TY_VIEW && bk != TY_MUT_VIEW && bk != TY_SLICE && bk != TY_STR {
+    if !mb_range_base_is_checked(ax) {
         return;
     }
+    let bk = unsafe { (*ax).kind };
     let usize_ty_v: u32 = unsafe { (*b.thir).interner.t_usize.v };
     let bool_ty_v: u32 = unsafe { (*b.thir).interner.t_bool.v };
     let len_loc = mb_new_temp(mut_view(*b), (TypeId { v: usize_ty_v }), sp);
@@ -4100,14 +4144,20 @@ fn mb_emit_range_bounds_check(
         }
     }
     if has_end {
+        // ADR-0045: an inclusive end `b` is valid iff `b < len`, checked in the bound's own width (never `b + 1 <= len`).
+        let end_cmp: u8 = if end_inclusive { MIR_BINOP_LT } else { MIR_BINOP_LE };
         let cond_loc = mb_new_temp(mut_view(*b), (TypeId { v: bool_ty_v }), sp);
         if end_wide_v != 0u32 {
-            mb_emit_range_le_assert(mut_view(*b), cond_loc.v, end_wide_v, len_w_v, sp);
+            mb_emit_range_cmp_assert(mut_view(*b), end_cmp, cond_loc.v, end_wide_v, len_w_v, sp);
         } else {
             let u_end = mb_new_temp(mut_view(*b), (TypeId { v: usize_ty_v }), sp);
             mb_emit_range_cast_usize(mut_view(*b), end_loc_v, u_end.v, usize_ty_v, sp);
-            mb_emit_range_le_assert(mut_view(*b), cond_loc.v, u_end.v, len_loc.v, sp);
+            mb_emit_range_cmp_assert(mut_view(*b), end_cmp, cond_loc.v, u_end.v, len_loc.v, sp);
         }
+    }
+    if end_inclusive {
+        // The `start <= end + 1` check is emitted by the caller on the usize exclusive end (ADR-0045).
+        return;
     }
     if has_start && has_end && any_wide {
         // Both bounds are <= len here; compare them in u128 (the narrow one is widened from its usize local).
@@ -4374,8 +4424,11 @@ fn mb_build_range_subslice_lvalue(
     } else {
         0 as *mut AxType
     };
-    if !b.is_diverged && (ax as usize) != 0 {
-        mb_emit_range_bounds_check(mut_view(*b), base_pl, ax, start_loc.v, end_loc.v, start_wide, end_wide, has_start, has_end, sp);
+    // ADR-0045: `s[a..=b]` / `s[..=b]` include `b`.
+    let end_inclusive: bool = has_end && unsafe { (*idx_arg).is_inclusive };
+    let checked: bool = !b.is_diverged && mb_range_base_is_checked(ax);
+    if checked {
+        mb_emit_range_bounds_check(mut_view(*b), base_pl, ax, start_loc.v, end_loc.v, start_wide, end_wide, has_start, has_end, end_inclusive, sp);
     }
     // ADR-0044 §1: a 128-bit bound is truncated to usize only after its check.
     if start_wide != 0u32 {
@@ -4383,6 +4436,23 @@ fn mb_build_range_subslice_lvalue(
     }
     if end_wide != 0u32 {
         end_loc = mb_wide_index_to_usize(mut_view(*b), end_wide, sp);
+    }
+    if end_inclusive {
+        // `b < len` holds here, so the exclusive end `b + 1` is computed in usize without overflow; then the
+        // usual `a <= end` check runs on it (ADR-0045).
+        let usize_ty_v: u32 = unsafe { (*b.thir).interner.t_usize.v };
+        let u_end = mb_new_temp(mut_view(*b), (TypeId { v: usize_ty_v }), sp);
+        mb_emit_range_cast_usize(mut_view(*b), end_loc.v, u_end.v, usize_ty_v, sp);
+        let end_excl = mb_new_temp(mut_view(*b), (TypeId { v: usize_ty_v }), sp);
+        mb_emit_usize_add_one(mut_view(*b), end_excl.v, u_end.v, usize_ty_v, sp);
+        if checked && has_start && !b.is_diverged {
+            let bool_ty_v: u32 = unsafe { (*b.thir).interner.t_bool.v };
+            let u_start = mb_new_temp(mut_view(*b), (TypeId { v: usize_ty_v }), sp);
+            mb_emit_range_cast_usize(mut_view(*b), start_loc.v, u_start.v, usize_ty_v, sp);
+            let cond_loc = mb_new_temp(mut_view(*b), (TypeId { v: bool_ty_v }), sp);
+            mb_emit_range_le_assert(mut_view(*b), cond_loc.v, u_start.v, end_excl.v, sp);
+        }
+        end_loc = end_excl;
     }
     let mut is_slice_view = false;
     if (ax as usize) != 0 {
