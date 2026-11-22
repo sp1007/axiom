@@ -15374,6 +15374,7 @@ use compiler.types.types.typeid_at
 use compiler.types.types.typeid_ptr_at
 use compiler.types.types.u32_at
 use compiler.types.types.usize_at
+use compiler.mir.mir.MirBb
 use compiler.mir.mir.MirBbId
 use compiler.mir.mir.MirBody
 use compiler.mir.mir.MirLocalId
@@ -15407,6 +15408,7 @@ use compiler.mir.mir.MIR_RVALUE_REPEAT
 use compiler.mir.mir.MIR_RVALUE_UNARY_OP
 use compiler.mir.mir.MIR_RVALUE_USE
 use compiler.mir.mir.MIR_STMT_ASSIGN
+use compiler.mir.mir.MIR_STMT_DROP
 use compiler.mir.mir.MIR_TERM_ASSERT
 use compiler.mir.mir.MIR_TERM_CALL
 use compiler.mir.mir.MIR_TERM_DROP
@@ -16521,6 +16523,561 @@ fn drop_place_has_deref(place: view<MirPlace>) -> bool {
     false
 }
 
+// T445a (ADR-0047, SPEC-12 AXS-DROP-003/009): per-leaf dynamic drop flags (`u8`) for original
+// locals whose fields or enum variant payloads are partially moved out (e.g. a place or temporary
+// scrutinee of `match` / `if let` / `while let` with some fields bound by value and others left
+// in place). Activated only for locals that actually undergo a projected move/drop, leaving MIR
+// byte-identical when no partial move occurs.
+struct SubDropLeaf {
+    place: MirPlace,
+    flag_local_v: u32,
+}
+
+struct SubDropRoot {
+    local_v: u32,
+    init_flag_v: u32,
+    leaf_start: usize,
+    leaf_count: usize,
+}
+
+struct SubDropFlags {
+    roots: *mut SubDropRoot,
+    root_count: usize,
+    root_cap: usize,
+    leaves: *mut SubDropLeaf,
+    leaf_count: usize,
+    leaf_cap: usize,
+    u8_ty_v: u32,
+}
+
+unsafe fn drop_sub_root_at(base: *mut SubDropRoot, idx: usize) -> *mut SubDropRoot {
+    ((base as usize) + mir_mul_usize(idx, size_of<SubDropRoot>())) as *mut SubDropRoot
+}
+
+unsafe fn drop_sub_leaf_at(base: *mut SubDropLeaf, idx: usize) -> *mut SubDropLeaf {
+    ((base as usize) + mir_mul_usize(idx, size_of<SubDropLeaf>())) as *mut SubDropLeaf
+}
+
+fn drop_place_has_index(place: view<MirPlace>) -> bool {
+    let mut i: usize = 0;
+    while i < place.proj_count {
+        let proj = unsafe { mir_proj_at(place.projs, i) };
+        let pk = unsafe { (*proj).kind };
+        if pk == MIR_PROJ_DEREF {
+            return false;
+        }
+        if pk == MIR_PROJ_INDEX || pk == MIR_PROJ_SUB_SLICE {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn drop_place_sub_prefix_len(place: view<MirPlace>) -> usize {
+    if place.proj_count == 0 || drop_place_has_deref(place) {
+        return 0;
+    }
+    let mut i: usize = 0;
+    while i < place.proj_count {
+        let proj = unsafe { mir_proj_at(place.projs, i) };
+        let pk = unsafe { (*proj).kind };
+        if pk == MIR_PROJ_INDEX || pk == MIR_PROJ_SUB_SLICE {
+            break;
+        }
+        if pk != MIR_PROJ_FIELD && pk != MIR_PROJ_DOWNCAST {
+            return 0;
+        }
+        i = i + 1;
+    }
+    i
+}
+
+fn drop_sub_proj_eq(pa: *const MirProjection, pb: *const MirProjection) -> bool {
+    let ka = unsafe { (*pa).kind };
+    let kb = unsafe { (*pb).kind };
+    if ka != kb {
+        return false;
+    }
+    if ka == MIR_PROJ_FIELD {
+        return (unsafe { (*pa).field_idx }) == (unsafe { (*pb).field_idx });
+    }
+    if ka == MIR_PROJ_DOWNCAST {
+        return (unsafe { (*pa).variant_idx }) == (unsafe { (*pb).variant_idx });
+    }
+    false
+}
+
+fn drop_sub_proj_prefix(a: view<MirPlace>, a_len: usize, b: view<MirPlace>, b_len: usize) -> bool {
+    if a.local.v != b.local.v || a_len > b_len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a_len {
+        let pa = unsafe { mir_proj_at(a.projs, i) };
+        let pb = unsafe { mir_proj_at(b.projs, i) };
+        if !drop_sub_proj_eq(pa, pb) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn drop_sub_proj_overlap(a: view<MirPlace>, a_len: usize, b: view<MirPlace>, b_len: usize) -> bool {
+    if a.local.v != b.local.v {
+        return false;
+    }
+    let min_len = if a_len < b_len { a_len } else { b_len };
+    let mut i: usize = 0;
+    while i < min_len {
+        let pa = unsafe { mir_proj_at(a.projs, i) };
+        let pb = unsafe { mir_proj_at(b.projs, i) };
+        if !drop_sub_proj_eq(pa, pb) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn drop_find_sub_root(sdf: view<SubDropFlags>, local_v: u32) -> *mut SubDropRoot {
+    let mut i: usize = 0;
+    while i < sdf.root_count {
+        let r = unsafe { drop_sub_root_at(sdf.roots, i) };
+        if (unsafe { (*r).local_v }) == local_v {
+            return r;
+        }
+        i = i + 1;
+    }
+    0 as *mut SubDropRoot
+}
+
+fn drop_sdf_has_local(sdf: view<SubDropFlags>, local_v: u32) -> bool {
+    (drop_find_sub_root(sdf, local_v) as usize) != 0
+}
+
+fn drop_sdf_is_flag(sdf: view<SubDropFlags>, flag_v: u32) -> bool {
+    let mut i: usize = 0;
+    while i < sdf.root_count {
+        let r = unsafe { drop_sub_root_at(sdf.roots, i) };
+        if (unsafe { (*r).init_flag_v }) == flag_v {
+            return true;
+        }
+        i = i + 1;
+    }
+    let mut li: usize = 0;
+    while li < sdf.leaf_count {
+        let lf = unsafe { drop_sub_leaf_at(sdf.leaves, li) };
+        if (unsafe { (*lf).flag_local_v }) == flag_v {
+            return true;
+        }
+        li = li + 1;
+    }
+    false
+}
+
+fn drop_find_exact_sub_flag(sdf: view<SubDropFlags>, place: view<MirPlace>) -> u32 {
+    if sdf.root_count == 0 || place.proj_count == 0 {
+        return 0u32;
+    }
+    let root = drop_find_sub_root(sdf, place.local.v);
+    if (root as usize) == 0 {
+        return 0u32;
+    }
+    let start = unsafe { (*root).leaf_start };
+    let end = start + (unsafe { (*root).leaf_count });
+    let pc = place.proj_count;
+    let mut i: usize = start;
+    while i < end {
+        let lf = unsafe { drop_sub_leaf_at(sdf.leaves, i) };
+        let lpc = unsafe { (*lf).place.proj_count };
+        if lpc == pc && (unsafe { drop_sub_proj_prefix(view((*lf).place), lpc, place, pc) }) {
+            return unsafe { (*lf).flag_local_v };
+        }
+        i = i + 1;
+    }
+    0u32
+}
+
+fn drop_sub_add_leaf(sdf: mut_view<SubDropFlags>, arena: mut_view<Arena>, place: view<MirPlace>) {
+    if sdf.leaf_count >= sdf.leaf_cap {
+        let new_cap: usize = if sdf.leaf_cap == 0 { 8 } else { sdf.leaf_cap + sdf.leaf_cap };
+        let new_bytes = mir_mul_usize(new_cap, size_of<SubDropLeaf>());
+        let new_arr = arena_alloc_raw(mut_view(*arena), new_bytes, align_of<SubDropLeaf>()) as *mut SubDropLeaf;
+        if sdf.leaf_count > 0 && (sdf.leaves as usize) != 0 {
+            let old_bytes = mir_mul_usize(sdf.leaf_count, size_of<SubDropLeaf>());
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(sdf.leaves as *const u8, new_arr as *mut u8, old_bytes);
+            }
+        }
+        sdf.leaves = new_arr;
+        sdf.leaf_cap = new_cap;
+    }
+    let slot = unsafe { drop_sub_leaf_at(sdf.leaves, sdf.leaf_count) };
+    unsafe {
+        mir_copy_place(mut_view((*slot).place), place);
+        (*slot).flag_local_v = 0u32;
+    }
+    sdf.leaf_count = sdf.leaf_count + 1;
+}
+
+fn drop_sub_add_root(
+    sdf: mut_view<SubDropFlags>,
+    arena: mut_view<Arena>,
+    local_v: u32,
+    leaf_start: usize,
+    leaf_count: usize
+) {
+    if sdf.root_count >= sdf.root_cap {
+        let new_cap: usize = if sdf.root_cap == 0 { 4 } else { sdf.root_cap + sdf.root_cap };
+        let new_bytes = mir_mul_usize(new_cap, size_of<SubDropRoot>());
+        let new_arr = arena_alloc_raw(mut_view(*arena), new_bytes, align_of<SubDropRoot>()) as *mut SubDropRoot;
+        if sdf.root_count > 0 && (sdf.roots as usize) != 0 {
+            let old_bytes = mir_mul_usize(sdf.root_count, size_of<SubDropRoot>());
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(sdf.roots as *const u8, new_arr as *mut u8, old_bytes);
+            }
+        }
+        sdf.roots = new_arr;
+        sdf.root_cap = new_cap;
+    }
+    let slot = unsafe { drop_sub_root_at(sdf.roots, sdf.root_count) };
+    unsafe {
+        (*slot).local_v = local_v;
+        (*slot).init_flag_v = 0u32;
+        (*slot).leaf_start = leaf_start;
+        (*slot).leaf_count = leaf_count;
+    }
+    sdf.root_count = sdf.root_count + 1;
+}
+
+fn drop_enum_sub_leaves(
+    thir: view<Thir>,
+    hir: view<HirFile>,
+    db: *const SourceDatabase,
+    str_in: view<StrInterner>,
+    cache: *mut DropNeedsCache,
+    arena: mut_view<Arena>,
+    sdf: mut_view<SubDropFlags>,
+    cur_place: view<MirPlace>,
+    ty: TypeId,
+    depth: usize
+) {
+    if depth >= 16 {
+        if cur_place.proj_count > 0 {
+            drop_sub_add_leaf(mut_view(*sdf), mut_view(*arena), cur_place);
+        }
+        return;
+    }
+    let t = drop_type_get(thir, TypeId { v: ty.v });
+    if (t as usize) == 0 {
+        if cur_place.proj_count > 0 {
+            drop_sub_add_leaf(mut_view(*sdf), mut_view(*arena), cur_place);
+        }
+        return;
+    }
+    let kind = unsafe { (*t).kind };
+    if kind == TY_STRUCT {
+        let def = unsafe { (*t).def };
+        let drop_fn = drop_find_impl_fn_with_thir(TypeId { v: ty.v }, thir, hir, def, db, str_in);
+        if (drop_fn as usize) != 0 {
+            if cur_place.proj_count > 0 {
+                drop_sub_add_leaf(mut_view(*sdf), mut_view(*arena), cur_place);
+            }
+            return;
+        }
+        let field_count = unsafe { (*t).field_count };
+        let fields = unsafe { (*t).fields };
+        let mut fi: usize = 0;
+        while fi < field_count {
+            let fty = drop_field_type(fields, fi);
+            if mir_type_needs_drop_cached((TypeId { v: fty.v }), thir, hir, db, str_in, cache) {
+                let fpl = drop_place_with_proj(mut_view(*arena), cur_place, MIR_PROJ_FIELD, fi as u32);
+                drop_enum_sub_leaves(thir, hir, db, str_in, cache, mut_view(*arena), mut_view(*sdf), view(fpl), (TypeId { v: fty.v }), depth + 1);
+            }
+            fi = fi + 1;
+        }
+        return;
+    }
+    if kind == TY_TUPLE {
+        let field_count = unsafe { (*t).field_count };
+        let fields = unsafe { (*t).fields };
+        let mut fi: usize = 0;
+        while fi < field_count {
+            let fty = drop_field_type(fields, fi);
+            if mir_type_needs_drop_cached((TypeId { v: fty.v }), thir, hir, db, str_in, cache) {
+                let fpl = drop_place_with_proj(mut_view(*arena), cur_place, MIR_PROJ_FIELD, fi as u32);
+                drop_enum_sub_leaves(thir, hir, db, str_in, cache, mut_view(*arena), mut_view(*sdf), view(fpl), (TypeId { v: fty.v }), depth + 1);
+            }
+            fi = fi + 1;
+        }
+        return;
+    }
+    if kind == TY_ENUM {
+        let variant_count = unsafe { (*t).variant_count };
+        let mut vi: usize = 0;
+        while vi < variant_count {
+            let fc = drop_variant_field_count(t, vi);
+            let mut fi: usize = 0;
+            while fi < fc {
+                let fty = drop_variant_field_type(t, vi, fi);
+                if mir_type_needs_drop_cached((TypeId { v: fty.v }), thir, hir, db, str_in, cache) {
+                    let dpl = drop_place_with_proj(mut_view(*arena), cur_place, MIR_PROJ_DOWNCAST, vi as u32);
+                    let fpl = drop_place_with_proj(mut_view(*arena), view(dpl), MIR_PROJ_FIELD, fi as u32);
+                    drop_enum_sub_leaves(thir, hir, db, str_in, cache, mut_view(*arena), mut_view(*sdf), view(fpl), (TypeId { v: fty.v }), depth + 1);
+                }
+                fi = fi + 1;
+            }
+            vi = vi + 1;
+        }
+        return;
+    }
+    if cur_place.proj_count > 0 {
+        drop_sub_add_leaf(mut_view(*sdf), mut_view(*arena), cur_place);
+    }
+}
+
+fn drop_mark_sub_place(
+    body: view<MirBody>,
+    thir: view<Thir>,
+    hir: view<HirFile>,
+    db: *const SourceDatabase,
+    str_in: view<StrInterner>,
+    cache: *mut DropNeedsCache,
+    orig_local_count: usize,
+    place: view<MirPlace>,
+    needs_sub: *mut u8
+) {
+    let lv = place.local.v as usize;
+    if lv == 0 || lv >= orig_local_count || place.proj_count == 0 {
+        return;
+    }
+    if (unsafe { *(needs_sub + lv) }) != 0u8 {
+        return;
+    }
+    let klen = drop_place_sub_prefix_len(place);
+    if klen == 0 {
+        return;
+    }
+    let decl = unsafe { mir_local_at(body.locals, lv) };
+    let root_ty = TypeId { v: unsafe { (*decl).ty.v } };
+    if !mir_type_needs_drop_cached(root_ty, thir, hir, db, str_in, cache) {
+        return;
+    }
+    let pty = mir_drop_place_type(body, thir, place);
+    if mir_type_needs_drop_cached(pty, thir, hir, db, str_in, cache) {
+        unsafe {
+            *(needs_sub + lv) = 1u8;
+        }
+    }
+}
+
+fn drop_mark_sub_operand(
+    body: view<MirBody>,
+    thir: view<Thir>,
+    hir: view<HirFile>,
+    db: *const SourceDatabase,
+    str_in: view<StrInterner>,
+    cache: *mut DropNeedsCache,
+    orig_local_count: usize,
+    op: view<MirOperand>,
+    needs_sub: *mut u8
+) {
+    if op.kind != MIR_OP_MOVE && op.kind != MIR_OP_COPY {
+        return;
+    }
+    if op.place.proj_count > 0 {
+        drop_mark_sub_place(body, thir, hir, db, str_in, cache, orig_local_count, view(op.place), needs_sub);
+    }
+}
+
+fn drop_mark_sub_rvalue(
+    body: view<MirBody>,
+    thir: view<Thir>,
+    hir: view<HirFile>,
+    db: *const SourceDatabase,
+    str_in: view<StrInterner>,
+    cache: *mut DropNeedsCache,
+    orig_local_count: usize,
+    rv: view<MirRvalue>,
+    needs_sub: *mut u8
+) {
+    if rv.kind == MIR_RVALUE_USE || rv.kind == MIR_RVALUE_CAST || rv.kind == MIR_RVALUE_UNARY_OP {
+        drop_mark_sub_operand(body, thir, hir, db, str_in, cache, orig_local_count, view(rv.use_op), needs_sub);
+    } else if rv.kind == MIR_RVALUE_REPEAT {
+        drop_mark_sub_operand(body, thir, hir, db, str_in, cache, orig_local_count, view(rv.use_op), needs_sub);
+        if (rv.repeat_count_op as usize) != 0 {
+            unsafe {
+                drop_mark_sub_operand(body, thir, hir, db, str_in, cache, orig_local_count, view(*rv.repeat_count_op), needs_sub);
+            }
+        }
+    } else if rv.kind == MIR_RVALUE_BINARY_OP || rv.kind == MIR_RVALUE_OVERFLOWS_BINARY_OP {
+        drop_mark_sub_operand(body, thir, hir, db, str_in, cache, orig_local_count, view(rv.lhs), needs_sub);
+        drop_mark_sub_operand(body, thir, hir, db, str_in, cache, orig_local_count, view(rv.rhs), needs_sub);
+    } else if rv.kind == MIR_RVALUE_AGGREGATE {
+        let mut i: usize = 0;
+        while i < rv.operand_count {
+            let op = unsafe { mir_op_at(rv.operands, i) };
+            unsafe {
+                drop_mark_sub_operand(body, thir, hir, db, str_in, cache, orig_local_count, view(*op), needs_sub);
+            }
+            i = i + 1;
+        }
+    }
+}
+
+fn drop_collect_sub_flags(
+    body: view<MirBody>,
+    thir: view<Thir>,
+    hir: view<HirFile>,
+    db: *const SourceDatabase,
+    str_in: view<StrInterner>,
+    cache: *mut DropNeedsCache,
+    orig_local_count: usize,
+    sdf: mut_view<SubDropFlags>,
+    arena: mut_view<Arena>
+) {
+    if orig_local_count <= 1 {
+        return;
+    }
+    let needs_sub = arena_alloc_raw(mut_view(*arena), orig_local_count + 1, 1);
+    let mut z: usize = 0;
+    while z <= orig_local_count {
+        unsafe {
+            *(needs_sub + z) = 0u8;
+        }
+        z = z + 1;
+    }
+    let mut b: usize = 0;
+    while b < body.bb_count {
+        let bb = unsafe { mir_bb_at(body.bbs, b) };
+        let sc = unsafe { (*bb).stmt_count };
+        let mut s: usize = 0;
+        while s < sc {
+            let stmt = unsafe { mir_stmt_at((*bb).stmts, s) };
+            let sk = unsafe { (*stmt).kind };
+            if sk == MIR_STMT_ASSIGN {
+                unsafe {
+                    drop_mark_sub_rvalue(body, thir, hir, db, str_in, cache, orig_local_count, view((*stmt).rvalue), needs_sub);
+                }
+            } else if sk == MIR_STMT_DROP {
+                unsafe {
+                    drop_mark_sub_place(body, thir, hir, db, str_in, cache, orig_local_count, view((*stmt).place), needs_sub);
+                }
+            }
+            s = s + 1;
+        }
+        if unsafe { (*bb).has_terminator } {
+            let tk = unsafe { (*bb).terminator.kind };
+            if tk == MIR_TERM_SWITCH_INT {
+                unsafe {
+                    drop_mark_sub_operand(body, thir, hir, db, str_in, cache, orig_local_count, view((*bb).terminator.discr), needs_sub);
+                }
+            } else if tk == MIR_TERM_CALL {
+                unsafe {
+                    drop_mark_sub_operand(body, thir, hir, db, str_in, cache, orig_local_count, view((*bb).terminator.func), needs_sub);
+                }
+                let ac = unsafe { (*bb).terminator.arg_count };
+                let args = unsafe { (*bb).terminator.args };
+                let mut a: usize = 0;
+                while a < ac {
+                    let arg = unsafe { mir_op_at(args, a) };
+                    unsafe {
+                        drop_mark_sub_operand(body, thir, hir, db, str_in, cache, orig_local_count, view(*arg), needs_sub);
+                    }
+                    a = a + 1;
+                }
+            } else if tk == MIR_TERM_ASSERT {
+                unsafe {
+                    drop_mark_sub_operand(body, thir, hir, db, str_in, cache, orig_local_count, view((*bb).terminator.cond), needs_sub);
+                }
+            } else if tk == MIR_TERM_DROP {
+                if !drop_place_has_index(unsafe { view((*bb).terminator.drop_place) }) {
+                    unsafe {
+                        drop_mark_sub_place(body, thir, hir, db, str_in, cache, orig_local_count, view((*bb).terminator.drop_place), needs_sub);
+                    }
+                }
+            }
+        }
+        b = b + 1;
+    }
+
+    let mut l: usize = 1;
+    while l < orig_local_count {
+        if (unsafe { *(needs_sub + l) }) != 0u8 {
+            let decl = unsafe { mir_local_at(body.locals, l) };
+            let lty = TypeId { v: unsafe { (*decl).ty.v } };
+            let root_pl = mir_local_place(l as u32);
+            let leaf_start = sdf.leaf_count;
+            drop_enum_sub_leaves(thir, hir, db, str_in, cache, mut_view(*arena), mut_view(*sdf), view(root_pl), lty, 0);
+            let leaf_cnt = sdf.leaf_count - leaf_start;
+            if leaf_cnt > 0 {
+                drop_sub_add_root(mut_view(*sdf), mut_view(*arena), l as u32, leaf_start, leaf_cnt);
+            }
+        }
+        l = l + 1;
+    }
+}
+
+fn drop_sub_set_for_place(
+    sdf: view<SubDropFlags>,
+    place: view<MirPlace>,
+    val: bool,
+    buf: mut_view<DropStmtBuf>,
+    arena: mut_view<Arena>
+) {
+    if sdf.root_count == 0 || drop_place_has_deref(place) {
+        return;
+    }
+    let root = drop_find_sub_root(sdf, place.local.v);
+    if (root as usize) == 0 {
+        return;
+    }
+    let start = unsafe { (*root).leaf_start };
+    let end = start + (unsafe { (*root).leaf_count });
+    if place.proj_count == 0 {
+        drop_stmt_buf_push_view_flag(mut_view(*buf), mut_view(*arena), unsafe { (*root).init_flag_v }, sdf.u8_ty_v, val);
+        let mut li: usize = start;
+        while li < end {
+            let lf = unsafe { drop_sub_leaf_at(sdf.leaves, li) };
+            drop_stmt_buf_push_view_flag(mut_view(*buf), mut_view(*arena), unsafe { (*lf).flag_local_v }, sdf.u8_ty_v, val);
+            li = li + 1;
+        }
+        return;
+    }
+    if val {
+        if drop_place_has_index(place) {
+            return;
+        }
+        drop_stmt_buf_push_view_flag(mut_view(*buf), mut_view(*arena), unsafe { (*root).init_flag_v }, sdf.u8_ty_v, true);
+        let pc = place.proj_count;
+        let mut li: usize = start;
+        while li < end {
+            let lf = unsafe { drop_sub_leaf_at(sdf.leaves, li) };
+            let lpc = unsafe { (*lf).place.proj_count };
+            if unsafe { drop_sub_proj_prefix(place, pc, view((*lf).place), lpc) } {
+                drop_stmt_buf_push_view_flag(mut_view(*buf), mut_view(*arena), unsafe { (*lf).flag_local_v }, sdf.u8_ty_v, true);
+            }
+            li = li + 1;
+        }
+    } else {
+        let klen = drop_place_sub_prefix_len(place);
+        if klen == 0 {
+            return;
+        }
+        let mut li: usize = start;
+        while li < end {
+            let lf = unsafe { drop_sub_leaf_at(sdf.leaves, li) };
+            let lpc = unsafe { (*lf).place.proj_count };
+            if unsafe { drop_sub_proj_overlap(place, klen, view((*lf).place), lpc) } {
+                drop_stmt_buf_push_view_flag(mut_view(*buf), mut_view(*arena), unsafe { (*lf).flag_local_v }, sdf.u8_ty_v, false);
+            }
+            li = li + 1;
+        }
+    }
+}
+
 // A move or copy out of a flagged local or tracked view-place clears its flag first.
 fn drop_visit_operand(
     body: view<MirBody>,
@@ -16531,6 +17088,7 @@ fn drop_visit_operand(
     cache: *mut DropNeedsCache,
     df: view<DropFlags>,
     vdf: view<ViewDropFlags>,
+    sdf: view<SubDropFlags>,
     op: view<MirOperand>,
     buf: mut_view<DropStmtBuf>,
     arena: mut_view<Arena>
@@ -16545,10 +17103,16 @@ fn drop_visit_operand(
                 let pty = mir_drop_place_type(body, thir, view(op.place));
                 if mir_type_needs_drop_cached(pty, thir, hir, db, str_in, cache) {
                     drop_stmt_buf_push_flag(mut_view(*buf), mut_view(*arena), flag, df.bool_ty_v, false);
+                    if sdf.root_count > 0 {
+                        drop_sub_set_for_place(sdf, view(op.place), false, mut_view(*buf), mut_view(*arena));
+                    }
                 }
             }
         } else {
             drop_stmt_buf_push_flag(mut_view(*buf), mut_view(*arena), flag, df.bool_ty_v, false);
+            if sdf.root_count > 0 {
+                drop_sub_set_for_place(sdf, view(op.place), false, mut_view(*buf), mut_view(*arena));
+            }
         }
     }
     if vdf.count > 0 && op.place.proj_count > 0 {
@@ -16579,28 +17143,29 @@ fn drop_visit_rvalue(
     cache: *mut DropNeedsCache,
     df: view<DropFlags>,
     vdf: view<ViewDropFlags>,
+    sdf: view<SubDropFlags>,
     rv: view<MirRvalue>,
     buf: mut_view<DropStmtBuf>,
     arena: mut_view<Arena>
 ) {
     if rv.kind == MIR_RVALUE_USE || rv.kind == MIR_RVALUE_CAST || rv.kind == MIR_RVALUE_UNARY_OP {
-        drop_visit_operand(body, thir, hir, db, str_in, cache, df, vdf, view(rv.use_op), mut_view(*buf), mut_view(*arena));
+        drop_visit_operand(body, thir, hir, db, str_in, cache, df, vdf, sdf, view(rv.use_op), mut_view(*buf), mut_view(*arena));
     } else if rv.kind == MIR_RVALUE_REPEAT {
-        drop_visit_operand(body, thir, hir, db, str_in, cache, df, vdf, view(rv.use_op), mut_view(*buf), mut_view(*arena));
+        drop_visit_operand(body, thir, hir, db, str_in, cache, df, vdf, sdf, view(rv.use_op), mut_view(*buf), mut_view(*arena));
         if (rv.repeat_count_op as usize) != 0 {
             unsafe {
-                drop_visit_operand(body, thir, hir, db, str_in, cache, df, vdf, view(*rv.repeat_count_op), mut_view(*buf), mut_view(*arena));
+                drop_visit_operand(body, thir, hir, db, str_in, cache, df, vdf, sdf, view(*rv.repeat_count_op), mut_view(*buf), mut_view(*arena));
             }
         }
     } else if rv.kind == MIR_RVALUE_BINARY_OP || rv.kind == MIR_RVALUE_OVERFLOWS_BINARY_OP {
-        drop_visit_operand(body, thir, hir, db, str_in, cache, df, vdf, view(rv.lhs), mut_view(*buf), mut_view(*arena));
-        drop_visit_operand(body, thir, hir, db, str_in, cache, df, vdf, view(rv.rhs), mut_view(*buf), mut_view(*arena));
+        drop_visit_operand(body, thir, hir, db, str_in, cache, df, vdf, sdf, view(rv.lhs), mut_view(*buf), mut_view(*arena));
+        drop_visit_operand(body, thir, hir, db, str_in, cache, df, vdf, sdf, view(rv.rhs), mut_view(*buf), mut_view(*arena));
     } else if rv.kind == MIR_RVALUE_AGGREGATE {
         let mut i: usize = 0;
         while i < rv.operand_count {
             let op = unsafe { mir_op_at(rv.operands, i) };
             unsafe {
-                drop_visit_operand(body, thir, hir, db, str_in, cache, df, vdf, view(*op), mut_view(*buf), mut_view(*arena));
+                drop_visit_operand(body, thir, hir, db, str_in, cache, df, vdf, sdf, view(*op), mut_view(*buf), mut_view(*arena));
             }
             i = i + 1;
         }
@@ -16618,7 +17183,13 @@ fn drop_op_touches_flagged(df: view<DropFlags>, op: view<MirOperand>) -> bool {
     (unsafe { *(((df.flags as usize) + (lv << 2)) as *mut u32) }) != 0u32
 }
 
-fn drop_block_needs_rewrite(body: view<MirBody>, df: view<DropFlags>, vdf: view<ViewDropFlags>, bb_idx: usize) -> bool {
+fn drop_block_needs_rewrite(
+    body: view<MirBody>,
+    df: view<DropFlags>,
+    vdf: view<ViewDropFlags>,
+    sdf: view<SubDropFlags>,
+    bb_idx: usize
+) -> bool {
     if vdf.count > 0 {
         return true;
     }
@@ -16670,6 +17241,10 @@ fn drop_block_needs_rewrite(body: view<MirBody>, df: view<DropFlags>, vdf: view<
                     k = k + 1;
                 }
             }
+        } else if stmt_kind == MIR_STMT_DROP && sdf.root_count > 0 {
+            if drop_sdf_has_local(sdf, unsafe { (*stmt).place.local.v }) {
+                return true;
+            }
         }
         j = j + 1;
     }
@@ -16697,6 +17272,41 @@ fn drop_block_needs_rewrite(body: view<MirBody>, df: view<DropFlags>, vdf: view<
     false
 }
 
+fn drop_attach_term_flag(
+    body: view<MirBody>,
+    thir: view<Thir>,
+    df: view<DropFlags>,
+    vdf: view<ViewDropFlags>,
+    sdf: view<SubDropFlags>,
+    bb: *mut MirBb
+) {
+    let drop_local_v = unsafe { (*bb).terminator.drop_place.local.v };
+    let drop_pc = unsafe { (*bb).terminator.drop_place.proj_count };
+    if drop_pc > 0 && sdf.root_count > 0 && drop_sdf_has_local(sdf, drop_local_v) &&
+       !drop_place_has_deref(unsafe { view((*bb).terminator.drop_place) }) {
+        let sflag = unsafe { drop_find_exact_sub_flag(sdf, view((*bb).terminator.drop_place)) };
+        if sflag != 0u32 {
+            unsafe {
+                (*bb).terminator.drop_flag = sflag;
+            }
+        }
+        return;
+    }
+    let flag = drop_flag_of(df, drop_local_v);
+    if flag != 0u32 {
+        unsafe {
+            (*bb).terminator.drop_flag = flag;
+        }
+    } else if vdf.count > 0 {
+        let vflag = unsafe { drop_find_exact_view_flag(body, thir, vdf, view((*bb).terminator.drop_place)) };
+        if vflag != 0u32 {
+            unsafe {
+                (*bb).terminator.drop_flag = vflag;
+            }
+        }
+    }
+}
+
 // Rewrites the statements of one block: flag set in a call's return block, flag clears before
 // moves and copies, flag sets after assignments; then records the flag of a `drop` terminator.
 fn drop_rewrite_block(
@@ -16708,22 +17318,17 @@ fn drop_rewrite_block(
     cache: *mut DropNeedsCache,
     df: view<DropFlags>,
     vdf: view<ViewDropFlags>,
+    sdf: view<SubDropFlags>,
     bb_idx: usize,
-    call_init_local_v: u32,
+    call_pred_plus1: u32,
     arena: mut_view<Arena>
 ) {
     let bb = unsafe { mir_bb_at(body.bbs, bb_idx) };
     let term_kind = unsafe { (*bb).terminator.kind };
 
-    if call_init_local_v == 0u32 && !drop_block_needs_rewrite(view(*body), df, vdf, bb_idx) {
+    if call_pred_plus1 == 0u32 && !drop_block_needs_rewrite(view(*body), df, vdf, sdf, bb_idx) {
         if term_kind == MIR_TERM_DROP {
-            let drop_local_v = unsafe { (*bb).terminator.drop_place.local.v };
-            let flag = drop_flag_of(df, drop_local_v);
-            if flag != 0u32 {
-                unsafe {
-                    (*bb).terminator.drop_flag = flag;
-                }
-            }
+            drop_attach_term_flag(view(*body), thir, df, vdf, sdf, bb);
         }
         return;
     }
@@ -16731,19 +17336,42 @@ fn drop_rewrite_block(
     let old_count = unsafe { (*bb).stmt_count };
     let mut buf = drop_stmt_buf_new(mut_view(*arena), old_count + 16);
 
-    if call_init_local_v != 0u32 {
+    if call_pred_plus1 != 0u32 {
+        let pred_bb = unsafe { mir_bb_at(body.bbs, (call_pred_plus1 - 1u32) as usize) };
+        let call_init_local_v = unsafe { (*pred_bb).terminator.destination.local.v };
         let flag = drop_flag_of(df, call_init_local_v);
         if flag != 0u32 {
             drop_stmt_buf_push_flag(mut_view(buf), mut_view(*arena), flag, df.bool_ty_v, true);
         }
+        if sdf.root_count > 0 {
+            unsafe {
+                drop_sub_set_for_place(sdf, view((*pred_bb).terminator.destination), true, mut_view(buf), mut_view(*arena));
+            }
+        }
         if vdf.count > 0 {
-            let mut vi: usize = 0;
-            while vi < vdf.count {
-                let e = unsafe { drop_view_entry_at(vdf.entries, vi) };
-                if (unsafe { (*e).place.local.v }) == call_init_local_v {
-                    drop_stmt_buf_push_view_flag(mut_view(buf), mut_view(*arena), unsafe { (*e).flag_local_v }, vdf.u8_ty_v, true);
+            let cpc = unsafe { (*pred_bb).terminator.destination.proj_count };
+            if cpc == 0 {
+                let mut vi: usize = 0;
+                while vi < vdf.count {
+                    let e = unsafe { drop_view_entry_at(vdf.entries, vi) };
+                    if (unsafe { (*e).place.local.v }) == call_init_local_v {
+                        drop_stmt_buf_push_view_flag(mut_view(buf), mut_view(*arena), unsafe { (*e).flag_local_v }, vdf.u8_ty_v, true);
+                    }
+                    vi = vi + 1;
                 }
-                vi = vi + 1;
+            } else {
+                let klen = unsafe { drop_place_view_key_len(view(*body), thir, view((*pred_bb).terminator.destination)) };
+                if klen > 0 {
+                    let mut vi: usize = 0;
+                    while vi < vdf.count {
+                        let e = unsafe { drop_view_entry_at(vdf.entries, vi) };
+                        let ek = unsafe { (*e).key_proj_count };
+                        if unsafe { drop_view_proj_prefix(view((*pred_bb).terminator.destination), klen, view((*e).place), ek) } {
+                            drop_stmt_buf_push_view_flag(mut_view(buf), mut_view(*arena), unsafe { (*e).flag_local_v }, vdf.u8_ty_v, true);
+                        }
+                        vi = vi + 1;
+                    }
+                }
             }
         }
     }
@@ -16754,7 +17382,11 @@ fn drop_rewrite_block(
         let stmt_kind = unsafe { (*stmt).kind };
         if stmt_kind == MIR_STMT_ASSIGN {
             unsafe {
-                drop_visit_rvalue(view(*body), thir, hir, db, str_in, cache, df, vdf, view((*stmt).rvalue), mut_view(buf), mut_view(*arena));
+                drop_visit_rvalue(view(*body), thir, hir, db, str_in, cache, df, vdf, sdf, view((*stmt).rvalue), mut_view(buf), mut_view(*arena));
+            }
+        } else if stmt_kind == MIR_STMT_DROP && sdf.root_count > 0 {
+            unsafe {
+                drop_sub_set_for_place(sdf, view((*stmt).place), false, mut_view(buf), mut_view(*arena));
             }
         }
         unsafe {
@@ -16765,6 +17397,11 @@ fn drop_rewrite_block(
             let flag = drop_flag_of(df, dest_v);
             if flag != 0u32 {
                 drop_stmt_buf_push_flag(mut_view(buf), mut_view(*arena), flag, df.bool_ty_v, true);
+            }
+            if sdf.root_count > 0 {
+                unsafe {
+                    drop_sub_set_for_place(sdf, view((*stmt).place), true, mut_view(buf), mut_view(*arena));
+                }
             }
             if vdf.count > 0 {
                 let pc = unsafe { (*stmt).place.proj_count };
@@ -16798,11 +17435,11 @@ fn drop_rewrite_block(
 
     if term_kind == MIR_TERM_SWITCH_INT {
         unsafe {
-            drop_visit_operand(view(*body), thir, hir, db, str_in, cache, df, vdf, view((*bb).terminator.discr), mut_view(buf), mut_view(*arena));
+            drop_visit_operand(view(*body), thir, hir, db, str_in, cache, df, vdf, sdf, view((*bb).terminator.discr), mut_view(buf), mut_view(*arena));
         }
     } else if term_kind == MIR_TERM_CALL {
         unsafe {
-            drop_visit_operand(view(*body), thir, hir, db, str_in, cache, df, vdf, view((*bb).terminator.func), mut_view(buf), mut_view(*arena));
+            drop_visit_operand(view(*body), thir, hir, db, str_in, cache, df, vdf, sdf, view((*bb).terminator.func), mut_view(buf), mut_view(*arena));
         }
         let arg_count = unsafe { (*bb).terminator.arg_count };
         let args = unsafe { (*bb).terminator.args };
@@ -16810,13 +17447,13 @@ fn drop_rewrite_block(
         while a < arg_count {
             let arg = unsafe { mir_op_at(args, a) };
             unsafe {
-                drop_visit_operand(view(*body), thir, hir, db, str_in, cache, df, vdf, view(*arg), mut_view(buf), mut_view(*arena));
+                drop_visit_operand(view(*body), thir, hir, db, str_in, cache, df, vdf, sdf, view(*arg), mut_view(buf), mut_view(*arena));
             }
             a = a + 1;
         }
     } else if term_kind == MIR_TERM_ASSERT {
         unsafe {
-            drop_visit_operand(view(*body), thir, hir, db, str_in, cache, df, vdf, view((*bb).terminator.cond), mut_view(buf), mut_view(*arena));
+            drop_visit_operand(view(*body), thir, hir, db, str_in, cache, df, vdf, sdf, view((*bb).terminator.cond), mut_view(buf), mut_view(*arena));
         }
     }
 
@@ -16827,20 +17464,7 @@ fn drop_rewrite_block(
     }
 
     if term_kind == MIR_TERM_DROP {
-        let drop_local_v = unsafe { (*bb).terminator.drop_place.local.v };
-        let flag = drop_flag_of(df, drop_local_v);
-        if flag != 0u32 {
-            unsafe {
-                (*bb).terminator.drop_flag = flag;
-            }
-        } else if vdf.count > 0 {
-            let vflag = unsafe { drop_find_exact_view_flag(view(*body), thir, vdf, view((*bb).terminator.drop_place)) };
-            if vflag != 0u32 {
-                unsafe {
-                    (*bb).terminator.drop_flag = vflag;
-                }
-            }
-        }
+        drop_attach_term_flag(view(*body), thir, df, vdf, sdf, bb);
     }
 }
 
@@ -17267,6 +17891,7 @@ fn drop_expand_block(
     db: *const SourceDatabase,
     str_in: view<StrInterner>,
     vdf: view<ViewDropFlags>,
+    sdf: view<SubDropFlags>,
     arena: mut_view<Arena>,
     bb_idx: usize
 ) -> bool {
@@ -17283,11 +17908,20 @@ fn drop_expand_block(
     }
     let target_v = unsafe { (*bb).terminator.drop_target.v };
     let mut flag = unsafe { (*bb).terminator.drop_flag };
-    let mut is_view_flag = (flag != 0u32 && flag != MIR_DROP_FLAG_NONE && vdf.count > 0 && drop_vdf_is_flag(vdf, flag));
+    let mut is_view_flag = flag != 0u32 && flag != MIR_DROP_FLAG_NONE &&
+        ((vdf.count > 0 && drop_vdf_is_flag(vdf, flag)) || (sdf.root_count > 0 && drop_sdf_is_flag(sdf, flag)));
     if (flag == 0u32 || flag == MIR_DROP_FLAG_NONE) && vdf.count > 0 {
         let vflag = drop_find_exact_view_flag(view(*body), view(*thir), vdf, view(place));
         if vflag != 0u32 {
             flag = vflag;
+            is_view_flag = true;
+        }
+    }
+    if (flag == 0u32 || flag == MIR_DROP_FLAG_NONE) && sdf.root_count > 0 && place.proj_count > 0 &&
+       !drop_place_has_deref(view(place)) {
+        let sflag = drop_find_exact_sub_flag(sdf, view(place));
+        if sflag != 0u32 {
+            flag = sflag;
             is_view_flag = true;
         }
     }
@@ -17305,7 +17939,27 @@ fn drop_expand_block(
         drop_fn = drop_find_impl_fn_with_thir(TypeId { v: ty.v }, view(*thir), hir, def, db, str_in);
     }
 
+    let mut sub_root: *mut SubDropRoot = 0 as *mut SubDropRoot;
+    if sdf.root_count > 0 && !drop_place_has_deref(view(place)) {
+        sub_root = drop_find_sub_root(sdf, place.local.v);
+    }
+
     let mut inner_target_v = target_v;
+    if (sub_root as usize) != 0 && place.proj_count == 0 {
+        let init_flag_v = unsafe { (*sub_root).init_flag_v };
+        let clear_init_bb = mir_add_bb(mut_view(*body), mut_view(*arena), false);
+        let clear_init_ptr = unsafe { mir_bb_at(body.bbs, clear_init_bb.v as usize) };
+        let clear_init_stmts = arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt;
+        unsafe {
+            drop_init_view_flag_assign(mut_view(*clear_init_stmts), init_flag_v, thir.interner.t_u8.v, false);
+            (*clear_init_ptr).stmts = clear_init_stmts;
+            (*clear_init_ptr).stmt_count = 1;
+            (*clear_init_ptr).stmt_cap = 1;
+        }
+        drop_set_goto(mut_view(*body), clear_init_bb.v as usize, target_v);
+        inner_target_v = clear_init_bb.v;
+    }
+
     if kind == TY_STRUCT || kind == TY_TUPLE {
         inner_target_v = drop_expand_aggregate_fields(
             mut_view(*body), view(*thir), hir, db, str_in, mut_view(*arena), t, view(place), inner_target_v
@@ -17350,6 +18004,83 @@ fn drop_expand_block(
         inner_target_v = drop_expand_user_destructor(
             mut_view(*body), mut_view(*thir), mut_view(*arena), drop_fn, TypeId { v: ty.v }, view(place), inner_target_v
         );
+    }
+
+    if (sub_root as usize) != 0 {
+        let init_flag_v = unsafe { (*sub_root).init_flag_v };
+        if place.proj_count == 0 {
+            let check_init_bb = mir_add_bb(mut_view(*body), mut_view(*arena), false);
+            let init_vals = arena_alloc_raw(mut_view(*arena), size_of<u64>(), align_of<u64>()) as *mut u64;
+            let init_tgts = arena_alloc_raw(mut_view(*arena), size_of<MirBbId>(), align_of<MirBbId>()) as *mut MirBbId;
+            unsafe {
+                *init_vals = 1u64;
+                (*init_tgts).v = inner_target_v;
+            }
+            let check_init_ptr = unsafe { mir_bb_at(body.bbs, check_init_bb.v as usize) };
+            unsafe {
+                mir_term_zero(mut_view((*check_init_ptr).terminator), MIR_TERM_SWITCH_INT);
+                mir_operand_zero(mut_view((*check_init_ptr).terminator.discr), MIR_OP_COPY);
+                mir_place_reset_u32(mut_view((*check_init_ptr).terminator.discr.place), init_flag_v);
+                (*check_init_ptr).terminator.values = init_vals;
+                (*check_init_ptr).terminator.targets = init_tgts;
+                (*check_init_ptr).terminator.switch_count = 1;
+                (*check_init_ptr).terminator.otherwise.v = target_v;
+                (*check_init_ptr).has_terminator = true;
+            }
+
+            if flag != 0u32 && flag != MIR_DROP_FLAG_NONE && !is_view_flag {
+                let clear_bb = mir_add_bb(mut_view(*body), mut_view(*arena), false);
+                let clear_ptr = unsafe { mir_bb_at(body.bbs, clear_bb.v as usize) };
+                let clear_stmts = arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt;
+                unsafe {
+                    drop_init_flag_assign(mut_view(*clear_stmts), flag, thir.interner.t_bool.v, false);
+                    (*clear_ptr).stmts = clear_stmts;
+                    (*clear_ptr).stmt_count = 1;
+                    (*clear_ptr).stmt_cap = 1;
+                }
+                drop_set_goto(mut_view(*body), clear_bb.v as usize, check_init_bb.v);
+
+                let values = arena_alloc_raw(mut_view(*arena), size_of<u64>(), align_of<u64>()) as *mut u64;
+                let targets = arena_alloc_raw(mut_view(*arena), size_of<MirBbId>(), align_of<MirBbId>()) as *mut MirBbId;
+                unsafe {
+                    *values = 1u64;
+                    (*targets).v = clear_bb.v;
+                }
+                let bb_now = unsafe { mir_bb_at(body.bbs, bb_idx) };
+                unsafe {
+                    mir_term_zero(mut_view((*bb_now).terminator), MIR_TERM_SWITCH_INT);
+                    mir_operand_zero(mut_view((*bb_now).terminator.discr), MIR_OP_COPY);
+                    mir_place_reset_u32(mut_view((*bb_now).terminator.discr.place), flag);
+                    (*bb_now).terminator.values = values;
+                    (*bb_now).terminator.targets = targets;
+                    (*bb_now).terminator.switch_count = 1;
+                    (*bb_now).terminator.otherwise.v = check_init_bb.v;
+                    (*bb_now).has_terminator = true;
+                }
+            } else {
+                drop_set_goto(mut_view(*body), bb_idx, check_init_bb.v);
+            }
+            return true;
+        } else if flag == 0u32 || flag == MIR_DROP_FLAG_NONE {
+            let init_vals = arena_alloc_raw(mut_view(*arena), size_of<u64>(), align_of<u64>()) as *mut u64;
+            let init_tgts = arena_alloc_raw(mut_view(*arena), size_of<MirBbId>(), align_of<MirBbId>()) as *mut MirBbId;
+            unsafe {
+                *init_vals = 1u64;
+                (*init_tgts).v = inner_target_v;
+            }
+            let bb_now = unsafe { mir_bb_at(body.bbs, bb_idx) };
+            unsafe {
+                mir_term_zero(mut_view((*bb_now).terminator), MIR_TERM_SWITCH_INT);
+                mir_operand_zero(mut_view((*bb_now).terminator.discr), MIR_OP_COPY);
+                mir_place_reset_u32(mut_view((*bb_now).terminator.discr.place), init_flag_v);
+                (*bb_now).terminator.values = init_vals;
+                (*bb_now).terminator.targets = init_tgts;
+                (*bb_now).terminator.switch_count = 1;
+                (*bb_now).terminator.otherwise.v = target_v;
+                (*bb_now).has_terminator = true;
+            }
+            return true;
+        }
     }
 
     if flag != 0u32 && flag != MIR_DROP_FLAG_NONE {
@@ -17464,18 +18195,50 @@ pub fn mir_drop_elaborate(
             vi = vi + 1;
         }
     }
+    let mut sdf = SubDropFlags {
+        roots: 0 as *mut SubDropRoot,
+        root_count: 0,
+        root_cap: 0,
+        leaves: 0 as *mut SubDropLeaf,
+        leaf_count: 0,
+        leaf_cap: 0,
+        u8_ty_v: u8_ty_v,
+    };
+    drop_collect_sub_flags(view(*body), view(*thir), hir, db, str_in, cache, orig_local_count, mut_view(sdf), mut_view(*arena));
+    if sdf.root_count > 0 {
+        let mut ri: usize = 0;
+        while ri < sdf.root_count {
+            let init_fl = drop_new_local(mut_view(*body), mut_view(*arena), u8_ty_v, false);
+            let r = unsafe { drop_sub_root_at(sdf.roots, ri) };
+            let lstart = unsafe { (*r).leaf_start };
+            let lend = lstart + (unsafe { (*r).leaf_count });
+            unsafe {
+                (*r).init_flag_v = init_fl.v;
+            }
+            let mut li: usize = lstart;
+            while li < lend {
+                let lfl = drop_new_local(mut_view(*body), mut_view(*arena), u8_ty_v, false);
+                let lf = unsafe { drop_sub_leaf_at(sdf.leaves, li) };
+                unsafe {
+                    (*lf).flag_local_v = lfl.v;
+                }
+                li = li + 1;
+            }
+            ri = ri + 1;
+        }
+    }
     body.drop_flag_count = body.drop_flag_count + flag_count;
 
     // 2..4. Flag initialisation, call-return arming, and per-block flag maintenance are all
     //       no-ops when no original local or view-place needs a drop flag.
-    if flag_count > 0 || vdf.count > 0 {
+    if flag_count > 0 || vdf.count > 0 || sdf.root_count > 0 {
         let df = DropFlags { flags: flags, orig_local_count: orig_local_count, bool_ty_v: bool_ty_v };
 
         // 2. Flag initialisation at the top of bb0: arguments and view-places arrive initialised.
         if body.bb_count > 0 {
             let bb0 = unsafe { mir_bb_at(body.bbs, 0) };
             let old_count = unsafe { (*bb0).stmt_count };
-            let mut buf = drop_stmt_buf_new(mut_view(*arena), old_count + flag_count + vdf.count);
+            let mut buf = drop_stmt_buf_new(mut_view(*arena), old_count + flag_count + vdf.count + sdf.root_count + sdf.leaf_count);
             if flag_count > 0 {
                 i = 1;
                 while i < orig_local_count {
@@ -17496,6 +18259,25 @@ pub fn mir_drop_elaborate(
                     vi = vi + 1;
                 }
             }
+            if sdf.root_count > 0 {
+                let mut ri: usize = 0;
+                while ri < sdf.root_count {
+                    let r = unsafe { drop_sub_root_at(sdf.roots, ri) };
+                    let rv_loc = (unsafe { (*r).local_v }) as usize;
+                    let decl = unsafe { mir_local_at(body.locals, rv_loc) };
+                    let is_arg = (unsafe { (*decl).kind }) == MIR_LOCAL_ARG;
+                    drop_stmt_buf_push_view_flag(mut_view(buf), mut_view(*arena), unsafe { (*r).init_flag_v }, u8_ty_v, is_arg);
+                    let lstart = unsafe { (*r).leaf_start };
+                    let lend = lstart + (unsafe { (*r).leaf_count });
+                    let mut li: usize = lstart;
+                    while li < lend {
+                        let lf = unsafe { drop_sub_leaf_at(sdf.leaves, li) };
+                        drop_stmt_buf_push_view_flag(mut_view(buf), mut_view(*arena), unsafe { (*lf).flag_local_v }, u8_ty_v, is_arg);
+                        li = li + 1;
+                    }
+                    ri = ri + 1;
+                }
+            }
             let mut j: usize = 0;
             while j < old_count {
                 let stmt = unsafe { mir_stmt_at((*bb0).stmts, j) };
@@ -17513,12 +18295,12 @@ pub fn mir_drop_elaborate(
 
         // 3. A call that writes a flagged local arms its flag at the start of its return block.
         let bb_count = body.bb_count;
-        let call_inits_bytes = mir_mul_usize(bb_count + 1, size_of<MirLocalId>());
-        let call_inits = arena_alloc_raw(mut_view(*arena), call_inits_bytes, align_of<MirLocalId>()) as *mut MirLocalId;
+        let call_inits_bytes = (bb_count + 1) << 2;
+        let call_preds = arena_alloc_raw(mut_view(*arena), call_inits_bytes, align_of<u32>()) as *mut u32;
         i = 0;
         while i <= bb_count {
             unsafe {
-                (*mir_local_id_at(call_inits, i)).v = 0u32;
+                *(((call_preds as usize) + (i << 2)) as *mut u32) = 0u32;
             }
             i = i + 1;
         }
@@ -17529,11 +18311,20 @@ pub fn mir_drop_elaborate(
             if term_kind == MIR_TERM_CALL {
                 let dest_v = unsafe { (*bb).terminator.destination.local.v };
                 let dest_pc = unsafe { (*bb).terminator.destination.proj_count };
-                if drop_flag_of(view(df), dest_v) != 0u32 || (dest_pc == 0 && drop_vdf_has_local(view(vdf), dest_v)) {
+                let has_vdf = if vdf.count > 0 {
+                    if dest_pc == 0 {
+                        drop_vdf_has_local(view(vdf), dest_v)
+                    } else {
+                        (unsafe { drop_place_view_key_len(view(*body), view(*thir), view((*bb).terminator.destination)) }) > 0
+                    }
+                } else {
+                    false
+                };
+                if drop_flag_of(view(df), dest_v) != 0u32 || has_vdf || drop_sdf_has_local(view(sdf), dest_v) {
                     let call_target = (unsafe { (*bb).terminator.call_target.v }) as usize;
                     if call_target < bb_count {
                         unsafe {
-                            (*mir_local_id_at(call_inits, call_target)).v = dest_v;
+                            *(((call_preds as usize) + (call_target << 2)) as *mut u32) = (i + 1) as u32;
                         }
                     }
                 }
@@ -17544,8 +18335,8 @@ pub fn mir_drop_elaborate(
         // 4. Flag maintenance inside every original block.
         i = 0;
         while i < bb_count {
-            let call_init_v = unsafe { (*mir_local_id_at(call_inits, i)).v };
-            drop_rewrite_block(mut_view(*body), view(*thir), hir, db, str_in, cache, view(df), view(vdf), i, call_init_v, mut_view(*arena));
+            let call_pred_plus1 = unsafe { *(((call_preds as usize) + (i << 2)) as *mut u32) };
+            drop_rewrite_block(mut_view(*body), view(*thir), hir, db, str_in, cache, view(df), view(vdf), view(sdf), i, call_pred_plus1, mut_view(*arena));
             i = i + 1;
         }
     }
@@ -17559,7 +18350,7 @@ pub fn mir_drop_elaborate(
         let current_count = body.bb_count;
         i = start_bb;
         while i < current_count {
-            if drop_expand_block(mut_view(*body), mut_view(*thir), hir, db, str_in, view(vdf), mut_view(*arena), i) {
+            if drop_expand_block(mut_view(*body), mut_view(*thir), hir, db, str_in, view(vdf), view(sdf), mut_view(*arena), i) {
                 changed = true;
             }
             i = i + 1;
