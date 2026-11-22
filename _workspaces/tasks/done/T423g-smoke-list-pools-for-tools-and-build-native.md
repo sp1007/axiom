@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T423f]
 priority: 45
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tests/smoke.list, tools/taskgate.py, tests/tools/taskgate_smoke_check]
 locks: []
 spec: [spec/decisions/ADR-0041-complete-suite-baseline-and-test-cache.md]
 covers: [REQ-TST-072]
+started: 2026-11-22 15:56:56
+finished: 2026-11-22 16:27:03
 ---
 # T423g — Smoke pools for every top-level group
 
@@ -41,3 +43,5 @@ and nothing flagged the gap when T423f added `tests/tools/`.
 
 ## Log
 - 2026-11-22 created by axiom-architect (triage-1122; T423f report/QA follow-up)
+- 2026-11-22 15:56:56 started (attempt 1) T423g-impl
+- 2026-11-22 16:27:03 accepted by QA -> done

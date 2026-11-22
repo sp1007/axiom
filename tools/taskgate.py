@@ -11,7 +11,9 @@ Runs, deduplicated and in one `axtest.py` invocation with `--gate --baseline <fi
   (2) affected  `axtest.py --affected` of the change set (derivation printed), plus the tool self-test
                 directories it selects (`tools/tests/X/run_selftests.py`, run separately);
   (3) smoke     `axtest.py --smoke` (tests/smoke.list; seed printed);
-  (4) archcheck `tools/archcheck.py`.
+  (4) archcheck `tools/archcheck.py`;
+  (5) smoke-check `axtest.py --smoke --check` (tests/smoke.list hygiene; printed, fails the gate only when the
+      change set adds a top-level `tests/<group>/` that has no pool entry).
 The change set defaults to the working-tree changes of the root against its HEAD (inside a QA snapshot
 `build-snap-<ID>` that is exactly the task's change set); `--range` or `--changed` override it.
 
@@ -19,7 +21,7 @@ Prints a Markdown block for the QA file (counts per part and per group, affected
 CACHED/miss/sample counts and seed, WEAK-NATIVE, NEW/BASELINE failures, tool self-tests, archcheck, wall time)
 and writes the same as JSON with `--json-out`.
 
-Exit status: 0 only if archcheck is clean, no failing id lies outside the baseline (tool self-test failures
+Exit status: 0 only if archcheck is clean, no newly added test group lacks a smoke pool, no failing id lies outside the baseline (tool self-test failures
 count as new failures) and no WEAK-NATIVE test is among the task's own or changed tests; otherwise 1;
 2 for a usage/environment error. Python 3 standard library only.
 """
@@ -131,6 +133,28 @@ def main(argv=None):
         Path(opts.json_out).parent.mkdir(parents=True, exist_ok=True)
         Path(opts.json_out).write_text(json.dumps(summary, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
     return summary["exit"]
+
+
+def tracked_at(root, ref, group):
+    """True when `tests/<group>/` has a tracked file at `ref` (None when git cannot tell)."""
+    out = axtest_cache.git(root, "ls-tree", "-r", "--name-only", ref, "--", "tests/%s/" % group)
+    return None if out is None else bool(out.strip())
+
+
+def smoke_hygiene(root, tests, durations, changed, base_ref="HEAD", known_at_base=None):
+    """`axtest.py --smoke --check` as part of the gate (T423g). Every problem of tests/smoke.list is reported;
+    only a top-level test group that the change set ADDS (`tests/<g>/` has no tracked file at `base_ref`) and that
+    has no pool entry fails the gate. Problems that exist independently of the change set are printed only."""
+    problems, notes, est, unknown = axtest_affected.smoke_check(root, tests, durations)
+    sl = axtest_affected.read_smoke(root)
+    missing = [g for g in axtest_affected.test_groups(tests) if not sl.pools.get(g)]
+    known_at_base = known_at_base or (lambda g: tracked_at(root, base_ref, g))
+    touched = sorted({p.split("/")[1] for p in changed if p.startswith("tests/") and p.count("/") >= 2})
+    new_missing = [g for g in missing if g in touched and known_at_base(g) is False]
+    return {"ok": not problems, "problems": problems, "notes": notes, "estimate_s": round(est, 1),
+            "unverified": bool(unknown), "new_groups_without_pool": new_missing,
+            "reasons": ["new test group %s has no pool entry in tests/smoke.list (add `pool %s: <light test id>`; "
+                        "see `python tools/axtest.py --smoke --check`)" % (g, g) for g in new_missing]}
 
 
 def gate(opts, root):
@@ -246,6 +270,10 @@ def gate(opts, root):
     else:
         arch_res = {"exit": None, "clean": False, "tail": ["tools/archcheck.py missing"], "s": 0}
 
+    # (5) smoke-list hygiene (T423g): `axtest.py --smoke --check`; fails the gate only for a newly added group
+    base_ref = opts.range.split("..")[0] if opts.range and ".." in opts.range else "HEAD"
+    smoke_chk = smoke_hygiene(root, tests, axtest_cache.load_durations(cache_dir), aff.changed, base_ref)
+
     # results by id
     results = doc["results"] if doc else []
     by_id = {}
@@ -296,6 +324,7 @@ def gate(opts, root):
         reasons.append("new failures outside the baseline: %s" % " ".join(new_fail))
     if tool_fail:
         reasons.append("tool self-tests failed: %s" % " ".join(tool_fail))
+    reasons.extend(smoke_chk["reasons"])
     if weak_task:
         reasons.append("WEAK-NATIVE in the task's own/changed tests: %s" % " ".join(weak_task))
     if ax_rc not in (0, 1):
@@ -329,6 +358,7 @@ def gate(opts, root):
         "tools": tools_res,
         "tools_known_failures": tool_known,
         "archcheck": arch_res,
+        "smoke_check": smoke_chk,
         "exit": 1 if reasons else 0,
         "reasons": reasons,
     }
@@ -379,6 +409,19 @@ def task_file_rel(tf, root):
         return tf.resolve().relative_to(root).as_posix()
     except ValueError:
         return tf.as_posix()
+
+
+def markdown_smoke_lines(s):
+    sc = s["smoke_check"]
+    L = ["smoke-check (tests/smoke.list): %s; est. worst-case draw %.0f s" % (
+        "OK" if sc["ok"] else "%d PROBLEM(S)%s" % (
+            len(sc["problems"]), "" if sc["new_groups_without_pool"] else " (not caused by this change set; not failing)"),
+        sc["estimate_s"])]
+    for p in sc["problems"]:
+        L.append("- SMOKE-CHECK PROBLEM %s" % p)
+    for r in sc["reasons"]:
+        L.append("- SMOKE-CHECK NEW-GROUP %s" % r)
+    return L
 
 
 def markdown(s):
@@ -464,6 +507,7 @@ def markdown(s):
                 L.append("- NEW tool self-test failure: `%s`" % f)
     ar = s["archcheck"]
     L.append("archcheck: %s (exit %s) %s" % ("clean" if ar["clean"] else "NOT CLEAN", ar["exit"], " | ".join(ar["tail"][-2:])))
+    L.extend(markdown_smoke_lines(s))
     L.append("axtest: `%s` (exit %s)" % (s["axtest"]["total_line"], s["axtest"]["exit"]))
     L.append("")
     L.append("TASKGATE %s exit=%d%s" % (s["task"], s["exit"], (" (" + "; ".join(s["reasons"]) + ")") if s["reasons"] else ""))
