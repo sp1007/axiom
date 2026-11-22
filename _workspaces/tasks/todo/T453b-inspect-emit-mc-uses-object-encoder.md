@@ -8,13 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T453, T498a]
 priority: 50
-status: blocked
-attempts: 1
-paths: [compiler/target/x64/frame.ax, tests/mc]
+status: todo
+attempts: 0
+paths: [compiler/target/x64/frame.ax, tests/mc, tests/selfhost/isel/qa_frame_layout_and_verify.ax.in, tests/selfhost/isel/qa_isel_diff_golden.ax.in, tests/selfhost/backend/harness_backend_diff_mi_mc.ax.in, tests/selfhost/backend/harness_backend_unit.ax.in, tests/selfhost/driver/gen_driver_tests.py]
 locks: []
 spec: [spec/SPEC-26-windows-artifact-kinds.md]
 covers: [REQ-TST-072]
 started: 2026-11-22 19:25:46
+unblocks: 1
 ---
 # T453b — One encoder for `--emit=mc` and object code
 
@@ -29,9 +30,11 @@ miscompiles.
 ## Scope
 - Route `--emit=mc` through `x64_encode_mi_inst` (the object path), with relocations shown as zero-filled fields as the
   object path writes them before relocation; delete `x64_encode_mi_inst_mc` and anything only it uses.
-- Existing `tests/mc/**` goldens whose bytes change because they recorded the wrong encoding: regenerate them and list every
-  changed golden with a one-line reason (wrong width / now encoded) in the report; a golden change for any other reason
-  is a finding to report, not to accept silently.
+- Existing `tests/mc/**` goldens and the 5 selfhost generator-input templates/scripts (`qa_frame_layout_and_verify.ax.in`,
+  `qa_isel_diff_golden.ax.in`, `harness_backend_diff_mi_mc.ax.in`, `harness_backend_unit.ax.in`, `gen_driver_tests.py`) whose
+  expected `--emit=mc` bytes recorded legacy `axiom0` (`emit_mc.c`) output: update them to reflect the unified object-path
+  encoder and list every changed golden/template with a one-line reason (wrong width / now encoded) in the report; a golden
+  change for any other reason is a finding to report, not to accept silently.
 - New `tests/mc/emit_mc_parity/`: for programs covering 1/2/4/8-byte loads and stores, SETcc, CMOVcc, TEST, i128 pair ops,
   the `--emit=mc` bytes of each function equal the `.text` bytes of `build --emit=obj` for that function (compare with the
   object symbol ranges; a small driver script is fine).
@@ -39,13 +42,45 @@ miscompiles.
 
 ## Acceptance
 - [ ] Parity test passes; no `x64_encode_mi_inst_mc` left; changed goldens justified one by one.
-- [ ] `tests/mc`, `tests/encode`, `tests/inspect`, selfhost isel/frame groups pass; gate per axiom-qa.md "Per-task gate scope".
+- [ ] `tests/mc`, `tests/encode`, `tests/inspect`, selfhost isel/frame/backend/driver groups pass; gate per axiom-qa.md "Per-task gate scope".
 - [ ] Report `_workspaces/reports/T453b-report.md` with exact `## Files changed`.
 
 ## Out of scope
 - Disassembly printing; other `--emit` stages; `spec/`, `bootstrap/axiom0`, `docs/`.
 
+## Resume after unblock (axiom-architect, 2026-11-22)
+Attempt 1 (`_workspaces/reports/T453b-report.md`) completed the encoder unification in `compiler/target/x64/frame.ax`,
+updated `tests/mc/frame/main_42.mc`, and added `tests/mc/emit_mc_parity/` (all uncommitted in the main tree — keep them and
+do not redo them). `paths:` is now widened with the 5 selfhost generator-input files (never edit or list generated bundles in
+`tests/selfhost/generated-files.txt`; `taskctl snapshot` and `taskctl accept` regenerate them via `bundles.py regen` with
+`axiom0=None`):
+1. `tests/selfhost/isel/qa_frame_layout_and_verify.ax.in`: update `MAIN_42_MC` (`[221]u8` -> `[218]u8`) and `MAIN_42_MC_LEN`
+   (`220` -> `217`) to the fixed `tests/mc/frame/main_42.mc` hex dump (`89 08` 4-byte `mov dword ptr [rax], ecx` instead of
+   `48 89 08` 8-byte store, plus trailing NUL).
+2. `tests/selfhost/isel/qa_isel_diff_golden.ax.in`: keep the 4 `exp_mi` slices (even indices in `ISEL_GOLDEN_OFF`) unchanged
+   and update the 4 `exp_mc` slices (odd indices for `vs1_return`, `vs1_locals`, `vs1_arith`, `main_42`) in
+   `ISEL_GOLDEN_DATA` / `ISEL_GOLDEN_OFF` to the exact `x64_emit_mi_body_mc` + `x64_dump_mc_hex` bytes produced by the unified
+   object-path encoder (1/4-byte store widths `88 08` / `89 08`, `SETcc`, and `X64_MI_ASSERT` `je` + inline
+   `x64_emit_panic_sequence` with zeroed relocation slots).
+3. `tests/selfhost/backend/harness_backend_diff_mi_mc.ax.in`: keep `exp_mi` byte-for-byte checks intact (`session_emit_mi_file`
+   and `session_emit_mi_mir_text`). Stop comparing `session_emit_mc_file` / `session_emit_mc_mir_text` against `exp_mc` in
+   `MIMC_DATA` (which `gen_backend_tests.py` extracts from cached frozen-`axiom0` `emit_mc.c` blobs when `bundles.py regen`
+   runs with `axiom0=None`); instead verify `ok_mc`, well-formed lowercase `"%02x "` + `"\n"` hex lines per emitted function
+   (matching emitted function count, non-empty, `line_len % 3 == 0`, valid prologue/epilogue), and exact unified-encoder hex
+   parity on `tests/mc/frame/main_42.ax` (`89 08` store, 217 bytes; note that legacy `session_emit_objmodel_hir` in
+   `compiler/backend/session.ax` places `X64_MI_ASSERT` panic blocks out-of-line whereas `driver_emit_build_mi_body_obj` and
+   `x64_emit_mi_body_mc` emit `x64_emit_panic_sequence` inline).
+4. `tests/selfhost/backend/harness_backend_unit.ax.in`: keep `exp_lir` and `exp_mi` byte-for-byte checks intact; replace the
+   cached `axiom0` `exp_mc` comparison in `run_mir_text_case` (`add.mir`, `qa_edge_cond_br.mir`, `qa_multi_branch.mir`) with
+   exact unified-encoder `session_emit_mc_mir_text` expectations (or verified hex + instruction byte checks) directly in
+   `harness_backend_unit.ax.in`.
+5. `tests/selfhost/driver/gen_driver_tests.py`: in `gen_inspect_diff_member`, override the expected stdout blob for `--emit=mc`
+   cases (`tests/mc/frame/main_42.ax` from `tests/mc/frame/main_42.mc` and `tests/lir/const.mir` with the unified encoder's hex
+   dump) **including when `axiom0 is None`**, because `taskctl snapshot` and `taskctl accept` run `bundles.py regen` without
+   `--refresh-goldens` on a fresh `HEAD` worktree where `qa_driver_full_native.ax` still holds `HEAD`'s pre-T453b blobs.
+
 ## Log
 - 2026-11-22 created by axiom-architect (triage-1122; T498a and T453 follow-ups)
 - 2026-11-22 19:25:46 started (attempt 1) t453b-impl
 - 2026-11-22 19:56:24 block: needs paths widened: 5 selfhost template/generator inputs hardcode legacy axiom0 emit_mc.c bytes
+- 2026-11-22 20:02:36 unblocked (cycle 1) 

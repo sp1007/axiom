@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T423]
 priority: 50
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 480
 paths: [tests/run/self_entry_placeholder]
 locks: [compiler/interp/interp.ax, compiler/lir/builder.ax, compiler/mir/builder.ax, std/thread/mod.ax, std/fiber/mod.ax, tests/std/fiber/gen_tests.py]
 spec: [spec/SPEC-32-threads-sync.md, spec/SPEC-34-executors-fibers.md, spec/decisions/ADR-0046-t423-fiber-followups-and-tracked-xfail.md]
 covers: [REQ-TST-072]
+started: 2026-11-22 20:00:11
+agent: t423e-impl
 ---
 # T423e — Self-entry placeholder resolved by identity, not by name
 
@@ -46,3 +48,4 @@ builder (`is_fiber_self_entry_name` / thread equivalent) rewrite. With a second 
 
 ## Log
 - 2026-11-21 created by axiom-architect (triage-t423, ADR-0046; T423 QA follow-up 4 / report F4)
+- 2026-11-22 20:00:11 started (attempt 1) t423e-impl
