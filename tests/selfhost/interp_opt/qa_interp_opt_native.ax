@@ -67134,25 +67134,6 @@ pub fn path_ctx_free(ctx: mut_view<PathCtx>) {
     ctx.local_count = 0;
 }
 
-pub fn resolve_place(ctx: view<PathCtx>, place: view<MirPlace>) -> u32 {
-    if (place.local.v as usize) >= ctx.local_count {
-        return 0u32;
-    }
-    let root_p = unsafe { own_u32_at(ctx.local_roots as *const u32, place.local.v as usize) };
-    let mut node = unsafe { *root_p };
-    let mut i: usize = 0;
-    while (i < place.proj_count) {
-        let pr = unsafe { mir_proj_at(place.projs, i) };
-        let pk = unsafe { (*pr).kind };
-        if pk == MIR_PROJ_FIELD || pk == MIR_PROJ_DOWNCAST {
-            let f = if pk == MIR_PROJ_DOWNCAST { unsafe { (*pr).variant_idx } } else { unsafe { (*pr).field_idx } };
-            node = path_child(ctx, node, pk, f);
-        }
-        i = i + 1;
-    }
-    node
-}
-
 // The path node one FIELD or DOWNCAST projection below `node` (T444b: DOWNCAST selects the variant
 // node of an enum); `node` itself when the tree has no such child.
 // `pk` is the projection kind, `f` its variant index (DOWNCAST) or field index (FIELD).
@@ -69927,10 +69908,14 @@ pub fn own_do_move(v: mut_view<OwnVisitor>, place: view<MirPlace>, loc: Span) {
     }
 }
 
+// T498e (SPEC-10 AXS-OWN-006): a write through an index (`a[i] = v`, `a[i].f = v`, `a[i][j] = v`)
+// never reinitialises anything — elements are not tracked (REQ-OWN-049) — so it is checked like a
+// read of the array place (moved/partial → AX_MOVE_USE_AFTER_MOVE, uninit → AX_INIT_USE_UNINIT) and
+// marks no node. Only a whole assignment `a = [...]` reinitialises the array.
 pub fn own_do_assign(v: mut_view<OwnVisitor>, place: view<MirPlace>, loc: Span) {
     let mut base = mir_place_local(MirLocalId { v: 0u32 });
     let had_deref = truncate_at_deref(place, mut_view(base));
-    if had_deref {
+    if had_deref || own_place_indexed(place) {
         own_check_use(v, view(base), loc);
         return;
     }
@@ -69939,6 +69924,14 @@ pub fn own_do_assign(v: mut_view<OwnVisitor>, place: view<MirPlace>, loc: Span) 
         mark_state(v.state, view(*v.ctx), node, OWN_OWNED, loc);
         update_parent(v.state, view(*v.ctx), node);
     }
+}
+
+// T498e: a non-explicit DROP of a place reached through an index (before any deref). Before drop
+// elaboration the MIR builder emits it only for an assignment `a[i] = v` of a type that needs drop
+// (SPEC-03 AXS-SEM-043: drop the old value, then store); an explicit `drop(a[i])` still moves the
+// element out (and with it the whole array, REQ-OWN-049).
+fn own_drop_replaces_element(t: view<MirTerminator>) -> bool {
+    !t.drop_is_explicit && own_place_indexed(view(t.drop_place))
 }
 
 fn own_span_copy(s: view<Span>) -> Span {
@@ -70032,6 +70025,12 @@ pub fn own_visit_bb(v: mut_view<OwnVisitor>, bb: view<MirBb>) {
     if tk == MIR_TERM_SWITCH_INT {
         own_visit_operand(v, view(bb.terminator.discr), loc);
     } else if tk == MIR_TERM_DROP {
+        if own_drop_replaces_element(view(bb.terminator)) {
+            // T498e: the drop of the old element before `a[i] = v` replaces it in place; the array
+            // must be OWNED and stays OWNED (AXS-OWN-006).
+            own_check_use(v, view(bb.terminator.drop_place), loc);
+            return;
+        }
         if bb.terminator.expected {
             own_check_use(mut_view(*v), view(bb.terminator.drop_place), own_span_copy(view(loc)));
         }
@@ -70277,7 +70276,8 @@ fn own_bits_do_move(bits: *mut u64, ctx: view<PathCtx>, place: view<MirPlace>, c
 fn own_bits_do_assign(bits: *mut u64, ctx: view<PathCtx>, place: view<MirPlace>, check_errors: bool, found_error: mut_view<bool>) {
     let mut had_deref = false;
     let node = own_bits_resolve(ctx, place, mut_view(had_deref));
-    if had_deref {
+    // T498e: an indexed write only reads the array (AXS-OWN-006), as `own_do_assign`.
+    if had_deref || own_place_indexed(place) {
         if check_errors && !(*found_error) && !own_bit_test(bits as *const u64, node as usize) {
             *found_error = true;
         }
@@ -70386,7 +70386,9 @@ fn own_bits_visit_bb(
     if tk == MIR_TERM_SWITCH_INT {
         own_bits_visit_operand(bits, ctx, env, view(bb.terminator.discr), check_errors, found_error);
     } else if tk == MIR_TERM_DROP {
-        if bb.terminator.expected {
+        if own_drop_replaces_element(view(bb.terminator)) {
+            own_bits_check_use(bits as *const u64, ctx, view(bb.terminator.drop_place), check_errors, found_error);
+        } else if bb.terminator.expected {
             own_bits_use_and_move(bits, ctx, view(bb.terminator.drop_place), check_errors, found_error);
         } else {
             own_bits_do_move(bits, ctx, view(bb.terminator.drop_place), check_errors, found_error);
@@ -74243,7 +74245,6 @@ pub use compiler.own.move_ck.own_type_is_copy
 pub use compiler.own.move_ck.populate_path_tree
 pub use compiler.own.move_ck.path_ctx_init
 pub use compiler.own.move_ck.path_ctx_free
-pub use compiler.own.move_ck.resolve_place
 pub use compiler.own.move_ck.update_parent
 pub use compiler.own.move_ck.mark_state
 pub use compiler.own.move_ck.merge_state_val
