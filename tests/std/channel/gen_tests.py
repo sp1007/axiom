@@ -1093,18 +1093,9 @@ BUNDLES = {
 
 
 def read_source(rel_path):
-    if rel_path.startswith("std/sync/channel"):
-        path = os.path.join(ROOT, rel_path.replace("/", os.sep))
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read().replace("\r\n", "\n")
-    import subprocess
-    try:
-        res = subprocess.run(["git", "show", f"HEAD:{rel_path}"], cwd=ROOT, capture_output=True, text=True, check=True)
-        return res.stdout.replace("\r\n", "\n")
-    except Exception:
-        path = os.path.join(ROOT, rel_path.replace("/", os.sep))
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read().replace("\r\n", "\n")
+    path = os.path.join(ROOT, rel_path.replace("/", os.sep))
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().replace("\r\n", "\n")
 
 
 def build_bundle(header, sources, main_code):

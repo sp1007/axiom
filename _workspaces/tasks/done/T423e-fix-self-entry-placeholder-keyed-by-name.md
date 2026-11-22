@@ -8,7 +8,7 @@ model: opus
 gate_model: sonnet
 depends: [T423]
 priority: 50
-status: doing
+status: done
 attempts: 1
 timeout_min: 480
 paths: [tests/run/self_entry_placeholder, tests/std/fiber, tests/std/async/executor, tests/std/async/waker, tests/std/async/waker_qa, tests/std/channel, tests/conformance/p11/e11_5_executors, tests/perf/p11_executor, tests/std/thread, tests/run/concurrency/tls, tests/run/interp_big_args/qa_fiber_big_capture.ax, tests/std/async/structured, tests/std/sync, tests/conformance/p11/e11_3_threads_sync]
@@ -16,7 +16,7 @@ locks: [compiler/interp/interp.ax, compiler/lir/builder.ax, compiler/mir/builder
 spec: [spec/SPEC-32-threads-sync.md, spec/SPEC-34-executors-fibers.md, spec/decisions/ADR-0046-t423-fiber-followups-and-tracked-xfail.md]
 covers: [REQ-TST-072]
 started: 2026-11-22 20:00:11
-agent: t423e-impl
+finished: 2026-11-22 21:55:45
 ---
 # T423e — Self-entry placeholder resolved by identity, not by name
 
@@ -51,3 +51,4 @@ builder (`is_fiber_self_entry_name` / thread equivalent) rewrite. With a second 
 - 2026-11-22 20:20 orchestrator: approved `@lang("self_entry")` identity-based fix (zero name list in compiler); widened `paths:` with the 10 disjoint non-selfhost test paths embedding `std/{thread,fiber}/mod.ax`; remaining 3 dirs (`tests/std/async/structured`, `tests/std/sync`, `tests/conformance/p11/e11_3_threads_sync`) will be added as soon as `T422e` rebase lands.
 - 2026-11-22 20:33 orchestrator: `T422e` landed (`49e3f942`); added the remaining 3 dirs (`tests/std/async/structured`, `tests/std/sync`, `tests/conformance/p11/e11_3_threads_sync`) to `T423e` `paths:`.
 - 2026-11-22 20:00:11 started (attempt 1) t423e-impl
+- 2026-11-22 21:55:45 accepted by QA -> done
