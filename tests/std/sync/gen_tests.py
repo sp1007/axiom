@@ -1046,6 +1046,99 @@ pub fn main() -> i32 {
 }
 """
 
+UI_GUARD_AWAIT_HEADER = """// test: ui
+// stderr-contains: synchronous lock guard or @no_suspend_hold value is held across an .await suspension point
+// covers: REQ-TST-072
+"""
+
+UI_GUARD_AWAIT_SOURCES = [
+    "std/sync/atomic.ax",
+    "std/sync/mutex.ax",
+    "std/sync/rwlock.ax",
+]
+
+UI_GUARD_AWAIT_MAIN = """module main
+
+use std.core.option.Option
+use std.sync.mutex.Mutex
+use std.sync.mutex.MutexGuard
+use std.sync.rwlock.RwLock
+
+async fn tick() -> i64 {
+    1i64
+}
+
+async fn allow_mutex_guard_dropped_before_await() -> i64 {
+    let m = Mutex.new(50i64);
+    let mut snap = 0i64;
+    {
+        let g = view(m).lock();
+        snap = g.val();
+    }
+    let t = tick().await;
+    snap + t
+}
+
+async fn reject_all_std_sync_guards_across_await() -> i64 {
+    let m = Mutex.new(10i64);
+    let rw = RwLock.new(30i64);
+    let mut sum = 0i64;
+    {
+        let g = view(m).lock();
+        let t = tick().await; //~ ERROR AX_ASYNC_GUARD_ACROSS_AWAIT
+        sum = sum + g.val() + t;
+    }
+    {
+        let maybe_g = view(m).try_lock();
+        let t = tick().await; //~ ERROR AX_ASYNC_GUARD_ACROSS_AWAIT
+        sum = sum + match maybe_g {
+            Option.Some(g) => g.val() + t,
+            Option.None => t,
+        };
+    }
+    {
+        let rg = view(rw).read();
+        let t = tick().await; //~ ERROR AX_ASYNC_GUARD_ACROSS_AWAIT
+        sum = sum + rg.val() + t;
+    }
+    {
+        let mut wg = view(rw).write();
+        let t = tick().await; //~ ERROR AX_ASYNC_GUARD_ACROSS_AWAIT
+        wg.set(41i64);
+        sum = sum + wg.val() + t;
+    }
+    sum
+}
+
+pub fn main() {}
+"""
+
+UI_GUARD_ESCAPE_HEADER = """// test: ui
+// covers: REQ-TST-072
+"""
+
+UI_GUARD_ESCAPE_MAIN = """module main
+
+use std.sync.mutex.Mutex
+use std.sync.mutex.MutexGuard
+use std.sync.rwlock.RwLock
+use std.sync.rwlock.RwLockReadGuard
+
+pub fn reject_returning_std_mutex_guard() -> MutexGuard<i64> {
+    let m = Mutex.new(60i64);
+    let g = view(m).lock();
+    return g; //~ ERROR AX_CONC_GUARD_ESCAPE
+}
+
+pub fn reject_returning_std_rwlock_guard() -> RwLockReadGuard<i64> {
+    let rw = RwLock.new(70i64);
+    let rg = view(rw).read();
+    return rg; //~ ERROR AX_CONC_GUARD_ESCAPE
+}
+
+pub fn main() {}
+"""
+
 BUNDLES = {
     "rc_basic.ax": (RC_BASIC_HEADER, RC_BASIC_SOURCES, RC_BASIC_MAIN),
     "arc_mutex_threads.ax": (ARC_MUTEX_HEADER, ARC_MUTEX_SOURCES, ARC_MUTEX_MAIN),
@@ -1054,6 +1147,8 @@ BUNDLES = {
     "once_cell_init.ax": (ONCE_CELL_HEADER, ONCE_CELL_SOURCES, ONCE_CELL_MAIN),
     "barrier_rendezvous.ax": (BARRIER_HEADER, BARRIER_SOURCES, BARRIER_MAIN),
     "big_struct_sync.ax": (BIG_STRUCT_HEADER, BIG_STRUCT_SOURCES, BIG_STRUCT_MAIN),
+    "ui_std_sync_guard_await_and_escape.ax": (UI_GUARD_AWAIT_HEADER, UI_GUARD_AWAIT_SOURCES, UI_GUARD_AWAIT_MAIN),
+    "ui_std_sync_guard_escape.ax": (UI_GUARD_ESCAPE_HEADER, UI_GUARD_AWAIT_SOURCES, UI_GUARD_ESCAPE_MAIN),
 }
 
 

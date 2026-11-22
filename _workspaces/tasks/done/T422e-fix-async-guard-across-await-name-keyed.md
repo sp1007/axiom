@@ -8,7 +8,7 @@ model: opus
 gate_model: sonnet
 depends: [T422c, T498f]
 priority: 16
-status: doing
+status: done
 attempts: 1
 timeout_min: 480
 paths: [compiler/verify/verifier.ax, compiler/types/typeck.ax, compiler/own/unsafe.ax, std/sync/mutex.ax, std/sync/rwlock.ax, tests/run/async_guard_across_await, tests/ui/async_guard_across_await, tests/ui/async/lock_guard_await, tests/std/sync, tests/conformance/p11/e11_3_threads_sync, tests/std/async/structured, tests/conformance/p11/e11_4_async/async_ui_guard_across_await.ax, tests/conformance/p11/e11_1_concurrency/ui_lock_guard_escape.ax, tests/ui/concurrency/data_race/guard_escape_and_atomic_mut_view.ax, tests/ui/concurrency/data_race/qa_arc_and_boundary_races.ax]
@@ -17,7 +17,7 @@ spec: [spec/SPEC-34-executors-fibers.md]
 covers: [REQ-TST-072]
 started: 2026-11-22 17:33:31
 unblocks: 1
-agent: t422e-impl
+finished: 2026-11-22 20:32:16
 ---
 # T422e — async guard across `.await`
 
@@ -75,3 +75,4 @@ Depends on T498f (holds typeck.ax); T499b also needs typeck.ax — the board ser
 - 2026-11-22 15:55:48 unblocked (cycle 1)
 - 2026-11-22 17:50 orchestrator: widened paths with 4 legacy mock-guard UI tests (`e11_4_async/async_ui_guard_across_await.ax`, `e11_1_concurrency/ui_lock_guard_escape.ax`, `data_race/guard_escape_and_atomic_mut_view.ax`, `data_race/qa_arc_and_boundary_races.ax`) so guard checks stay purely attribute-based (`@no_suspend_hold`, zero name heuristics); disjoint from all active tasks.
 - 2026-11-22 17:33:31 started (attempt 1) t422e-impl
+- 2026-11-22 20:32:16 accepted by QA -> done

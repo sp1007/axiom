@@ -8,14 +8,15 @@ model: sonnet
 gate_model: sonnet
 depends: [T453, T498a]
 priority: 50
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/target/x64/frame.ax, tests/mc, tests/selfhost/isel/qa_frame_layout_and_verify.ax.in, tests/selfhost/isel/qa_isel_diff_golden.ax.in, tests/selfhost/backend/harness_backend_diff_mi_mc.ax.in, tests/selfhost/backend/harness_backend_unit.ax.in, tests/selfhost/driver/gen_driver_tests.py]
 locks: []
 spec: [spec/SPEC-26-windows-artifact-kinds.md]
 covers: [REQ-TST-072]
-started: 2026-11-22 19:25:46
+started: 2026-11-22 20:06:07
 unblocks: 1
+agent: t453b-impl2
 ---
 # T453b — One encoder for `--emit=mc` and object code
 
@@ -84,3 +85,4 @@ do not redo them). `paths:` is now widened with the 5 selfhost generator-input f
 - 2026-11-22 19:25:46 started (attempt 1) t453b-impl
 - 2026-11-22 19:56:24 block: needs paths widened: 5 selfhost template/generator inputs hardcode legacy axiom0 emit_mc.c bytes
 - 2026-11-22 20:02:36 unblocked (cycle 1) 
+- 2026-11-22 20:06:07 started (attempt 1) t453b-impl2
