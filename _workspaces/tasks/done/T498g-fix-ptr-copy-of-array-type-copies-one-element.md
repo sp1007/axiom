@@ -8,7 +8,7 @@ model: opus
 gate_model: sonnet
 depends: [T498c, T448]
 priority: 11
-status: doing
+status: done
 attempts: 1
 timeout_min: 480
 paths: [compiler/mir/builder.ax, compiler/types/typeck.ax, compiler/interp, compiler/lir/builder.ax, tests/run/mem_generic_array]
@@ -16,7 +16,7 @@ locks: []
 spec: [spec/SPEC-50-unsafe-ub-ffi.md, spec/SPEC-51-raw-memory-volatile-mmio-layout.md, spec/SPEC-03-core-semantics.md]
 covers: [REQ-TST-072]
 started: 2026-11-22 10:45:22
-agent: T498g-impl
+finished: 2026-11-22 13:39:21
 ---
 # T498g — Generic raw-memory intrinsics with an array `T`
 
@@ -66,3 +66,4 @@ temporary is typed from the wrong type). Find the root cause; do not special-cas
 ## Log
 - 2026-11-22 created by axiom-architect (triage-1122; T498c-qa FU-QA-T498c-2)
 - 2026-11-22 10:45:22 started (attempt 1) T498g-impl
+- 2026-11-22 13:39:21 accepted by QA -> done
