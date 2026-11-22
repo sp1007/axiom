@@ -6,7 +6,7 @@ owner: axiom-semantics
 reviewer: axiom-qa
 model: sonnet
 gate_model: sonnet
-depends: [T500]
+depends: [T500, T537]
 priority: 151
 status: todo
 attempts: 0
@@ -42,3 +42,4 @@ Implement full `unsafe` block/fn/trait/impl checking, raw-pointer-to-view proven
 
 ## Log
 - 2026-11-03 01:58:00 created by T213 (P13 phase planning)
+- 2026-11-22 depends += T537 (architect, triage-1122)

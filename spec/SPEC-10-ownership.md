@@ -1,7 +1,7 @@
 # SPEC-10: Ownership and Place Model
 
 ## Tóm tắt
-Đặc tả này chuẩn hóa mô hình Ownership của Axiom (lưu ý: Ownership ≠ Borrow Checker). Nó định nghĩa Place Model, các trạng thái khởi tạo (UNINIT, OWNED, MOVED) và quy tắc partial move, copy vs move semantics. Điểm quan trọng là Move không bắt buộc sinh ra physical copy trong MIR, tuỳ thuộc vào backend. Custom Drop ngăn cấm partial move. Phải thiết kế sao cho compiler đảm nhiệm tính đúng đắn thay vì bắt lập trình viên viết annotation.
+Đặc tả này chuẩn hóa mô hình Ownership của Axiom (lưu ý: Ownership ≠ Borrow Checker). Nó định nghĩa Place Model, các trạng thái khởi tạo (UNINIT, OWNED, MOVED) và quy tắc partial move, copy vs move semantics. Điểm quan trọng là Move không bắt buộc sinh ra physical copy trong MIR, tuỳ thuộc vào backend. Custom Drop ngăn cấm partial move. Phải thiết kế sao cho compiler đảm nhiệm tính đúng đắn thay vì bắt lập trình viên viết annotation. Gán lại chỉ khôi phục đúng đường dẫn được gán; ghi qua chỉ số (`a[i] = v`, `a[i].f = v`) không bao giờ khôi phục mảng và bị từ chối nếu mảng đã bị move (AXS-OWN-006, triage-1122).
 
 ## 1. Place Model & Ownership State
 
@@ -31,6 +31,18 @@ If a struct implements a *Custom Drop*, partial moves are strictly forbidden. Th
 
 ### AXS-OWN-006: Reinitialization
 A `MOVED` or `UNINIT` place can be assigned to again. Reinitialization restores the state to `OWNED`.
+Reinitialization restores ownership only for the assigned path, never for a wider place
+[0540 §130 AOWNENG-30 (REQ-OWN-267); 0124 §15 AOWN-37 (REQ-OWN-048)]:
+- Assigning a field `s.f = v` of a `MOVED`/`PARTIAL` struct reinitializes `s.f` only; `s` becomes
+  `OWNED` again once every moved field has been reinitialized (AOWN-37). Reading another still-moved
+  field stays `AX_MOVE_USE_AFTER_MOVE`.
+- Array elements are not tracked individually (element-level tracking is post-v1, REQ-OWN-049) and
+  an index is dynamic, so a write through an index — `a[i] = v`, `a[i].f = v`, `a[i][j] = v`,
+  compound `a[i] op= v` — never reinitializes anything: it requires the array place `a` to be
+  definitely `OWNED` at that point. If `a` is (maybe-)`MOVED` or `PARTIAL` the write is rejected with
+  `AX_MOVE_USE_AFTER_MOVE` (span: the indexed place; note: where `a` was moved); if `a` is (maybe-)
+  `UNINIT` it is `AX_INIT_USE_UNINIT`. Only a whole assignment `a = [...]` reinitializes the array.
+  (Clarification from triage-1122; implemented by T498e.)
 
 ### AXS-OWN-007: Path Sensitivity at Control-Flow Joins
 Ownership analysis must track state across branches. If a place is `OWNED` on one branch and `MOVED` on another, its state at the join point is conditionally moved, and any subsequent unconditional read is invalid without reinitialization.
@@ -51,6 +63,8 @@ The MIR (Mid-level IR) must carry enough structural information to enact these r
 | AXS-OWN-005 | `let f = CustomDrop(); let h = f.handle;` | No | T046 |
 | AXS-OWN-001 | `let a: i32; print(a);` | No (Uninitialized) | T047 |
 | AXS-OWN-006 | `let a = NonCopy(); let b = a; a = NonCopy(); let c = a;` | Yes | T047 |
+| AXS-OWN-006 | `let mut hs: [2]H = [mk(), mk()]; let t = hs; hs[0] = mk(); let u = hs[1].n;` | No (`AX_MOVE_USE_AFTER_MOVE` at `hs[0]`) | T498e |
+| AXS-OWN-006 | `let mut hs: [2]H = [mk(), mk()]; let t = hs; hs = [mk(), mk()]; let u = hs[1].n;` | Yes | T498e |
 | AXS-OWN-007 | `let a = NonCopy(); if c { let b = a; } let d = a;` | No (Maybe moved) | T046 |
 
 ## References

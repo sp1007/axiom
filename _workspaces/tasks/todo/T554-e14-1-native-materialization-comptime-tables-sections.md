@@ -6,7 +6,7 @@ owner: axiom-backend
 reviewer: axiom-qa
 model: sonnet
 gate_model: sonnet
-depends: [T552, T553]
+depends: [T552, T553, T537]
 priority: 174
 status: todo
 attempts: 0
@@ -40,3 +40,4 @@ Lower comptime-lifted aggregates, nested slices/views, and initialized `const`/`
 
 ## Log
 - 2026-11-03 02:20:00 created by T214 (P14 phase planning)
+- 2026-11-22 depends += T537 (architect, triage-1122)

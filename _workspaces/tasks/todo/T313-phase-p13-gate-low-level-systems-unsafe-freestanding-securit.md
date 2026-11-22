@@ -6,7 +6,7 @@ owner: axiom-qa
 reviewer: axiom-architect
 model: opus
 gate_model: opus
-depends: [T213, T500, T501, T502, T503, T504, T505, T506, T507, T508, T509, T510, T511, T512, T513, T514, T515, T516, T517, T518, T519, T520, T521, T522, T523, T524, T525, T526, T527, T528, T529, T530, T531, T532, T533, T534, T535, T536]
+depends: [T213, T500, T501, T502, T503, T504, T505, T506, T507, T508, T509, T510, T511, T512, T513, T514, T515, T516, T517, T518, T519, T520, T521, T522, T523, T524, T525, T526, T527, T528, T529, T530, T531, T532, T533, T534, T535, T536, T537, T538]
 priority: 313
 status: todo
 attempts: 0
@@ -39,3 +39,4 @@ requirements mapped to the phase are implemented.
 
 ## Log
 - 2026-10-06 02:31:20 covers += REQ-SEC-123 (metadata only)
+- 2026-11-22 depends += T537, T538 (architect, triage-1122)

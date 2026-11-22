@@ -6,7 +6,7 @@ owner: axiom-semantics
 reviewer: axiom-qa
 model: sonnet
 gate_model: sonnet
-depends: [T501, T508, T512, T525]
+depends: [T501, T508, T512, T525, T537]
 priority: 175
 status: todo
 attempts: 0
@@ -39,3 +39,4 @@ Implement full `@at(<expr>)` and `@addr(<expr>)` overlay and placement semantics
 
 ## Log
 - 2026-11-03 02:05:00 created by T213 (P13 phase planning)
+- 2026-11-22 depends += T537 (architect, triage-1122)

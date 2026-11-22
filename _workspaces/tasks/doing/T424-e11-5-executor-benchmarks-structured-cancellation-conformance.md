@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T420, T421, T422, T423]
 priority: 147
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tests/conformance/p11/e11_5_executors, tests/perf/p11_executor]
 spec: [spec/SPEC-34-executors-fibers.md, 0202, 0204, 0205, tasks/0277, tasks/0278, tasks/0620, tasks/0836]
 covers: [REQ-ASY-165]
+started: 2026-11-22 09:28:56
+agent: T424-impl
 ---
 # T424 — E11.5 — Executor benchmarks, fiber & structured-cancellation conformance suite
 
@@ -38,3 +40,4 @@ Verify the `E11.5` exit criterion ('executor benchmarks + structured-cancellatio
 
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
+- 2026-11-22 09:28:56 started (attempt 1) T424-impl

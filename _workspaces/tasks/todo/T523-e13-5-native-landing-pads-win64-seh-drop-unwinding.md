@@ -6,7 +6,7 @@ owner: axiom-backend
 reviewer: axiom-qa
 model: sonnet
 gate_model: sonnet
-depends: [T522]
+depends: [T522, T538]
 priority: 172
 status: todo
 attempts: 0
@@ -39,3 +39,4 @@ Lower MIR cleanup landing pads, `catch_unwind`, and FFI no-unwind abort barriers
 
 ## Log
 - 2026-11-03 02:04:00 created by T213 (P13 phase planning)
+- 2026-11-22 depends += T538 (architect, triage-1122)
