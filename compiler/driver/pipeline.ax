@@ -27,6 +27,7 @@ use compiler.source.manager.source_db_span_text
 use compiler.diag.code.AX_IO_FILE_NOT_FOUND
 use compiler.diag.code.AX_NAME_UNRESOLVED_IMPORT
 use compiler.diag.code.AX_NAME_FREESTANDING_FORBIDDEN_IMPORT
+use compiler.diag.code.AX_SEC_CAPABILITY_FORGERY
 use compiler.diag.code.DiagCode
 use compiler.diag.code.DiagDataKind
 use compiler.diag.code.DiagSeverity
@@ -154,6 +155,8 @@ use compiler.types.layout.type_align
 use compiler.types.typeck.patch_unknown_intrinsic_diag_buf
 use compiler.types.typeck.fre_is_forbidden_std_layer3_seg
 use compiler.types.typeck.typeck_check_profile
+use compiler.types.typeck.typeck_check_safety_profile
+use compiler.types.typeck.typeck_dedup_unsafe_diags_under_forbid
 use compiler.typeck.session.session_render_thir_into
 use compiler.traits.mono.MonoInstance
 use compiler.traits.mono.MonoEngine
@@ -357,8 +360,12 @@ use compiler.driver.opts.PROFILE_HOSTED
 use compiler.driver.opts.PROFILE_FREESTANDING
 use compiler.driver.opts.PROFILE_KERNEL
 use compiler.driver.opts.PROFILE_SYSTEM
+use compiler.driver.opts.SAFETY_PROFILE_SYSTEM
+use compiler.driver.opts.SAFETY_PROFILE_SAFE
+use compiler.driver.opts.SAFETY_PROFILE_SANDBOX
 use compiler.driver.opts.AX_DRIVER_INVALID_ARTIFACT_KIND
 use compiler.driver.opts.AX_DRIVER_INVALID_PROFILE
+use compiler.driver.opts.AX_DRIVER_INVALID_SAFETY_PROFILE
 use compiler.driver.opts.AX_FFI_GENERIC_EXPORT
 use compiler.driver.opts.err_run_kind_not_supported
 use compiler.driver.opts.DriverOptions
@@ -381,6 +388,7 @@ use compiler.driver.opts.sv_slot_set
 use compiler.driver.opts.arena_clone_sv
 use compiler.driver.opts.driver_parse_artifact_kind
 use compiler.driver.opts.driver_parse_profile
+use compiler.driver.opts.driver_parse_safety_profile
 use compiler.driver.opts.derive_file_stem_sv
 use compiler.driver.opts.derive_default_output_path
 use compiler.driver.opts.emit_driver_diag
@@ -803,6 +811,8 @@ pub struct PipelineCtx {
     pub panic_msg: StrView,
     pub eff_profile: u32,
     pub invalid_profile: bool,
+    pub eff_safety_profile: u32,
+    pub pkg_forbid_unsafe: bool,
 }
 
 pub fn pipeline_ctx_init(ctx: mut_view<PipelineCtx>) {
@@ -878,6 +888,8 @@ pub fn pipeline_ctx_init(ctx: mut_view<PipelineCtx>) {
     sv_clear(mut_view(ctx.panic_msg));
     ctx.eff_profile = PROFILE_HOSTED;
     ctx.invalid_profile = false;
+    ctx.eff_safety_profile = SAFETY_PROFILE_SYSTEM;
+    ctx.pkg_forbid_unsafe = false;
 }
 
 pub fn pipeline_ctx_free(ctx: mut_view<PipelineCtx>) {
@@ -1371,6 +1383,32 @@ fn pipe_skip_blanks(text: view<StrView>, pos: usize) -> usize {
     i
 }
 
+fn pipe_skip_line_attrs(text: view<StrView>, pos: usize) -> usize {
+    let mut i: usize = pipe_skip_blanks(text, pos);
+    while i < text.len && (unsafe { *(text.ptr + i) }) == 64u8 {
+        i = i + 1;
+        while i < text.len && pipe_is_ident_byte(unsafe { *(text.ptr + i) }) {
+            i = i + 1;
+        }
+        i = pipe_skip_blanks(text, i);
+        if i < text.len && (unsafe { *(text.ptr + i) }) == 40u8 {
+            let mut depth: usize = 1;
+            i = i + 1;
+            while i < text.len && depth > 0 && (unsafe { *(text.ptr + i) }) != 10u8 {
+                let c = unsafe { *(text.ptr + i) };
+                if c == 40u8 {
+                    depth = depth + 1;
+                } else if c == 41u8 {
+                    depth = depth - 1;
+                }
+                i = i + 1;
+            }
+        }
+        i = pipe_skip_blanks(text, i);
+    }
+    i
+}
+
 // Adds the path of every `module <path>` line of `text` to `out`.
 fn pipe_collect_module_headers(
     arena: mut_view<Arena>,
@@ -1383,7 +1421,7 @@ fn pipe_collect_module_headers(
     }
     let mut ls: usize = 0;
     while ls < text.len {
-        let i = pipe_skip_blanks(text, ls);
+        let i = pipe_skip_line_attrs(text, ls);
         let after = pipe_kw_at(text, i, view(lits.kw_module));
         if after > 0 {
             let p = pipe_path_at(text, after);
@@ -2414,6 +2452,8 @@ pub fn pipe_write_dep_file(ctx: view<PipelineCtx>, dopts: view<DriverOptions>) {
 pub fn pipeline_stage_source(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptions>) -> bool {
     ctx.eff_profile = dopts.profile;
     ctx.invalid_profile = false;
+    ctx.eff_safety_profile = dopts.safety_profile;
+    ctx.pkg_forbid_unsafe = false;
     if dopts.input_file.len == 0 {
         emit_driver_diag(mut_view(ctx.sess.diag_sink), AX_IO_FILE_NOT_FOUND, 0, 25);
         return false;
@@ -2462,6 +2502,20 @@ pub fn pipeline_stage_source(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptio
             return false;
         }
         ctx.eff_profile = mp;
+    }
+
+    if ctx.proj.has_manifest && ctx.proj.manifest.has_forbid_unsafe {
+        ctx.pkg_forbid_unsafe = ctx.proj.manifest.forbid_unsafe;
+    }
+    if !dopts.has_explicit_safety_profile && ctx.proj.has_manifest && ctx.proj.manifest.safety_profile.len > 0 {
+        let mut msp: u32 = SAFETY_PROFILE_SYSTEM;
+        if !driver_parse_safety_profile(view(ctx.proj.manifest.safety_profile), mut_view(msp)) {
+            ctx.invalid_profile = true;
+            let spmsg_sv = pipe_lit(mut_view(ctx.proj.arena), "invalid safety_profile in axiom.toml");
+            emit_driver_diag_text(mut_view(ctx.sess.diag_sink), AX_DRIVER_INVALID_SAFETY_PROFILE, view(spmsg_sv));
+            return false;
+        }
+        ctx.eff_safety_profile = msp;
     }
 
     if dopts.cmd == CMD_BUILD {
@@ -3017,13 +3071,91 @@ pub fn pipeline_stage_typeck(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptio
         is_dll,
         ctx.main_fid.v
     );
-    if session_has_errors(view(ctx.sess)) {
+
+    let mut user_fid_count: usize = 0;
+    let mut user_fids: *const u32 = 0 as *const u32;
+    if ctx.proj.file_count > 0 {
+        let mut uf_cap: usize = 0;
+        let mut ufi: usize = 0;
+        while ufi < ctx.proj.file_count {
+            let pf = unsafe { project_file_const_at(ctx.proj.files as *const ProjectFile, ufi) };
+            if !pf_is_std(pf) && pf_get_fid_v(pf) != 0u32 {
+                uf_cap = uf_cap + 1;
+            }
+            ufi = ufi + 1;
+        }
+        if uf_cap > 0 {
+            let uf_bytes = opts_mul_usize(uf_cap, size_of<u32>());
+            let uf_raw = arena_alloc_raw(mut_view(ctx.hir_arena), uf_bytes, align_of<u32>()) as *mut u32;
+            let mut ufj: usize = 0;
+            let mut ufk: usize = 0;
+            while ufj < ctx.proj.file_count {
+                let pf = unsafe { project_file_const_at(ctx.proj.files as *const ProjectFile, ufj) };
+                let f_v = pf_get_fid_v(pf);
+                if !pf_is_std(pf) && f_v != 0u32 && ufk < uf_cap {
+                    unsafe { *(uf_raw + ufk) = f_v; }
+                    ufk = ufk + 1;
+                }
+                ufj = ufj + 1;
+            }
+            user_fids = uf_raw as *const u32;
+            user_fid_count = ufk;
+        }
+    } else if ctx.main_fid.v != 0u32 {
+        let uf_raw = arena_alloc_raw(mut_view(ctx.hir_arena), size_of<u32>(), align_of<u32>()) as *mut u32;
+        unsafe { *uf_raw = ctx.main_fid.v; }
+        user_fids = uf_raw as *const u32;
+        user_fid_count = 1;
+    }
+
+    let mut had_non_sec_errors: bool = false;
+    if ctx.sess.diag_sink.errors > 0 && (ctx.sess.diag_sink.diags as usize) != 0 {
+        let dsz = size_of<Diagnostic>();
+        let mut di: usize = 0;
+        while di < ctx.sess.diag_sink.len {
+            let dp = ((ctx.sess.diag_sink.diags as usize) + opts_mul_usize(di, dsz)) as *const Diagnostic;
+            let is_err = match unsafe { (*dp).severity } {
+                DiagSeverity.Error => true,
+                _ => false,
+            };
+            if is_err && (unsafe { (*dp).code.v }) != AX_SEC_CAPABILITY_FORGERY {
+                had_non_sec_errors = true;
+                break;
+            }
+            di = di + 1;
+        }
+    }
+    if had_non_sec_errors {
         return;
     }
-    let _ = session_unsafe_check(
-        mut_view(ctx.sess),
+
+    let pre_unsafe_diag_idx: usize = ctx.sess.diag_sink.len;
+    if !session_has_errors(view(ctx.sess)) {
+        let _ = session_unsafe_check(
+            mut_view(ctx.sess),
+            view(ctx.hir),
+            view(ctx.thir)
+        );
+    }
+    typeck_check_safety_profile(
         view(ctx.hir),
-        view(ctx.thir)
+        view(ctx.thir),
+        mut_view(ctx.sess.diag_sink),
+        view(ctx.sess.interner),
+        ctx.eff_safety_profile,
+        ctx.pkg_forbid_unsafe,
+        user_fids,
+        user_fid_count
+    );
+    typeck_dedup_unsafe_diags_under_forbid(
+        view(ctx.hir),
+        mut_view(ctx.sess.diag_sink),
+        view(ctx.sess.interner),
+        pre_unsafe_diag_idx,
+        ctx.eff_safety_profile,
+        ctx.pkg_forbid_unsafe,
+        user_fids,
+        user_fid_count
     );
     if session_has_errors(view(ctx.sess)) {
         return;

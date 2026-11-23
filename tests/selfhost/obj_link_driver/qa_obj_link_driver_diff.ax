@@ -2939,7 +2939,12 @@ pub const AX_TYPE_INVALID_NAKED_FN: u32 = 180u32;
 pub const AX_TYPE_INVALID_SECTION: u32 = 181u32;
 pub const AX_UNSAFE_INTERRUPT_FORBIDDEN_OP: u32 = 182u32;
 pub const AX_FFI_BAD_TYPE: u32 = 183u32;
+pub const AX_SEC_UNSAFE_FORBIDDEN: u32 = 184u32;
+pub const AX_SEC_CONFLICTING_SAFETY_POLICY: u32 = 185u32;
+pub const AX_SEC_AMBIENT_AUTHORITY_FORBIDDEN: u32 = 186u32;
+pub const AX_SEC_CAPABILITY_FORGERY: u32 = 187u32;
 pub const AX_DRIVER_INVALID_PROFILE: u32 = 217u32;
+pub const AX_DRIVER_INVALID_SAFETY_PROFILE: u32 = 218u32;
 
 pub fn diag_code_name(c: DiagCode) -> Str {
     match c.v {
@@ -3004,7 +3009,12 @@ pub fn diag_code_name(c: DiagCode) -> Str {
         181u32 => "AX_TYPE_INVALID_SECTION",
         182u32 => "AX_UNSAFE_INTERRUPT_FORBIDDEN_OP",
         183u32 => "AX_FFI_BAD_TYPE",
+        184u32 => "AX_SEC_UNSAFE_FORBIDDEN",
+        185u32 => "AX_SEC_CONFLICTING_SAFETY_POLICY",
+        186u32 => "AX_SEC_AMBIENT_AUTHORITY_FORBIDDEN",
+        187u32 => "AX_SEC_CAPABILITY_FORGERY",
         217u32 => "AX_DRIVER_INVALID_PROFILE",
+        218u32 => "AX_DRIVER_INVALID_SAFETY_PROFILE",
         _ => "<unknown>",
     }
 }
@@ -3120,7 +3130,12 @@ pub fn diag_code_default_message(c: DiagCode) -> Str {
         181u32 => "@section or @used attribute has an invalid target or malformed section name",
         182u32 => "extern \"interrupt\" handler cannot allocate on the heap, spawn threads, block, perform OS I/O, or .await",
         183u32 => "extern ABI function parameter or return type is invalid for the declared ABI",
+        184u32 => "unsafe construct or operation is forbidden by the active safety profile or @forbid_unsafe policy",
+        185u32 => "conflicting or invalid safety policy (@allow_unsafe cannot escalate an enclosing @forbid_unsafe or safety profile)",
+        186u32 => "ambient OS authority is forbidden in sandbox or comptime without an explicit capability token",
+        187u32 => "safe capability view or authority token cannot be forged from raw pointers or integer addresses outside unsafe",
         217u32 => "unknown --profile value (expected hosted, freestanding, kernel, or system)",
+        218u32 => "unknown --safety-profile value (expected safe, sandbox, or system)",
         _ => "",
     }
 }
@@ -28887,6 +28902,11 @@ use compiler.diag.code.AX_TYPE_INVALID_NAKED_FN
 use compiler.diag.code.AX_TYPE_INVALID_SECTION
 use compiler.diag.code.AX_UNSAFE_INTERRUPT_FORBIDDEN_OP
 use compiler.diag.code.AX_FFI_BAD_TYPE
+use compiler.diag.code.AX_CONC_UNSYNC_STATIC
+use compiler.diag.code.AX_SEC_UNSAFE_FORBIDDEN
+use compiler.diag.code.AX_SEC_CONFLICTING_SAFETY_POLICY
+use compiler.diag.code.AX_SEC_AMBIENT_AUTHORITY_FORBIDDEN
+use compiler.diag.code.AX_SEC_CAPABILITY_FORGERY
 use compiler.diag.code.DiagCode
 use compiler.diag.code.DiagDataKind
 use compiler.diag.code.DiagSeverity
@@ -30608,6 +30628,10 @@ pub fn coerce(cx: mut_view<TypeckCtx>, from: TypeId, to: TypeId, sp: view<Span>)
         }
     }
     if !unify_ty(mut_view(*cx), (TypeId { v: from.v }), (TypeId { v: to.v })) {
+        if tc_try_report_capability_forgery(mut_view(*cx), (TypeId { v: from.v }), (TypeId { v: to.v }), sp, false) {
+            let err_v = unsafe { (*cx.thir).interner.t_error.v };
+            return (TypeId { v: err_v });
+        }
         return type_error(mut_view(*cx), sp, AX_TYPE_MISMATCH);
     }
     (TypeId { v: from.v })
@@ -36682,7 +36706,7 @@ fn scan_expr_captures(
         let in_e: *mut HirExpr = unsafe { (*expr).inner };
         let is_m = unsafe { (*expr).is_mut };
         scan_expr_captures(mut_view(*cx), in_e, inner, mut_view(*inner_count), caps, mut_view(*cap_count), is_m, false);
-    } else if ek == HIR_EXPR_BLOCK || ek == HIR_EXPR_UNSAFE {
+    } else if ek == HIR_EXPR_BLOCK || ek == HIR_EXPR_UNSAFE || ek == HIR_EXPR_COMPTIME {
         let blk: *mut HirBlock = unsafe { (*expr).block };
         scan_block_captures(mut_view(*cx), blk, inner, mut_view(*inner_count), caps, mut_view(*cap_count));
     } else if ek == HIR_EXPR_IF {
@@ -37474,6 +37498,9 @@ fn check_expr_flow_or_cast(cx: mut_view<TypeckCtx>, expr: *const HirExpr, expect
             is_valid = true;
         }
         if is_valid { return (TypeId { v: dest_ty.v }); }
+        if unsafe { tc_try_report_capability_forgery(mut_view(*cx), (TypeId { v: src_ty.v }), (TypeId { v: dest_ty.v }), view((*expr).span), true) } {
+            return (TypeId { v: err_v });
+        }
         return unsafe { type_error(mut_view(*cx), view((*expr).span), AX_TYPE_INVALID_CAST) };
     }
     (TypeId { v: err_v })
@@ -37710,7 +37737,8 @@ fn check_expr_match_or_view(cx: mut_view<TypeckCtx>, expr: *const HirExpr, expec
         return check_expr_kind(mut_view(*cx), expr, (TypeId { v: expected.v }));
     }
     if ek == HIR_EXPR_COMPTIME {
-        return (TypeId { v: err_v });
+        let blk: *mut HirBlock = unsafe { (*expr).block };
+        return check_block(mut_view(*cx), blk, (TypeId { v: expected.v }));
     }
     (TypeId { v: err_v })
 }
@@ -38910,6 +38938,9 @@ pub fn check_block(cx: mut_view<TypeckCtx>, block: *const HirBlock, expected: Ty
             return unsafe { type_error(mut_view(*cx), view((*block).span), AX_TYPE_RETURN) };
         }
         if (tail as usize) != 0 {
+            if unsafe { tc_try_report_capability_forgery(mut_view(*cx), (TypeId { v: r_ty.v }), (TypeId { v: expected.v }), view((*tail).span), false) } {
+                return (TypeId { v: err_v });
+            }
             return unsafe { type_error(mut_view(*cx), view((*tail).span), AX_TYPE_MISMATCH) };
         }
         return unsafe { type_error(mut_view(*cx), view((*block).span), AX_TYPE_MISMATCH) };
@@ -40452,7 +40483,7 @@ fn scan_spawn_boundaries_expr(cx: mut_view<TypeckCtx>, expr: *const HirExpr, is_
                 arg = unsafe { (*arg).next };
             }
         }
-    } else if ek == HIR_EXPR_BLOCK || ek == HIR_EXPR_UNSAFE {
+    } else if ek == HIR_EXPR_BLOCK || ek == HIR_EXPR_UNSAFE || ek == HIR_EXPR_COMPTIME {
         let blk: *mut HirBlock = unsafe { (*expr).block };
         scan_spawn_boundaries_block(mut_view(*cx), blk, is_ret_pos);
     } else if ek == HIR_EXPR_IF {
@@ -47769,6 +47800,2393 @@ pub fn typeck_check_profile(
     }
 }
 
+// =============================================================================
+// E13.4 (T517, SPEC-53): Safety Profiles, `@forbid_unsafe`, Ambient-Authority
+// Ban (`sandbox` / `comptime`), and Capability Forgery Rejection (`REQ-CAP-123`)
+// =============================================================================
+
+pub const TY_SAFETY_PROFILE_SYSTEM: u32 = 0u32;
+pub const TY_SAFETY_PROFILE_SAFE: u32 = 1u32;
+pub const TY_SAFETY_PROFILE_SANDBOX: u32 = 2u32;
+
+const SEC_AUTH_FS: u32 = 1u32;
+const SEC_AUTH_NET: u32 = 2u32;
+const SEC_AUTH_ENV: u32 = 4u32;
+const SEC_AUTH_PROCESS: u32 = 8u32;
+const SEC_AUTH_CLOCK: u32 = 16u32;
+
+fn sec_is_authority_cap_struct_name(sv: view<StrView>) -> u32 {
+    if fre_sv_eq_str(sv, "FsCap") { return SEC_AUTH_FS; }
+    if fre_sv_eq_str(sv, "NetCap") { return SEC_AUTH_NET; }
+    if fre_sv_eq_str(sv, "EnvCap") { return SEC_AUTH_ENV; }
+    if fre_sv_eq_str(sv, "ProcessCap") { return SEC_AUTH_PROCESS; }
+    if fre_sv_eq_str(sv, "ClockCap") { return SEC_AUTH_CLOCK; }
+    if fre_sv_eq_str(sv, "SandboxCaps") || fre_sv_eq_str(sv, "RootCaps") {
+        return SEC_AUTH_FS | SEC_AUTH_NET | SEC_AUTH_ENV | SEC_AUTH_PROCESS | SEC_AUTH_CLOCK;
+    }
+    0u32
+}
+
+fn sec_is_raw_addr_struct_name(sv: view<StrView>) -> bool {
+    fre_sv_eq_str(sv, "PhysAddr") || fre_sv_eq_str(sv, "VirtAddr") || fre_sv_eq_str(sv, "WasmAddr")
+}
+
+fn tc_try_report_capability_forgery(
+    cx: mut_view<TypeckCtx>,
+    src_raw: TypeId,
+    dest_raw: TypeId,
+    sp: view<Span>,
+    is_explicit_cast: bool
+) -> bool {
+    if (cx.thir as usize) == 0 || (cx.sink as usize) == 0 {
+        return false;
+    }
+    let src_ty = resolve_ty(mut_view(*cx), (TypeId { v: src_raw.v }));
+    let dest_ty = resolve_ty(mut_view(*cx), (TypeId { v: dest_raw.v }));
+    if src_ty.v == 0u32 || dest_ty.v == 0u32 ||
+       is_error(mut_view(*cx), (TypeId { v: src_ty.v })) ||
+       is_error(mut_view(*cx), (TypeId { v: dest_ty.v })) {
+        return false;
+    }
+    let st = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: src_ty.v })) };
+    let dt = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: dest_ty.v })) };
+    if (st as usize) == 0 || (dt as usize) == 0 {
+        return false;
+    }
+    let sk = unsafe { (*st).kind };
+    let dk = unsafe { (*dt).kind };
+
+    let mut src_kind_code: u8 = 0u8; // 1 = raw_ptr, 2 = integer_addr
+    if sk == TY_PTR {
+        src_kind_code = 1u8;
+    } else if is_intlike(mut_view(*cx), (TypeId { v: src_ty.v })) {
+        src_kind_code = 2u8;
+    } else if sk == TY_STRUCT && (cx.str_in as usize) != 0 {
+        let sdef: *const HirItem = unsafe { (*st).def };
+        if (sdef as usize) != 0 {
+            let sname = unsafe { interner_get(view(*cx.str_in), StrId { v: (*sdef).name.v }) };
+            if sec_is_raw_addr_struct_name(view(sname)) {
+                src_kind_code = 2u8;
+            }
+        }
+    }
+    if src_kind_code == 0u8 {
+        return false;
+    }
+
+    let mut dst_kind_code: u8 = 0u8; // 1 = view, 2 = mut_view, 3 = str, 4 = authority_cap
+    if dk == TY_VIEW {
+        dst_kind_code = 1u8;
+    } else if dk == TY_MUT_VIEW {
+        dst_kind_code = 2u8;
+    } else if dk == TY_STR {
+        if is_explicit_cast || src_kind_code == 1u8 {
+            dst_kind_code = 3u8;
+        }
+    } else if dk == TY_STRUCT && (cx.str_in as usize) != 0 {
+        let ddef: *const HirItem = unsafe { (*dt).def };
+        if (ddef as usize) != 0 {
+            let dname = unsafe { interner_get(view(*cx.str_in), StrId { v: (*ddef).name.v }) };
+            if sec_is_authority_cap_struct_name(view(dname)) != 0u32 {
+                dst_kind_code = 4u8;
+            }
+        }
+    }
+    if dst_kind_code == 0u8 {
+        return false;
+    }
+
+    let sink = cx.sink;
+    let code = DiagCode { v: AX_SEC_CAPABILITY_FORGERY };
+    let msg_sv = unsafe { tc_alloc_code_default_msg(mut_view((*sink).arena), code) };
+    let src_sv = if src_kind_code == 1u8 {
+        unsafe { fre_arena_str(mut_view((*sink).arena), "raw_ptr") }
+    } else {
+        unsafe { fre_arena_str(mut_view((*sink).arena), "integer_addr") }
+    };
+    let dst_sv = if dst_kind_code == 1u8 {
+        unsafe { fre_arena_str(mut_view((*sink).arena), "view") }
+    } else if dst_kind_code == 2u8 {
+        unsafe { fre_arena_str(mut_view((*sink).arena), "mut_view") }
+    } else if dst_kind_code == 3u8 {
+        unsafe { fre_arena_str(mut_view((*sink).arena), "str") }
+    } else {
+        unsafe { fre_arena_str(mut_view((*sink).arena), "authority_cap") }
+    };
+    let data_arr = unsafe {
+        arena_alloc_raw(mut_view((*sink).arena), mul_usize(2, size_of<DiagDataEntry>()), align_of<DiagDataEntry>()) as *mut DiagDataEntry
+    };
+    let e0 = unsafe { fre_make_str_data_entry(mut_view((*sink).arena), "source", src_sv) };
+    let e1 = unsafe { fre_make_str_data_entry(mut_view((*sink).arena), "target", dst_sv) };
+    let e1_ptr = ((data_arr as usize) + size_of<DiagDataEntry>()) as *mut DiagDataEntry;
+    unsafe {
+        *data_arr = e0;
+        *e1_ptr = e1;
+    }
+    let d = Diagnostic {
+        code: code,
+        severity: diag_code_severity(code),
+        message: msg_sv,
+        primary: Span { file: FileId { v: sp.file.v }, start: sp.start, end: sp.end },
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: data_arr,
+        data_count: 2,
+    };
+    unsafe { diag_sink_report(mut_view(*sink), view(d)); }
+    true
+}
+
+fn sec_type_direct_authority_cap_mask(interner: view<StrInterner>, thir: view<Thir>, tid: TypeId) -> u32 {
+    if tid.v == 0u32 {
+        return 0u32;
+    }
+    let mut cur_id = TypeId { v: tid.v };
+    let mut depth: usize = 0;
+    while cur_id.v != 0u32 && depth < 6 {
+        let t = type_get(view(thir.interner), cur_id);
+        if (t as usize) == 0 {
+            return 0u32;
+        }
+        let tk = unsafe { (*t).kind };
+        if tk == TY_VIEW || tk == TY_MUT_VIEW {
+            cur_id.v = unsafe { (*t).pointee.v };
+            depth = depth + 1;
+        } else if tk == TY_STRUCT {
+            let def: *const HirItem = unsafe { (*t).def };
+            if (def as usize) != 0 {
+                let sv = interner_get(interner, StrId { v: unsafe { (*def).name.v } });
+                return sec_is_authority_cap_struct_name(view(sv));
+            }
+            return 0u32;
+        } else {
+            return 0u32;
+        }
+    }
+    0u32
+}
+
+fn sec_type_contains_authority_cap_mask(interner: view<StrInterner>, thir: view<Thir>, tid: TypeId, depth: usize) -> u32 {
+    let tv = tid.v;
+    if tv == 0u32 || depth > 8 {
+        return 0u32;
+    }
+    let direct = sec_type_direct_authority_cap_mask(interner, thir, TypeId { v: tv });
+    if direct != 0u32 {
+        return direct;
+    }
+    let t = type_get(view(thir.interner), TypeId { v: tv });
+    if (t as usize) == 0 {
+        return 0u32;
+    }
+    let tk = unsafe { (*t).kind };
+    if tk == TY_VIEW || tk == TY_MUT_VIEW {
+        return sec_type_contains_authority_cap_mask(interner, thir, TypeId { v: unsafe { (*t).pointee.v } }, depth + 1);
+    }
+    if tk == TY_ARRAY || tk == TY_SLICE {
+        return sec_type_contains_authority_cap_mask(interner, thir, TypeId { v: unsafe { (*t).elem.v } }, depth + 1);
+    }
+    if tk == TY_TUPLE || tk == TY_STRUCT {
+        let fcnt = unsafe { (*t).field_count };
+        let flds = unsafe { (*t).fields };
+        if (flds as usize) == 0 {
+            return 0u32;
+        }
+        let mut i: usize = 0;
+        while i < fcnt {
+            let fv = unsafe { (*typeid_at(flds, i)).v };
+            let m = sec_type_contains_authority_cap_mask(interner, thir, TypeId { v: fv }, depth + 1);
+            if m != 0u32 {
+                return m;
+            }
+            i = i + 1;
+        }
+        return 0u32;
+    }
+    if tk == TY_ENUM {
+        let vcnt = unsafe { (*t).variant_count };
+        let vf_arr = unsafe { (*t).variant_fields };
+        let vfc_arr = unsafe { (*t).variant_field_counts };
+        if (vf_arr as usize) == 0 || (vfc_arr as usize) == 0 {
+            return 0u32;
+        }
+        let mut v: usize = 0;
+        while v < vcnt {
+            let fc = unsafe { *usize_at(vfc_arr, v) };
+            let vf = unsafe { *typeid_ptr_at(vf_arr, v) };
+            let mut f: usize = 0;
+            while f < fc && (vf as usize) != 0 {
+                let fv = unsafe { (*typeid_at(vf, f)).v };
+                let m = sec_type_contains_authority_cap_mask(interner, thir, TypeId { v: fv }, depth + 1);
+                if m != 0u32 {
+                    return m;
+                }
+                f = f + 1;
+            }
+            v = v + 1;
+        }
+    }
+    0u32
+}
+
+struct SecForbidMod {
+    mod_path: AstDottedName,
+    file_v: u32,
+    attr_span: Span,
+}
+
+unsafe fn sec_forbid_mod_at(base: *mut SecForbidMod, idx: usize) -> *mut SecForbidMod {
+    ((base as usize) + mul_usize(idx, size_of<SecForbidMod>())) as *mut SecForbidMod
+}
+
+unsafe fn sec_forbid_mod_const_at(base: *const SecForbidMod, idx: usize) -> *const SecForbidMod {
+    ((base as usize) + mul_usize(idx, size_of<SecForbidMod>())) as *const SecForbidMod
+}
+
+unsafe fn sec_u32_const_at(base: *const u32, idx: usize) -> *const u32 {
+    ((base as usize) + mul_usize(idx, size_of<u32>())) as *const u32
+}
+
+fn sec_is_user_item(
+    interner: view<StrInterner>,
+    it: *const HirItem,
+    user_fids: *const u32,
+    user_fid_count: usize
+) -> bool {
+    if (it as usize) == 0 {
+        return false;
+    }
+    let fv = unsafe { (*it).span.file.v };
+    if user_fid_count > 0 && (user_fids as usize) != 0 && fv != 0u32 {
+        let mut i: usize = 0;
+        while i < user_fid_count {
+            if (unsafe { *sec_u32_const_at(user_fids, i) }) == fv {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+    !tc_item_is_std_module(interner, it)
+}
+
+fn sec_dotted_is_prefix(interner: view<StrInterner>, prefix: view<AstDottedName>, full: view<AstDottedName>) -> bool {
+    if prefix.count == 0 || prefix.count > full.count {
+        return false;
+    }
+    if (prefix.segments as usize) == 0 || (full.segments as usize) == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < prefix.count {
+        let p_id = unsafe { (*strid_at_const(prefix.segments as *const StrId, i)).v };
+        let f_id = unsafe { (*strid_at_const(full.segments as *const StrId, i)).v };
+        if p_id != f_id {
+            let p_sv = interner_get(interner, StrId { v: p_id });
+            let f_sv = interner_get(interner, StrId { v: f_id });
+            if !sv_eq(view(p_sv), view(f_sv)) {
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn sec_is_item_mod_forbidden(
+    interner: view<StrInterner>,
+    it: *const HirItem,
+    forbid_mods: *const SecForbidMod,
+    forbid_mod_count: usize,
+    safety_profile: u32,
+    pkg_forbid_unsafe: bool
+) -> bool {
+    if safety_profile != TY_SAFETY_PROFILE_SYSTEM || pkg_forbid_unsafe {
+        return true;
+    }
+    if (it as usize) == 0 || forbid_mod_count == 0 || (forbid_mods as usize) == 0 {
+        return false;
+    }
+    let fv = unsafe { (*it).span.file.v };
+    let ik = unsafe { (*it).kind };
+    let mut i: usize = 0;
+    while i < forbid_mod_count {
+        let fm = unsafe { sec_forbid_mod_const_at(forbid_mods, i) };
+        let fm_cnt = unsafe { (*fm).mod_path.count };
+        if fm_cnt > 0 {
+            let matched = if ik == HIR_ITEM_MODULE && (unsafe { (*it).mod_path.count }) > 0 {
+                unsafe { sec_dotted_is_prefix(interner, view((*fm).mod_path), view((*it).mod_path)) }
+            } else {
+                unsafe { sec_dotted_is_prefix(interner, view((*fm).mod_path), view((*it).module_path)) }
+            };
+            if matched {
+                return true;
+            }
+        } else if fv != 0u32 && (unsafe { (*fm).file_v }) == fv {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn sec_mk_span(fv: u32, s: u32, e: u32) -> Span {
+    Span { file: FileId { v: fv }, start: s, end: e }
+}
+
+fn sec_report_1data_diag(sink: mut_view<DiagSink>, code_v: u32, sp: Span, k0: str, v0_lit: str) {
+    let code = DiagCode { v: code_v };
+    let msg_sv = tc_alloc_code_default_msg(mut_view(sink.arena), code);
+    let v0_sv = fre_arena_str(mut_view(sink.arena), v0_lit);
+    let data_arr = arena_alloc_raw(mut_view(sink.arena), size_of<DiagDataEntry>(), align_of<DiagDataEntry>()) as *mut DiagDataEntry;
+    let e0 = fre_make_str_data_entry(mut_view(sink.arena), k0, v0_sv);
+    unsafe { *data_arr = e0; }
+    let d = Diagnostic {
+        code: code,
+        severity: diag_code_severity(code),
+        message: msg_sv,
+        primary: Span { file: FileId { v: sp.file.v }, start: sp.start, end: sp.end },
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: data_arr,
+        data_count: 1,
+    };
+    diag_sink_report(sink, view(d));
+}
+
+fn sec_report_ambient_diag(
+    sink: mut_view<DiagSink>,
+    sp: Span,
+    op_sv_raw: view<StrView>,
+    req_cap_lit: str,
+    profile_lit: str,
+    reason_lit: str,
+    has_reason: bool,
+    chain_note: view<StrView>
+) {
+    let code = DiagCode { v: AX_SEC_AMBIENT_AUTHORITY_FORBIDDEN };
+    let msg_sv = tc_alloc_code_default_msg(mut_view(sink.arena), code);
+    let op_sv = if op_sv_raw.len > 0 && (op_sv_raw.ptr as usize) != 0 {
+        fre_arena_clone_sv(mut_view(sink.arena), op_sv_raw)
+    } else {
+        fre_arena_str(mut_view(sink.arena), "ambient_os")
+    };
+    let cap_sv = fre_arena_str(mut_view(sink.arena), req_cap_lit);
+    let prof_sv = fre_arena_str(mut_view(sink.arena), profile_lit);
+    let dcount: usize = if has_reason { 4 } else { 3 };
+    let data_arr = arena_alloc_raw(mut_view(sink.arena), mul_usize(dcount, size_of<DiagDataEntry>()), align_of<DiagDataEntry>()) as *mut DiagDataEntry;
+    let e0 = fre_make_str_data_entry(mut_view(sink.arena), "operation", op_sv);
+    let e1 = fre_make_str_data_entry(mut_view(sink.arena), "required_cap", cap_sv);
+    let e2 = fre_make_str_data_entry(mut_view(sink.arena), "profile", prof_sv);
+    let p1 = ((data_arr as usize) + size_of<DiagDataEntry>()) as *mut DiagDataEntry;
+    let p2 = ((data_arr as usize) + mul_usize(2, size_of<DiagDataEntry>())) as *mut DiagDataEntry;
+    unsafe {
+        *data_arr = e0;
+        *p1 = e1;
+        *p2 = e2;
+    }
+    if has_reason {
+        let r_sv = fre_arena_str(mut_view(sink.arena), reason_lit);
+        let e3 = fre_make_str_data_entry(mut_view(sink.arena), "reason", r_sv);
+        let p3 = ((data_arr as usize) + mul_usize(3, size_of<DiagDataEntry>())) as *mut DiagDataEntry;
+        unsafe { *p3 = e3; }
+    }
+    let mut notes_ptr: *mut StrView = 0 as *mut StrView;
+    let mut note_cnt: usize = 0;
+    if chain_note.len > 0 && (chain_note.ptr as usize) != 0 {
+        let narr = arena_alloc_raw(mut_view(sink.arena), size_of<StrView>(), align_of<StrView>()) as *mut StrView;
+        unsafe { *narr = StrView { ptr: chain_note.ptr, len: chain_note.len }; }
+        notes_ptr = narr;
+        note_cnt = 1;
+    }
+    let d = Diagnostic {
+        code: code,
+        severity: diag_code_severity(code),
+        message: msg_sv,
+        primary: Span { file: FileId { v: sp.file.v }, start: sp.start, end: sp.end },
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: notes_ptr,
+        note_count: note_cnt,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: data_arr,
+        data_count: dcount,
+    };
+    diag_sink_report(sink, view(d));
+}
+
+fn sec_scan_policy_attrs(
+    interner: view<StrInterner>,
+    sink: mut_view<DiagSink>,
+    attrs: *mut HirAttr,
+    allow_on_this_node: bool,
+    out_has_forbid: mut_view<bool>,
+    out_forbid_sp: mut_view<Span>,
+    out_has_allow: mut_view<bool>,
+    out_allow_sp: mut_view<Span>
+) {
+    *out_has_forbid = false;
+    *out_has_allow = false;
+    let mut cur: *mut HirAttr = attrs;
+    while (cur as usize) != 0 {
+        let sv = interner_get(interner, StrId { v: unsafe { (*cur).name.v } });
+        let is_forbid = fre_sv_eq_str(view(sv), "forbid_unsafe");
+        let is_allow = !is_forbid && fre_sv_eq_str(view(sv), "allow_unsafe");
+        if is_forbid || is_allow {
+            let csp = unsafe { (*cur).span };
+            if !allow_on_this_node || (unsafe { (*cur).args as usize }) != 0 {
+                sec_report_1data_diag(mut_view(*sink), AX_SEC_CONFLICTING_SAFETY_POLICY, csp, "policy", "invalid_safety_attr");
+            } else if is_forbid {
+                *out_has_forbid = true;
+                *out_forbid_sp = csp;
+            } else {
+                *out_has_allow = true;
+                *out_allow_sp = csp;
+            }
+        }
+        cur = unsafe { (*cur).next };
+    }
+}
+
+fn sec_find_fixed_addr_attr(interner: view<StrInterner>, attrs: *mut HirAttr, out_sp: mut_view<Span>) -> bool {
+    let mut cur: *mut HirAttr = attrs;
+    while (cur as usize) != 0 {
+        let sv = interner_get(interner, StrId { v: unsafe { (*cur).name.v } });
+        if fre_sv_eq_str(view(sv), "at") || fre_sv_eq_str(view(sv), "addr") {
+            *out_sp = unsafe { (*cur).span };
+            return true;
+        }
+        cur = unsafe { (*cur).next };
+    }
+    false
+}
+
+fn sec_check_item_header_forbid_unsafe(
+    interner: view<StrInterner>,
+    sink: mut_view<DiagSink>,
+    it: *const HirItem
+) {
+    if (it as usize) == 0 {
+        return;
+    }
+    let ik = unsafe { (*it).kind };
+    let attrs: *mut HirAttr = unsafe { (*it).attrs };
+    let it_f = unsafe { (*it).span.file.v };
+    let it_s = unsafe { (*it).span.start };
+    let it_e = unsafe { (*it).span.end };
+
+    let mut addr_sp = sec_mk_span(it_f, it_s, it_e);
+    if sec_find_fixed_addr_attr(interner, attrs, mut_view(addr_sp)) {
+        sec_report_1data_diag(sink, AX_SEC_UNSAFE_FORBIDDEN, addr_sp, "construct", "fixed_addr");
+        return;
+    }
+    if ik == HIR_ITEM_STRUCT {
+        let mut fd: *mut HirFieldDecl = unsafe { (*it).struct_fields };
+        while (fd as usize) != 0 {
+            if sec_find_fixed_addr_attr(interner, unsafe { (*fd).attrs }, mut_view(addr_sp)) {
+                sec_report_1data_diag(sink, AX_SEC_UNSAFE_FORBIDDEN, addr_sp, "construct", "fixed_addr");
+                return;
+            }
+            fd = unsafe { (*fd).next };
+        }
+    }
+
+    let mut naked_at: *mut HirAttr = 0 as *mut HirAttr;
+    if (unsafe { (*it).is_naked }) || fre_item_has_attr_name(interner, attrs, "naked", mut_view(naked_at)) {
+        let nsp = if (naked_at as usize) != 0 { unsafe { (*naked_at).span } } else { sec_mk_span(it_f, it_s, it_e) };
+        sec_report_1data_diag(sink, AX_SEC_UNSAFE_FORBIDDEN, nsp, "construct", "naked_fn");
+        return;
+    }
+
+    if ik == HIR_ITEM_EXTERN_BLOCK {
+        sec_report_1data_diag(sink, AX_SEC_UNSAFE_FORBIDDEN, sec_mk_span(it_f, it_s, it_e), "construct", "extern_block");
+        return;
+    }
+
+    let abi_v = unsafe { (*it).abi.v };
+    let mut is_foreign_abi = false;
+    if abi_v != 0u32 {
+        let abi_sv = interner_get(interner, StrId { v: abi_v });
+        if !fre_sv_eq_str(view(abi_sv), "axiom") {
+            is_foreign_abi = true;
+        }
+    }
+    let mut exp_at: *mut HirAttr = 0 as *mut HirAttr;
+    let mut nm_at: *mut HirAttr = 0 as *mut HirAttr;
+    let has_exp = fre_item_has_attr_name(interner, attrs, "export", mut_view(exp_at));
+    let has_nm = (unsafe { (*it).is_no_mangle }) || fre_item_has_attr_name(interner, attrs, "no_mangle", mut_view(nm_at));
+    if is_foreign_abi || has_exp || has_nm {
+        sec_report_1data_diag(sink, AX_SEC_UNSAFE_FORBIDDEN, sec_mk_span(it_f, it_s, it_e), "construct", "extern_block");
+        return;
+    }
+
+    if ik == HIR_ITEM_FN && (unsafe { (*it).is_unsafe }) {
+        sec_report_1data_diag(sink, AX_SEC_UNSAFE_FORBIDDEN, sec_mk_span(it_f, it_s, it_e), "construct", "unsafe_fn");
+        return;
+    }
+    if ik == HIR_ITEM_TRAIT && (unsafe { (*it).is_unsafe }) {
+        sec_report_1data_diag(sink, AX_SEC_UNSAFE_FORBIDDEN, sec_mk_span(it_f, it_s, it_e), "construct", "unsafe_trait");
+        return;
+    }
+    if ik == HIR_ITEM_IMPL && (unsafe { (*it).is_unsafe }) {
+        sec_report_1data_diag(sink, AX_SEC_UNSAFE_FORBIDDEN, sec_mk_span(it_f, it_s, it_e), "construct", "unsafe_impl");
+        return;
+    }
+    if ik == HIR_ITEM_STATIC && (unsafe { (*it).is_mut }) {
+        sec_report_1data_diag(sink, AX_SEC_UNSAFE_FORBIDDEN, sec_mk_span(it_f, it_s, it_e), "construct", "static_mut");
+        return;
+    }
+}
+
+fn sec_is_raw_ptr_intrinsic_name(sv: view<StrView>) -> bool {
+    fre_sv_eq_str(sv, "address_of") ||
+    fre_sv_eq_str(sv, "address_of_mut") ||
+    fre_sv_eq_str(sv, "ptr_add") ||
+    fre_sv_eq_str(sv, "ptr_sub") ||
+    fre_sv_eq_str(sv, "ptr_read") ||
+    fre_sv_eq_str(sv, "ptr_write") ||
+    fre_sv_eq_str(sv, "ptr_copy") ||
+    fre_sv_eq_str(sv, "ptr_copy_nonoverlapping") ||
+    fre_sv_eq_str(sv, "ptr_write_bytes") ||
+    fre_sv_eq_str(sv, "drop_in_place") ||
+    fre_sv_eq_str(sv, "volatile_load") ||
+    fre_sv_eq_str(sv, "volatile_store")
+}
+
+fn sec_find_mut_static_by_path(hir_file: view<HirFile>, sym_v: u32, name_v: u32) -> *const HirItem {
+    if sym_v == 0u32 && name_v == 0u32 {
+        return 0 as *const HirItem;
+    }
+    let mut it: *mut HirItem = hir_file.items;
+    while (it as usize) != 0 {
+        if (unsafe { (*it).kind }) == HIR_ITEM_STATIC && (unsafe { (*it).is_mut }) && !(unsafe { (*it).is_tls }) {
+            let isym = unsafe { (*it).symbol.v };
+            let iname = unsafe { (*it).name.v };
+            if (sym_v != 0u32 && isym == sym_v) || (sym_v == 0u32 && name_v != 0u32 && iname == name_v) {
+                return it as *const HirItem;
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+    0 as *const HirItem
+}
+
+struct SecOsNode {
+    item: *const HirItem,
+    is_std: bool,
+    has_cap_param: bool,
+    raw_os_mask: u32,
+    ambient_os_mask: u32,
+    next_hop_plus1: u32,
+    edges: *mut CapEdge,
+}
+
+struct SecOsGraph {
+    nodes: *mut SecOsNode,
+    count: usize,
+    hir: *const HirFile,
+    thir: *const Thir,
+    interner: *const StrInterner,
+}
+
+unsafe fn sec_os_node_at(base: *mut SecOsNode, idx: usize) -> *mut SecOsNode {
+    ((base as usize) + mul_usize(idx, size_of<SecOsNode>())) as *mut SecOsNode
+}
+
+unsafe fn sec_os_node_const_at(base: *const SecOsNode, idx: usize) -> *const SecOsNode {
+    ((base as usize) + mul_usize(idx, size_of<SecOsNode>())) as *const SecOsNode
+}
+
+fn sec_fn_has_authority_cap_param(interner: view<StrInterner>, thir: view<Thir>, it: *const HirItem) -> bool {
+    if (it as usize) == 0 {
+        return false;
+    }
+    let mut p: *mut HirParam = unsafe { (*it).params };
+    while (p as usize) != 0 {
+        let mut ptid = thir_get_param_type(thir, p as *const HirParam);
+        if ptid.v == 0u32 && (unsafe { (*p).symbol.v }) != 0u32 {
+            ptid = thir_get_symbol_type(thir, SymbolId { v: unsafe { (*p).symbol.v } });
+        }
+        if sec_type_direct_authority_cap_mask(interner, thir, ptid) != 0u32 {
+            return true;
+        }
+        p = unsafe { (*p).next };
+    }
+    let fn_tid = thir_get_item_type(thir, it);
+    let fn_t = type_get(view(thir.interner), fn_tid);
+    if (fn_t as usize) != 0 && (unsafe { (*fn_t).kind }) == TY_FN {
+        let pc = unsafe { (*fn_t).param_count };
+        let ptypes = unsafe { (*fn_t).param_types };
+        let mut i: usize = 0;
+        while i < pc && (ptypes as usize) != 0 {
+            let pv = unsafe { (*typeid_at(ptypes, i)).v };
+            if sec_type_direct_authority_cap_mask(interner, thir, (TypeId { v: pv })) != 0u32 {
+                return true;
+            }
+            i = i + 1;
+        }
+    }
+    false
+}
+
+fn sec_fn_direct_os_mask(interner: view<StrInterner>, it: *const HirItem, has_cap_param: bool) -> u32 {
+    if (it as usize) == 0 || (unsafe { (*it).kind }) != HIR_ITEM_FN {
+        return 0u32;
+    }
+    let fn_sv = interner_get(interner, StrId { v: unsafe { (*it).name.v } });
+    let mut intr_at: *mut HirAttr = 0 as *mut HirAttr;
+    let is_intr = fre_item_has_attr_name(interner, unsafe { (*it).attrs }, "intrinsic", mut_view(intr_at));
+    let is_ext_no_body = (unsafe { (*it).abi.v }) != 0u32 && (unsafe { (*it).body as usize }) == 0;
+
+    let mcount = unsafe { (*it).module_path.count };
+    let msegs = unsafe { (*it).module_path.segments };
+    let mut is_host_mod = false;
+    let mut is_std = false;
+    let mut s1_sv = StrView { ptr: 0 as *const u8, len: 0 };
+    if mcount >= 1 && (msegs as usize) != 0 {
+        let s0_sv = interner_get(interner, StrId { v: unsafe { (*strid_at_const(msegs as *const StrId, 0)).v } });
+        if fre_sv_eq_str(view(s0_sv), "host_intrinsics") {
+            is_host_mod = true;
+        } else if fre_sv_eq_str(view(s0_sv), "std") {
+            is_std = true;
+            if mcount >= 2 {
+                s1_sv = interner_get(interner, StrId { v: unsafe { (*strid_at_const(msegs as *const StrId, 1)).v } });
+                if mcount >= 3 {
+                    let s2_sv = interner_get(interner, StrId { v: unsafe { (*strid_at_const(msegs as *const StrId, 2)).v } });
+                    if fre_sv_eq_str(view(s1_sv), "core") && fre_sv_eq_str(view(s2_sv), "host") {
+                        is_host_mod = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Root ambient authority constructors (in std.security, std.os, or test modules)
+    if !has_cap_param {
+        if fre_sv_eq_str(view(fn_sv), "root_fs_cap") { return SEC_AUTH_FS; }
+        if fre_sv_eq_str(view(fn_sv), "root_net_cap") { return SEC_AUTH_NET; }
+        if fre_sv_eq_str(view(fn_sv), "root_env_cap") { return SEC_AUTH_ENV; }
+        if fre_sv_eq_str(view(fn_sv), "root_process_cap") { return SEC_AUTH_PROCESS; }
+        if fre_sv_eq_str(view(fn_sv), "root_clock_cap") { return SEC_AUTH_CLOCK; }
+        if fre_sv_eq_str(view(fn_sv), "ambient_caps") {
+            return SEC_AUTH_FS | SEC_AUTH_NET | SEC_AUTH_ENV | SEC_AUTH_PROCESS | SEC_AUTH_CLOCK;
+        }
+    }
+
+    if is_intr || is_host_mod || is_ext_no_body {
+        if fre_sv_eq_str(view(fn_sv), "stdio") ||
+           fre_sv_eq_str(view(fn_sv), "open") ||
+           fre_sv_eq_str(view(fn_sv), "read") ||
+           fre_sv_eq_str(view(fn_sv), "write") ||
+           fre_sv_eq_str(view(fn_sv), "close") ||
+           fre_sv_eq_str(view(fn_sv), "file_size") ||
+           fre_sv_eq_str(view(fn_sv), "remove") ||
+           fre_sv_eq_str(view(fn_sv), "mkdir") ||
+           fre_sv_eq_str(view(fn_sv), "metadata") ||
+           fre_sv_eq_str(view(fn_sv), "dir_open") ||
+           fre_sv_eq_str(view(fn_sv), "dir_next") ||
+           fre_sv_eq_str(view(fn_sv), "dir_close") {
+            return SEC_AUTH_FS;
+        }
+        if fre_sv_eq_str(view(fn_sv), "aio_submit_accept") ||
+           fre_sv_eq_str(view(fn_sv), "aio_submit_connect") ||
+           fre_sv_eq_str(view(fn_sv), "aio_submit_recv") ||
+           fre_sv_eq_str(view(fn_sv), "aio_submit_send") {
+            return SEC_AUTH_NET;
+        }
+        if fre_sv_eq_str(view(fn_sv), "env_get") ||
+           fre_sv_eq_str(view(fn_sv), "args_count") ||
+           fre_sv_eq_str(view(fn_sv), "arg") {
+            return SEC_AUTH_ENV;
+        }
+        if fre_sv_eq_str(view(fn_sv), "exit") ||
+           fre_sv_eq_str(view(fn_sv), "exe_path") ||
+           fre_sv_eq_str(view(fn_sv), "proc_spawn") ||
+           fre_sv_eq_str(view(fn_sv), "proc_wait") ||
+           fre_sv_eq_str(view(fn_sv), "proc_kill") {
+            return SEC_AUTH_PROCESS;
+        }
+        if fre_sv_eq_str(view(fn_sv), "monotonic_ns") {
+            return SEC_AUTH_CLOCK;
+        }
+    }
+
+    if is_std && mcount >= 2 && !has_cap_param {
+        if fre_sv_eq_str(view(s1_sv), "net") {
+            if fre_sv_eq_str(view(fn_sv), "connect") ||
+               fre_sv_eq_str(view(fn_sv), "bind") ||
+               fre_sv_eq_str(view(fn_sv), "accept") ||
+               fre_sv_eq_str(view(fn_sv), "send") ||
+               fre_sv_eq_str(view(fn_sv), "recv") ||
+               fre_sv_eq_str(view(fn_sv), "send_to") ||
+               fre_sv_eq_str(view(fn_sv), "recv_from") ||
+               fre_sv_eq_str(view(fn_sv), "lookup_host") {
+                return SEC_AUTH_NET;
+            }
+        } else if fre_sv_eq_str(view(s1_sv), "io") {
+            if fre_sv_eq_str(view(fn_sv), "open") ||
+               fre_sv_eq_str(view(fn_sv), "create") ||
+               fre_sv_eq_str(view(fn_sv), "append") ||
+               fre_sv_eq_str(view(fn_sv), "file_open") ||
+               fre_sv_eq_str(view(fn_sv), "file_create") ||
+               fre_sv_eq_str(view(fn_sv), "file_append") ||
+               fre_sv_eq_str(view(fn_sv), "file_read") ||
+               fre_sv_eq_str(view(fn_sv), "file_write") ||
+               fre_sv_eq_str(view(fn_sv), "file_size_of") ||
+               fre_sv_eq_str(view(fn_sv), "file_close") ||
+               fre_sv_eq_str(view(fn_sv), "read_to_string") ||
+               fre_sv_eq_str(view(fn_sv), "write_string") ||
+               fre_sv_eq_str(view(fn_sv), "write_file") ||
+               fre_sv_eq_str(view(fn_sv), "print") ||
+               fre_sv_eq_str(view(fn_sv), "println") ||
+               fre_sv_eq_str(view(fn_sv), "eprint") ||
+               fre_sv_eq_str(view(fn_sv), "eprintln") {
+                return SEC_AUTH_FS;
+            }
+        } else if fre_sv_eq_str(view(s1_sv), "fs") {
+            if fre_sv_eq_str(view(fn_sv), "open") ||
+               fre_sv_eq_str(view(fn_sv), "create") ||
+               fre_sv_eq_str(view(fn_sv), "read") ||
+               fre_sv_eq_str(view(fn_sv), "read_to_string") ||
+               fre_sv_eq_str(view(fn_sv), "write") ||
+               fre_sv_eq_str(view(fn_sv), "remove_file") ||
+               fre_sv_eq_str(view(fn_sv), "remove_dir") ||
+               fre_sv_eq_str(view(fn_sv), "remove_dir_all") ||
+               fre_sv_eq_str(view(fn_sv), "create_dir") ||
+               fre_sv_eq_str(view(fn_sv), "create_dir_all") ||
+               fre_sv_eq_str(view(fn_sv), "metadata") ||
+               fre_sv_eq_str(view(fn_sv), "exists") ||
+               fre_sv_eq_str(view(fn_sv), "read_dir") {
+                return SEC_AUTH_FS;
+            }
+        } else if fre_sv_eq_str(view(s1_sv), "env") {
+            if fre_sv_eq_str(view(fn_sv), "get") ||
+               fre_sv_eq_str(view(fn_sv), "var") ||
+               fre_sv_eq_str(view(fn_sv), "set_var") ||
+               fre_sv_eq_str(view(fn_sv), "remove_var") ||
+               fre_sv_eq_str(view(fn_sv), "args") ||
+               fre_sv_eq_str(view(fn_sv), "current_dir") ||
+               fre_sv_eq_str(view(fn_sv), "set_current_dir") ||
+               fre_sv_eq_str(view(fn_sv), "temp_dir") {
+                return SEC_AUTH_ENV;
+            }
+        } else if fre_sv_eq_str(view(s1_sv), "process") {
+            if fre_sv_eq_str(view(fn_sv), "spawn") ||
+               fre_sv_eq_str(view(fn_sv), "status") ||
+               fre_sv_eq_str(view(fn_sv), "output") ||
+               fre_sv_eq_str(view(fn_sv), "exit") ||
+               fre_sv_eq_str(view(fn_sv), "abort") ||
+               fre_sv_eq_str(view(fn_sv), "exe_path") ||
+               fre_sv_eq_str(view(fn_sv), "args") {
+                return SEC_AUTH_PROCESS;
+            }
+        } else if fre_sv_eq_str(view(s1_sv), "time") {
+            if fre_sv_eq_str(view(fn_sv), "now") ||
+               fre_sv_eq_str(view(fn_sv), "instant_now") ||
+               fre_sv_eq_str(view(fn_sv), "elapsed") ||
+               fre_sv_eq_str(view(fn_sv), "instant_elapsed") ||
+               fre_sv_eq_str(view(fn_sv), "system_time_now") {
+                return SEC_AUTH_CLOCK;
+            }
+        }
+    }
+    0u32
+}
+
+fn sec_os_find_node(g: view<SecOsGraph>, target: *const HirItem) -> isize {
+    if (target as usize) == 0 {
+        return -1isize;
+    }
+    let tsym_v = unsafe { (*target).symbol.v };
+    let mut i: usize = 0;
+    while i < g.count {
+        let np = unsafe { sec_os_node_const_at(g.nodes as *const SecOsNode, i) };
+        if (unsafe { (*np).item as usize }) == (target as usize) {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    if tsym_v != 0u32 {
+        let mut j: usize = 0;
+        while j < g.count {
+            let np2 = unsafe { sec_os_node_const_at(g.nodes as *const SecOsNode, j) };
+            let nit2 = unsafe { (*np2).item };
+            if (nit2 as usize) != 0 && (unsafe { (*nit2).symbol.v }) == tsym_v {
+                return j as isize;
+            }
+            j = j + 1;
+        }
+    }
+    -1isize
+}
+
+fn sec_os_resolve_call_target(hir_ptr: *const HirFile, thir_ptr: *const Thir, expr: *const HirExpr) -> *const HirItem {
+    if (expr as usize) == 0 || (thir_ptr as usize) == 0 {
+        return 0 as *const HirItem;
+    }
+    let ek = unsafe { (*expr).kind };
+    if ek == HIR_EXPR_METHOD_CALL {
+        let mp = unsafe { thir_get_expr_method(view(*thir_ptr), expr) };
+        if (mp as usize) != 0 {
+            return unsafe { *mp };
+        }
+        return 0 as *const HirItem;
+    }
+    if ek == HIR_EXPR_CALL {
+        let mp0 = unsafe { thir_get_expr_method(view(*thir_ptr), expr) };
+        if (mp0 as usize) != 0 && (unsafe { *mp0 as usize }) != 0 {
+            return unsafe { *mp0 };
+        }
+        let callee: *mut HirExpr = unsafe { (*expr).callee };
+        if (callee as usize) != 0 {
+            if (unsafe { (*callee).kind }) == HIR_EXPR_PATH {
+                let sym = unsafe { (*callee).path.symbol };
+                if sym.v != 0u32 {
+                    let hit = unsafe_find_item_by_sym(hir_ptr, thir_ptr, sym);
+                    if (hit as usize) != 0 && (unsafe { (*hit).kind }) == HIR_ITEM_FN {
+                        return hit;
+                    }
+                }
+            }
+            let ctid = unsafe { thir_get_expr_type(view(*thir_ptr), callee as *const HirExpr) };
+            if ctid.v != 0u32 {
+                let ct = unsafe { type_get(view((*thir_ptr).interner), ctid) };
+                if (ct as usize) != 0 && (unsafe { (*ct).kind }) == TY_FN {
+                    let def = unsafe { (*ct).def };
+                    if (def as usize) != 0 && (unsafe { (*def).kind }) == HIR_ITEM_FN {
+                        return def;
+                    }
+                }
+            }
+        }
+    }
+    0 as *const HirItem
+}
+
+fn sec_os_add_edge(arena: mut_view<Arena>, node: *mut SecOsNode, callee_idx: u32, sp: Span) {
+    let mut cur: *mut CapEdge = unsafe { (*node).edges };
+    while (cur as usize) != 0 {
+        if (unsafe { (*cur).callee_idx }) == callee_idx {
+            return;
+        }
+        cur = unsafe { (*cur).next };
+    }
+    let e = arena_alloc_raw(mut_view(*arena), size_of<CapEdge>(), align_of<CapEdge>()) as *mut CapEdge;
+    unsafe {
+        (*e).callee_idx = callee_idx;
+        (*e).call_span = sp;
+        (*e).next = (*node).edges;
+        (*node).edges = e;
+    }
+}
+
+fn sec_os_scan_expr(arena: mut_view<Arena>, g: view<SecOsGraph>, node: *mut SecOsNode, expr: *mut HirExpr) {
+    let mut cur = expr;
+    while (cur as usize) != 0 {
+        let k = unsafe { (*cur).kind };
+        if k == HIR_EXPR_CALL || k == HIR_EXPR_METHOD_CALL {
+            if k == HIR_EXPR_CALL {
+                let callee: *mut HirExpr = unsafe { (*cur).callee };
+                if (callee as usize) != 0 {
+                    let ctid = unsafe { thir_get_expr_type(view(*g.thir), callee as *const HirExpr) };
+                    if ctid.v != 0u32 {
+                        let ct = unsafe { type_get(view((*g.thir).interner), ctid) };
+                        if (ct as usize) != 0 {
+                            let ck = unsafe { (*ct).kind };
+                            if ck == TY_BUILTIN_PRINT || ck == TY_BUILTIN_PRINT_INT {
+                                unsafe {
+                                    (*node).raw_os_mask = (*node).raw_os_mask | SEC_AUTH_FS;
+                                    if !((*node).is_std && (*node).has_cap_param) {
+                                        (*node).ambient_os_mask = (*node).ambient_os_mask | SEC_AUTH_FS;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                sec_os_scan_expr(mut_view(*arena), g, node, callee);
+            } else {
+                sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*cur).receiver });
+            }
+            let target = sec_os_resolve_call_target(g.hir, g.thir, cur as *const HirExpr);
+            if (target as usize) != 0 {
+                let tidx = sec_os_find_node(g, target);
+                if tidx >= 0isize {
+                    sec_os_add_edge(mut_view(*arena), node, tidx as u32, unsafe { (*cur).span });
+                } else {
+                    let t_has_cap = unsafe { sec_fn_has_authority_cap_param(view(*g.interner), view(*g.thir), target) };
+                    let dm = unsafe { sec_fn_direct_os_mask(view(*g.interner), target, t_has_cap) };
+                    if dm != 0u32 {
+                        unsafe {
+                            (*node).raw_os_mask = (*node).raw_os_mask | dm;
+                            if !((*node).is_std && (*node).has_cap_param) {
+                                (*node).ambient_os_mask = (*node).ambient_os_mask | dm;
+                            }
+                        }
+                    }
+                }
+            }
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*cur).args });
+        } else if k == HIR_EXPR_BLOCK || k == HIR_EXPR_UNSAFE || k == HIR_EXPR_LOOP || k == HIR_EXPR_COMPTIME {
+            sec_os_scan_block(mut_view(*arena), g, node, unsafe { (*cur).block });
+        } else if k == HIR_EXPR_IF {
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*cur).cond });
+            sec_os_scan_block(mut_view(*arena), g, node, unsafe { (*cur).block });
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*cur).else_branch });
+        } else if k == HIR_EXPR_WHILE {
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*cur).cond });
+            sec_os_scan_block(mut_view(*arena), g, node, unsafe { (*cur).block });
+        } else if k == HIR_EXPR_FOR {
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*cur).iter });
+            sec_os_scan_block(mut_view(*arena), g, node, unsafe { (*cur).block });
+        } else if k == HIR_EXPR_MATCH {
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*cur).cond });
+            let mut a: *mut HirMatchArm = unsafe { (*cur).arms };
+            while (a as usize) != 0 {
+                sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*a).guard });
+                sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*a).body });
+                a = unsafe { (*a).next };
+            }
+        } else if k == HIR_EXPR_CLOSURE {
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*cur).body });
+        } else if k == HIR_EXPR_BINARY {
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*cur).left });
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*cur).right });
+        } else if k == HIR_EXPR_UNARY || k == HIR_EXPR_VIEW || k == HIR_EXPR_JUMP || k == HIR_EXPR_CAST || k == HIR_EXPR_TRY || k == HIR_EXPR_AWAIT {
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*cur).inner });
+        } else if k == HIR_EXPR_ARRAY {
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*cur).elems });
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*cur).count_expr });
+        } else if k == HIR_EXPR_TUPLE {
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*cur).elems });
+        } else if k == HIR_EXPR_STRUCT {
+            let mut f: *mut HirFieldInit = unsafe { (*cur).fields };
+            while (f as usize) != 0 {
+                sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*f).expr });
+                f = unsafe { (*f).next };
+            }
+        } else if k == HIR_EXPR_RANGE {
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*cur).start_expr });
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*cur).end_expr });
+        } else if k == HIR_EXPR_FIELD || k == HIR_EXPR_TUPLE_INDEX {
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*cur).base });
+        } else if k == HIR_EXPR_INDEX {
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*cur).base });
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*cur).index_arg });
+        }
+        cur = unsafe { (*cur).next };
+    }
+}
+
+fn sec_os_scan_block(arena: mut_view<Arena>, g: view<SecOsGraph>, node: *mut SecOsNode, blk: *mut HirBlock) {
+    if (blk as usize) == 0 {
+        return;
+    }
+    let mut s: *mut HirStmt = unsafe { (*blk).stmts };
+    while (s as usize) != 0 {
+        let sk = unsafe { (*s).kind };
+        if sk == HIR_STMT_LET {
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*s).expr });
+            sec_os_scan_block(mut_view(*arena), g, node, unsafe { (*s).else_block });
+        } else if sk == HIR_STMT_ASSIGN {
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*s).left });
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*s).right });
+        } else if sk == HIR_STMT_EXPR {
+            sec_os_scan_expr(mut_view(*arena), g, node, unsafe { (*s).expr });
+        }
+        s = unsafe { (*s).next };
+    }
+}
+
+fn sec_os_graph_build(
+    arena: mut_view<Arena>,
+    hir_file: view<HirFile>,
+    thir: view<Thir>,
+    interner: view<StrInterner>,
+    user_fids: *const u32,
+    user_fid_count: usize
+) -> SecOsGraph {
+    let hir_ptr = unsafe { address_of(hir_file.items) as *const HirFile };
+    let thir_ptr = unsafe { address_of(thir.interner.arena.head) as *const Thir };
+    let int_ptr = unsafe { address_of(interner.bytes.head) as *const StrInterner };
+
+    let mut count: usize = 0;
+    let mut it0: *mut HirItem = hir_file.items;
+    while (it0 as usize) != 0 {
+        let ik0 = unsafe { (*it0).kind };
+        if ik0 == HIR_ITEM_FN {
+            count = count + 1;
+        } else if ik0 == HIR_ITEM_IMPL || ik0 == HIR_ITEM_TRAIT || ik0 == HIR_ITEM_EXTERN_BLOCK {
+            let mut m0: *mut HirItem = unsafe { (*it0).members };
+            while (m0 as usize) != 0 {
+                if (unsafe { (*m0).kind }) == HIR_ITEM_FN {
+                    count = count + 1;
+                }
+                m0 = unsafe { (*m0).next };
+            }
+        }
+        it0 = unsafe { (*it0).next };
+    }
+
+    if count == 0 {
+        return SecOsGraph {
+            nodes: 0 as *mut SecOsNode,
+            count: 0,
+            hir: hir_ptr,
+            thir: thir_ptr,
+            interner: int_ptr,
+        };
+    }
+
+    let raw_bytes = mul_usize(count, size_of<SecOsNode>());
+    let nodes_raw = arena_alloc_raw(mut_view(*arena), raw_bytes, align_of<SecOsNode>());
+    tc_zero_bytes(nodes_raw, raw_bytes);
+    let nodes = nodes_raw as *mut SecOsNode;
+
+    let mut idx: usize = 0;
+    let mut it1: *mut HirItem = hir_file.items;
+    while (it1 as usize) != 0 {
+        let ik1 = unsafe { (*it1).kind };
+        if ik1 == HIR_ITEM_FN {
+            let np = unsafe { sec_os_node_at(nodes, idx) };
+            let is_std = !sec_is_user_item(interner, it1 as *const HirItem, user_fids, user_fid_count);
+            let has_cap = sec_fn_has_authority_cap_param(interner, thir, it1 as *const HirItem);
+            let dm = sec_fn_direct_os_mask(interner, it1 as *const HirItem, has_cap);
+            unsafe {
+                (*np).item = it1 as *const HirItem;
+                (*np).is_std = is_std;
+                (*np).has_cap_param = has_cap;
+                (*np).raw_os_mask = dm;
+                (*np).ambient_os_mask = if is_std && has_cap { 0u32 } else { dm };
+            }
+            idx = idx + 1;
+        } else if ik1 == HIR_ITEM_IMPL || ik1 == HIR_ITEM_TRAIT || ik1 == HIR_ITEM_EXTERN_BLOCK {
+            let p_std = !sec_is_user_item(interner, it1 as *const HirItem, user_fids, user_fid_count);
+            let mut m1: *mut HirItem = unsafe { (*it1).members };
+            while (m1 as usize) != 0 {
+                if (unsafe { (*m1).kind }) == HIR_ITEM_FN {
+                    let np2 = unsafe { sec_os_node_at(nodes, idx) };
+                    let is_std2 = p_std || !sec_is_user_item(interner, m1 as *const HirItem, user_fids, user_fid_count);
+                    let has_cap2 = sec_fn_has_authority_cap_param(interner, thir, m1 as *const HirItem);
+                    let dm2 = sec_fn_direct_os_mask(interner, m1 as *const HirItem, has_cap2);
+                    unsafe {
+                        (*np2).item = m1 as *const HirItem;
+                        (*np2).is_std = is_std2;
+                        (*np2).has_cap_param = has_cap2;
+                        (*np2).raw_os_mask = dm2;
+                        (*np2).ambient_os_mask = if is_std2 && has_cap2 { 0u32 } else { dm2 };
+                    }
+                    idx = idx + 1;
+                }
+                m1 = unsafe { (*m1).next };
+            }
+        }
+        it1 = unsafe { (*it1).next };
+    }
+
+    let g = SecOsGraph {
+        nodes: nodes,
+        count: idx,
+        hir: hir_ptr,
+        thir: thir_ptr,
+        interner: int_ptr,
+    };
+
+    let mut u: usize = 0;
+    while u < g.count {
+        let np = unsafe { sec_os_node_at(g.nodes, u) };
+        let uit = unsafe { (*np).item };
+        let body_blk: *mut HirBlock = unsafe { (*uit).body };
+        if (body_blk as usize) != 0 {
+            sec_os_scan_block(mut_view(*arena), view(g), np, body_blk);
+        }
+        u = u + 1;
+    }
+
+    let mut changed = true;
+    let mut guard: usize = 0;
+    let max_iters: usize = (g.count + 2) * 8;
+    while changed && guard < max_iters {
+        changed = false;
+        guard = guard + 1;
+        let mut i: usize = 0;
+        while i < g.count {
+            let unode = unsafe { sec_os_node_at(g.nodes, i) };
+            let u_gated = (unsafe { (*unode).is_std }) && (unsafe { (*unode).has_cap_param });
+            let mut e: *mut CapEdge = unsafe { (*unode).edges };
+            while (e as usize) != 0 {
+                let v_idx = (unsafe { (*e).callee_idx }) as usize;
+                if v_idx < g.count {
+                    let vnode = unsafe { sec_os_node_const_at(g.nodes as *const SecOsNode, v_idx) };
+                    let v_raw = unsafe { (*vnode).raw_os_mask };
+                    let u_raw = unsafe { (*unode).raw_os_mask };
+                    if (v_raw & (u_raw ^ 0xFFFFFFFFu32)) != 0u32 {
+                        unsafe {
+                            (*unode).raw_os_mask = u_raw | v_raw;
+                            if (*unode).next_hop_plus1 == 0u32 {
+                                (*unode).next_hop_plus1 = (v_idx as u32) + 1u32;
+                            }
+                        }
+                        changed = true;
+                    }
+                    if !u_gated {
+                        let v_amb = unsafe { (*vnode).ambient_os_mask };
+                        let u_amb = unsafe { (*unode).ambient_os_mask };
+                        if (v_amb & (u_amb ^ 0xFFFFFFFFu32)) != 0u32 {
+                            unsafe {
+                                (*unode).ambient_os_mask = u_amb | v_amb;
+                                if (*unode).next_hop_plus1 == 0u32 {
+                                    (*unode).next_hop_plus1 = (v_idx as u32) + 1u32;
+                                }
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+                e = unsafe { (*e).next };
+            }
+            i = i + 1;
+        }
+    }
+
+    g
+}
+
+fn sec_call_passes_authority_cap(interner: view<StrInterner>, thir: view<Thir>, call_expr: *const HirExpr) -> bool {
+    if (call_expr as usize) == 0 {
+        return false;
+    }
+    if (unsafe { (*call_expr).kind }) == HIR_EXPR_METHOD_CALL {
+        let recv: *mut HirExpr = unsafe { (*call_expr).receiver };
+        if (recv as usize) != 0 {
+            let rty = thir_get_expr_type(thir, recv as *const HirExpr);
+            if sec_type_direct_authority_cap_mask(interner, thir, rty) != 0u32 {
+                return true;
+            }
+        }
+    }
+    let mut a: *mut HirExpr = unsafe { (*call_expr).args };
+    while (a as usize) != 0 {
+        let aty = thir_get_expr_type(thir, a as *const HirExpr);
+        if sec_type_direct_authority_cap_mask(interner, thir, aty) != 0u32 {
+            return true;
+        }
+        a = unsafe { (*a).next };
+    }
+    false
+}
+
+fn sec_required_cap_name_for_mask(mask: u32) -> str {
+    if (mask & SEC_AUTH_FS) != 0u32 { return "FsCap"; }
+    if (mask & SEC_AUTH_NET) != 0u32 { return "NetCap"; }
+    if (mask & SEC_AUTH_ENV) != 0u32 { return "EnvCap"; }
+    if (mask & SEC_AUTH_PROCESS) != 0u32 { return "ProcessCap"; }
+    if (mask & SEC_AUTH_CLOCK) != 0u32 { return "ClockCap"; }
+    "FsCap"
+}
+
+fn sec_format_os_chain_note(
+    arena: mut_view<Arena>,
+    g: view<SecOsGraph>,
+    caller_it: *const HirItem,
+    first_callee_idx: isize
+) -> StrView {
+    if first_callee_idx < 0isize || g.count == 0 || (g.nodes as usize) == 0 {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let np0 = unsafe { sec_os_node_const_at(g.nodes as *const SecOsNode, first_callee_idx as usize) };
+    if (unsafe { (*np0).next_hop_plus1 }) == 0u32 {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let mut b = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    let pfx = fre_arena_str(mut_view(*arena), "call chain: ");
+    diag_buf_push_bytes(mut_view(b), pfx.ptr, pfx.len);
+    let arrow = fre_arena_str(mut_view(*arena), " -> ");
+    if (caller_it as usize) != 0 {
+        let c_sv = unsafe { interner_get(view(*g.interner), StrId { v: (*caller_it).name.v }) };
+        if c_sv.len > 0 {
+            diag_buf_push_bytes(mut_view(b), c_sv.ptr, c_sv.len);
+            diag_buf_push_bytes(mut_view(b), arrow.ptr, arrow.len);
+        }
+    }
+    let mut cur = first_callee_idx as usize;
+    let mut hops: usize = 0;
+    while cur < g.count && hops < 16 {
+        let np = unsafe { sec_os_node_const_at(g.nodes as *const SecOsNode, cur) };
+        let cit = unsafe { (*np).item };
+        let fn_sv = unsafe { interner_get(view(*g.interner), StrId { v: (*cit).name.v }) };
+        if hops > 0 {
+            diag_buf_push_bytes(mut_view(b), arrow.ptr, arrow.len);
+        }
+        diag_buf_push_bytes(mut_view(b), fn_sv.ptr, fn_sv.len);
+        let nh = unsafe { (*np).next_hop_plus1 };
+        if nh == 0u32 {
+            break;
+        }
+        cur = (nh - 1u32) as usize;
+        hops = hops + 1;
+    }
+    let tmp_sv = StrView { ptr: b.ptr as *const u8, len: b.len };
+    let out = fre_arena_clone_sv(mut_view(*arena), view(tmp_sv));
+    if b.cap > 0 && (b.ptr as usize) != 0 {
+        unsafe { heap_free(b.ptr, b.cap, 1); }
+    }
+    out
+}
+
+struct SecBodyWalkCtx {
+    hir: *const HirFile,
+    thir: *const Thir,
+    interner: *const StrInterner,
+    sink: *mut DiagSink,
+    os_graph: *const SecOsGraph,
+    owner_item: *const HirItem,
+    forbid_unsafe: bool,
+    is_sandbox: bool,
+    fn_has_cap_param: bool,
+    suppress_cap_path_diag: bool,
+    ambient_emitted: usize,
+}
+
+fn sec_check_hir_type_comptime_exprs(w: mut_view<SecBodyWalkCtx>, ht: *mut HirType, in_rejected_unsafe: bool) {
+    if (ht as usize) == 0 {
+        return;
+    }
+    let tk = unsafe { (*ht).kind };
+    if tk == HIR_TYPE_ARRAY {
+        sec_walk_expr(mut_view(*w), unsafe { (*ht).count_expr }, in_rejected_unsafe, true);
+        sec_check_hir_type_comptime_exprs(w, unsafe { (*ht).elem }, in_rejected_unsafe);
+    } else if tk == HIR_TYPE_SLICE || tk == HIR_TYPE_PTR || tk == HIR_TYPE_VIEW {
+        sec_check_hir_type_comptime_exprs(w, unsafe { (*ht).elem }, in_rejected_unsafe);
+    } else if tk == HIR_TYPE_TUPLE {
+        let mut cur: *mut HirType = unsafe { (*ht).elem_types };
+        while (cur as usize) != 0 {
+            sec_check_hir_type_comptime_exprs(mut_view(*w), cur, in_rejected_unsafe);
+            cur = unsafe { (*cur).next };
+        }
+    } else if tk == HIR_TYPE_FN {
+        let mut cur_p: *mut HirType = unsafe { (*ht).param_types };
+        while (cur_p as usize) != 0 {
+            sec_check_hir_type_comptime_exprs(mut_view(*w), cur_p, in_rejected_unsafe);
+            cur_p = unsafe { (*cur_p).next };
+        }
+        sec_check_hir_type_comptime_exprs(w, unsafe { (*ht).ret_type }, in_rejected_unsafe);
+    }
+}
+
+fn sec_check_disallowed_local_policy_attrs(interner: view<StrInterner>, sink: mut_view<DiagSink>, attrs: *mut HirAttr) {
+    let mut hf = false;
+    let mut fsp = Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 };
+    let mut ha = false;
+    let mut asp = Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 };
+    sec_scan_policy_attrs(interner, sink, attrs, false, mut_view(hf), mut_view(fsp), mut_view(ha), mut_view(asp));
+}
+
+fn sec_walk_block(
+    w: mut_view<SecBodyWalkCtx>,
+    blk: *mut HirBlock,
+    in_rejected_unsafe: bool,
+    in_comptime: bool
+) {
+    if (blk as usize) == 0 {
+        return;
+    }
+    let mut s: *mut HirStmt = unsafe { (*blk).stmts };
+    while (s as usize) != 0 {
+        unsafe { sec_check_disallowed_local_policy_attrs(view(*w.interner), mut_view(*w.sink), (*s).attrs); }
+        let sk = unsafe { (*s).kind };
+        if sk == HIR_STMT_LET {
+            sec_check_hir_type_comptime_exprs(mut_view(*w), unsafe { (*s).ty }, in_rejected_unsafe);
+            sec_walk_expr(mut_view(*w), unsafe { (*s).expr }, in_rejected_unsafe, in_comptime);
+            sec_walk_block(mut_view(*w), unsafe { (*s).else_block }, in_rejected_unsafe, in_comptime);
+        } else if sk == HIR_STMT_ASSIGN {
+            sec_walk_expr(mut_view(*w), unsafe { (*s).left }, in_rejected_unsafe, in_comptime);
+            sec_walk_expr(mut_view(*w), unsafe { (*s).right }, in_rejected_unsafe, in_comptime);
+        } else if sk == HIR_STMT_EXPR {
+            sec_walk_expr(mut_view(*w), unsafe { (*s).expr }, in_rejected_unsafe, in_comptime);
+        }
+        s = unsafe { (*s).next };
+    }
+}
+
+fn sec_walk_expr(
+    w: mut_view<SecBodyWalkCtx>,
+    expr: *mut HirExpr,
+    in_rejected_unsafe: bool,
+    in_comptime: bool
+) {
+    let mut cur = expr;
+    while (cur as usize) != 0 {
+        let ek = unsafe { (*cur).kind };
+        let sp_f = unsafe { (*cur).span.file.v };
+        let sp_s = unsafe { (*cur).span.start };
+        let sp_e = unsafe { (*cur).span.end };
+        let empty_note = StrView { ptr: 0 as *const u8, len: 0 };
+
+        if ek == HIR_EXPR_UNSAFE {
+            let mut next_rej = in_rejected_unsafe;
+            if w.forbid_unsafe {
+                if !in_rejected_unsafe {
+                    unsafe { sec_report_1data_diag(mut_view(*w.sink), AX_SEC_UNSAFE_FORBIDDEN, sec_mk_span(sp_f, sp_s, sp_e), "construct", "unsafe_block"); }
+                }
+                next_rej = true;
+            }
+            sec_walk_block(mut_view(*w), unsafe { (*cur).block }, next_rej, in_comptime);
+            cur = unsafe { (*cur).next };
+            continue;
+        }
+
+        if ek == HIR_EXPR_COMPTIME {
+            sec_walk_block(mut_view(*w), unsafe { (*cur).block }, in_rejected_unsafe, true);
+            cur = unsafe { (*cur).next };
+            continue;
+        }
+
+        if ek == HIR_EXPR_PATH {
+            if w.forbid_unsafe && !in_rejected_unsafe {
+                let st_it = unsafe { sec_find_mut_static_by_path(view(*w.hir), (*cur).path.symbol.v, (*cur).path.name.v) };
+                if (st_it as usize) != 0 {
+                    unsafe { sec_report_1data_diag(mut_view(*w.sink), AX_SEC_UNSAFE_FORBIDDEN, sec_mk_span(sp_f, sp_s, sp_e), "construct", "static_mut"); }
+                }
+            }
+            if in_comptime {
+                let psym_v = unsafe { (*cur).path.symbol.v };
+                if psym_v != 0u32 {
+                    let sym_ty = unsafe { thir_get_symbol_type(view(*w.thir), SymbolId { v: psym_v }) };
+                    let cap_m = unsafe { sec_type_direct_authority_cap_mask(view(*w.interner), view(*w.thir), sym_ty) };
+                    if cap_m != 0u32 && !w.suppress_cap_path_diag {
+                        let pname_sv = unsafe { interner_get(view(*w.interner), StrId { v: (*cur).path.name.v }) };
+                        let req_cap = sec_required_cap_name_for_mask(cap_m);
+                        unsafe {
+                            sec_report_ambient_diag(
+                                mut_view(*w.sink),
+                                sec_mk_span(sp_f, sp_s, sp_e),
+                                view(pname_sv),
+                                req_cap,
+                                "comptime",
+                                "runtime_to_comptime_authority",
+                                true,
+                                view(empty_note)
+                            );
+                        }
+                        w.ambient_emitted = w.ambient_emitted + 1;
+                    }
+                }
+            }
+            cur = unsafe { (*cur).next };
+            continue;
+        }
+
+        if ek == HIR_EXPR_UNARY {
+            let op = unsafe { (*cur).op };
+            let inner: *mut HirExpr = unsafe { (*cur).inner };
+            let mut next_rej = in_rejected_unsafe;
+            if w.forbid_unsafe && !in_rejected_unsafe && op == UNOP_DEREF && (inner as usize) != 0 {
+                let op_ty = unsafe { thir_get_expr_type(view(*w.thir), inner as *const HirExpr) };
+                if op_ty.v != 0u32 {
+                    let t = unsafe { type_get(view((*w.thir).interner), op_ty) };
+                    if (t as usize) != 0 && (unsafe { (*t).kind }) == TY_PTR {
+                        unsafe { sec_report_1data_diag(mut_view(*w.sink), AX_SEC_UNSAFE_FORBIDDEN, sec_mk_span(sp_f, sp_s, sp_e), "construct", "raw_ptr_op"); }
+                        next_rej = true;
+                    }
+                }
+            }
+            sec_walk_expr(mut_view(*w), inner, next_rej, in_comptime);
+            cur = unsafe { (*cur).next };
+            continue;
+        }
+
+        if ek == HIR_EXPR_FIELD {
+            let base: *mut HirExpr = unsafe { (*cur).base };
+            let mut next_rej = in_rejected_unsafe;
+            if w.forbid_unsafe && !in_rejected_unsafe && (base as usize) != 0 {
+                let bty = unsafe { thir_get_expr_type(view(*w.thir), base as *const HirExpr) };
+                if bty.v != 0u32 {
+                    let bt = unsafe { type_get(view((*w.thir).interner), bty) };
+                    if (bt as usize) != 0 && (unsafe { (*bt).kind }) == TY_PTR {
+                        unsafe { sec_report_1data_diag(mut_view(*w.sink), AX_SEC_UNSAFE_FORBIDDEN, sec_mk_span(sp_f, sp_s, sp_e), "construct", "raw_ptr_op"); }
+                        next_rej = true;
+                    }
+                }
+            }
+            sec_walk_expr(mut_view(*w), base, next_rej, in_comptime);
+            cur = unsafe { (*cur).next };
+            continue;
+        }
+
+        if ek == HIR_EXPR_BINARY {
+            let op = unsafe { (*cur).op };
+            let left: *mut HirExpr = unsafe { (*cur).left };
+            let right: *mut HirExpr = unsafe { (*cur).right };
+            if w.forbid_unsafe && !in_rejected_unsafe && (op == BINOP_ADD || op == BINOP_SUB) {
+                let lty = if (left as usize) != 0 { unsafe { thir_get_expr_type(view(*w.thir), left as *const HirExpr) } } else { TypeId { v: 0u32 } };
+                let rty = if (right as usize) != 0 { unsafe { thir_get_expr_type(view(*w.thir), right as *const HirExpr) } } else { TypeId { v: 0u32 } };
+                let mut is_ptr_arith = false;
+                if lty.v != 0u32 {
+                    let lt = unsafe { type_get(view((*w.thir).interner), lty) };
+                    if (lt as usize) != 0 && (unsafe { (*lt).kind }) == TY_PTR {
+                        is_ptr_arith = true;
+                    }
+                }
+                if rty.v != 0u32 {
+                    let rt = unsafe { type_get(view((*w.thir).interner), rty) };
+                    if (rt as usize) != 0 && (unsafe { (*rt).kind }) == TY_PTR {
+                        is_ptr_arith = true;
+                    }
+                }
+                if is_ptr_arith {
+                    unsafe { sec_report_1data_diag(mut_view(*w.sink), AX_SEC_UNSAFE_FORBIDDEN, sec_mk_span(sp_f, sp_s, sp_e), "construct", "raw_ptr_op"); }
+                }
+            }
+            sec_walk_expr(mut_view(*w), left, in_rejected_unsafe, in_comptime);
+            sec_walk_expr(mut_view(*w), right, in_rejected_unsafe, in_comptime);
+            cur = unsafe { (*cur).next };
+            continue;
+        }
+
+        if ek == HIR_EXPR_CALL || ek == HIR_EXPR_METHOD_CALL {
+            let target = sec_os_resolve_call_target(w.hir, w.thir, cur as *const HirExpr);
+
+            // 1. `@forbid_unsafe` / `--safety-profile safe|sandbox` call checks
+            if w.forbid_unsafe && !in_rejected_unsafe {
+                let mut reported_call_unsafe = false;
+                if ek == HIR_EXPR_CALL {
+                    let callee: *mut HirExpr = unsafe { (*cur).callee };
+                    if (callee as usize) != 0 {
+                        let ctid = unsafe { thir_get_expr_type(view(*w.thir), callee as *const HirExpr) };
+                        if ctid.v != 0u32 {
+                            let ct = unsafe { type_get(view((*w.thir).interner), ctid) };
+                            if (ct as usize) != 0 {
+                                let ck = unsafe { (*ct).kind };
+                                if ck == TY_BUILTIN_ADDRESS_OF ||
+                                   ck == TY_BUILTIN_ADDRESS_OF_MUT ||
+                                   ck == TY_BUILTIN_PTR_ADD ||
+                                   ck == TY_BUILTIN_PTR_SUB ||
+                                   ck == TY_BUILTIN_DROP_IN_PLACE ||
+                                   ck == TY_BUILTIN_PTR_COPY ||
+                                   ck == TY_BUILTIN_PTR_COPY_NONOVERLAPPING ||
+                                   ck == TY_BUILTIN_PTR_WRITE_BYTES {
+                                    unsafe { sec_report_1data_diag(mut_view(*w.sink), AX_SEC_UNSAFE_FORBIDDEN, sec_mk_span(sp_f, sp_s, sp_e), "construct", "raw_ptr_op"); }
+                                    reported_call_unsafe = true;
+                                } else if ck == TY_FN && (unsafe { (*ct).is_unsafe }) && (target as usize) == 0 {
+                                    unsafe { sec_report_1data_diag(mut_view(*w.sink), AX_SEC_UNSAFE_FORBIDDEN, sec_mk_span(sp_f, sp_s, sp_e), "construct", "unsafe_fn"); }
+                                    reported_call_unsafe = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !reported_call_unsafe && (target as usize) != 0 {
+                    let t_abi_v = unsafe { (*target).abi.v };
+                    let mut t_foreign = false;
+                    if t_abi_v != 0u32 {
+                        let t_abi_sv = unsafe { interner_get(view(*w.interner), StrId { v: t_abi_v }) };
+                        if !fre_sv_eq_str(view(t_abi_sv), "axiom") {
+                            t_foreign = true;
+                        }
+                    }
+                    if t_foreign {
+                        unsafe { sec_report_1data_diag(mut_view(*w.sink), AX_SEC_UNSAFE_FORBIDDEN, sec_mk_span(sp_f, sp_s, sp_e), "construct", "extern_block"); }
+                    } else if unsafe { (*target).is_unsafe } {
+                        let t_name_sv = unsafe { interner_get(view(*w.interner), StrId { v: (*target).name.v }) };
+                        let mut intr_at: *mut HirAttr = 0 as *mut HirAttr;
+                        let is_intr = unsafe { fre_item_has_attr_name(view(*w.interner), (*target).attrs, "intrinsic", mut_view(intr_at)) };
+                        if is_intr && sec_is_raw_ptr_intrinsic_name(view(t_name_sv)) {
+                            unsafe { sec_report_1data_diag(mut_view(*w.sink), AX_SEC_UNSAFE_FORBIDDEN, sec_mk_span(sp_f, sp_s, sp_e), "construct", "raw_ptr_op"); }
+                        } else {
+                            unsafe { sec_report_1data_diag(mut_view(*w.sink), AX_SEC_UNSAFE_FORBIDDEN, sec_mk_span(sp_f, sp_s, sp_e), "construct", "unsafe_fn"); }
+                        }
+                    }
+                }
+            }
+
+            // 2. `sandbox` and `comptime` ambient-authority checks (`REQ-CAP-131`, `AXS-SEC-011`)
+            if in_comptime || w.is_sandbox {
+                let passes_cap = unsafe { sec_call_passes_authority_cap(view(*w.interner), view(*w.thir), cur as *const HirExpr) };
+                let mut builtin_print_mask: u32 = 0u32;
+                if ek == HIR_EXPR_CALL {
+                    let callee_p: *mut HirExpr = unsafe { (*cur).callee };
+                    if (callee_p as usize) != 0 {
+                        let ctid2 = unsafe { thir_get_expr_type(view(*w.thir), callee_p as *const HirExpr) };
+                        if ctid2.v != 0u32 {
+                            let ct2 = unsafe { type_get(view((*w.thir).interner), ctid2) };
+                            if (ct2 as usize) != 0 {
+                                let ck2 = unsafe { (*ct2).kind };
+                                if ck2 == TY_BUILTIN_PRINT || ck2 == TY_BUILTIN_PRINT_INT {
+                                    builtin_print_mask = SEC_AUTH_FS;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if builtin_print_mask != 0u32 {
+                    let p_sv = unsafe { fre_arena_str(mut_view((*w.sink).arena), "print") };
+                    if in_comptime {
+                        let has_rt_rsn = w.fn_has_cap_param || passes_cap;
+                        unsafe {
+                            sec_report_ambient_diag(
+                                mut_view(*w.sink),
+                                sec_mk_span(sp_f, sp_s, sp_e),
+                                view(p_sv),
+                                "FsCap",
+                                "comptime",
+                                "runtime_to_comptime_authority",
+                                has_rt_rsn,
+                                view(empty_note)
+                            );
+                        }
+                    } else {
+                        unsafe {
+                            sec_report_ambient_diag(mut_view(*w.sink), sec_mk_span(sp_f, sp_s, sp_e), view(p_sv), "FsCap", "sandbox", "", false, view(empty_note));
+                        }
+                    }
+                    w.ambient_emitted = w.ambient_emitted + 1;
+                } else if (target as usize) != 0 && (w.os_graph as usize) != 0 {
+                    let tidx = unsafe { sec_os_find_node(view(*w.os_graph), target) };
+                    let mut t_is_std = false;
+                    let mut t_raw_mask: u32 = 0u32;
+                    let mut t_amb_mask: u32 = 0u32;
+                    if tidx >= 0isize {
+                        let np = unsafe { sec_os_node_const_at((*w.os_graph).nodes as *const SecOsNode, tidx as usize) };
+                        t_is_std = unsafe { (*np).is_std };
+                        t_raw_mask = unsafe { (*np).raw_os_mask };
+                        t_amb_mask = unsafe { (*np).ambient_os_mask };
+                    } else {
+                        t_is_std = unsafe { tc_item_is_std_module(view(*w.interner), target) };
+                        let t_has_cap = unsafe { sec_fn_has_authority_cap_param(view(*w.interner), view(*w.thir), target) };
+                        t_raw_mask = unsafe { sec_fn_direct_os_mask(view(*w.interner), target, t_has_cap) };
+                        t_amb_mask = if t_is_std && t_has_cap { 0u32 } else { t_raw_mask };
+                    }
+                    let op_name_sv = unsafe { interner_get(view(*w.interner), StrId { v: (*target).name.v }) };
+                    if in_comptime {
+                        if t_raw_mask != 0u32 {
+                            let req_cap = sec_required_cap_name_for_mask(t_raw_mask);
+                            let has_rt_rsn = w.fn_has_cap_param || passes_cap;
+                            let cnote = unsafe { sec_format_os_chain_note(mut_view((*w.sink).arena), view(*w.os_graph), w.owner_item, tidx) };
+                            unsafe {
+                                sec_report_ambient_diag(
+                                    mut_view(*w.sink),
+                                    sec_mk_span(sp_f, sp_s, sp_e),
+                                    view(op_name_sv),
+                                    req_cap,
+                                    "comptime",
+                                    "runtime_to_comptime_authority",
+                                    has_rt_rsn,
+                                    view(cnote)
+                                );
+                            }
+                            w.ambient_emitted = w.ambient_emitted + 1;
+                        }
+                    } else if w.is_sandbox && !passes_cap && t_amb_mask != 0u32 {
+                        let req_cap2 = sec_required_cap_name_for_mask(t_amb_mask);
+                        let cnote2 = unsafe { sec_format_os_chain_note(mut_view((*w.sink).arena), view(*w.os_graph), w.owner_item, tidx) };
+                        unsafe {
+                            sec_report_ambient_diag(
+                                mut_view(*w.sink),
+                                sec_mk_span(sp_f, sp_s, sp_e),
+                                view(op_name_sv),
+                                req_cap2,
+                                "sandbox",
+                                "",
+                                false,
+                                view(cnote2)
+                            );
+                        }
+                        w.ambient_emitted = w.ambient_emitted + 1;
+                    }
+                }
+            }
+
+            let prev_amb = w.ambient_emitted;
+            if ek == HIR_EXPR_CALL {
+                sec_walk_expr(mut_view(*w), unsafe { (*cur).callee }, in_rejected_unsafe, in_comptime);
+            } else {
+                sec_walk_expr(mut_view(*w), unsafe { (*cur).receiver }, in_rejected_unsafe, in_comptime);
+            }
+            // Avoid emitting a second runtime_to_comptime_authority on `cap` arg if the call itself already reported it
+            if in_comptime && w.ambient_emitted > prev_amb {
+                let old_sup = w.suppress_cap_path_diag;
+                w.suppress_cap_path_diag = true;
+                sec_walk_expr(mut_view(*w), unsafe { (*cur).args }, in_rejected_unsafe, in_comptime);
+                w.suppress_cap_path_diag = old_sup;
+            } else {
+                sec_walk_expr(mut_view(*w), unsafe { (*cur).args }, in_rejected_unsafe, in_comptime);
+            }
+            cur = unsafe { (*cur).next };
+            continue;
+        }
+
+        if ek == HIR_EXPR_BLOCK || ek == HIR_EXPR_LOOP {
+            sec_walk_block(mut_view(*w), unsafe { (*cur).block }, in_rejected_unsafe, in_comptime);
+        } else if ek == HIR_EXPR_IF {
+            sec_walk_expr(mut_view(*w), unsafe { (*cur).cond }, in_rejected_unsafe, in_comptime);
+            sec_walk_block(mut_view(*w), unsafe { (*cur).block }, in_rejected_unsafe, in_comptime);
+            sec_walk_expr(mut_view(*w), unsafe { (*cur).else_branch }, in_rejected_unsafe, in_comptime);
+        } else if ek == HIR_EXPR_WHILE {
+            sec_walk_expr(mut_view(*w), unsafe { (*cur).cond }, in_rejected_unsafe, in_comptime);
+            sec_walk_block(mut_view(*w), unsafe { (*cur).block }, in_rejected_unsafe, in_comptime);
+        } else if ek == HIR_EXPR_FOR {
+            sec_walk_expr(mut_view(*w), unsafe { (*cur).iter }, in_rejected_unsafe, in_comptime);
+            sec_walk_block(mut_view(*w), unsafe { (*cur).block }, in_rejected_unsafe, in_comptime);
+        } else if ek == HIR_EXPR_MATCH {
+            sec_walk_expr(mut_view(*w), unsafe { (*cur).cond }, in_rejected_unsafe, in_comptime);
+            let mut arm: *mut HirMatchArm = unsafe { (*cur).arms };
+            while (arm as usize) != 0 {
+                sec_walk_expr(mut_view(*w), unsafe { (*arm).guard }, in_rejected_unsafe, in_comptime);
+                sec_walk_expr(mut_view(*w), unsafe { (*arm).body }, in_rejected_unsafe, in_comptime);
+                arm = unsafe { (*arm).next };
+            }
+        } else if ek == HIR_EXPR_CLOSURE {
+            let mut cp: *mut HirParam = unsafe { (*cur).params };
+            while (cp as usize) != 0 {
+                unsafe { sec_check_disallowed_local_policy_attrs(view(*w.interner), mut_view(*w.sink), (*cp).attrs); }
+                sec_check_hir_type_comptime_exprs(mut_view(*w), unsafe { (*cp).ty }, in_rejected_unsafe);
+                cp = unsafe { (*cp).next };
+            }
+            sec_walk_expr(mut_view(*w), unsafe { (*cur).body }, in_rejected_unsafe, in_comptime);
+        } else if ek == HIR_EXPR_VIEW || ek == HIR_EXPR_JUMP || ek == HIR_EXPR_CAST || ek == HIR_EXPR_TRY || ek == HIR_EXPR_AWAIT {
+            if ek == HIR_EXPR_CAST {
+                sec_check_hir_type_comptime_exprs(mut_view(*w), unsafe { (*cur).cast_ty }, in_rejected_unsafe);
+            }
+            sec_walk_expr(mut_view(*w), unsafe { (*cur).inner }, in_rejected_unsafe, in_comptime);
+        } else if ek == HIR_EXPR_ARRAY {
+            sec_walk_expr(mut_view(*w), unsafe { (*cur).elems }, in_rejected_unsafe, in_comptime);
+            sec_walk_expr(mut_view(*w), unsafe { (*cur).count_expr }, in_rejected_unsafe, true);
+        } else if ek == HIR_EXPR_TUPLE {
+            sec_walk_expr(mut_view(*w), unsafe { (*cur).elems }, in_rejected_unsafe, in_comptime);
+        } else if ek == HIR_EXPR_STRUCT {
+            let mut f: *mut HirFieldInit = unsafe { (*cur).fields };
+            while (f as usize) != 0 {
+                sec_walk_expr(mut_view(*w), unsafe { (*f).expr }, in_rejected_unsafe, in_comptime);
+                f = unsafe { (*f).next };
+            }
+        } else if ek == HIR_EXPR_RANGE {
+            sec_walk_expr(mut_view(*w), unsafe { (*cur).start_expr }, in_rejected_unsafe, in_comptime);
+            sec_walk_expr(mut_view(*w), unsafe { (*cur).end_expr }, in_rejected_unsafe, in_comptime);
+        } else if ek == HIR_EXPR_TUPLE_INDEX {
+            sec_walk_expr(mut_view(*w), unsafe { (*cur).base }, in_rejected_unsafe, in_comptime);
+        } else if ek == HIR_EXPR_INDEX {
+            sec_walk_expr(mut_view(*w), unsafe { (*cur).base }, in_rejected_unsafe, in_comptime);
+            sec_walk_expr(mut_view(*w), unsafe { (*cur).index_arg }, in_rejected_unsafe, in_comptime);
+        }
+        cur = unsafe { (*cur).next };
+    }
+}
+
+fn sec_check_single_item(
+    hir_file: view<HirFile>,
+    thir: view<Thir>,
+    interner: view<StrInterner>,
+    sink: mut_view<DiagSink>,
+    os_graph: view<SecOsGraph>,
+    it: *const HirItem,
+    eff_forbid: bool,
+    is_sandbox: bool
+) {
+    if (it as usize) == 0 {
+        return;
+    }
+    let ik = unsafe { (*it).kind };
+    if eff_forbid {
+        sec_check_item_header_forbid_unsafe(interner, mut_view(*sink), it);
+    }
+
+    let hir_ptr = unsafe { address_of(hir_file.items) as *const HirFile };
+    let thir_ptr = unsafe { address_of(thir.interner.arena.head) as *const Thir };
+    let int_ptr = unsafe { address_of(interner.bytes.head) as *const StrInterner };
+    let sink_ptr = unsafe { address_of_mut(sink.arena.head) as *mut DiagSink };
+    let g_ptr = unsafe { address_of(os_graph.nodes) as *const SecOsGraph };
+
+    if ik == HIR_ITEM_STRUCT {
+        let mut fd: *mut HirFieldDecl = unsafe { (*it).struct_fields };
+        while (fd as usize) != 0 {
+            sec_check_disallowed_local_policy_attrs(interner, mut_view(*sink), unsafe { (*fd).attrs });
+            let mut fw = SecBodyWalkCtx {
+                hir: hir_ptr,
+                thir: thir_ptr,
+                interner: int_ptr,
+                sink: sink_ptr,
+                os_graph: g_ptr,
+                owner_item: it,
+                forbid_unsafe: eff_forbid,
+                is_sandbox: is_sandbox,
+                fn_has_cap_param: false,
+                suppress_cap_path_diag: false,
+                ambient_emitted: 0,
+            };
+            sec_check_hir_type_comptime_exprs(mut_view(fw), unsafe { (*fd).ty }, false);
+            fd = unsafe { (*fd).next };
+        }
+        return;
+    }
+    if ik == HIR_ITEM_ENUM {
+        let mut vd: *mut HirVariantDecl = unsafe { (*it).variants };
+        while (vd as usize) != 0 {
+            sec_check_disallowed_local_policy_attrs(interner, mut_view(*sink), unsafe { (*vd).attrs });
+            let mut vfd: *mut HirFieldDecl = unsafe { (*vd).struct_fields };
+            while (vfd as usize) != 0 {
+                sec_check_disallowed_local_policy_attrs(interner, mut_view(*sink), unsafe { (*vfd).attrs });
+                vfd = unsafe { (*vfd).next };
+            }
+            vd = unsafe { (*vd).next };
+        }
+        return;
+    }
+
+    let empty_note = StrView { ptr: 0 as *const u8, len: 0 };
+
+    // ASEC-24 (`SPEC-53 AXS-SEC-011 (3)`): comptime authority NEVER becomes runtime authority
+    if ik == HIR_ITEM_CONST || ik == HIR_ITEM_STATIC {
+        let mut item_tid = thir_get_item_type(thir, it);
+        if item_tid.v == 0u32 && (unsafe { (*it).symbol.v }) != 0u32 {
+            item_tid = thir_get_symbol_type(thir, SymbolId { v: unsafe { (*it).symbol.v } });
+        }
+        let cap_m = sec_type_contains_authority_cap_mask(interner, thir, item_tid, 0);
+        if cap_m != 0u32 {
+            let iname_sv = interner_get(interner, StrId { v: unsafe { (*it).name.v } });
+            let req_cap = sec_required_cap_name_for_mask(cap_m);
+            sec_report_ambient_diag(
+                mut_view(*sink),
+                unsafe { (*it).span },
+                view(iname_sv),
+                req_cap,
+                "comptime",
+                "comptime_to_runtime_authority",
+                true,
+                view(empty_note)
+            );
+            return;
+        }
+        let mut cw = SecBodyWalkCtx {
+            hir: hir_ptr,
+            thir: thir_ptr,
+            interner: int_ptr,
+            sink: sink_ptr,
+            os_graph: g_ptr,
+            owner_item: it,
+            forbid_unsafe: eff_forbid,
+            is_sandbox: is_sandbox,
+            fn_has_cap_param: false,
+            suppress_cap_path_diag: false,
+            ambient_emitted: 0,
+        };
+        sec_check_hir_type_comptime_exprs(mut_view(cw), unsafe { (*it).ty }, false);
+        sec_walk_expr(mut_view(cw), unsafe { (*it).expr }, false, true);
+        return;
+    }
+
+    if ik == HIR_ITEM_FN {
+        let is_ct_fn = unsafe { (*it).is_comptime };
+        let fn_has_cap = sec_fn_has_authority_cap_param(interner, thir, it);
+        let mut first_cap_param_sp = unsafe { (*it).span };
+        let mut first_cap_mask: u32 = 0u32;
+        let mut p: *mut HirParam = unsafe { (*it).params };
+        while (p as usize) != 0 {
+            sec_check_disallowed_local_policy_attrs(interner, mut_view(*sink), unsafe { (*p).attrs });
+            let mut ptid = thir_get_param_type(thir, p as *const HirParam);
+            if ptid.v == 0u32 && (unsafe { (*p).symbol.v }) != 0u32 {
+                ptid = thir_get_symbol_type(thir, SymbolId { v: unsafe { (*p).symbol.v } });
+            }
+            let pm = sec_type_direct_authority_cap_mask(interner, thir, ptid);
+            if pm != 0u32 && first_cap_mask == 0u32 {
+                first_cap_mask = pm;
+                first_cap_param_sp = unsafe { (*p).span };
+            }
+            p = unsafe { (*p).next };
+        }
+
+        // ASEC-25 (`SPEC-53 AXS-SEC-011 (3)`): comptime fn declaring a runtime authority capability param
+        let mut reported_ct_param = false;
+        if is_ct_fn && first_cap_mask != 0u32 {
+            let fname_sv = interner_get(interner, StrId { v: unsafe { (*it).name.v } });
+            let req_cap = sec_required_cap_name_for_mask(first_cap_mask);
+            sec_report_ambient_diag(
+                mut_view(*sink),
+                first_cap_param_sp,
+                view(fname_sv),
+                req_cap,
+                "comptime",
+                "runtime_to_comptime_authority",
+                true,
+                view(empty_note)
+            );
+            reported_ct_param = true;
+        }
+
+        let mut bw = SecBodyWalkCtx {
+            hir: hir_ptr,
+            thir: thir_ptr,
+            interner: int_ptr,
+            sink: sink_ptr,
+            os_graph: g_ptr,
+            owner_item: it,
+            forbid_unsafe: eff_forbid,
+            is_sandbox: is_sandbox,
+            fn_has_cap_param: fn_has_cap,
+            suppress_cap_path_diag: reported_ct_param,
+            ambient_emitted: 0,
+        };
+        let mut p2: *mut HirParam = unsafe { (*it).params };
+        while (p2 as usize) != 0 {
+            sec_check_hir_type_comptime_exprs(mut_view(bw), unsafe { (*p2).ty }, false);
+            p2 = unsafe { (*p2).next };
+        }
+        sec_check_hir_type_comptime_exprs(mut_view(bw), unsafe { (*it).ret_type }, false);
+        let in_rej = eff_forbid && (unsafe { (*it).is_unsafe });
+        sec_walk_block(mut_view(bw), unsafe { (*it).body }, in_rej, is_ct_fn);
+    }
+}
+
+pub fn typeck_check_safety_profile(
+    hir_file: view<HirFile>,
+    thir: view<Thir>,
+    sink: mut_view<DiagSink>,
+    interner: view<StrInterner>,
+    safety_profile: u32,
+    pkg_forbid_unsafe: bool,
+    user_fids: *const u32,
+    user_fid_count: usize
+) {
+    let thir_ptr = unsafe { address_of(thir.interner.arena.head) as *const Thir };
+    let is_sandbox = safety_profile == TY_SAFETY_PROFILE_SANDBOX;
+
+    // 1. Collect module-level `@forbid_unsafe` declarations and validate module policy attributes
+    let mut mod_cap: usize = 0;
+    let mut it_cnt: *mut HirItem = hir_file.items;
+    while (it_cnt as usize) != 0 {
+        if (unsafe { (*it_cnt).kind }) == HIR_ITEM_MODULE &&
+           sec_is_user_item(interner, it_cnt as *const HirItem, user_fids, user_fid_count) {
+            mod_cap = mod_cap + 1;
+        }
+        it_cnt = unsafe { (*it_cnt).next };
+    }
+
+    let forbid_mods: *mut SecForbidMod = if mod_cap > 0 {
+        let mbytes = mul_usize(mod_cap, size_of<SecForbidMod>());
+        let raw = arena_alloc_raw(mut_view(sink.arena), mbytes, align_of<SecForbidMod>());
+        tc_zero_bytes(raw, mbytes);
+        raw as *mut SecForbidMod
+    } else {
+        0 as *mut SecForbidMod
+    };
+    let mut forbid_mod_count: usize = 0;
+
+    let mut it_m1: *mut HirItem = hir_file.items;
+    while (it_m1 as usize) != 0 {
+        if (unsafe { (*it_m1).kind }) == HIR_ITEM_MODULE &&
+           sec_is_user_item(interner, it_m1 as *const HirItem, user_fids, user_fid_count) {
+            let mut hf = false;
+            let mut fsp = Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 };
+            let mut ha = false;
+            let mut asp = Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 };
+            sec_scan_policy_attrs(
+                interner,
+                mut_view(*sink),
+                unsafe { (*it_m1).attrs },
+                true,
+                mut_view(hf),
+                mut_view(fsp),
+                mut_view(ha),
+                mut_view(asp)
+            );
+            if hf && forbid_mod_count < mod_cap {
+                let slot = unsafe { sec_forbid_mod_at(forbid_mods, forbid_mod_count) };
+                unsafe {
+                    (*slot).mod_path = (*it_m1).mod_path;
+                    (*slot).file_v = (*it_m1).span.file.v;
+                    (*slot).attr_span = fsp;
+                }
+                forbid_mod_count = forbid_mod_count + 1;
+            }
+        }
+        it_m1 = unsafe { (*it_m1).next };
+    }
+
+    // Check module-level `@allow_unsafe` monotonic non-escalation against profile, package, or parent modules
+    let mut it_m2: *mut HirItem = hir_file.items;
+    while (it_m2 as usize) != 0 {
+        if (unsafe { (*it_m2).kind }) == HIR_ITEM_MODULE &&
+           sec_is_user_item(interner, it_m2 as *const HirItem, user_fids, user_fid_count) {
+            let mut cur_at: *mut HirAttr = unsafe { (*it_m2).attrs };
+            while (cur_at as usize) != 0 {
+                let sv = interner_get(interner, StrId { v: unsafe { (*cur_at).name.v } });
+                if fre_sv_eq_str(view(sv), "allow_unsafe") && (unsafe { (*cur_at).args as usize }) == 0 {
+                    if sec_is_item_mod_forbidden(
+                        interner,
+                        it_m2 as *const HirItem,
+                        forbid_mods as *const SecForbidMod,
+                        forbid_mod_count,
+                        safety_profile,
+                        pkg_forbid_unsafe
+                    ) {
+                        sec_report_1data_diag(
+                            mut_view(*sink),
+                            AX_SEC_CONFLICTING_SAFETY_POLICY,
+                            unsafe { (*cur_at).span },
+                            "policy",
+                            "allow_unsafe"
+                        );
+                    }
+                }
+                cur_at = unsafe { (*cur_at).next };
+            }
+        }
+        it_m2 = unsafe { (*it_m2).next };
+    }
+
+    // 2. Build OS authority call graph for `sandbox` and `comptime` verification
+    let os_graph = sec_os_graph_build(mut_view(sink.arena), hir_file, thir, interner, user_fids, user_fid_count);
+
+    // 3. Walk all user items and members
+    let mut it: *mut HirItem = hir_file.items;
+    while (it as usize) != 0 {
+        if sec_is_user_item(interner, it as *const HirItem, user_fids, user_fid_count) &&
+           !fre_is_synth_fn_clone(hir_file, thir_ptr, it as *const HirItem, true) &&
+           !sec_is_extern_block_clone(hir_file, it as *const HirItem) {
+            let ik = unsafe { (*it).kind };
+            if ik != HIR_ITEM_MODULE {
+                let mod_forbid = sec_is_item_mod_forbidden(
+                    interner,
+                    it as *const HirItem,
+                    forbid_mods as *const SecForbidMod,
+                    forbid_mod_count,
+                    safety_profile,
+                    pkg_forbid_unsafe
+                );
+                let mut hf = false;
+                let mut fsp = Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 };
+                let mut ha = false;
+                let mut asp = Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 };
+                sec_scan_policy_attrs(
+                    interner,
+                    mut_view(*sink),
+                    unsafe { (*it).attrs },
+                    true,
+                    mut_view(hf),
+                    mut_view(fsp),
+                    mut_view(ha),
+                    mut_view(asp)
+                );
+                let item_forbid = mod_forbid || hf;
+                if ha && item_forbid {
+                    sec_report_1data_diag(mut_view(*sink), AX_SEC_CONFLICTING_SAFETY_POLICY, asp, "policy", "allow_unsafe");
+                }
+
+                sec_check_single_item(
+                    hir_file,
+                    thir,
+                    interner,
+                    mut_view(*sink),
+                    view(os_graph),
+                    it as *const HirItem,
+                    item_forbid,
+                    is_sandbox
+                );
+
+                if ik == HIR_ITEM_IMPL || ik == HIR_ITEM_TRAIT || ik == HIR_ITEM_EXTERN_BLOCK {
+                    let is_ext_blk = ik == HIR_ITEM_EXTERN_BLOCK;
+                    let mut m: *mut HirItem = unsafe { (*it).members };
+                    while (m as usize) != 0 {
+                        if !fre_is_synth_fn_clone(hir_file, thir_ptr, m as *const HirItem, false) {
+                            let mut m_hf = false;
+                            let mut m_fsp = Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 };
+                            let mut m_ha = false;
+                            let mut m_asp = Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 };
+                            sec_scan_policy_attrs(
+                                interner,
+                                mut_view(*sink),
+                                unsafe { (*m).attrs },
+                                true,
+                                mut_view(m_hf),
+                                mut_view(m_fsp),
+                                mut_view(m_ha),
+                                mut_view(m_asp)
+                            );
+                            let mem_forbid = item_forbid || m_hf;
+                            if m_ha && mem_forbid {
+                                sec_report_1data_diag(mut_view(*sink), AX_SEC_CONFLICTING_SAFETY_POLICY, m_asp, "policy", "allow_unsafe");
+                            }
+                            if !is_ext_blk {
+                                sec_check_single_item(
+                                    hir_file,
+                                    thir,
+                                    interner,
+                                    mut_view(*sink),
+                                    view(os_graph),
+                                    m as *const HirItem,
+                                    mem_forbid,
+                                    is_sandbox
+                                );
+                            }
+                        }
+                        m = unsafe { (*m).next };
+                    }
+                }
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+}
+
+fn sec_is_extern_block_clone(hir_file: view<HirFile>, it: *const HirItem) -> bool {
+    if (it as usize) == 0 || (unsafe { (*it).kind }) != HIR_ITEM_FN || (unsafe { (*it).body as usize }) != 0 {
+        return false;
+    }
+    let sym_v = unsafe { (*it).symbol.v };
+    let sp_f = unsafe { (*it).span.file.v };
+    let sp_s = unsafe { (*it).span.start };
+    let sp_e = unsafe { (*it).span.end };
+    let mut cur: *mut HirItem = hir_file.items;
+    while (cur as usize) != 0 {
+        if (unsafe { (*cur).kind }) == HIR_ITEM_EXTERN_BLOCK {
+            let mut m: *mut HirItem = unsafe { (*cur).members };
+            while (m as usize) != 0 {
+                if (m as *const HirItem) != it && (unsafe { (*m).kind }) == HIR_ITEM_FN {
+                    let m_sym = unsafe { (*m).symbol.v };
+                    if sym_v != 0u32 && m_sym == sym_v {
+                        return true;
+                    }
+                    if sp_f != 0u32 &&
+                       (unsafe { (*m).span.file.v }) == sp_f &&
+                       (unsafe { (*m).span.start }) == sp_s &&
+                       (unsafe { (*m).span.end }) == sp_e {
+                        return true;
+                    }
+                }
+                m = unsafe { (*m).next };
+            }
+        }
+        cur = unsafe { (*cur).next };
+    }
+    false
+}
+
+fn sec_expr_max_end(ex: *mut HirExpr) -> u32 {
+    let mut e: u32 = 0u32;
+    let mut cur = ex;
+    while (cur as usize) != 0 {
+        let ce = unsafe { (*cur).span.end };
+        if ce > e {
+            e = ce;
+        }
+        let ek = unsafe { (*cur).kind };
+        if ek == HIR_EXPR_BLOCK || ek == HIR_EXPR_LOOP || ek == HIR_EXPR_UNSAFE || ek == HIR_EXPR_COMPTIME {
+            let be = sec_block_max_end(unsafe { (*cur).block });
+            if be > e { e = be; }
+        } else if ek == HIR_EXPR_IF {
+            let c1 = sec_expr_max_end(unsafe { (*cur).cond });
+            let b1 = sec_block_max_end(unsafe { (*cur).block });
+            let e1 = sec_expr_max_end(unsafe { (*cur).else_branch });
+            if c1 > e { e = c1; }
+            if b1 > e { e = b1; }
+            if e1 > e { e = e1; }
+        } else if ek == HIR_EXPR_WHILE {
+            let c1 = sec_expr_max_end(unsafe { (*cur).cond });
+            let b1 = sec_block_max_end(unsafe { (*cur).block });
+            if c1 > e { e = c1; }
+            if b1 > e { e = b1; }
+        } else if ek == HIR_EXPR_FOR {
+            let i1 = sec_expr_max_end(unsafe { (*cur).iter });
+            let b1 = sec_block_max_end(unsafe { (*cur).block });
+            if i1 > e { e = i1; }
+            if b1 > e { e = b1; }
+        } else if ek == HIR_EXPR_MATCH {
+            let c1 = sec_expr_max_end(unsafe { (*cur).cond });
+            if c1 > e { e = c1; }
+            let mut arm: *mut HirMatchArm = unsafe { (*cur).arms };
+            while (arm as usize) != 0 {
+                let ae = unsafe { (*arm).span.end };
+                let ab = sec_expr_max_end(unsafe { (*arm).body });
+                if ae > e { e = ae; }
+                if ab > e { e = ab; }
+                arm = unsafe { (*arm).next };
+            }
+        } else if ek == HIR_EXPR_UNARY || ek == HIR_EXPR_VIEW || ek == HIR_EXPR_JUMP || ek == HIR_EXPR_CAST || ek == HIR_EXPR_TRY || ek == HIR_EXPR_AWAIT {
+            let ie = sec_expr_max_end(unsafe { (*cur).inner });
+            if ie > e { e = ie; }
+        } else if ek == HIR_EXPR_BINARY {
+            let le = sec_expr_max_end(unsafe { (*cur).left });
+            let re = sec_expr_max_end(unsafe { (*cur).right });
+            if le > e { e = le; }
+            if re > e { e = re; }
+        } else if ek == HIR_EXPR_FIELD || ek == HIR_EXPR_TUPLE_INDEX {
+            let be = sec_expr_max_end(unsafe { (*cur).base });
+            if be > e { e = be; }
+        } else if ek == HIR_EXPR_INDEX {
+            let be = sec_expr_max_end(unsafe { (*cur).base });
+            let ie = sec_expr_max_end(unsafe { (*cur).index_arg });
+            if be > e { e = be; }
+            if ie > e { e = ie; }
+        } else if ek == HIR_EXPR_CALL {
+            let ce2 = sec_expr_max_end(unsafe { (*cur).callee });
+            let ae2 = sec_expr_max_end(unsafe { (*cur).args });
+            if ce2 > e { e = ce2; }
+            if ae2 > e { e = ae2; }
+        } else if ek == HIR_EXPR_METHOD_CALL {
+            let re2 = sec_expr_max_end(unsafe { (*cur).receiver });
+            let ae2 = sec_expr_max_end(unsafe { (*cur).args });
+            if re2 > e { e = re2; }
+            if ae2 > e { e = ae2; }
+        } else if ek == HIR_EXPR_CLOSURE {
+            let be = sec_expr_max_end(unsafe { (*cur).body });
+            if be > e { e = be; }
+        }
+        cur = unsafe { (*cur).next };
+    }
+    e
+}
+
+fn sec_block_max_end(b: *mut HirBlock) -> u32 {
+    if (b as usize) == 0 {
+        return 0u32;
+    }
+    let mut e = unsafe { (*b).span.end };
+    let mut s: *mut HirStmt = unsafe { (*b).stmts };
+    while (s as usize) != 0 {
+        let se = unsafe { (*s).span.end };
+        if se > e {
+            e = se;
+        }
+        let sk = unsafe { (*s).kind };
+        if sk == HIR_STMT_LET {
+            let ee = sec_expr_max_end(unsafe { (*s).expr });
+            let eb = sec_block_max_end(unsafe { (*s).else_block });
+            if ee > e { e = ee; }
+            if eb > e { e = eb; }
+        } else if sk == HIR_STMT_ASSIGN {
+            let le = sec_expr_max_end(unsafe { (*s).left });
+            let re = sec_expr_max_end(unsafe { (*s).right });
+            if le > e { e = le; }
+            if re > e { e = re; }
+        } else if sk == HIR_STMT_EXPR {
+            let ee = sec_expr_max_end(unsafe { (*s).expr });
+            if ee > e { e = ee; }
+        }
+        s = unsafe { (*s).next };
+    }
+    e
+}
+
+fn sec_item_file_v(it: *const HirItem) -> u32 {
+    let fv = unsafe { (*it).span.file.v };
+    if fv != 0u32 {
+        return fv;
+    }
+    let mut a: *mut HirAttr = unsafe { (*it).attrs };
+    while (a as usize) != 0 {
+        let afv = unsafe { (*a).span.file.v };
+        if afv != 0u32 {
+            return afv;
+        }
+        a = unsafe { (*a).next };
+    }
+    let mut m: *mut HirItem = unsafe { (*it).members };
+    while (m as usize) != 0 {
+        let mfv = unsafe { (*m).span.file.v };
+        if mfv != 0u32 {
+            return mfv;
+        }
+        m = unsafe { (*m).next };
+    }
+    0u32
+}
+
+fn sec_item_full_start(it: *const HirItem) -> u32 {
+    let mut s = unsafe { (*it).span.start };
+    let mut a: *mut HirAttr = unsafe { (*it).attrs };
+    while (a as usize) != 0 {
+        let as_v = unsafe { (*a).span.start };
+        if s == 0u32 || as_v < s {
+            s = as_v;
+        }
+        a = unsafe { (*a).next };
+    }
+    s
+}
+
+fn sec_item_full_end(it: *const HirItem) -> u32 {
+    let mut e = unsafe { (*it).span.end };
+    let be = sec_block_max_end(unsafe { (*it).body });
+    if be > e {
+        e = be;
+    }
+    let ee = sec_expr_max_end(unsafe { (*it).expr });
+    if ee > e {
+        e = ee;
+    }
+    let ik = unsafe { (*it).kind };
+    if ik == HIR_ITEM_IMPL || ik == HIR_ITEM_TRAIT || ik == HIR_ITEM_EXTERN_BLOCK {
+        let mut m: *mut HirItem = unsafe { (*it).members };
+        while (m as usize) != 0 {
+            let me = sec_item_full_end(m as *const HirItem);
+            if me > e {
+                e = me;
+            }
+            m = unsafe { (*m).next };
+        }
+    }
+    e
+}
+
+fn sec_span_in_forbid_unsafe_scope(
+    hir_file: view<HirFile>,
+    interner: view<StrInterner>,
+    forbid_mods: *const SecForbidMod,
+    forbid_mod_count: usize,
+    safety_profile: u32,
+    pkg_forbid_unsafe: bool,
+    user_fids: *const u32,
+    user_fid_count: usize,
+    sp: Span
+) -> bool {
+    let sp_f = sp.file.v;
+    let sp_s = sp.start;
+    let sp_e = sp.end;
+    if sp_f == 0u32 {
+        return false;
+    }
+    let mut it: *mut HirItem = hir_file.items;
+    while (it as usize) != 0 {
+        if sec_is_user_item(interner, it as *const HirItem, user_fids, user_fid_count) &&
+           (unsafe { (*it).kind }) != HIR_ITEM_MODULE {
+            let mod_f = sec_is_item_mod_forbidden(
+                interner,
+                it as *const HirItem,
+                forbid_mods,
+                forbid_mod_count,
+                safety_profile,
+                pkg_forbid_unsafe
+            );
+            let it_f_v = sec_item_file_v(it as *const HirItem);
+            if mod_f && it_f_v == sp_f {
+                return true;
+            }
+            let mut f_at: *mut HirAttr = 0 as *mut HirAttr;
+            let it_f = mod_f || fre_item_has_attr_name(interner, unsafe { (*it).attrs }, "forbid_unsafe", mut_view(f_at));
+            if it_f && it_f_v == sp_f && sp_s >= sec_item_full_start(it as *const HirItem) && sp_e <= sec_item_full_end(it as *const HirItem) {
+                return true;
+            }
+            let ik = unsafe { (*it).kind };
+            if ik == HIR_ITEM_IMPL || ik == HIR_ITEM_TRAIT {
+                let mut m: *mut HirItem = unsafe { (*it).members };
+                while (m as usize) != 0 {
+                    let mut mf_at: *mut HirAttr = 0 as *mut HirAttr;
+                    let mem_f = it_f || fre_item_has_attr_name(interner, unsafe { (*m).attrs }, "forbid_unsafe", mut_view(mf_at));
+                    let m_f_v = sec_item_file_v(m as *const HirItem);
+                    if mem_f && m_f_v == sp_f && sp_s >= sec_item_full_start(m as *const HirItem) && sp_e <= sec_item_full_end(m as *const HirItem) {
+                        return true;
+                    }
+                    m = unsafe { (*m).next };
+                }
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+    false
+}
+
+pub fn typeck_dedup_unsafe_diags_under_forbid(
+    hir_file: view<HirFile>,
+    sink: mut_view<DiagSink>,
+    interner: view<StrInterner>,
+    from_diag_idx: usize,
+    safety_profile: u32,
+    pkg_forbid_unsafe: bool,
+    user_fids: *const u32,
+    user_fid_count: usize
+) {
+    if sink.len <= from_diag_idx || (sink.diags as usize) == 0 {
+        return;
+    }
+    let mut mod_cap: usize = 0;
+    let mut it_cnt: *mut HirItem = hir_file.items;
+    while (it_cnt as usize) != 0 {
+        if (unsafe { (*it_cnt).kind }) == HIR_ITEM_MODULE &&
+           sec_is_user_item(interner, it_cnt as *const HirItem, user_fids, user_fid_count) {
+            mod_cap = mod_cap + 1;
+        }
+        it_cnt = unsafe { (*it_cnt).next };
+    }
+    let forbid_mods: *mut SecForbidMod = if mod_cap > 0 {
+        let mbytes = mul_usize(mod_cap, size_of<SecForbidMod>());
+        let raw = arena_alloc_raw(mut_view(sink.arena), mbytes, align_of<SecForbidMod>());
+        tc_zero_bytes(raw, mbytes);
+        raw as *mut SecForbidMod
+    } else {
+        0 as *mut SecForbidMod
+    };
+    let mut forbid_mod_count: usize = 0;
+    let mut it_m: *mut HirItem = hir_file.items;
+    while (it_m as usize) != 0 {
+        if (unsafe { (*it_m).kind }) == HIR_ITEM_MODULE &&
+           sec_is_user_item(interner, it_m as *const HirItem, user_fids, user_fid_count) {
+            let mut f_at: *mut HirAttr = 0 as *mut HirAttr;
+            if fre_item_has_attr_name(interner, unsafe { (*it_m).attrs }, "forbid_unsafe", mut_view(f_at)) &&
+               (unsafe { (*f_at).args as usize }) == 0 &&
+               forbid_mod_count < mod_cap {
+                let slot = unsafe { sec_forbid_mod_at(forbid_mods, forbid_mod_count) };
+                unsafe {
+                    (*slot).mod_path = (*it_m).mod_path;
+                    (*slot).file_v = (*it_m).span.file.v;
+                    (*slot).attr_span = (*f_at).span;
+                }
+                forbid_mod_count = forbid_mod_count + 1;
+            }
+        }
+        it_m = unsafe { (*it_m).next };
+    }
+
+    let dsz = size_of<Diagnostic>();
+    let mut i: usize = from_diag_idx;
+    while i < sink.len {
+        let dp = ((sink.diags as usize) + mul_usize(i, dsz)) as *mut Diagnostic;
+        let cv = unsafe { (*dp).code.v };
+        let psp = unsafe { (*dp).primary };
+        if (cv == AX_UNSAFE_REQUIRED || cv == AX_CONC_UNSYNC_STATIC) &&
+           sec_span_in_forbid_unsafe_scope(
+               hir_file,
+               interner,
+               forbid_mods as *const SecForbidMod,
+               forbid_mod_count,
+               safety_profile,
+               pkg_forbid_unsafe,
+               user_fids,
+               user_fid_count,
+               psp
+           ) {
+            let mut j: usize = i;
+            while j + 1 < sink.len {
+                let dst = ((sink.diags as usize) + mul_usize(j, dsz)) as *mut Diagnostic;
+                let src = ((sink.diags as usize) + mul_usize(j + 1, dsz)) as *mut Diagnostic;
+                unsafe { *dst = *src; }
+                j = j + 1;
+            }
+            sink.len = sink.len - 1;
+            if sink.errors > 0 {
+                sink.errors = sink.errors - 1;
+            }
+            continue;
+        }
+        i = i + 1;
+    }
+}
+
 // compiler.types — Type representation, interner, layout engine, match exhaustiveness, and typeck.
 module compiler.types
 
@@ -48041,6 +50459,11 @@ pub use compiler.types.typeck.RT_CAP_GPU_RUNTIME
 pub use compiler.types.typeck.RT_CAP_REFLECT
 pub use compiler.types.typeck.fre_is_forbidden_std_layer3_seg
 pub use compiler.types.typeck.typeck_check_profile
+pub use compiler.types.typeck.TY_SAFETY_PROFILE_SYSTEM
+pub use compiler.types.typeck.TY_SAFETY_PROFILE_SAFE
+pub use compiler.types.typeck.TY_SAFETY_PROFILE_SANDBOX
+pub use compiler.types.typeck.typeck_check_safety_profile
+pub use compiler.types.typeck.typeck_dedup_unsafe_diags_under_forbid
 
 module compiler.traits
 
@@ -147329,11 +149752,16 @@ pub const PROFILE_FREESTANDING: u32 = 1u32;
 pub const PROFILE_KERNEL: u32 = 2u32;
 pub const PROFILE_SYSTEM: u32 = 3u32;
 
+pub const SAFETY_PROFILE_SYSTEM: u32 = 0u32;
+pub const SAFETY_PROFILE_SAFE: u32 = 1u32;
+pub const SAFETY_PROFILE_SANDBOX: u32 = 2u32;
+
 pub const AX_DRIVER_INVALID_ARTIFACT_KIND: u32 = 137u32;
 pub const AX_FFI_GENERIC_EXPORT: u32 = 141u32;
 pub const AX_LINK_ABI_MISMATCH: u32 = 153u32;
 pub const AX_LINK_ARTIFACT_TARGET_MISMATCH: u32 = 154u32;
 pub const AX_DRIVER_INVALID_PROFILE: u32 = 217u32;
+pub const AX_DRIVER_INVALID_SAFETY_PROFILE: u32 = 218u32;
 
 // =============================================================================
 // 2. Constant Byte Tables for Stage-0 & Native Parity
@@ -147995,6 +150423,45 @@ pub fn driver_parse_profile(sv: view<StrView>, out_profile: mut_view<u32>) -> bo
     false
 }
 
+pub fn driver_parse_safety_profile(sv: view<StrView>, out_safety_profile: mut_view<u32>) -> bool {
+    if (sv.ptr as usize) == 0 {
+        return false;
+    }
+    if sv.len == 4 {
+        // "safe"
+        let ok = unsafe {
+            *(sv.ptr + 0) == 115u8 && *(sv.ptr + 1) == 97u8 &&
+            *(sv.ptr + 2) == 102u8 && *(sv.ptr + 3) == 101u8
+        };
+        if ok {
+            *out_safety_profile = SAFETY_PROFILE_SAFE;
+            return true;
+        }
+    } else if sv.len == 6 {
+        // "system"
+        let ok = unsafe {
+            *(sv.ptr + 0) == 115u8 && *(sv.ptr + 1) == 121u8 && *(sv.ptr + 2) == 115u8 &&
+            *(sv.ptr + 3) == 116u8 && *(sv.ptr + 4) == 101u8 && *(sv.ptr + 5) == 109u8
+        };
+        if ok {
+            *out_safety_profile = SAFETY_PROFILE_SYSTEM;
+            return true;
+        }
+    } else if sv.len == 7 {
+        // "sandbox"
+        let ok = unsafe {
+            *(sv.ptr + 0) == 115u8 && *(sv.ptr + 1) == 97u8 && *(sv.ptr + 2) == 110u8 &&
+            *(sv.ptr + 3) == 100u8 && *(sv.ptr + 4) == 98u8 && *(sv.ptr + 5) == 111u8 &&
+            *(sv.ptr + 6) == 120u8
+        };
+        if ok {
+            *out_safety_profile = SAFETY_PROFILE_SANDBOX;
+            return true;
+        }
+    }
+    false
+}
+
 pub fn derive_file_stem_sv(path: view<StrView>) -> StrView {
     if path.len == 0 || (path.ptr as usize) == 0 {
         return sv_empty();
@@ -148372,6 +150839,9 @@ pub struct DriverOptions {
     pub profile: u32,
     pub has_explicit_profile: bool,
     pub profile_str: StrView,
+    pub safety_profile: u32,
+    pub has_explicit_safety_profile: bool,
+    pub safety_profile_str: StrView,
 }
 
 pub fn driver_parse_i32_decimal(sv: view<StrView>, default_val: i32) -> i32 {
@@ -148468,6 +150938,9 @@ pub fn driver_options_new() -> DriverOptions {
         profile: PROFILE_HOSTED,
         has_explicit_profile: false,
         profile_str: sv_empty(),
+        safety_profile: SAFETY_PROFILE_SYSTEM,
+        has_explicit_safety_profile: false,
+        safety_profile_str: sv_empty(),
     }
 }
 
@@ -148517,6 +150990,9 @@ pub fn driver_options_init(dopts: mut_view<DriverOptions>) {
     dopts.profile = PROFILE_HOSTED;
     dopts.has_explicit_profile = false;
     sv_clear(mut_view(dopts.profile_str));
+    dopts.safety_profile = SAFETY_PROFILE_SYSTEM;
+    dopts.has_explicit_safety_profile = false;
+    sv_clear(mut_view(dopts.safety_profile_str));
 }
 
 pub fn driver_options_free(dopts: mut_view<DriverOptions>) {
@@ -148823,6 +151299,50 @@ pub fn err_invalid_profile(err_out: mut_view<DiagBuffer>, prof_sv: view<StrView>
     }
 }
 
+fn sv_is_opt_safety_profile(sv: view<StrView>) -> bool {
+    if sv.len != 16 || (sv.ptr as usize) == 0 {
+        return false;
+    }
+    unsafe {
+        *(sv.ptr + 0) == 45u8 && *(sv.ptr + 1) == 45u8 &&
+        *(sv.ptr + 2) == 115u8 && *(sv.ptr + 3) == 97u8 &&
+        *(sv.ptr + 4) == 102u8 && *(sv.ptr + 5) == 101u8 &&
+        *(sv.ptr + 6) == 116u8 && *(sv.ptr + 7) == 121u8 &&
+        *(sv.ptr + 8) == 45u8 &&
+        *(sv.ptr + 9) == 112u8 && *(sv.ptr + 10) == 114u8 &&
+        *(sv.ptr + 11) == 111u8 && *(sv.ptr + 12) == 102u8 &&
+        *(sv.ptr + 13) == 105u8 && *(sv.ptr + 14) == 108u8 &&
+        *(sv.ptr + 15) == 101u8
+    }
+}
+
+pub fn err_invalid_safety_profile(err_out: mut_view<DiagBuffer>, prof_sv: view<StrView>) {
+    // "axiom0: invalid safety profile '<prof>' [AX_DRIVER_INVALID_SAFETY_PROFILE]\n"
+    let pfx: [32]u8 = [
+        97u8, 120u8, 105u8, 111u8, 109u8, 48u8, 58u8, 32u8,
+        105u8, 110u8, 118u8, 97u8, 108u8, 105u8, 100u8, 32u8,
+        115u8, 97u8, 102u8, 101u8, 116u8, 121u8, 32u8,
+        112u8, 114u8, 111u8, 102u8, 105u8, 108u8, 101u8, 32u8, 39u8,
+    ];
+    let sfx: [37]u8 = [
+        39u8, 32u8, 91u8, 65u8, 88u8, 95u8, 68u8, 82u8, 73u8, 86u8, 69u8, 82u8, 95u8,
+        73u8, 78u8, 86u8, 65u8, 76u8, 73u8, 68u8, 95u8,
+        83u8, 65u8, 70u8, 69u8, 84u8, 89u8, 95u8,
+        80u8, 82u8, 79u8, 70u8, 73u8, 76u8, 69u8, 93u8, 10u8,
+    ];
+    let mut i: usize = 0;
+    while i < 32 {
+        diag_buf_push_byte(mut_view(*err_out), pfx[i]);
+        i = i + 1;
+    }
+    diag_buf_push_bytes(mut_view(*err_out), prof_sv.ptr, prof_sv.len);
+    let mut j: usize = 0;
+    while j < 37 {
+        diag_buf_push_byte(mut_view(*err_out), sfx[j]);
+        j = j + 1;
+    }
+}
+
 pub fn driver_validate_target(dopts: view<DriverOptions>, err_out: mut_view<DiagBuffer>) -> i32 {
     if dopts.target.len == 0 {
         return AX_EXIT_OK;
@@ -149037,6 +151557,9 @@ pub fn driver_parse_options(
             } else if sv_is_opt_profile(view(name_sv)) {
                 is_str_opt = true;
                 opt_kind = 12u32;
+            } else if sv_is_opt_safety_profile(view(name_sv)) {
+                is_str_opt = true;
+                opt_kind = 13u32;
             }
 
             if is_str_opt {
@@ -149102,6 +151625,15 @@ pub fn driver_parse_options(
                         return AX_EXIT_USAGE;
                     }
                     dopts.profile = parsed_p;
+                } else if opt_kind == 13u32 {
+                    dopts.has_explicit_safety_profile = true;
+                    sv_set(mut_view(dopts.safety_profile_str), val_ptr, val_len);
+                    let mut parsed_sp: u32 = SAFETY_PROFILE_SYSTEM;
+                    if !driver_parse_safety_profile(view(val_sv), mut_view(parsed_sp)) {
+                        err_invalid_safety_profile(mut_view(*err_out), view(val_sv));
+                        return AX_EXIT_USAGE;
+                    }
+                    dopts.safety_profile = parsed_sp;
                 }
                 i = i + 1;
                 continue;
@@ -149370,6 +151902,9 @@ pub struct PackageManifest {
     pub version: StrView,
     pub kind: StrView,
     pub profile: StrView,
+    pub safety_profile: StrView,
+    pub forbid_unsafe: bool,
+    pub has_forbid_unsafe: bool,
 }
 
 pub fn manifest_new() -> PackageManifest {
@@ -149381,6 +151916,9 @@ pub fn manifest_new() -> PackageManifest {
         version: sv_empty(),
         kind: k,
         profile: sv_empty(),
+        safety_profile: sv_empty(),
+        forbid_unsafe: false,
+        has_forbid_unsafe: false,
     }
 }
 
@@ -149391,6 +151929,9 @@ pub fn manifest_init(m: mut_view<PackageManifest>) {
     let k = arena_table_sv(mut_view(m.arena), 273, 3);
     sv_copy_to(mut_view(m.kind), view(k));
     sv_clear(mut_view(m.profile));
+    sv_clear(mut_view(m.safety_profile));
+    m.forbid_unsafe = false;
+    m.has_forbid_unsafe = false;
 }
 
 pub fn manifest_free(m: mut_view<PackageManifest>) {
@@ -149399,6 +151940,9 @@ pub fn manifest_free(m: mut_view<PackageManifest>) {
     sv_clear(mut_view(m.version));
     sv_clear(mut_view(m.kind));
     sv_clear(mut_view(m.profile));
+    sv_clear(mut_view(m.safety_profile));
+    m.forbid_unsafe = false;
+    m.has_forbid_unsafe = false;
 }
 
 pub fn manifest_alloc() -> *mut PackageManifest {
@@ -149486,16 +152030,83 @@ fn sv_is_profile_key(sv: view<StrView>) -> bool {
     }
 }
 
+fn sv_is_toml_security_section(sv: view<StrView>) -> bool {
+    if sv.len != 10 || (sv.ptr as usize) == 0 {
+        return false;
+    }
+    unsafe {
+        *(sv.ptr + 0) == 91u8 &&
+        *(sv.ptr + 1) == 115u8 && *(sv.ptr + 2) == 101u8 && *(sv.ptr + 3) == 99u8 &&
+        *(sv.ptr + 4) == 117u8 && *(sv.ptr + 5) == 114u8 && *(sv.ptr + 6) == 105u8 &&
+        *(sv.ptr + 7) == 116u8 && *(sv.ptr + 8) == 121u8 &&
+        *(sv.ptr + 9) == 93u8
+    }
+}
+
+fn sv_is_safety_profile_key(sv: view<StrView>) -> bool {
+    if sv.len != 14 || (sv.ptr as usize) == 0 {
+        return false;
+    }
+    unsafe {
+        *(sv.ptr + 0) == 115u8 && *(sv.ptr + 1) == 97u8 && *(sv.ptr + 2) == 102u8 &&
+        *(sv.ptr + 3) == 101u8 && *(sv.ptr + 4) == 116u8 && *(sv.ptr + 5) == 121u8 &&
+        *(sv.ptr + 6) == 95u8 &&
+        *(sv.ptr + 7) == 112u8 && *(sv.ptr + 8) == 114u8 && *(sv.ptr + 9) == 111u8 &&
+        *(sv.ptr + 10) == 102u8 && *(sv.ptr + 11) == 105u8 && *(sv.ptr + 12) == 108u8 &&
+        *(sv.ptr + 13) == 101u8
+    }
+}
+
+fn sv_is_forbid_unsafe_key(sv: view<StrView>) -> bool {
+    if sv.len != 13 || (sv.ptr as usize) == 0 {
+        return false;
+    }
+    unsafe {
+        *(sv.ptr + 0) == 102u8 && *(sv.ptr + 1) == 111u8 && *(sv.ptr + 2) == 114u8 &&
+        *(sv.ptr + 3) == 98u8 && *(sv.ptr + 4) == 105u8 && *(sv.ptr + 5) == 100u8 &&
+        *(sv.ptr + 6) == 95u8 &&
+        *(sv.ptr + 7) == 117u8 && *(sv.ptr + 8) == 110u8 && *(sv.ptr + 9) == 115u8 &&
+        *(sv.ptr + 10) == 97u8 && *(sv.ptr + 11) == 102u8 && *(sv.ptr + 12) == 101u8
+    }
+}
+
+fn sv_parse_toml_bool(sv: view<StrView>, out_bool: mut_view<bool>) -> bool {
+    if (sv.ptr as usize) == 0 {
+        return false;
+    }
+    if sv.len == 4 && unsafe {
+        *(sv.ptr + 0) == 116u8 && *(sv.ptr + 1) == 114u8 &&
+        *(sv.ptr + 2) == 117u8 && *(sv.ptr + 3) == 101u8
+    } {
+        *out_bool = true;
+        return true;
+    }
+    if sv.len == 5 && unsafe {
+        *(sv.ptr + 0) == 102u8 && *(sv.ptr + 1) == 97u8 &&
+        *(sv.ptr + 2) == 108u8 && *(sv.ptr + 3) == 115u8 && *(sv.ptr + 4) == 101u8
+    } {
+        *out_bool = false;
+        return true;
+    }
+    false
+}
+
 pub fn manifest_parse_text(text: view<StrView>, out: mut_view<PackageManifest>) -> bool {
     sv_clear(mut_view(out.name));
     sv_clear(mut_view(out.version));
     let k0 = arena_table_sv(mut_view(out.arena), 273, 3);
     sv_copy_to(mut_view(out.kind), view(k0));
     sv_clear(mut_view(out.profile));
+    sv_clear(mut_view(out.safety_profile));
+    out.forbid_unsafe = false;
+    out.has_forbid_unsafe = false;
 
     let mut in_package: bool = false;
     let mut in_target: bool = false;
+    let mut in_security: bool = false;
     let mut has_target_profile: bool = false;
+    let mut has_override_safety_profile: bool = false;
+    let mut has_security_forbid_unsafe: bool = false;
     let mut found_package: bool = false;
     let mut line_start: usize = 0;
     let mut pos: usize = 0;
@@ -149514,13 +152125,20 @@ pub fn manifest_parse_text(text: view<StrView>, out: mut_view<PackageManifest>) 
                     if sv_eq_table(view(line), 276, 9) {
                         in_package = true;
                         in_target = false;
+                        in_security = false;
                         found_package = true;
                     } else if sv_is_toml_target_section(view(line)) {
                         in_package = false;
                         in_target = true;
+                        in_security = false;
+                    } else if sv_is_toml_security_section(view(line)) {
+                        in_package = false;
+                        in_target = false;
+                        in_security = true;
                     } else {
                         in_package = false;
                         in_target = false;
+                        in_security = false;
                     }
                 } else if in_package {
                     let eq_idx = find_eq_index(view(line));
@@ -149536,26 +152154,75 @@ pub fn manifest_parse_text(text: view<StrView>, out: mut_view<PackageManifest>) 
                     };
                     let key = trim_sv(view(key_raw));
                     let val = strip_toml_comment(view(val_raw));
-                    let val_len = val.len;
-                    if val_len < 2 || (unsafe { *val.ptr }) != 34u8 || (unsafe { *(val.ptr + val_len - 1) }) != 34u8 {
+                    if sv_is_forbid_unsafe_key(view(key)) {
+                        let mut fb: bool = false;
+                        if !sv_parse_toml_bool(view(val), mut_view(fb)) {
+                            return false;
+                        }
+                        if !has_security_forbid_unsafe {
+                            out.forbid_unsafe = fb;
+                            out.has_forbid_unsafe = true;
+                        }
+                    } else {
+                        let val_len = val.len;
+                        if val_len < 2 || (unsafe { *val.ptr }) != 34u8 || (unsafe { *(val.ptr + val_len - 1) }) != 34u8 {
+                            return false;
+                        }
+                        let unquoted = StrView {
+                            ptr: unsafe { val.ptr + 1 },
+                            len: val_len - 2,
+                        };
+                        if sv_eq_table(view(key), 285, 4) {
+                            let cloned = arena_clone_sv(mut_view(out.arena), view(unquoted));
+                            sv_copy_to(mut_view(out.name), view(cloned));
+                        } else if sv_eq_table(view(key), 12, 7) {
+                            let cloned = arena_clone_sv(mut_view(out.arena), view(unquoted));
+                            sv_copy_to(mut_view(out.version), view(cloned));
+                        } else if sv_eq_table(view(key), 289, 4) {
+                            let cloned = arena_clone_sv(mut_view(out.arena), view(unquoted));
+                            sv_copy_to(mut_view(out.kind), view(cloned));
+                        } else if sv_is_profile_key(view(key)) && !has_target_profile {
+                            let cloned = arena_clone_sv(mut_view(out.arena), view(unquoted));
+                            sv_copy_to(mut_view(out.profile), view(cloned));
+                        } else if sv_is_safety_profile_key(view(key)) && !has_override_safety_profile {
+                            let cloned = arena_clone_sv(mut_view(out.arena), view(unquoted));
+                            sv_copy_to(mut_view(out.safety_profile), view(cloned));
+                        }
+                    }
+                } else if in_security {
+                    let eq_idx = find_eq_index(view(line));
+                    if eq_idx < 0isize {
                         return false;
                     }
-                    let unquoted = StrView {
-                        ptr: unsafe { val.ptr + 1 },
-                        len: val_len - 2,
+                    let ueq = eq_idx as usize;
+                    let val_off: usize = ueq + 1;
+                    let key_raw = StrView { ptr: line.ptr, len: ueq };
+                    let val_raw = StrView {
+                        ptr: unsafe { line.ptr + val_off },
+                        len: line.len - val_off,
                     };
-                    if sv_eq_table(view(key), 285, 4) {
+                    let key = trim_sv(view(key_raw));
+                    let val = strip_toml_comment(view(val_raw));
+                    if sv_is_forbid_unsafe_key(view(key)) {
+                        let mut fb: bool = false;
+                        if !sv_parse_toml_bool(view(val), mut_view(fb)) {
+                            return false;
+                        }
+                        out.forbid_unsafe = fb;
+                        out.has_forbid_unsafe = true;
+                        has_security_forbid_unsafe = true;
+                    } else if sv_is_safety_profile_key(view(key)) {
+                        let val_len = val.len;
+                        if val_len < 2 || (unsafe { *val.ptr }) != 34u8 || (unsafe { *(val.ptr + val_len - 1) }) != 34u8 {
+                            return false;
+                        }
+                        let unquoted = StrView {
+                            ptr: unsafe { val.ptr + 1 },
+                            len: val_len - 2,
+                        };
                         let cloned = arena_clone_sv(mut_view(out.arena), view(unquoted));
-                        sv_copy_to(mut_view(out.name), view(cloned));
-                    } else if sv_eq_table(view(key), 12, 7) {
-                        let cloned = arena_clone_sv(mut_view(out.arena), view(unquoted));
-                        sv_copy_to(mut_view(out.version), view(cloned));
-                    } else if sv_eq_table(view(key), 289, 4) {
-                        let cloned = arena_clone_sv(mut_view(out.arena), view(unquoted));
-                        sv_copy_to(mut_view(out.kind), view(cloned));
-                    } else if sv_is_profile_key(view(key)) && !has_target_profile {
-                        let cloned = arena_clone_sv(mut_view(out.arena), view(unquoted));
-                        sv_copy_to(mut_view(out.profile), view(cloned));
+                        sv_copy_to(mut_view(out.safety_profile), view(cloned));
+                        has_override_safety_profile = true;
                     }
                 } else if in_target {
                     let eq_idx = find_eq_index(view(line));
@@ -149583,6 +152250,18 @@ pub fn manifest_parse_text(text: view<StrView>, out: mut_view<PackageManifest>) 
                         let cloned = arena_clone_sv(mut_view(out.arena), view(unquoted));
                         sv_copy_to(mut_view(out.profile), view(cloned));
                         has_target_profile = true;
+                    } else if sv_is_safety_profile_key(view(key)) {
+                        let val_len = val.len;
+                        if val_len < 2 || (unsafe { *val.ptr }) != 34u8 || (unsafe { *(val.ptr + val_len - 1) }) != 34u8 {
+                            return false;
+                        }
+                        let unquoted = StrView {
+                            ptr: unsafe { val.ptr + 1 },
+                            len: val_len - 2,
+                        };
+                        let cloned = arena_clone_sv(mut_view(out.arena), view(unquoted));
+                        sv_copy_to(mut_view(out.safety_profile), view(cloned));
+                        has_override_safety_profile = true;
                     }
                 }
             }
@@ -150270,6 +152949,23 @@ pub fn ax_text_module_header(text: view<StrView>) -> StrView {
         if b == 47u8 && i + 1 < n && (unsafe { *(p + i + 1) }) == 47u8 {
             while i < n && (unsafe { *(p + i) }) != 10u8 {
                 i = i + 1;
+            }
+            continue;
+        }
+        if b == 64u8 {
+            i = i + 1;
+            while i < n && opts_is_path_byte(unsafe { *(p + i) }) {
+                i = i + 1;
+            }
+            if i < n && (unsafe { *(p + i) }) == 40u8 {
+                let mut depth: usize = 1;
+                i = i + 1;
+                while i < n && depth > 0 {
+                    let cb = unsafe { *(p + i) };
+                    if cb == 40u8 { depth = depth + 1; }
+                    else if cb == 41u8 { depth = depth - 1; }
+                    i = i + 1;
+                }
             }
             continue;
         }
@@ -151074,6 +153770,7 @@ use compiler.source.manager.source_db_span_text
 use compiler.diag.code.AX_IO_FILE_NOT_FOUND
 use compiler.diag.code.AX_NAME_UNRESOLVED_IMPORT
 use compiler.diag.code.AX_NAME_FREESTANDING_FORBIDDEN_IMPORT
+use compiler.diag.code.AX_SEC_CAPABILITY_FORGERY
 use compiler.diag.code.DiagCode
 use compiler.diag.code.DiagDataKind
 use compiler.diag.code.DiagSeverity
@@ -151201,6 +153898,8 @@ use compiler.types.layout.type_align
 use compiler.types.typeck.patch_unknown_intrinsic_diag_buf
 use compiler.types.typeck.fre_is_forbidden_std_layer3_seg
 use compiler.types.typeck.typeck_check_profile
+use compiler.types.typeck.typeck_check_safety_profile
+use compiler.types.typeck.typeck_dedup_unsafe_diags_under_forbid
 use compiler.typeck.session.session_render_thir_into
 use compiler.traits.mono.MonoInstance
 use compiler.traits.mono.MonoEngine
@@ -151404,8 +154103,12 @@ use compiler.driver.opts.PROFILE_HOSTED
 use compiler.driver.opts.PROFILE_FREESTANDING
 use compiler.driver.opts.PROFILE_KERNEL
 use compiler.driver.opts.PROFILE_SYSTEM
+use compiler.driver.opts.SAFETY_PROFILE_SYSTEM
+use compiler.driver.opts.SAFETY_PROFILE_SAFE
+use compiler.driver.opts.SAFETY_PROFILE_SANDBOX
 use compiler.driver.opts.AX_DRIVER_INVALID_ARTIFACT_KIND
 use compiler.driver.opts.AX_DRIVER_INVALID_PROFILE
+use compiler.driver.opts.AX_DRIVER_INVALID_SAFETY_PROFILE
 use compiler.driver.opts.AX_FFI_GENERIC_EXPORT
 use compiler.driver.opts.err_run_kind_not_supported
 use compiler.driver.opts.DriverOptions
@@ -151428,6 +154131,7 @@ use compiler.driver.opts.sv_slot_set
 use compiler.driver.opts.arena_clone_sv
 use compiler.driver.opts.driver_parse_artifact_kind
 use compiler.driver.opts.driver_parse_profile
+use compiler.driver.opts.driver_parse_safety_profile
 use compiler.driver.opts.derive_file_stem_sv
 use compiler.driver.opts.derive_default_output_path
 use compiler.driver.opts.emit_driver_diag
@@ -151850,6 +154554,8 @@ pub struct PipelineCtx {
     pub panic_msg: StrView,
     pub eff_profile: u32,
     pub invalid_profile: bool,
+    pub eff_safety_profile: u32,
+    pub pkg_forbid_unsafe: bool,
 }
 
 pub fn pipeline_ctx_init(ctx: mut_view<PipelineCtx>) {
@@ -151925,6 +154631,8 @@ pub fn pipeline_ctx_init(ctx: mut_view<PipelineCtx>) {
     sv_clear(mut_view(ctx.panic_msg));
     ctx.eff_profile = PROFILE_HOSTED;
     ctx.invalid_profile = false;
+    ctx.eff_safety_profile = SAFETY_PROFILE_SYSTEM;
+    ctx.pkg_forbid_unsafe = false;
 }
 
 pub fn pipeline_ctx_free(ctx: mut_view<PipelineCtx>) {
@@ -152418,6 +155126,32 @@ fn pipe_skip_blanks(text: view<StrView>, pos: usize) -> usize {
     i
 }
 
+fn pipe_skip_line_attrs(text: view<StrView>, pos: usize) -> usize {
+    let mut i: usize = pipe_skip_blanks(text, pos);
+    while i < text.len && (unsafe { *(text.ptr + i) }) == 64u8 {
+        i = i + 1;
+        while i < text.len && pipe_is_ident_byte(unsafe { *(text.ptr + i) }) {
+            i = i + 1;
+        }
+        i = pipe_skip_blanks(text, i);
+        if i < text.len && (unsafe { *(text.ptr + i) }) == 40u8 {
+            let mut depth: usize = 1;
+            i = i + 1;
+            while i < text.len && depth > 0 && (unsafe { *(text.ptr + i) }) != 10u8 {
+                let c = unsafe { *(text.ptr + i) };
+                if c == 40u8 {
+                    depth = depth + 1;
+                } else if c == 41u8 {
+                    depth = depth - 1;
+                }
+                i = i + 1;
+            }
+        }
+        i = pipe_skip_blanks(text, i);
+    }
+    i
+}
+
 // Adds the path of every `module <path>` line of `text` to `out`.
 fn pipe_collect_module_headers(
     arena: mut_view<Arena>,
@@ -152430,7 +155164,7 @@ fn pipe_collect_module_headers(
     }
     let mut ls: usize = 0;
     while ls < text.len {
-        let i = pipe_skip_blanks(text, ls);
+        let i = pipe_skip_line_attrs(text, ls);
         let after = pipe_kw_at(text, i, view(lits.kw_module));
         if after > 0 {
             let p = pipe_path_at(text, after);
@@ -153461,6 +156195,8 @@ pub fn pipe_write_dep_file(ctx: view<PipelineCtx>, dopts: view<DriverOptions>) {
 pub fn pipeline_stage_source(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptions>) -> bool {
     ctx.eff_profile = dopts.profile;
     ctx.invalid_profile = false;
+    ctx.eff_safety_profile = dopts.safety_profile;
+    ctx.pkg_forbid_unsafe = false;
     if dopts.input_file.len == 0 {
         emit_driver_diag(mut_view(ctx.sess.diag_sink), AX_IO_FILE_NOT_FOUND, 0, 25);
         return false;
@@ -153509,6 +156245,20 @@ pub fn pipeline_stage_source(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptio
             return false;
         }
         ctx.eff_profile = mp;
+    }
+
+    if ctx.proj.has_manifest && ctx.proj.manifest.has_forbid_unsafe {
+        ctx.pkg_forbid_unsafe = ctx.proj.manifest.forbid_unsafe;
+    }
+    if !dopts.has_explicit_safety_profile && ctx.proj.has_manifest && ctx.proj.manifest.safety_profile.len > 0 {
+        let mut msp: u32 = SAFETY_PROFILE_SYSTEM;
+        if !driver_parse_safety_profile(view(ctx.proj.manifest.safety_profile), mut_view(msp)) {
+            ctx.invalid_profile = true;
+            let spmsg_sv = pipe_lit(mut_view(ctx.proj.arena), "invalid safety_profile in axiom.toml");
+            emit_driver_diag_text(mut_view(ctx.sess.diag_sink), AX_DRIVER_INVALID_SAFETY_PROFILE, view(spmsg_sv));
+            return false;
+        }
+        ctx.eff_safety_profile = msp;
     }
 
     if dopts.cmd == CMD_BUILD {
@@ -154064,13 +156814,91 @@ pub fn pipeline_stage_typeck(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptio
         is_dll,
         ctx.main_fid.v
     );
-    if session_has_errors(view(ctx.sess)) {
+
+    let mut user_fid_count: usize = 0;
+    let mut user_fids: *const u32 = 0 as *const u32;
+    if ctx.proj.file_count > 0 {
+        let mut uf_cap: usize = 0;
+        let mut ufi: usize = 0;
+        while ufi < ctx.proj.file_count {
+            let pf = unsafe { project_file_const_at(ctx.proj.files as *const ProjectFile, ufi) };
+            if !pf_is_std(pf) && pf_get_fid_v(pf) != 0u32 {
+                uf_cap = uf_cap + 1;
+            }
+            ufi = ufi + 1;
+        }
+        if uf_cap > 0 {
+            let uf_bytes = opts_mul_usize(uf_cap, size_of<u32>());
+            let uf_raw = arena_alloc_raw(mut_view(ctx.hir_arena), uf_bytes, align_of<u32>()) as *mut u32;
+            let mut ufj: usize = 0;
+            let mut ufk: usize = 0;
+            while ufj < ctx.proj.file_count {
+                let pf = unsafe { project_file_const_at(ctx.proj.files as *const ProjectFile, ufj) };
+                let f_v = pf_get_fid_v(pf);
+                if !pf_is_std(pf) && f_v != 0u32 && ufk < uf_cap {
+                    unsafe { *(uf_raw + ufk) = f_v; }
+                    ufk = ufk + 1;
+                }
+                ufj = ufj + 1;
+            }
+            user_fids = uf_raw as *const u32;
+            user_fid_count = ufk;
+        }
+    } else if ctx.main_fid.v != 0u32 {
+        let uf_raw = arena_alloc_raw(mut_view(ctx.hir_arena), size_of<u32>(), align_of<u32>()) as *mut u32;
+        unsafe { *uf_raw = ctx.main_fid.v; }
+        user_fids = uf_raw as *const u32;
+        user_fid_count = 1;
+    }
+
+    let mut had_non_sec_errors: bool = false;
+    if ctx.sess.diag_sink.errors > 0 && (ctx.sess.diag_sink.diags as usize) != 0 {
+        let dsz = size_of<Diagnostic>();
+        let mut di: usize = 0;
+        while di < ctx.sess.diag_sink.len {
+            let dp = ((ctx.sess.diag_sink.diags as usize) + opts_mul_usize(di, dsz)) as *const Diagnostic;
+            let is_err = match unsafe { (*dp).severity } {
+                DiagSeverity.Error => true,
+                _ => false,
+            };
+            if is_err && (unsafe { (*dp).code.v }) != AX_SEC_CAPABILITY_FORGERY {
+                had_non_sec_errors = true;
+                break;
+            }
+            di = di + 1;
+        }
+    }
+    if had_non_sec_errors {
         return;
     }
-    let _ = session_unsafe_check(
-        mut_view(ctx.sess),
+
+    let pre_unsafe_diag_idx: usize = ctx.sess.diag_sink.len;
+    if !session_has_errors(view(ctx.sess)) {
+        let _ = session_unsafe_check(
+            mut_view(ctx.sess),
+            view(ctx.hir),
+            view(ctx.thir)
+        );
+    }
+    typeck_check_safety_profile(
         view(ctx.hir),
-        view(ctx.thir)
+        view(ctx.thir),
+        mut_view(ctx.sess.diag_sink),
+        view(ctx.sess.interner),
+        ctx.eff_safety_profile,
+        ctx.pkg_forbid_unsafe,
+        user_fids,
+        user_fid_count
+    );
+    typeck_dedup_unsafe_diags_under_forbid(
+        view(ctx.hir),
+        mut_view(ctx.sess.diag_sink),
+        view(ctx.sess.interner),
+        pre_unsafe_diag_idx,
+        ctx.eff_safety_profile,
+        ctx.pkg_forbid_unsafe,
+        user_fids,
+        user_fid_count
     );
     if session_has_errors(view(ctx.sess)) {
         return;
@@ -160049,13 +162877,18 @@ pub use compiler.driver.opts.PROFILE_HOSTED
 pub use compiler.driver.opts.PROFILE_FREESTANDING
 pub use compiler.driver.opts.PROFILE_KERNEL
 pub use compiler.driver.opts.PROFILE_SYSTEM
+pub use compiler.driver.opts.SAFETY_PROFILE_SYSTEM
+pub use compiler.driver.opts.SAFETY_PROFILE_SAFE
+pub use compiler.driver.opts.SAFETY_PROFILE_SANDBOX
 pub use compiler.driver.opts.AX_DRIVER_INVALID_ARTIFACT_KIND
 pub use compiler.driver.opts.AX_DRIVER_INVALID_PROFILE
+pub use compiler.driver.opts.AX_DRIVER_INVALID_SAFETY_PROFILE
 pub use compiler.driver.opts.AX_FFI_GENERIC_EXPORT
 pub use compiler.driver.opts.AX_LINK_ABI_MISMATCH
 pub use compiler.driver.opts.AX_LINK_ARTIFACT_TARGET_MISMATCH
 pub use compiler.driver.opts.err_run_kind_not_supported
 pub use compiler.driver.opts.err_invalid_profile
+pub use compiler.driver.opts.err_invalid_safety_profile
 pub use compiler.driver.opts.DriverOptions
 pub use compiler.driver.opts.PackageManifest
 pub use compiler.driver.opts.ProjectFile
@@ -160076,6 +162909,7 @@ pub use compiler.driver.opts.sv_ends_with_a
 pub use compiler.driver.opts.sv_is_obj_or_archive
 pub use compiler.driver.opts.driver_parse_artifact_kind
 pub use compiler.driver.opts.driver_parse_profile
+pub use compiler.driver.opts.driver_parse_safety_profile
 pub use compiler.driver.opts.derive_file_stem_sv
 pub use compiler.driver.opts.derive_default_output_path
 pub use compiler.driver.opts.driver_options_new

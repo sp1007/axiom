@@ -8,14 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T516]
 priority: 166
-status: doing
+status: done
 attempts: 1
 paths: [compiler/driver, compiler/types, tests/ui/security_profiles]
 locks: [compiler/hir, compiler/diag/code.ax]
 spec: [spec/SPEC-53-safety-profiles-capability-security.md, tasks/0342, tasks/0449, tasks/0703]
 covers: [REQ-CAP-010, REQ-CAP-123, REQ-CAP-131]
 started: 2026-11-23 08:11:48
-agent: axiom-semantics
+finished: 2026-11-23 10:29:42
 ---
 # T517 — E13.4 — Safety profile enforcement (@forbid_unsafe, capability-only IO/net/fs, sandbox verification)
 
@@ -43,3 +43,4 @@ Implement `--safety-profile safe|sandbox|system`, `@forbid_unsafe` module/crate 
 ## Log
 - 2026-11-03 02:03:00 created by T213 (P13 phase planning)
 - 2026-11-23 08:11:48 started (attempt 1) axiom-semantics
+- 2026-11-23 10:29:42 accepted by QA -> done
