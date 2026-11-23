@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 0
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tests/conformance/stress/f001.ax, tests/conformance/stress/f002.ax]
 locks: []
 spec: [spec/SPEC-02-grammar.md, spec/SPEC-03-core-semantics.md, spec/SPEC-11-capability.md]
 covers: [REQ-TST-072]
+started: 2026-11-23 15:33:08
+finished: 2026-11-23 15:47:58
 ---
 # T498i — Update `conformance/stress/f001.ax` and `f002.ax` to declare `let mut p` (`fullrun-4` R1)
 
@@ -43,3 +45,5 @@ python tools/axtest.py --compiler build/axiomc2.exe --build-dir build --no-cache
 
 ## Log
 - 2026-11-23 created by axiom-architect (fullrun-4 triage R1; culprit T498f `2d69ea8d`)
+- 2026-11-23 15:33:08 started (attempt 1) axiom-semantics
+- 2026-11-23 15:47:58 accepted by QA -> done
