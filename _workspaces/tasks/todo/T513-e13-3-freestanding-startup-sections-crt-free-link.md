@@ -10,9 +10,13 @@ depends: [T512]
 priority: 162
 status: todo
 attempts: 0
+timeout_min: 480
 paths: [compiler/lir, compiler/target/x64, compiler/obj, compiler/link, tests/link/freestanding]
+locks: [compiler/driver/pipeline.ax, compiler/backend/session.ax, compiler/types/typeck.ax, compiler/mir/mir.ax, compiler/mir/builder.ax, compiler/abi/win64.ax, compiler/interp_opt/session.ax, compiler/interp/interp.ax, compiler/interp/frame.ax]
 spec: [spec/SPEC-52-freestanding-runtime-composition.md, 0143, 0097, tasks/0370, tasks/0455]
 covers: [REQ-ABI-055, REQ-ABI-056, REQ-ABI-083, REQ-RES-145, REQ-CAP-140, REQ-CAP-143]
+started: 2026-11-23 09:11:08
+unblocks: 1
 ---
 # T513 — E13.3 — Freestanding startup, static init order, custom section layout & CRT-free native image emission
 
@@ -20,12 +24,12 @@ covers: [REQ-ABI-055, REQ-ABI-056, REQ-ABI-083, REQ-RES-145, REQ-CAP-140, REQ-CA
 Emit CRT-free and `kernel32.dll`-free native binaries in `--profile freestanding`, lowering `@entry`, `@naked`, `@section("...")`, `@used`, and deterministic const-initialized statics through LIR, COFF object emission, and the linker.
 
 ## Scope
-- Lower `@entry` as the direct PE/image entry point without emitting the hosted startup stub or default `kernel32.dll` import table when `--profile freestanding` is active.
-- Lower `@naked` functions without prologue/epilogue stack frame generation and lower `extern "interrupt"` functions with interrupt-frame preservation (`IRETQ`).
-- Emit custom named sections for `@section("...")` items and retain `@used` symbols against dead-strip/section GC in `compiler/obj` and `compiler/link`.
+- Lower `@entry` as the direct PE/image entry point without emitting the hosted startup stub (`axiom_start`) or default `KERNEL32.dll` import table when `--profile freestanding` or `--profile kernel` is active (`SPEC-52 AXS-FRE-010`, `AXS-FRE-023`), and execute `@entry` in `--interp` (`0 WEAK-NATIVE`).
+- Lower `@naked` functions without prologue/epilogue/stack-probe generation (`AXS-FRE-013`, rejecting nonzero local stack frames with `AX_TYPE_INVALID_NAKED_FN`) and lower `extern "interrupt"` functions via `CallingConventionDescription` metadata (`REQ-ABI-078`, `AXS-FRE-015`: hardware interrupt frame binding, full modified-GPR preservation, and `IRETQ`).
+- Const-evaluate and emit deterministic const-initialized `static` / `static mut` items (`.rdata`, `.data`, `.bss`), custom named sections for `@section("...")` (`fn` and `static`), `@no_mangle` verbatim symbols, `@used` GC roots (`LGC_ROOT_USED`), and `@panic_handler` / `@global_allocator` hooks (with freestanding `UD2` trap fallback instead of `KERNEL32.dll`-backed `axiom_panic`) across MIR, LIR, `ObjModel`, the PE32+ linker, and `--interp`.
 
 ## Acceptance
-- [ ] Link and objdump tests in `tests/link/freestanding` verify that a `--profile freestanding` executable has zero DLL imports (`objdump -p` shows no import directory), uses the `@entry` symbol as its entry point, places `@section` items in their named COFF sections, and runs natively.
+- [ ] Link and objdump tests in `tests/link/freestanding` verify that a `--profile freestanding` executable has zero DLL imports (`objdump -p` shows no import directory), uses the `@entry` symbol as its entry point, places `@section` items in their named COFF sections, retains `@used` items under section GC, and runs natively and in `--interp` (`0 WEAK-NATIVE`).
 - [ ] Full test suite passes in the snapshot (`axiomc2.exe`).
 - [ ] Report `_workspaces/reports/T513-report.md` with exact `## Files changed`.
 
@@ -34,8 +38,14 @@ Emit CRT-free and `kernel32.dll`-free native binaries in `--profile freestanding
 
 ## Notes
 - Phase P13 (`P13-low-level-systems-unsafe-frees`). `bootstrap/axiom0` is frozen at tag `axiom0-frozen` (ROADMAP R3); all compiler and library changes live in `compiler/` and `std/`.
+- **Non-TLS `static` / `static mut` lowering without touching `own/`/`verify/`/`opt/`**: Represent non-TLS `HIR_ITEM_STATIC` places in `compiler/mir/builder.ax` with `MirLocalDecl { kind: MIR_LOCAL_CONST, mut_flag: true, const_sym: sym }` (matching `mb_build_tls_local`), distinguishing `(*it).is_tls` via `HirFile` in `compiler/lir/builder.ax` (`emit_tls_addr_inst` vs RIP-relative `emit_fn_addr_inst`) and `compiler/interp/interp.ax` (per-thread `tid` vs process-wide `tid = 0xFFFFFFFFu32` registered via `interp_register_alloc` at `call_depth = 0`), and guard `compiler/interp/frame.ax:get_local_ptr` (`line 414`) with `!(unsafe { (*decl).mut_flag })` so aggregate statics/TLS slots use `frm.local_ptrs`. Check `HEAD` first in case `T537` has already landed process-wide `static` support and extend rather than duplicate if present.
+- Const-evaluate allowed non-TLS `HIR_ITEM_STATIC` initializers at all three `is_tls` gates in `compiler/types/typeck.ax` (`lines 3217, 12664, 13612`), serialize aggregate `HIR_ITEM_STATIC` constants in `compiler/backend/session.ax:backend_populate_hir_const_aggregates`, and accept allowed `HIR_ITEM_STATIC` items in `compiler/interp_opt/session.ax:session_comptime_check_and_eval`.
 - Build and test inside the task snapshot (`python tools/build_axiomc.py --out build-snap-T513/build` and `python tools/axtest.py --compiler build-snap-T513/build/axiomc2.exe --exclude-requires axiom0-internal`).
 - All Axiom source code and examples use canonical syntax (`axiom-syntax`).
 
 ## Log
 - 2026-11-03 02:02:00 created by T213 (P13 phase planning)
+- 2026-11-23 09:11:08 started (attempt 1) axiom-backend
+- 2026-11-23 09:20:16 block: Requires locks outside current paths (driver/pipeline.ax, backend/session.ax, types/typeck.ax, mir/mir.ax, mir/builder.ax, abi/win64.ax, interp_opt/session.ax, interp/interp.ax); two overlap active T517
+- 2026-11-23 09:31:00 architect (T513-unblock): verified E13.3 seams against SPEC-52 and INV-LAYER-002; widened locks to the exact 9 upstream/interp files (incl. interp/frame.ax) and added timeout_min 480
+- 2026-11-23 09:34:01 unblocked (cycle 1) 
