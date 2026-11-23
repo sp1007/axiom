@@ -213,6 +213,66 @@ def main() -> int:
             raise ValidationError(f"axiom_rt.obj symbol table missing {def_sym!r}:\n{rt_x_txt}")
 
     # =========================================================================
+    # 1b. Compile `std/sys/windows/*.ax` Host Providers -> `axiom_host_rt.lib`
+    # =========================================================================
+    win_sys_dir = std_root / "sys" / "windows"
+    host_providers_dir = tmp_dir / "host_providers"
+    host_providers_dir.mkdir(parents=True, exist_ok=True)
+    provider_specs: list[tuple[str, list[Path]]] = [
+        ("heap", [win_sys_dir / "heap.ax"]),
+        ("io", [win_sys_dir / "io.ax"]),
+        ("fs", [win_sys_dir / "fs.ax"]),
+        ("process", [win_sys_dir / "process.ax"]),
+        ("time", [win_sys_dir / "time.ax"]),
+        ("thread", [win_sys_dir / "thread.ax", win_sys_dir / "fiber.ax"]),
+        ("fiber", [win_sys_dir / "fiber.ax", win_sys_dir / "thread.ax"]),
+    ]
+    provider_objs: list[Path] = []
+    for mod_name, src_files in provider_specs:
+        out_obj = host_providers_dir / f"{mod_name}.obj"
+        r_prov = subprocess.run(
+            [
+                compiler,
+                "build",
+                "--std-root",
+                str(std_root),
+                "--emit=obj",
+                "-o",
+                str(out_obj),
+                *[str(p) for p in src_files],
+            ],
+            capture_output=True,
+            timeout=60,
+        )
+        if r_prov.returncode != 0 or not out_obj.is_file():
+            raise ValidationError(
+                f"failed to emit host provider {mod_name}.obj (rc={r_prov.returncode}): "
+                f"{r_prov.stderr.decode('utf-8', errors='replace')}"
+            )
+        inspect_coff_external_symbols(out_obj.read_bytes(), f"host_provider:{mod_name}.obj")
+        provider_objs.append(out_obj)
+
+    axiom_host_rt_lib = tmp_dir / "axiom_host_rt.lib"
+    r_lib = subprocess.run(
+        [
+            compiler,
+            "build",
+            "--kind",
+            "lib",
+            "-o",
+            str(axiom_host_rt_lib),
+            *[str(p) for p in provider_objs],
+        ],
+        capture_output=True,
+        timeout=60,
+    )
+    if r_lib.returncode != 0 or not axiom_host_rt_lib.is_file():
+        raise ValidationError(
+            f"failed to pack axiom_host_rt.lib (rc={r_lib.returncode}): "
+            f"{r_lib.stderr.decode('utf-8', errors='replace')}"
+        )
+
+    # =========================================================================
     # 2. Verify `gcc -nostdlib` Frontend Cross-Linking of `--emit=obj` + `axiom_rt.obj`
     # =========================================================================
     gcc_smoke_ax = tmp_dir / "gcc_smoke.ax"
@@ -265,6 +325,80 @@ pub fn main() -> i32 {
     if r_smoke_run.returncode != 37 or r_smoke_run.stdout != "Xin chào từ GNU ld\n".encode("utf-8"):
         raise ValidationError(
             f"gcc_smoke.exe mismatch: rc={r_smoke_run.returncode}, stdout={r_smoke_run.stdout!r}"
+        )
+
+    gcc_host_smoke_ax = tmp_dir / "gcc_host_smoke.ax"
+    gcc_host_smoke_ax.write_text(
+        """\
+module gcc_host_smoke
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.core.host.thread_yield
+use std.core.host.fiber_destroy
+
+pub fn main() -> i32 {
+    let p = unsafe { heap_alloc(64, 8) };
+    if (p as usize) == 0 {
+        return 1;
+    }
+    unsafe { heap_free(p, 64, 8) };
+    thread_yield();
+    let rc = fiber_destroy(0i64);
+    if rc != -4i64 {
+        return 2;
+    }
+    print("host-smoke-ok\\n");
+    41
+}
+""",
+        encoding="utf-8",
+    )
+    gcc_host_smoke_obj = tmp_dir / "gcc_host_smoke.obj"
+    gcc_host_smoke_exe = tmp_dir / "gcc_host_smoke.exe"
+    r_host_smoke_obj = subprocess.run(
+        [
+            compiler,
+            "build",
+            "--std-root",
+            str(std_root),
+            "--emit=obj",
+            "-o",
+            str(gcc_host_smoke_obj),
+            str(gcc_host_smoke_ax),
+        ],
+        capture_output=True,
+        timeout=30,
+    )
+    if r_host_smoke_obj.returncode != 0 or not gcc_host_smoke_obj.is_file():
+        raise ValidationError(
+            f"failed to emit gcc_host_smoke.obj: {r_host_smoke_obj.stderr.decode('utf-8', errors='replace')}"
+        )
+    inspect_coff_external_symbols(gcc_host_smoke_obj.read_bytes(), "gcc_host_smoke.obj")
+    r_gcc_host_link = subprocess.run(
+        [
+            gcc_tool,
+            "-nostdlib",
+            "-Wl,-e,axiom_start",
+            str(gcc_host_smoke_obj),
+            str(rt_obj_1),
+            str(axiom_host_rt_lib),
+            "-lkernel32",
+            *(["-lsynchronization"] if has_sync_lib else []),
+            "-o",
+            str(gcc_host_smoke_exe),
+        ],
+        capture_output=True,
+        timeout=30,
+    )
+    if r_gcc_host_link.returncode != 0 or not gcc_host_smoke_exe.is_file():
+        raise ValidationError(
+            f"gcc host smoke cross-link failed: {r_gcc_host_link.stderr.decode('utf-8', errors='replace')}"
+        )
+    r_host_smoke_run = subprocess.run([str(gcc_host_smoke_exe)], capture_output=True, timeout=30)
+    if r_host_smoke_run.returncode != 41 or r_host_smoke_run.stdout != b"host-smoke-ok\n":
+        raise ValidationError(
+            f"gcc_host_smoke.exe mismatch: rc={r_host_smoke_run.returncode}, stdout={r_host_smoke_run.stdout!r}"
         )
 
     # =========================================================================
@@ -349,7 +483,7 @@ pub fn main() -> i32 {
             except ValidationError as ve:
                 return str(ve)
 
-            # 3) Link `prog.obj` + `axiom_rt.obj` with GNU `ld`
+            # 3) Link `prog.obj` + `axiom_rt.obj` + `axiom_host_rt.lib` with GNU `ld`
             ld_extra = extract_ld_stack_args(t.flags)
             ld_cmd = [
                 ld_tool,
@@ -362,6 +496,7 @@ pub fn main() -> i32 {
                 *ld_extra,
                 str(prog_obj),
                 str(rt_obj_1),
+                str(axiom_host_rt_lib),
                 *mingw_L_args,
                 "-lkernel32",
                 "-lshell32",

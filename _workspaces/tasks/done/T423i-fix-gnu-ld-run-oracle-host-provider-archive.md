@@ -8,13 +8,15 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 0
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 300
 paths: [tests/link/dll/gnu_ld_run_oracle.py]
 locks: [compiler/driver/pipeline.ax]
 spec: [spec/SPEC-26-windows-artifact-kinds.md, spec/decisions/ADR-0048-std-module-loading-host-providers.md, spec/decisions/ADR-0034-oracle-independence.md, spec/decisions/ADR-0002-oracle-host-interface.md]
 covers: [REQ-TST-072]
+started: 2026-11-23 14:59:43
+finished: 2026-11-23 15:32:03
 ---
 # T423i — Provide linkable `std.sys.windows.*` host-provider archive in `gnu_ld_run_oracle.py` and private-fn `SYM_LOCAL` in multi-file `--emit=obj` (`fullrun-4` R2)
 
@@ -49,3 +51,5 @@ python tests/link/dll/gnu_ld_run_oracle.py build/axiomc2.exe build/_tmp_gnu_ld .
 
 ## Log
 - 2026-11-23 created by axiom-architect (fullrun-4 triage R2; culprit T423h `4f2daaf0`)
+- 2026-11-23 14:59:43 started (attempt 1) axiom-frontend
+- 2026-11-23 15:32:03 accepted by QA -> done
