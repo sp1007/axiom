@@ -8,7 +8,7 @@ model: opus
 gate_model: sonnet
 depends: [T423]
 priority: 45
-status: doing
+status: done
 attempts: 1
 timeout_min: 480
 paths: [tests/run/closure_generic_infer, tests/std/fiber/closure_generic_infer_xfail.ax]
@@ -16,7 +16,7 @@ locks: [compiler/types/typeck.ax, compiler/traits/mono.ax, compiler/mir/builder.
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-34-executors-fibers.md, spec/decisions/ADR-0046-t423-fiber-followups-and-tracked-xfail.md]
 covers: [REQ-TST-072]
 started: 2026-11-23 13:09:56
-agent: axiom-semantics
+finished: 2026-11-23 14:58:23
 ---
 # T423c — Generic call inference inside closure bodies
 
@@ -49,3 +49,4 @@ Inference of a generic call must not depend on whether the call sits in a closur
 ## Log
 - 2026-11-21 created by axiom-architect (triage-t423, ADR-0046 D1; T423 QA F4 / report F2)
 - 2026-11-23 13:09:56 started (attempt 1) axiom-semantics
+- 2026-11-23 14:58:23 accepted by QA -> done

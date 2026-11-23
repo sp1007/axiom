@@ -7855,6 +7855,40 @@ fn scan_block_captures(
     *inner_count = save_inner;
 }
 
+fn tc_is_builtin_drop_callee(
+    cx: view<TypeckCtx>,
+    callee: *const HirExpr,
+    inner: *mut SymbolId,
+    inner_count: usize
+) -> bool {
+    if (callee as usize) == 0 || (unsafe { (*callee).kind }) != HIR_EXPR_PATH {
+        return false;
+    }
+    let name = unsafe { tc_path_name_sv(cx, view((*callee).path)) };
+    if builtin_name_kind(view(name)) != TY_BUILTIN_DROP {
+        return false;
+    }
+    let sym_v = unsafe { (*callee).path.symbol.v };
+    if sym_v != 0u32 {
+        if is_inner_sym((SymbolId { v: sym_v }), inner, inner_count) {
+            return false;
+        }
+        if tc_sym_in_active_scope(cx, sym_v) {
+            return false;
+        }
+        if (find_item_by_symbol(cx, (SymbolId { v: sym_v })) as usize) != 0 {
+            return false;
+        }
+        if (cx.thir as usize) != 0 {
+            let st = unsafe { thir_get_symbol_type(view(*cx.thir), (SymbolId { v: sym_v })) };
+            if st.v != 0u32 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn scan_expr_captures(
     cx: mut_view<TypeckCtx>,
     expr: *const HirExpr,
@@ -7938,17 +7972,10 @@ fn scan_expr_captures(
         }
     } else if ek == HIR_EXPR_CALL {
         let callee: *mut HirExpr = unsafe { (*expr).callee };
-        let mut is_drop = false;
-        if (callee as usize) != 0 && unsafe { (*callee).kind } == HIR_EXPR_PATH {
-            let mut dummy_gargs = (GenericArgsSlice { args: 0 as *mut TypeId, count: 0 });
-            let cty = unsafe { lookup_path_type(mut_view(*cx), view((*callee).path), mut_view(dummy_gargs)) };
-            if cty.v != 0u32 {
-                let ct = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: cty.v })) };
-                if (ct as usize) != 0 && unsafe { (*ct).kind } == TY_BUILTIN_DROP {
-                    is_drop = true;
-                }
-            }
-        }
+        // T423c: check for prelude `drop` without calling `lookup_path_type`, which would
+        // instantiate generic callees with fresh `TY_VAR`s that are discarded and later fail
+        // `default_int_vars` with `AX_TYPE_UNKNOWN`.
+        let is_drop = tc_is_builtin_drop_callee(view(*cx), callee as *const HirExpr, inner, *inner_count);
         scan_expr_captures(mut_view(*cx), callee, inner, mut_view(*inner_count), caps, mut_view(*cap_count), false, false);
         let mut a: *mut HirExpr = unsafe { (*expr).args };
         while ((a as usize) != 0) {
@@ -9225,7 +9252,67 @@ fn finish_closure_item(
             }
         }
 
-        return unsafe { intern_closure_ty(mut_view((*cx.thir).interner), closure_id, closure_sym, (TypeId { v: fn_type_id.v }), (TypeId { v: body_ty.v }), closure_param_types, param_count, caps, raw_cap_count) };
+        let clos_ty_id = unsafe { intern_closure_ty(mut_view((*cx.thir).interner), closure_id, closure_sym, (TypeId { v: fn_type_id.v }), (TypeId { v: body_ty.v }), closure_param_types, param_count, caps, raw_cap_count) };
+        let clos_t = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: clos_ty_id.v })) };
+        if (clos_t as usize) != 0 {
+            unsafe { (*clos_t).def = fn_item as *const HirItem; }
+            let impl_gn = if (cx.current_impl as usize) != 0 && (cx.current_fn as usize) != (cx.current_impl as usize) {
+                tc_item_generic_count(cx.current_impl)
+            } else {
+                0
+            };
+            let fn_gn = tc_item_generic_count(cx.current_fn);
+            let enc_gn = impl_gn + fn_gn;
+            if enc_gn > 0 {
+                let gbytes = mul_usize(enc_gn, size_of<TypeId>());
+                let clos_gargs = unsafe {
+                    arena_alloc_raw(mut_view((*cx.thir).interner.arena), gbytes, align_of<TypeId>()) as *mut TypeId
+                };
+                let mut gidx: usize = 0;
+                if impl_gn > 0 && (cx.current_impl as usize) != 0 {
+                    let igps: *mut HirGenericParams = unsafe { (*cx.current_impl).generic_params };
+                    if (igps as usize) != 0 {
+                        let mut igp: *mut HirGenericParam = unsafe { (*igps).params };
+                        while (igp as usize) != 0 && gidx < impl_gn {
+                            let iname = unsafe { (*igp).name };
+                            let pid = unsafe { intern_param_ty(mut_view((*cx.thir).interner), (StrId { v: iname.v }), gidx as u32) };
+                            unsafe { (*typeid_at(clos_gargs, gidx)).v = pid.v; }
+                            gidx = gidx + 1;
+                            igp = unsafe { (*igp).next };
+                        }
+                    }
+                }
+                if fn_gn > 0 && (cx.current_fn as usize) != 0 {
+                    let fgps: *mut HirGenericParams = unsafe { (*cx.current_fn).generic_params };
+                    if (fgps as usize) != 0 {
+                        let mut fgp: *mut HirGenericParam = unsafe { (*fgps).params };
+                        while (fgp as usize) != 0 && gidx < enc_gn {
+                            let fname = unsafe { (*fgp).name };
+                            let pid = unsafe { intern_param_ty(mut_view((*cx.thir).interner), (StrId { v: fname.v }), gidx as u32) };
+                            unsafe { (*typeid_at(clos_gargs, gidx)).v = pid.v; }
+                            gidx = gidx + 1;
+                            fgp = unsafe { (*fgp).next };
+                        }
+                    }
+                }
+                while gidx < enc_gn {
+                    let pid = unsafe { intern_param_ty(mut_view((*cx.thir).interner), (StrId { v: 0u32 }), gidx as u32) };
+                    unsafe { (*typeid_at(clos_gargs, gidx)).v = pid.v; }
+                    gidx = gidx + 1;
+                }
+                unsafe {
+                    (*clos_t).args = clos_gargs;
+                    (*clos_t).arg_count = enc_gn;
+                    ptr_itemmap_insert(mut_view((*cx.thir).expr_methods), (fn_item as usize) | 1usize, cx.current_fn);
+                    ptr_itemmap_insert(mut_view((*cx.thir).expr_methods), (fn_item as usize) | 3usize, cx.current_impl);
+                    if (cx.current_impl as usize) != 0 && cx.self_ty.v != 0u32 {
+                        ptr_itemmap_insert(mut_view((*cx.thir).expr_methods), (fn_item as usize) | 2usize, cx.current_impl);
+                        ptr_typemap_insert(mut_view((*cx.thir).item_types), (fn_item as usize) | 2usize, (TypeId { v: cx.self_ty.v }));
+                    }
+                }
+            }
+        }
+        return clos_ty_id;
     }
     unsafe { (*cx.thir).interner.t_error }
 }
@@ -10533,6 +10620,7 @@ fn finalize_types(cx: mut_view<TypeckCtx>) {
                         }
                     }
                 } else if k == TY_CLOSURE {
+                    let mut clos_changed = false;
                     let cc = (*t).capture_count;
                     let cptr = (*t).captures;
                     if (cptr as usize) != 0 {
@@ -10541,8 +10629,84 @@ fn finalize_types(cx: mut_view<TypeckCtx>) {
                             let cap = capture_at(cptr, j);
                             let old_v = (*cap).ty.v;
                             let r_ty = resolve_deep_ty(mut_view(*cx), (TypeId { v: old_v }));
-                            (*cap).ty.v = r_ty.v;
+                            if r_ty.v != old_v {
+                                (*cap).ty.v = r_ty.v;
+                                clos_changed = true;
+                            }
                             j = j + 1;
+                        }
+                    }
+                    let pc = (*t).param_count;
+                    let pptr = (*t).param_types;
+                    if (pptr as usize) != 0 {
+                        let mut j: usize = 0;
+                        while j < pc {
+                            let pp = typeid_at(pptr, j);
+                            let old_pv = (*pp).v;
+                            let r_pty = resolve_deep_ty(mut_view(*cx), (TypeId { v: old_pv }));
+                            if r_pty.v != old_pv {
+                                (*pp).v = r_pty.v;
+                                clos_changed = true;
+                            }
+                            j = j + 1;
+                        }
+                    }
+                    let old_ret = (*t).ret_type.v;
+                    let r_ret = resolve_deep_ty(mut_view(*cx), (TypeId { v: old_ret }));
+                    if r_ret.v != old_ret {
+                        (*t).ret_type.v = r_ret.v;
+                        clos_changed = true;
+                    }
+                    if clos_changed {
+                        let tot_p = cc + pc;
+                        let alloc_p = if tot_p > 0 { tot_p } else { 1 };
+                        let fp_bytes = mul_usize(alloc_p, size_of<TypeId>());
+                        let fn_ptypes = arena_alloc_raw(mut_view((*thir_ptr).interner.arena), fp_bytes, align_of<TypeId>()) as *mut TypeId;
+                        let mut j: usize = 0;
+                        while j < cc {
+                            let cap = capture_at(cptr, j);
+                            (*typeid_at(fn_ptypes, j)).v = (*cap).ty.v;
+                            j = j + 1;
+                        }
+                        j = 0;
+                        while j < pc {
+                            (*typeid_at(fn_ptypes, cc + j)).v = (*typeid_at(pptr, j)).v;
+                            j = j + 1;
+                        }
+                        let new_fn_ty = intern_fn_ty(
+                            mut_view((*thir_ptr).interner),
+                            false,
+                            (StrId { v: 0u32 }),
+                            fn_ptypes,
+                            tot_p,
+                            (TypeId { v: r_ret.v })
+                        );
+                        (*t).fn_type.v = new_fn_ty.v;
+                        let csym_v = (*t).fn_sym;
+                        let fn_ptr = ptr_itemmap_get(view((*thir_ptr).expr_methods), ((csym_v as usize) << 3) | 4usize);
+                        if (fn_ptr as usize) != 0 {
+                            let fn_it = (*fn_ptr) as *mut HirItem;
+                            if (fn_it as usize) != 0 {
+                                thir_set_item_type(mut_view(*thir_ptr), fn_it, (TypeId { v: new_fn_ty.v }));
+                                let mut hp: *mut HirParam = (*fn_it).params;
+                                let mut pi: usize = 0;
+                                while pi < cc && (hp as usize) != 0 {
+                                    let cap = capture_at(cptr, pi);
+                                    thir_set_param_type(mut_view(*thir_ptr), hp, (TypeId { v: (*cap).ty.v }));
+                                    hp = (*hp).next;
+                                    pi = pi + 1;
+                                }
+                                pi = 0;
+                                while pi < pc && (hp as usize) != 0 {
+                                    let pty_v = (*typeid_at(pptr, pi)).v;
+                                    thir_set_param_type(mut_view(*thir_ptr), hp, (TypeId { v: pty_v }));
+                                    if (*hp).symbol.v != 0u32 {
+                                        thir_set_sym_type(mut_view(*thir_ptr), (SymbolId { v: (*hp).symbol.v }), (TypeId { v: pty_v }));
+                                    }
+                                    hp = (*hp).next;
+                                    pi = pi + 1;
+                                }
+                            }
                         }
                     }
                 } else if k == TY_COROUTINE {

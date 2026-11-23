@@ -26832,6 +26832,18 @@ pub fn type_contains_param(ti: view<TypeInterner>, ty: TypeId) -> bool {
                 i = i + 1;
             }
         }
+        let acount = unsafe { (*t).arg_count };
+        let cargs = unsafe { (*t).args };
+        if (cargs as usize) != 0 {
+            let mut a: usize = 0;
+            while (a < acount) {
+                let av = unsafe { (*typeid_at(cargs, a)).v };
+                if type_contains_param(ti, (TypeId { v: av })) {
+                    return true;
+                }
+                a = a + 1;
+            }
+        }
         let rv = unsafe { (*t).ret_type.v };
         if rv != 0u32 && type_contains_param(ti, (TypeId { v: rv })) {
             return true;
@@ -27261,6 +27273,8 @@ fn subst_ty_enum_or_closure(
     }
 
     if tk == TY_CLOSURE {
+        let gcount = unsafe { (*t).arg_count };
+        let orig_gargs = unsafe { (*t).args };
         let ccount = unsafe { (*t).capture_count };
         let orig_caps = unsafe { (*t).captures };
         let pcount = unsafe { (*t).param_count };
@@ -27270,6 +27284,28 @@ fn subst_ty_enum_or_closure(
         let orig_cid = unsafe { (*t).closure_id };
         let mut changed: bool = false;
         let mut cid_mix: u32 = orig_cid;
+
+        let mut new_gargs: *mut TypeId = orig_gargs;
+        if gcount > 0 && (orig_gargs as usize) != 0 {
+            new_gargs = arena_alloc_raw(
+                mut_view(ti.arena),
+                (((gcount as isize) * (size_of<TypeId>() as isize)) as usize),
+                align_of<TypeId>()
+            ) as *mut TypeId;
+            let mut gi: usize = 0;
+            while (gi < gcount) {
+                let orig_gv = unsafe { (*typeid_at(orig_gargs, gi)).v };
+                let sub_g = subst_ty_self(mut_view(*ti), TypeId { v: orig_gv }, args, self_v);
+                if sub_g.v != orig_gv {
+                    changed = true;
+                }
+                cid_mix = mono_cid_mix(cid_mix, sub_g.v);
+                unsafe {
+                    (*typeid_at(new_gargs, gi)).v = sub_g.v;
+                }
+                gi = gi + 1;
+            }
+        }
 
         let mut new_caps: *mut ClosureCapture = orig_caps;
         if ccount > 0 && (orig_caps as usize) != 0 {
@@ -27329,16 +27365,60 @@ fn subst_ty_enum_or_closure(
         if !changed {
             return TypeId { v: ty_v };
         }
-        let new_cid: u32 = if cid_mix == orig_cid { orig_cid ^ 0x40000000u32 } else { cid_mix | 0x40000000u32 };
+        let mut new_cid: u32 = if cid_mix == orig_cid { orig_cid ^ 0x40000000u32 } else { cid_mix | 0x40000000u32 };
         let t_latest = type_get(view(*ti), TypeId { v: ty_v });
         let sp = ti.scratch;
+        let orig_def_ptr = unsafe { (*t_latest).def };
+        let base_fn_sym: u32 = if (orig_def_ptr as usize) != 0 {
+            unsafe { (*orig_def_ptr).symbol.v }
+        } else {
+            unsafe { (*t_latest).fn_sym }
+        };
         unsafe {
             copy_ax_type_into(mut_view(*sp), view(*t_latest));
             (*sp).closure_id = new_cid;
+            (*sp).fn_sym = base_fn_sym;
+            (*sp).args = new_gargs;
+            (*sp).arg_count = gcount;
             (*sp).captures = new_caps;
             (*sp).param_types = new_params;
             (*sp).ret_type.v = new_ret.v;
             (*sp).fn_type.v = new_fn.v;
+        }
+        loop {
+            let ex_ptr = typemap_get(view(ti.map), unsafe { view(*sp) });
+            if (ex_ptr as usize) == 0 {
+                break;
+            }
+            let ex_v = unsafe { (*ex_ptr).v };
+            let ex_t = type_get(view(*ti), TypeId { v: ex_v });
+            if (ex_t as usize) == 0 {
+                break;
+            }
+            let mut same = (unsafe { (*ex_t).def as usize }) == (orig_def_ptr as usize) &&
+                (unsafe { (*ex_t).arg_count }) == gcount &&
+                (unsafe { (*ex_t).fn_type.v }) == new_fn.v &&
+                (unsafe { (*ex_t).ret_type.v }) == new_ret.v;
+            if same && gcount > 0 {
+                let ex_args = unsafe { (*ex_t).args };
+                if (ex_args as usize) == 0 || (new_gargs as usize) == 0 {
+                    same = (ex_args as usize) == (new_gargs as usize);
+                } else {
+                    let mut ai: usize = 0;
+                    while ai < gcount {
+                        if (unsafe { (*typeid_at(ex_args, ai)).v }) != (unsafe { (*typeid_at(new_gargs, ai)).v }) {
+                            same = false;
+                            break;
+                        }
+                        ai = ai + 1;
+                    }
+                }
+            }
+            if same {
+                return TypeId { v: ex_v };
+            }
+            new_cid = ((new_cid + 1u32) & 0x3FFFFFFFu32) | 0x40000000u32;
+            unsafe { (*sp).closure_id = new_cid; }
         }
         return intern_type(mut_view(*ti), unsafe { view(*sp) });
     }
@@ -27443,10 +27523,10 @@ pub fn deduce_args(
         return;
     }
 
-    if gk == TY_STRUCT || gk == TY_ENUM {
+    if gk == TY_STRUCT || gk == TY_ENUM || gk == TY_CLOSURE {
         let g_def = unsafe { (*gt).def as usize };
         let s_def = unsafe { (*st).def as usize };
-        if g_def == s_def {
+        if g_def == s_def && g_def != 0 {
             let g_ac = unsafe { (*gt).arg_count };
             let s_ac = unsafe { (*st).arg_count };
             if g_ac > 0 && g_ac == s_ac {
@@ -35932,6 +36012,40 @@ fn scan_block_captures(
     *inner_count = save_inner;
 }
 
+fn tc_is_builtin_drop_callee(
+    cx: view<TypeckCtx>,
+    callee: *const HirExpr,
+    inner: *mut SymbolId,
+    inner_count: usize
+) -> bool {
+    if (callee as usize) == 0 || (unsafe { (*callee).kind }) != HIR_EXPR_PATH {
+        return false;
+    }
+    let name = unsafe { tc_path_name_sv(cx, view((*callee).path)) };
+    if builtin_name_kind(view(name)) != TY_BUILTIN_DROP {
+        return false;
+    }
+    let sym_v = unsafe { (*callee).path.symbol.v };
+    if sym_v != 0u32 {
+        if is_inner_sym((SymbolId { v: sym_v }), inner, inner_count) {
+            return false;
+        }
+        if tc_sym_in_active_scope(cx, sym_v) {
+            return false;
+        }
+        if (find_item_by_symbol(cx, (SymbolId { v: sym_v })) as usize) != 0 {
+            return false;
+        }
+        if (cx.thir as usize) != 0 {
+            let st = unsafe { thir_get_symbol_type(view(*cx.thir), (SymbolId { v: sym_v })) };
+            if st.v != 0u32 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn scan_expr_captures(
     cx: mut_view<TypeckCtx>,
     expr: *const HirExpr,
@@ -36015,17 +36129,10 @@ fn scan_expr_captures(
         }
     } else if ek == HIR_EXPR_CALL {
         let callee: *mut HirExpr = unsafe { (*expr).callee };
-        let mut is_drop = false;
-        if (callee as usize) != 0 && unsafe { (*callee).kind } == HIR_EXPR_PATH {
-            let mut dummy_gargs = (GenericArgsSlice { args: 0 as *mut TypeId, count: 0 });
-            let cty = unsafe { lookup_path_type(mut_view(*cx), view((*callee).path), mut_view(dummy_gargs)) };
-            if cty.v != 0u32 {
-                let ct = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: cty.v })) };
-                if (ct as usize) != 0 && unsafe { (*ct).kind } == TY_BUILTIN_DROP {
-                    is_drop = true;
-                }
-            }
-        }
+        // T423c: check for prelude `drop` without calling `lookup_path_type`, which would
+        // instantiate generic callees with fresh `TY_VAR`s that are discarded and later fail
+        // `default_int_vars` with `AX_TYPE_UNKNOWN`.
+        let is_drop = tc_is_builtin_drop_callee(view(*cx), callee as *const HirExpr, inner, *inner_count);
         scan_expr_captures(mut_view(*cx), callee, inner, mut_view(*inner_count), caps, mut_view(*cap_count), false, false);
         let mut a: *mut HirExpr = unsafe { (*expr).args };
         while ((a as usize) != 0) {
@@ -37302,7 +37409,67 @@ fn finish_closure_item(
             }
         }
 
-        return unsafe { intern_closure_ty(mut_view((*cx.thir).interner), closure_id, closure_sym, (TypeId { v: fn_type_id.v }), (TypeId { v: body_ty.v }), closure_param_types, param_count, caps, raw_cap_count) };
+        let clos_ty_id = unsafe { intern_closure_ty(mut_view((*cx.thir).interner), closure_id, closure_sym, (TypeId { v: fn_type_id.v }), (TypeId { v: body_ty.v }), closure_param_types, param_count, caps, raw_cap_count) };
+        let clos_t = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: clos_ty_id.v })) };
+        if (clos_t as usize) != 0 {
+            unsafe { (*clos_t).def = fn_item as *const HirItem; }
+            let impl_gn = if (cx.current_impl as usize) != 0 && (cx.current_fn as usize) != (cx.current_impl as usize) {
+                tc_item_generic_count(cx.current_impl)
+            } else {
+                0
+            };
+            let fn_gn = tc_item_generic_count(cx.current_fn);
+            let enc_gn = impl_gn + fn_gn;
+            if enc_gn > 0 {
+                let gbytes = mul_usize(enc_gn, size_of<TypeId>());
+                let clos_gargs = unsafe {
+                    arena_alloc_raw(mut_view((*cx.thir).interner.arena), gbytes, align_of<TypeId>()) as *mut TypeId
+                };
+                let mut gidx: usize = 0;
+                if impl_gn > 0 && (cx.current_impl as usize) != 0 {
+                    let igps: *mut HirGenericParams = unsafe { (*cx.current_impl).generic_params };
+                    if (igps as usize) != 0 {
+                        let mut igp: *mut HirGenericParam = unsafe { (*igps).params };
+                        while (igp as usize) != 0 && gidx < impl_gn {
+                            let iname = unsafe { (*igp).name };
+                            let pid = unsafe { intern_param_ty(mut_view((*cx.thir).interner), (StrId { v: iname.v }), gidx as u32) };
+                            unsafe { (*typeid_at(clos_gargs, gidx)).v = pid.v; }
+                            gidx = gidx + 1;
+                            igp = unsafe { (*igp).next };
+                        }
+                    }
+                }
+                if fn_gn > 0 && (cx.current_fn as usize) != 0 {
+                    let fgps: *mut HirGenericParams = unsafe { (*cx.current_fn).generic_params };
+                    if (fgps as usize) != 0 {
+                        let mut fgp: *mut HirGenericParam = unsafe { (*fgps).params };
+                        while (fgp as usize) != 0 && gidx < enc_gn {
+                            let fname = unsafe { (*fgp).name };
+                            let pid = unsafe { intern_param_ty(mut_view((*cx.thir).interner), (StrId { v: fname.v }), gidx as u32) };
+                            unsafe { (*typeid_at(clos_gargs, gidx)).v = pid.v; }
+                            gidx = gidx + 1;
+                            fgp = unsafe { (*fgp).next };
+                        }
+                    }
+                }
+                while gidx < enc_gn {
+                    let pid = unsafe { intern_param_ty(mut_view((*cx.thir).interner), (StrId { v: 0u32 }), gidx as u32) };
+                    unsafe { (*typeid_at(clos_gargs, gidx)).v = pid.v; }
+                    gidx = gidx + 1;
+                }
+                unsafe {
+                    (*clos_t).args = clos_gargs;
+                    (*clos_t).arg_count = enc_gn;
+                    ptr_itemmap_insert(mut_view((*cx.thir).expr_methods), (fn_item as usize) | 1usize, cx.current_fn);
+                    ptr_itemmap_insert(mut_view((*cx.thir).expr_methods), (fn_item as usize) | 3usize, cx.current_impl);
+                    if (cx.current_impl as usize) != 0 && cx.self_ty.v != 0u32 {
+                        ptr_itemmap_insert(mut_view((*cx.thir).expr_methods), (fn_item as usize) | 2usize, cx.current_impl);
+                        ptr_typemap_insert(mut_view((*cx.thir).item_types), (fn_item as usize) | 2usize, (TypeId { v: cx.self_ty.v }));
+                    }
+                }
+            }
+        }
+        return clos_ty_id;
     }
     unsafe { (*cx.thir).interner.t_error }
 }
@@ -38610,6 +38777,7 @@ fn finalize_types(cx: mut_view<TypeckCtx>) {
                         }
                     }
                 } else if k == TY_CLOSURE {
+                    let mut clos_changed = false;
                     let cc = (*t).capture_count;
                     let cptr = (*t).captures;
                     if (cptr as usize) != 0 {
@@ -38618,8 +38786,84 @@ fn finalize_types(cx: mut_view<TypeckCtx>) {
                             let cap = capture_at(cptr, j);
                             let old_v = (*cap).ty.v;
                             let r_ty = resolve_deep_ty(mut_view(*cx), (TypeId { v: old_v }));
-                            (*cap).ty.v = r_ty.v;
+                            if r_ty.v != old_v {
+                                (*cap).ty.v = r_ty.v;
+                                clos_changed = true;
+                            }
                             j = j + 1;
+                        }
+                    }
+                    let pc = (*t).param_count;
+                    let pptr = (*t).param_types;
+                    if (pptr as usize) != 0 {
+                        let mut j: usize = 0;
+                        while j < pc {
+                            let pp = typeid_at(pptr, j);
+                            let old_pv = (*pp).v;
+                            let r_pty = resolve_deep_ty(mut_view(*cx), (TypeId { v: old_pv }));
+                            if r_pty.v != old_pv {
+                                (*pp).v = r_pty.v;
+                                clos_changed = true;
+                            }
+                            j = j + 1;
+                        }
+                    }
+                    let old_ret = (*t).ret_type.v;
+                    let r_ret = resolve_deep_ty(mut_view(*cx), (TypeId { v: old_ret }));
+                    if r_ret.v != old_ret {
+                        (*t).ret_type.v = r_ret.v;
+                        clos_changed = true;
+                    }
+                    if clos_changed {
+                        let tot_p = cc + pc;
+                        let alloc_p = if tot_p > 0 { tot_p } else { 1 };
+                        let fp_bytes = mul_usize(alloc_p, size_of<TypeId>());
+                        let fn_ptypes = arena_alloc_raw(mut_view((*thir_ptr).interner.arena), fp_bytes, align_of<TypeId>()) as *mut TypeId;
+                        let mut j: usize = 0;
+                        while j < cc {
+                            let cap = capture_at(cptr, j);
+                            (*typeid_at(fn_ptypes, j)).v = (*cap).ty.v;
+                            j = j + 1;
+                        }
+                        j = 0;
+                        while j < pc {
+                            (*typeid_at(fn_ptypes, cc + j)).v = (*typeid_at(pptr, j)).v;
+                            j = j + 1;
+                        }
+                        let new_fn_ty = intern_fn_ty(
+                            mut_view((*thir_ptr).interner),
+                            false,
+                            (StrId { v: 0u32 }),
+                            fn_ptypes,
+                            tot_p,
+                            (TypeId { v: r_ret.v })
+                        );
+                        (*t).fn_type.v = new_fn_ty.v;
+                        let csym_v = (*t).fn_sym;
+                        let fn_ptr = ptr_itemmap_get(view((*thir_ptr).expr_methods), ((csym_v as usize) << 3) | 4usize);
+                        if (fn_ptr as usize) != 0 {
+                            let fn_it = (*fn_ptr) as *mut HirItem;
+                            if (fn_it as usize) != 0 {
+                                thir_set_item_type(mut_view(*thir_ptr), fn_it, (TypeId { v: new_fn_ty.v }));
+                                let mut hp: *mut HirParam = (*fn_it).params;
+                                let mut pi: usize = 0;
+                                while pi < cc && (hp as usize) != 0 {
+                                    let cap = capture_at(cptr, pi);
+                                    thir_set_param_type(mut_view(*thir_ptr), hp, (TypeId { v: (*cap).ty.v }));
+                                    hp = (*hp).next;
+                                    pi = pi + 1;
+                                }
+                                pi = 0;
+                                while pi < pc && (hp as usize) != 0 {
+                                    let pty_v = (*typeid_at(pptr, pi)).v;
+                                    thir_set_param_type(mut_view(*thir_ptr), hp, (TypeId { v: pty_v }));
+                                    if (*hp).symbol.v != 0u32 {
+                                        thir_set_sym_type(mut_view(*thir_ptr), (SymbolId { v: (*hp).symbol.v }), (TypeId { v: pty_v }));
+                                    }
+                                    hp = (*hp).next;
+                                    pi = pi + 1;
+                                }
+                            }
                         }
                     }
                 } else if k == TY_COROUTINE {
@@ -57777,6 +58021,7 @@ use compiler.types.types.thir_is_mono_prepared
 use compiler.types.types.thir_set_item_type
 use compiler.types.types.thir_set_mono_prepared
 use compiler.types.types.thir_set_orig_item_name
+use compiler.types.types.thir_set_param_type
 use compiler.types.types.type_get
 use compiler.types.layout.type_align
 use compiler.types.layout.type_layout
@@ -58288,15 +58533,127 @@ fn mb_alloc_msg_kind(arena: mut_view<Arena>, msg_kind: u8, out_len: mut_view<usi
 
 // --- Builder Core Helpers ---
 
+fn mb_bind_closure_mono_in_ty(
+    thir: *mut Thir,
+    hir: *const HirFile,
+    str_in: *mut StrInterner,
+    mono: *mut MonoEngine,
+    ty: TypeId,
+    depth: usize
+) {
+    if ty.v == 0u32 || (thir as usize) == 0 || depth > 8 {
+        return;
+    }
+    let t = unsafe { type_get(view((*thir).interner), (TypeId { v: ty.v })) };
+    if (t as usize) == 0 {
+        return;
+    }
+    let tk = unsafe { (*t).kind };
+    if tk == TY_CLOSURE {
+        let cc = unsafe { (*t).capture_count };
+        let caps = unsafe { (*t).captures };
+        if (caps as usize) != 0 {
+            let mut ci: usize = 0;
+            while ci < cc {
+                let cap = unsafe { capture_at(caps, ci) };
+                mb_bind_closure_mono_in_ty(thir, hir, str_in, mono, (TypeId { v: unsafe { (*cap).ty.v } }), depth + 1);
+                ci = ci + 1;
+            }
+        }
+        let pc = unsafe { (*t).param_count };
+        let params = unsafe { (*t).param_types };
+        if (params as usize) != 0 {
+            let mut pi: usize = 0;
+            while pi < pc {
+                mb_bind_closure_mono_in_ty(thir, hir, str_in, mono, (TypeId { v: unsafe { (*typeid_at(params, pi)).v } }), depth + 1);
+                pi = pi + 1;
+            }
+        }
+        let rv = unsafe { (*t).ret_type.v };
+        if rv != 0u32 {
+            mb_bind_closure_mono_in_ty(thir, hir, str_in, mono, (TypeId { v: rv }), depth + 1);
+        }
+        let ac = unsafe { (*t).arg_count };
+        let aptr = unsafe { (*t).args };
+        if ac > 0 && (aptr as usize) != 0 {
+            let c_slice = GenericArgsSlice { args: aptr, count: ac };
+            if unsafe { mono_has_concrete_args(view(c_slice), view((*thir).interner)) } {
+                let orig_it = (unsafe { (*t).def }) as *mut HirItem;
+                if (orig_it as usize) != 0 && (unsafe { (*t).fn_sym }) == (unsafe { (*orig_it).symbol.v }) {
+                    let is_prepared = unsafe { thir_is_mono_prepared(view(*thir)) };
+                    let mono_ptr = if is_prepared {
+                        (unsafe { thir_get_mono_engine(view(*thir)) }) as *mut MonoEngine
+                    } else {
+                        mono
+                    };
+                    if (mono_ptr as usize) != 0 && (str_in as usize) != 0 {
+                        let inst = mb_mono_find_or_create(mono_ptr, thir, hir, str_in, orig_it, view(c_slice));
+                        if (inst as usize) != 0 {
+                            unsafe { (*t).fn_sym = (*inst).mangled_sym.v; }
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+    if tk == TY_VIEW || tk == TY_MUT_VIEW || tk == TY_PTR {
+        mb_bind_closure_mono_in_ty(thir, hir, str_in, mono, (TypeId { v: unsafe { (*t).pointee.v } }), depth + 1);
+        return;
+    }
+    if tk == TY_ARRAY || tk == TY_SLICE {
+        mb_bind_closure_mono_in_ty(thir, hir, str_in, mono, (TypeId { v: unsafe { (*t).elem.v } }), depth + 1);
+        return;
+    }
+    if tk == TY_TUPLE {
+        let fc = unsafe { (*t).field_count };
+        let fptr = unsafe { (*t).fields };
+        if (fptr as usize) != 0 {
+            let mut fi: usize = 0;
+            while fi < fc {
+                mb_bind_closure_mono_in_ty(thir, hir, str_in, mono, (TypeId { v: unsafe { (*typeid_at(fptr, fi)).v } }), depth + 1);
+                fi = fi + 1;
+            }
+        }
+        return;
+    }
+    if tk == TY_STRUCT || tk == TY_ENUM {
+        let ac = unsafe { (*t).arg_count };
+        let aptr = unsafe { (*t).args };
+        if (aptr as usize) != 0 {
+            let mut ai: usize = 0;
+            while ai < ac {
+                mb_bind_closure_mono_in_ty(thir, hir, str_in, mono, (TypeId { v: unsafe { (*typeid_at(aptr, ai)).v } }), depth + 1);
+                ai = ai + 1;
+            }
+        }
+        return;
+    }
+    if tk == TY_FN {
+        let pc = unsafe { (*t).param_count };
+        let pptr = unsafe { (*t).param_types };
+        if (pptr as usize) != 0 {
+            let mut pi: usize = 0;
+            while pi < pc {
+                mb_bind_closure_mono_in_ty(thir, hir, str_in, mono, (TypeId { v: unsafe { (*typeid_at(pptr, pi)).v } }), depth + 1);
+                pi = pi + 1;
+            }
+        }
+        let rv = unsafe { (*t).ret_type.v };
+        if rv != 0u32 {
+            mb_bind_closure_mono_in_ty(thir, hir, str_in, mono, (TypeId { v: rv }), depth + 1);
+        }
+    }
+}
+
 pub fn mb_resolve_ty(b: mut_view<MirBuilder>, ty: TypeId) -> TypeId {
     let has_args = b.subst_args.count > 0 && (b.subst_args.args as usize) != 0;
     if has_args || b.self_ty_v != 0u32 {
-        let ti = unsafe {
-            mut_view((*b.thir).interner)
-        };
-        return subst_ty_self(ti, (TypeId {
+        let sub = subst_ty_self(unsafe { mut_view((*b.thir).interner) }, (TypeId {
             v: ty.v
         }), view(b.subst_args), b.self_ty_v);
+        mb_bind_closure_mono_in_ty(b.thir, b.hir, b.str_in, b.mono, (TypeId { v: sub.v }), 0);
+        return sub;
     }
     (TypeId { v: ty.v })
 }
@@ -70222,6 +70579,26 @@ fn mb_find_enclosing_generic_impl(thir: *const Thir, hir: *const HirFile, str_in
 }
 
 fn mb_count_generic_params_in_hir(thir: *const Thir, hir: *const HirFile, str_in: *const StrInterner, it: *const HirItem) -> usize {
+    if (it as usize) != 0 && (thir as usize) != 0 &&
+       (unsafe { (*it).kind }) == HIR_ITEM_FN &&
+       (unsafe { (*it).span.file.v }) != 0xFFFFFFFEu32 {
+        let sym_v = unsafe { (*it).symbol.v };
+        if sym_v >= 0x40000000u32 && sym_v < 0x50000000u32 && (unsafe { (*thir).expr_methods.cap }) > 0 {
+            let cfn_p = unsafe { ptr_itemmap_get(view((*thir).expr_methods), (it as usize) | 1usize) };
+            let cimpl_p = unsafe { ptr_itemmap_get(view((*thir).expr_methods), (it as usize) | 3usize) };
+            let cfn = if (cfn_p as usize) != 0 { unsafe { *cfn_p } } else { 0 as *const HirItem };
+            let cimpl = if (cimpl_p as usize) != 0 { unsafe { *cimpl_p } } else { 0 as *const HirItem };
+            let impl_gn = if (cimpl as usize) != 0 && (cimpl as usize) != (cfn as usize) {
+                mb_count_generic_params(cimpl)
+            } else {
+                0
+            };
+            let fn_gn = if (cfn as usize) != 0 { mb_count_generic_params(cfn) } else { 0 };
+            if impl_gn + fn_gn > 0 {
+                return impl_gn + fn_gn;
+            }
+        }
+    }
     let own_n = mb_count_generic_params(it);
     let impl_it = mb_find_enclosing_generic_impl(thir, hir, str_in, it);
     let impl_n = if (impl_it as usize) != 0 {
@@ -70350,10 +70727,7 @@ fn mb_mono_find_or_create(
     let mut m_sym_v: u32 = orig_sym_v;
     let mut m_name_v: u32 = orig_name_v;
     let mut new_it: *mut HirItem = orig;
-    if orig_name_v == 0u32 {
-        let anon_id = unsafe { mangle_anon_fn_name(mut_view(*str_in), SymbolId { v: orig_sym_v }) };
-        m_name_v = anon_id.v;
-    } else if ac > 0 {
+    if ac > 0 {
         m_sym_v = unsafe { (*eng).next_sym_id };
         unsafe { (*eng).next_sym_id = m_sym_v + 1u32; }
         let cnt = unsafe { (*eng).next_counter };
@@ -70380,18 +70754,73 @@ fn mb_mono_find_or_create(
             (*new_it).span.file.v = 0xFFFFFFFEu32;
             (*new_it).next = 0 as *mut HirItem;
         }
-        let orig_pty = unsafe { thir_get_item_type(view(*thir), orig as *const HirItem) };
-        if (orig_pty as usize) != 0 {
+        if (thir as usize) != 0 {
             let copied_slice = GenericArgsSlice { args: copied_args, count: ac };
-            let new_ty = unsafe {
-                subst_ty(mut_view((*thir).interner), TypeId { v: (*orig_pty).v }, view(copied_slice))
-            };
-            unsafe {
-                thir_set_item_type(mut_view(*thir), new_it as *const HirItem, new_ty);
+            let mut self_sub_v: u32 = 0u32;
+            let st_pp = unsafe { thir_get_item_type(view(*thir), ((orig as usize) | 2) as *const HirItem) };
+            if (st_pp as usize) != 0 && (unsafe { (*st_pp).v }) != 0u32 {
+                let sub_sv = unsafe { subst_ty(mut_view((*thir).interner), TypeId { v: (*st_pp).v }, view(copied_slice)) };
+                self_sub_v = if sub_sv.v != 0u32 { sub_sv.v } else { unsafe { (*st_pp).v } };
+            }
+            let orig_pty = unsafe { thir_get_item_type(view(*thir), orig as *const HirItem) };
+            if (orig_pty as usize) != 0 {
+                let new_ty = unsafe {
+                    subst_ty_self(mut_view((*thir).interner), TypeId { v: (*orig_pty).v }, view(copied_slice), self_sub_v)
+                };
+                unsafe {
+                    thir_set_item_type(mut_view(*thir), new_it as *const HirItem, new_ty);
+                }
+            }
+            if orig_sym_v >= 0x40000000u32 && orig_sym_v < 0x50000000u32 && ((unsafe { (*orig).params }) as usize) != 0 {
+                let mut np_head: *mut HirParam = 0 as *mut HirParam;
+                let mut np_tail: *mut HirParam = 0 as *mut HirParam;
+                let mut op: *mut HirParam = unsafe { (*orig).params };
+                let pbytes = size_of<HirParam>();
+                while (op as usize) != 0 {
+                    let np = unsafe {
+                        arena_alloc_raw(mut_view(*arena_ptr), pbytes, align_of<HirParam>()) as *mut HirParam
+                    };
+                    unsafe {
+                        ptr_copy_nonoverlapping<u8>(op as *const u8, np as *mut u8, pbytes);
+                        (*np).next = 0 as *mut HirParam;
+                    }
+                    if (np_head as usize) == 0 {
+                        np_head = np;
+                    } else {
+                        unsafe { (*np_tail).next = np; }
+                    }
+                    np_tail = np;
+                    let op_ty = unsafe { thir_get_param_type(view(*thir), op as *const HirParam) };
+                    if (op_ty as usize) != 0 && (unsafe { (*op_ty).v }) != 0u32 {
+                        let sub_pty = unsafe {
+                            subst_ty_self(mut_view((*thir).interner), TypeId { v: (*op_ty).v }, view(copied_slice), self_sub_v)
+                        };
+                        unsafe {
+                            thir_set_param_type(mut_view(*thir), np as *const HirParam, sub_pty);
+                        }
+                    }
+                    op = unsafe { (*op).next };
+                }
+                unsafe { (*new_it).params = np_head; }
             }
         }
         mb_append_hir_item_tail(hir, new_it);
         mb_copy_default_inst_tags(thir, orig as *const HirItem, new_it as *const HirItem);
+        if (thir as usize) != 0 && (unsafe { (*thir).expr_methods.cap }) > 0 && m_sym_v != 0u32 {
+            let indexed: *mut *const HirItem = unsafe { ptr_itemmap_get(view((*thir).expr_methods), 4usize) };
+            if (indexed as usize) != 0 {
+                unsafe {
+                    ptr_itemmap_insert(
+                        mut_view((*thir).expr_methods),
+                        ((m_sym_v as usize) << 3) | 4usize,
+                        new_it as *const HirItem
+                    );
+                }
+            }
+        }
+    } else if orig_name_v == 0u32 {
+        let anon_id = unsafe { mangle_anon_fn_name(mut_view(*str_in), SymbolId { v: orig_sym_v }) };
+        m_name_v = anon_id.v;
     }
     unsafe {
         (*inst).orig_item = orig;
