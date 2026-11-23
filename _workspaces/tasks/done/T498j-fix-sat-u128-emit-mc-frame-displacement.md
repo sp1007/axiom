@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 0
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tests/ui/backend_ice/sat_u128_emit_mc.test]
 locks: []
 spec: [spec/decisions/ADR-0003-backend-pipeline-robustness.md, spec/SPEC-40-integers.md]
 covers: [REQ-TST-072]
+started: 2026-11-23 15:48:43
+finished: 2026-11-23 16:01:38
 ---
 # T498j — Update `ui/backend_ice/sat_u128_emit_mc.test` for `T498h` 16B stack-frame reduction (`fullrun-4` R3)
 
@@ -43,3 +45,5 @@ python tools/axtest.py --compiler build/axiomc2.exe --build-dir build --no-cache
 
 ## Log
 - 2026-11-23 created by axiom-architect (fullrun-4 triage R3; culprit T498h `2e50e70a`)
+- 2026-11-23 15:48:43 started (attempt 1) axiom-backend
+- 2026-11-23 16:01:38 accepted by QA -> done
