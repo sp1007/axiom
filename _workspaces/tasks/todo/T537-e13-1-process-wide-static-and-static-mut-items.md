@@ -11,10 +11,12 @@ priority: 140
 status: todo
 attempts: 0
 timeout_min: 600
-paths: [compiler/types/typeck.ax, compiler/mir/builder.ax, compiler/interp, compiler/lir/builder.ax, compiler/obj, compiler/link/linker.ax, compiler/link/pe.ax, tests/run/static_items, tests/ui/static_items]
-locks: [compiler/diag/code.ax]
+paths: [compiler/types/typeck.ax, compiler/mir, compiler/interp, compiler/lir/builder.ax, compiler/obj, compiler/link/linker.ax, compiler/link/pe.ax, tests/run/static_items, tests/ui/static_items]
+locks: [compiler/diag/code.ax, compiler/driver/pipeline.ax, compiler/interp_opt/session.ax, compiler/backend/session.ax, compiler/verify/verifier.ax, compiler/own/init.ax, compiler/opt]
 spec: [spec/SPEC-02-grammar.md, spec/SPEC-30-concurrency.md, spec/SPEC-50-unsafe-ub-ffi.md, spec/decisions/ADR-0004-self-host-subset-additions.md]
 covers: [REQ-CORE-2226, REQ-CORE-2227]
+started: 2026-11-23 16:58:49
+unblocks: 1
 ---
 # T537 — Process-wide statics
 
@@ -28,19 +30,29 @@ state in the EXE's import lookup table (`_workspaces/reports/T423b-report.md` / 
 any linker change.
 
 ## Scope
-- typeck: accept `static` and `static mut` items whose initialiser is a constant expression (the same const evaluator as
-  `const`/TLS statics); type of a use is the declared type; a use of a `static mut` (read, write, `address_of(_mut)`,
-  `mut_view`) outside `unsafe` reports `AX_UNSAFE_REQUIRED` (T501 later adds the full provenance rules and
-  `AX_CONC_UNSYNC_STATIC` policy); `view`/`mut_view` of a `static` follow the place rules (a `static` is an immutable place,
-  a `static mut` a mutable one); statics are never moved out of (non-Copy read by value → `AX_MOVE_*` as for a borrowed place)
-  and never dropped.
-- MIR: a global place kind next to `MIR_LOCAL_TLS` (one storage per process); the verifier accepts it.
+- typeck & own: accept `static` and `static mut` items whose initialiser is a constant expression (the same const evaluator as
+  `const`/TLS statics across `typeck.ax`, `pipeline.ax`, and `interp_opt/session.ax`); type of a use is the declared type;
+  accessing a non-`@thread_local` `static mut` (read, write, field/index projection, `view`, `mut_view`) outside `unsafe`
+  keeps reporting `AX_CONC_UNSYNC_STATIC` per `SPEC-30 AXS-CONC-034` and `SPEC-50 AXS-UNS-002` row 5 (`compiler/own/unsafe.ax:3162`,
+  preserving the 4 accepted P11/T433/T485 UI tests), while calling `address_of(S)` / `address_of_mut(S)` outside `unsafe`
+  also reports `AX_UNSAFE_REQUIRED` on the unsafe intrinsic call (T501 later adds `static_addr` and full raw-pointer
+  provenance rules); `view`/`mut_view` and assignment follow the place mutability rules (an immutable `static` rejects
+  direct/projected assignment and `address_of_mut` with `AX_TYPE_ASSIGN_IMMUTABLE`, projected `mut_view` with
+  `AX_CAP_CONFLICT_MUT` / `AX_TYPE_ASSIGN_IMMUTABLE`, and whole-binding `mut_view` in `typeck` or MIR verifier; a `static mut`
+  is a mutable place inside `unsafe`); statics are never moved out of (non-Copy read by value -> `AX_MOVE_USE_AFTER_MOVE` in
+  `compiler/own/init.ax`, matching borrowed places) and never dropped (`compiler/mir/drop.ax`, `compiler/verify/verifier.ax`).
+- MIR & Opt: add `MIR_LOCAL_STATIC` (`6u8`) next to `MIR_LOCAL_TLS` (`5u8`) in `compiler/mir/mir.ax` (re-exported in `mod.ax`,
+  lowered in `builder.ax`, skipped by `drop.ax`, accepted by `verifier.ax`); preserve global static liveness, memory backing,
+  and alias/inlining semantics across both `-O1` (`const_fold.ax`, `dce.ax`) and `-O2` (`optir/mod.ax`, `alias/mod.ax`,
+  `escape/mod.ax`, `sroa/mod.ax`, `inline/mod.ax`, `ipa/mod.ax`).
 - Oracle: one zero-/const-initialised allocation per static, shared by every interp thread, stable address.
-- Native: immutable `static` → `.rdata` (ADR-0004), `static mut` with a non-zero initialiser → `.data`, all-zero → `.bss`
-  (or zero-filled `.data` if `.bss` is not yet supported by the writer/linker); relocations for address-taking.
+- Native: immutable `static` → `.rdata` (`SEC_RODATA`, ADR-0004), `static mut` with a non-zero initialiser → `.data` (`SEC_DATA`),
+  all-zero → `.bss` (`SEC_BSS`, or zero-filled `.data` if `.bss` is not yet supported by the writer/linker) in `pipeline.ax` and
+  `backend/session.ax`; relocations for string/fn-pointer initialisers and RIP-relative address-taking.
 - Tests `tests/run/static_items/` (three modes, exact `stdout:`): counters, arrays and structs in `static mut`, address
   identity across functions and threads (`std.thread` spawn, joined), `static` tables read in a loop; `tests/ui/static_items/`:
-  access without `unsafe`, non-const initialiser, assignment to an immutable `static`, move out of a `static`.
+  access without `unsafe` (`AX_CONC_UNSYNC_STATIC`, plus `AX_UNSAFE_REQUIRED` on `address_of_mut` without `unsafe`), non-const
+  initialiser, assignment to an immutable `static` (`AX_TYPE_ASSIGN_IMMUTABLE`), move out of a `static` (`AX_MOVE_USE_AFTER_MOVE`).
 - Keep the stage-2/stage-3 fixed point; selfhost bundles are regenerated by `taskctl snapshot`/`accept` (do not edit or list them).
 
 ## Acceptance
@@ -53,5 +65,16 @@ any linker change.
 - `@at`/`@addr` placement (T526); comptime-lifted aggregates (T554); full unsafe/provenance model (T501); removing the ILT
   stash from `std/sys/windows` (T538); `spec/`, `bootstrap/axiom0`, `docs/`.
 
+## Notes
+- **Const-eval & driver gates**: Allow hosted non-TLS `HIR_ITEM_STATIC` items through `pipeline_mask_allowed_statics` (`pipeline.ax:3013`) and `session_comptime_check_and_eval` (`interp_opt/session.ax:716, 780`), const-evaluate them at all three `is_tls` gates in `typeck.ax` (`lines 3219, 12888, 13836`), and include `HIR_ITEM_STATIC` in `backend_populate_hir_const_aggregates` (`backend/session.ax:1137`).
+- **Immutable `static` mutability checks**: Update `check_stmt_assign` (`typeck.ax:10089`), `tc_check_place_mutable` (`typeck.ax:10054`), and `address_of_mut` / `mut_view` checks so immutable `HIR_ITEM_STATIC` (and `HIR_ITEM_CONST`) places report `AX_TYPE_ASSIGN_IMMUTABLE` (and `verify_mir_cap` at `verifier.ax:3692` includes `MIR_LOCAL_STATIC`).
+- **Ownership & Drop**: Seed `OWN_OWNED` for `MIR_LOCAL_STATIC` and `MIR_LOCAL_TLS` in `own/init.ax:1096, 1266`; reject `!Copy` moves rooted at `MIR_LOCAL_STATIC` / `MIR_LOCAL_TLS` (before any `MIR_PROJ_DEREF`) with `AX_MOVE_USE_AFTER_MOVE` in `own_do_move` and `own_bits_use_and_move`; skip `MIR_LOCAL_STATIC` / `MIR_LOCAL_TLS` / `MIR_LOCAL_CONST` in `mir/drop.ax` (`2858`, `drop_collect_sub_flags`) and `verifier.ax` (`3050`, while seeding `VERIFY_ST_OWNED` at `3264`).
+- **`-O1` and `-O2` optimizer preservation (`compiler/opt`)**: In `-O1`, mark `MIR_LOCAL_STATIC` as `is_bad = 1u8` in `const_fold.ax:1524` and seed `uses[lv] = 1u32` for `MIR_LOCAL_STATIC` / `MIR_LOCAL_TLS` in `dce.ax:253`. In `-O2`, mark `MIR_LOCAL_STATIC` / `MIR_LOCAL_TLS` / `MIR_LOCAL_CONST` as `local_addr_taken = true` (`OPT_LOCAL_MEMORY`) in `optir/mod.ax:1070`, classify `MIR_LOCAL_STATIC` (`mut_flag ? DOMAIN_GLOBAL_STATIC : DOMAIN_CONST_RDATA`, with `raw_addr_exposed = true` / `escaped_external = true` when mutable so calls clobber and `memopt` DSE keeps stores) in `alias/mod.ax:1650, 2173`, skip `MIR_LOCAL_STATIC` / `MIR_LOCAL_TLS` / `MIR_LOCAL_CONST` in `sroa/mod.ax:1401, 1796, 3096` and seed init bitsets in `sroa/mod.ax:3343` and `escape/mod.ax:6814`, and preserve `MIR_LOCAL_STATIC` / `MIR_LOCAL_TLS` in `inline/mod.ax:2287` (while restricting `inline/mod.ax:791` and `ipa/mod.ax:924` constant `fn_sym` lookup to `!mut_flag`).
+- **Oracle & Native symbol tracking**: Key `MIR_LOCAL_STATIC` slots on a process-wide sentinel (`tid = 0xFFFFFFFFu32`) in `interp/interp.ax:342` (registering `host_buf` via `interp_register_alloc` at `call_depth = 0`) and guard `interp/frame.ax:414` so `MIR_LOCAL_STATIC` and mutable `MIR_LOCAL_CONST`/`MIR_LOCAL_TLS` use `frm.local_ptrs`. In `pipeline.ax`, use non-`.L` symbol names for statics (lines `7848–7851` demote `.L*` to `SYM_LOCAL`) and scan `(*body).locals` (`const_sym`) in `pipe_bodies_ref_sym` (`6995`) and `pipe_mark_body_std_refs` (`7179`) so `std` statics (consumed by T538) are retained and emitted.
+
 ## Log
 - 2026-11-22 created by axiom-architect (triage-1122; T423b-report follow-up, T423b-qa follow-up 2)
+- 2026-11-23 16:58:49 started (attempt 1) axiom-semantics
+- 2026-11-23 17:20:15 block: Needs widened paths/locks (compiler/mir, driver/pipeline.ax, interp_opt/session.ax, backend/session.ax, verify/verifier.ax, own/init.ax, opt/const_fold.ax, opt/dce.ax) and architect clarification on AX_CONC_UNSYNC_STATIC vs AX_UNSAFE_REQUIRED
+- 2026-11-23 17:35:00 architect (T537-unblock): widened paths (compiler/mir) and locks (driver/pipeline.ax, interp_opt/session.ax, backend/session.ax, verify/verifier.ax, own/init.ax, compiler/opt for -O1/-O2), clarified AX_CONC_UNSYNC_STATIC per SPEC-30 AXS-CONC-034, and ordered T513 after T537
+- 2026-11-23 17:39:27 unblocked (cycle 1) 

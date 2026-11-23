@@ -6,7 +6,7 @@ owner: axiom-backend
 reviewer: axiom-qa
 model: sonnet
 gate_model: sonnet
-depends: [T512]
+depends: [T512, T537]
 priority: 162
 status: todo
 attempts: 0
@@ -38,7 +38,7 @@ Emit CRT-free and `kernel32.dll`-free native binaries in `--profile freestanding
 
 ## Notes
 - Phase P13 (`P13-low-level-systems-unsafe-frees`). `bootstrap/axiom0` is frozen at tag `axiom0-frozen` (ROADMAP R3); all compiler and library changes live in `compiler/` and `std/`.
-- **Non-TLS `static` / `static mut` lowering without touching `own/`/`verify/`/`opt/`**: Represent non-TLS `HIR_ITEM_STATIC` places in `compiler/mir/builder.ax` with `MirLocalDecl { kind: MIR_LOCAL_CONST, mut_flag: true, const_sym: sym }` (matching `mb_build_tls_local`), distinguishing `(*it).is_tls` via `HirFile` in `compiler/lir/builder.ax` (`emit_tls_addr_inst` vs RIP-relative `emit_fn_addr_inst`) and `compiler/interp/interp.ax` (per-thread `tid` vs process-wide `tid = 0xFFFFFFFFu32` registered via `interp_register_alloc` at `call_depth = 0`), and guard `compiler/interp/frame.ax:get_local_ptr` (`line 414`) with `!(unsafe { (*decl).mut_flag })` so aggregate statics/TLS slots use `frm.local_ptrs`. Check `HEAD` first in case `T537` has already landed process-wide `static` support and extend rather than duplicate if present.
+- **Build on `T537`'s process-wide `MIR_LOCAL_STATIC` & `.rdata`/`.data`/`.bss` pipeline**: `T537` (`depends: [T512, T537]`) delivers `MIR_LOCAL_STATIC` (`6u8`), non-TLS `HIR_ITEM_STATIC` const-evaluation, `--interp` process-wide static slots, and hosted `.rdata`/`.data`/`.bss` emission. Extend that pipeline directly for `--profile freestanding` and `--profile kernel`: custom `@section("...")` COFF section routing on `fn` and `static`, `@no_mangle` verbatim symbols, `@used` GC roots (`LGC_ROOT_USED`), and `@panic_handler` / `@global_allocator` static dispatch hooks without introducing a competing `MIR_LOCAL_CONST` static representation.
 - Const-evaluate allowed non-TLS `HIR_ITEM_STATIC` initializers at all three `is_tls` gates in `compiler/types/typeck.ax` (`lines 3217, 12664, 13612`), serialize aggregate `HIR_ITEM_STATIC` constants in `compiler/backend/session.ax:backend_populate_hir_const_aggregates`, and accept allowed `HIR_ITEM_STATIC` items in `compiler/interp_opt/session.ax:session_comptime_check_and_eval`.
 - Build and test inside the task snapshot (`python tools/build_axiomc.py --out build-snap-T513/build` and `python tools/axtest.py --compiler build-snap-T513/build/axiomc2.exe --exclude-requires axiom0-internal`).
 - All Axiom source code and examples use canonical syntax (`axiom-syntax`).
@@ -49,3 +49,4 @@ Emit CRT-free and `kernel32.dll`-free native binaries in `--profile freestanding
 - 2026-11-23 09:20:16 block: Requires locks outside current paths (driver/pipeline.ax, backend/session.ax, types/typeck.ax, mir/mir.ax, mir/builder.ax, abi/win64.ax, interp_opt/session.ax, interp/interp.ax); two overlap active T517
 - 2026-11-23 09:31:00 architect (T513-unblock): verified E13.3 seams against SPEC-52 and INV-LAYER-002; widened locks to the exact 9 upstream/interp files (incl. interp/frame.ax) and added timeout_min 480
 - 2026-11-23 09:34:01 unblocked (cycle 1) 
+- 2026-11-23 17:35:00 architect (T537-unblock): depends += T537 so freestanding static sections/hooks build directly on T537's MIR_LOCAL_STATIC pipeline
