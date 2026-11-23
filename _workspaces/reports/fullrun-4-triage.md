@@ -1,0 +1,47 @@
+# fullrun-4-triage — Architect Triage of `fullrun-4` Regressions
+
+## Tóm tắt
+Đã thẩm định toàn bộ 4 nhóm thoái lui (5 test ID / 7 kết quả mode) từ đợt quét định kỳ Tier-1 `fullrun-4` (`HEAD 10154138`, so với `fullrun-3` `3b705825`) bằng cách đối chiếu đặc tả chuẩn (`SPEC-02`, `SPEC-03`, `SPEC-11`, `SPEC-26`, `SPEC-53`, `ADR-0002`, `ADR-0034`, `ADR-0048`) và kiểm chứng thực nghiệm chỉ-đọc trong thư mục tạm:
+1. **R1 (`conformance/stress/f001.ax` & `conformance/stress/f002.ax` — thủ phạm `T498f` / `2d69ea8d`)**: `T498f` từ chối `mut_view(p.x)` trên biến `let p` bất biến với mã `AX_TYPE_ASSIGN_IMMUTABLE` là **hoàn toàn đúng đặc tả** (`SPEC-02 AXS-GRM-041`, `SPEC-11 AXS-CAP-002`, `SPEC-03 AXS-SEM-047`). Hai bài kiểm thử stress đời đầu cần khai báo `let mut p` (đồng thời nâng cấp `f001.ax` ghi thật qua cả hai `mut_view` rời nhau và kiểm tra `// stdout:` để đạt `WEAK-NATIVE 0`) → tạo task ưu tiên 0 **`T498i`** (`axiom-semantics`, `sonnet`).
+2. **R2 (`link/dll/gnu_ld_run.test` — thủ phạm `T423h` / `4f2daaf0`)**: Việc `T423h` để trống các ký hiệu ngoài `__ax_host_*` trong đầu ra khả định vị `--emit=obj` / `--kind lib` là đúng kiến trúc (`SPEC-26 AXS-WLIB-032`), tránh trùng lặp ký hiệu mạnh và biến `@thread_local` khi liên kết nhiều tệp `.obj`; đồng thời `axiom_rt.obj` phải giữ nguyên từng byte theo `qa_t431_tls_and_std_reachability_bounds.test`. Giải pháp sạch nhất là cho phép hàm nội bộ module (`vis.kind == 0`, không `@export`/`@entry`/`main`) mang liên kết cục bộ `SYM_LOCAL` trong chế độ `--emit=obj` đa tệp (`filter_fid_v != 0`) và đóng gói thư viện tĩnh `axiom_host_rt.lib` từ `std/sys/windows/{heap,io,fs,process,time,thread,fiber}.ax` trong `gnu_ld_run_oracle.py` đặt sau `prog.obj` + `axiom_rt.obj` khi gọi GNU `ld` → tạo task ưu tiên 0 **`T423i`** (`axiom-frontend`, `sonnet`).
+3. **R3 (`ui/backend_ice/sat_u128_emit_mc.test` — thủ phạm `T498h` / `2e50e70a`)**: `T498h` thu gọn khe trả về ẩn `sret` (`_0: u128`, `i == 0`) từ 16 byte xuống con trỏ 8 byte tại `[rbp-0x10]`, làm khung stack của `sat_u128_lowered.mir` giảm hợp lệ 16 byte (`sub rsp, 0x90`) và dịch độ dời RBP của toán hạng thứ hai trong cặp `add`/`adc` từ `[rbp-0x80]`/`[rbp-0x78]` (`80`/`88`) sang `[rbp-0x70]`/`[rbp-0x68]` (`90`/`98`). Cập nhật kỳ vọng mã máy của test sát với khung thực tế và kiểm tra trọn chuỗi `add`/`adc`/`cmovb` → tạo task ưu tiên 0 **`T498j`** (`axiom-backend`, `sonnet`).
+4. **R4 (`ui/method/inherent_methods_err.ax` — thủ phạm `T517` / `4579f0ec`)**: `tc_try_report_capability_forgery` trong `compiler/types/typeck.ax` đang chặn mọi kiểu `is_intlike` kể cả khi ép kiểu ngầm (`is_explicit_cast == false`), khiến biểu thức/hằng nguyên thông thường như `Point.sum(10)` (`TY_INT_VAR` / `i32`) cướp chỗ chẩn đoán `AX_TYPE_MISMATCH`. Cần thu hẹp nhánh ép kiểu ngầm chỉ bắt con trỏ thô (`*const T`, `*mut T`), kiểu địa chỉ (`usize`, `isize`), và struct địa chỉ (`PhysAddr`, `VirtAddr`, `WasmAddr`), trong khi vẫn báo `AX_SEC_CAPABILITY_FORGERY` cho mọi phép ép kiểu tường minh `as` sang `view<T>`/`mut_view<T>`/`*Cap` theo `SPEC-53 AXS-SEC-004` → tạo task ưu tiên 0 **`T539`** (`axiom-semantics`, `opus`).
+
+---
+
+## Triage Matrix (`fullrun-4` Step 9b)
+
+| Regression | Failing ID(s) | Culprit Commit / Task | Classification | Fix Task | Phase | Owner | Model / Gate | `paths` / `locks` |
+|---|---|---|---|---|---|---|---|---|
+| **R1** | `conformance/stress/f001.ax`, `conformance/stress/f002.ax` | `2d69ea8d` (`T498f`) | TYPE A — Legacy test expectation update (`T498f` matches `SPEC-02 AXS-GRM-041` & `SPEC-11 AXS-CAP-002`) | **`T498i`** | `P12-numeric-floating-point-simd` | `axiom-semantics` | `sonnet` / `sonnet` | `paths: [tests/conformance/stress/f001.ax, tests/conformance/stress/f002.ax]` |
+| **R2** | `link/dll/gnu_ld_run.test` (10 `tests/run/host/**` cases) | `4f2daaf0` (`T423h`) | TYPE A — Multi-file `--emit=obj` private-fn `SYM_LOCAL` + `axiom_host_rt.lib` archive in `gnu_ld_run_oracle.py` (`SPEC-26 AXS-WLIB-032`) | **`T423i`** | `P12-numeric-floating-point-simd` | `axiom-frontend` | `sonnet` / `sonnet` | `paths: [tests/link/dll/gnu_ld_run_oracle.py]`, `locks: [compiler/driver/pipeline.ax]` |
+| **R3** | `ui/backend_ice/sat_u128_emit_mc.test` | `2e50e70a` (`T498h`) | TYPE A — Test expectation update for legitimate 16B `sret`-slot frame shrink (`sub rsp, 0x90`, `[rbp-0x70]`/`[rbp-0x68]`) | **`T498j`** | `P12-numeric-floating-point-simd` | `axiom-backend` | `sonnet` / `sonnet` | `paths: [tests/ui/backend_ice/sat_u128_emit_mc.test]` |
+| **R4** | `ui/method/inherent_methods_err.ax` | `4579f0ec` (`T517`) | TYPE A — Compiler diagnostic-precision fix in `tc_try_report_capability_forgery` (`SPEC-53 AXS-SEC-004`, `REQ-CAP-123`) | **`T539`** | `P13-low-level-systems-unsafe-frees` | `axiom-semantics` | `opus` / `sonnet` | `paths: [tests/ui/security_profiles]`, `locks: [compiler/types/typeck.ax]` |
+
+---
+
+## Detailed Root-Cause & Architectural Decisions
+
+### 1. R1 — `conformance/stress/f001.ax` & `conformance/stress/f002.ax` → **`T498i`**
+- **Analysis:** Both stress tests declare `let p = Point { x: 1, y: 2 };` (immutable) and take `mut_view(p.x)`. Under `SPEC-02 AXS-GRM-041`, bindings without `mut` are immutable; under `SPEC-11 AXS-CAP-002` and `SPEC-03 AXS-SEM-047`, `mut_view<T>` grants write capability and requires a mutable root place when projecting through owned fields/indices. Allowing `mut_view(p.x)` on immutable `let p` was a pre-`T498f` soundness hole that let safe code mutate immutable bindings via field projections.
+- **Decision:** Keep `T498f` unchanged. In **`T498i`**, update `f001.ax` and `f002.ax` to `let mut p = Point { x: 1, y: 2 };`, and upgrade `f001.ax` so `mutate` writes through both disjoint field capabilities and prints `11 12\n` (`// stdout: 11 12\n`, `WEAK-NATIVE 0`).
+
+### 2. R2 — `link/dll/gnu_ld_run.test` → **`T423i`**
+- **Analysis:** `T423h` (`ADR-0048`) removed inline `fn __ax_host_*` workarounds from `tests/run/host/{fs,heap,io}/*.ax` while keeping `pipe_wants_host_providers == false` for `--emit=obj` and `--kind lib`. Leaving `__ax_host_*` undefined in relocatable `.obj` files is essential so multi-object links do not suffer duplicate strong symbols or split `@thread_local` state (`FIBER_TABLE`). Meanwhile, `axiom_rt.obj` (`build --rt-obj`) has its exact section sizes and relocations pinned by `qa_t431_tls_and_std_reachability_bounds.test`.
+- **Empirical check & Decision:** Building a static COFF archive `axiom_host_rt.lib` from `std/sys/windows/{heap,io,fs,process,time,thread,fiber}.ax` and passing it to GNU `ld` *after* `prog.obj` and `axiom_rt.obj` resolves all 10 failing host tests with byte-for-byte identical exit codes, stdout, and stderr while leaving non-host tests and legacy inline-`__ax_host_*` tests untouched. One driver nuance was caught during verification: when `fiber.ax` and `thread.ax` are compiled as multi-file `--emit=obj` units (`filter_fid_v != 0`) so `fiber.obj` imports `__ax_host_thread_current_id` externally instead of duplicating `thread.ax`, three non-`pub` helpers (`fn_entry_to_addr`, `fn_exit_to_addr`, `addr_to_fn_exit`) were emitted as `SYM_GLOBAL` instead of `SYM_LOCAL` (`compiler/driver/pipeline.ax` line 7726). Marking module-private functions `SYM_LOCAL` when `for_obj && filter_fid_v != 0u32` (leaving single-file `--emit=obj` untouched) makes `fiber.obj` + `thread.obj` co-link cleanly as well. Assigned to **`T423i`**.
+
+### 3. R3 — `ui/backend_ice/sat_u128_emit_mc.test` → **`T498j`**
+- **Analysis:** Verified directly with `axiomc2` (`sha256 == 221e7c1f...`): `sat_u128_lowered.mir` returns `u128` (`16` bytes) via Win64 hidden `sret` pointer (`RCX`). `T498h` shrunk slot `_0` (`i == 0`) from an unused 16-byte aggregate copy to the 8-byte `sret` pointer slot `[rbp-0x10]`, shrinking the frame from `0xa0` to `0x90` (`48 81 ec 90 00 00 00`) and shifting `copy _2` from `[rbp-0x80]`/`[rbp-0x78]` (`80`/`88`) to `[rbp-0x70]`/`[rbp-0x68]` (`90`/`98`).
+- **Decision:** Update `tests/ui/backend_ice/sat_u128_emit_mc.test` in **`T498j`** to match `sub rsp, 0x90` and the full 128-bit saturating-add encoding (`48 03 45 90 48 13 55 98 49 b8 ff ff ff ff ff ff ff ff 49 0f 42 c0 49 0f 42 d0`).
+
+### 4. R4 — `ui/method/inherent_methods_err.ax` → **`T539`**
+- **Analysis:** `SPEC-53 §1.4 AXS-SEC-004 (2)` (`REQ-CAP-123`) forbids forging `view<T>`, `mut_view<T>`, `Str`, or OS authority tokens (`*Cap`) from raw pointers (`*const T`, `*mut T`), pointer-sized integer addresses (`usize`, `isize`), or address structs (`PhysAddr`, `VirtAddr`, `WasmAddr`). In `T517`, `tc_try_report_capability_forgery` checked `is_intlike` unconditionally on implicit coercions (`is_explicit_cast == false`), intercepting `Point.sum(10)` (`TY_INT_VAR` -> `view<Point>`) before `AX_TYPE_MISMATCH`.
+- **Decision:** Keep `tests/ui/method/inherent_methods_err.ax` untouched. In **`T539`**, restrict `src_kind_code = 2` (`integer_addr`) when `is_explicit_cast == false` to `TY_USIZE`, `TY_ISIZE`, and `PhysAddr`/`VirtAddr`/`WasmAddr` (keeping `TY_PTR` as `raw_ptr`), while continuing to report `AX_SEC_CAPABILITY_FORGERY` on explicit `as` casts (`is_explicit_cast == true`) from any `is_intlike` type.
+
+---
+
+## Files changed
+- _workspaces/tasks/todo/T498i-fix-stress-f001-f002-mutable-point-binding.md
+- _workspaces/tasks/todo/T423i-fix-gnu-ld-run-oracle-host-provider-archive.md
+- _workspaces/tasks/todo/T498j-fix-sat-u128-emit-mc-frame-displacement.md
+- _workspaces/tasks/todo/T539-fix-capability-forgery-non-addr-int-coercion.md
