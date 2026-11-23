@@ -8,13 +8,15 @@ model: opus
 gate_model: sonnet
 depends: []
 priority: 0
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 300
 paths: [tests/ui/security_profiles]
 locks: [compiler/types/typeck.ax]
 spec: [spec/SPEC-53-safety-profiles-capability-security.md, spec/SPEC-11-capability.md, spec/SPEC-03-core-semantics.md]
 covers: [REQ-CAP-123]
+started: 2026-11-23 16:02:26
+finished: 2026-11-23 16:57:48
 ---
 # T539 — Restrict implicit capability-forgery diagnostic to raw pointers and address types so non-address integers emit `AX_TYPE_MISMATCH` (`fullrun-4` R4)
 
@@ -52,3 +54,5 @@ python tools/axtest.py --compiler build/axiomc2.exe --build-dir build --no-cache
 
 ## Log
 - 2026-11-23 created by axiom-architect (fullrun-4 triage R4; culprit T517 `4579f0ec`)
+- 2026-11-23 16:02:26 started (attempt 1) axiom-semantics
+- 2026-11-23 16:57:48 accepted by QA -> done
