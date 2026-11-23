@@ -273,6 +273,7 @@ use compiler.types.types.ptr_itemmap_insert
 use compiler.types.types.ptr_typemap_insert
 use compiler.mir.mir.mir_stmt_at
 use compiler.traits.solver.impl_matches_receiver
+use compiler.traits.solver.type_matches_impl_self_exact
 use compiler.mir.mir.MirBb
 use compiler.mir.mir.MirBbId
 use compiler.mir.mir.MirBody
@@ -12917,6 +12918,54 @@ fn mb_coroutine_receiver_ty(body: *mut MirBody, bb: *mut MirBb, thir: *mut Thir)
     0u32
 }
 
+fn mb_peel_receiver_ty(thir: *const Thir, ty: TypeId) -> TypeId {
+    if (thir as usize) == 0 || ty.v == 0u32 {
+        return TypeId { v: ty.v };
+    }
+    let mut v = ty.v;
+    let mut depth: usize = 0;
+    while depth < 8 && v != 0u32 {
+        let t = unsafe { type_get(view((*thir).interner), TypeId { v: v }) };
+        if (t as usize) == 0 {
+            break;
+        }
+        let k = unsafe { (*t).kind };
+        if k == TY_VIEW || k == TY_MUT_VIEW || k == TY_PTR {
+            v = unsafe { (*t).pointee.v };
+        } else {
+            break;
+        }
+        depth = depth + 1;
+    }
+    TypeId { v: v }
+}
+
+fn mb_impl_matches_receiver_exact(
+    thir: *const Thir,
+    str_in: *const StrInterner,
+    impl_it: *const HirItem,
+    receiver_ty: TypeId
+) -> bool {
+    let recv_v = receiver_ty.v;
+    if (thir as usize) == 0 || (str_in as usize) == 0 || (impl_it as usize) == 0 || recv_v == 0u32 {
+        return false;
+    }
+    let self_ty_ptr = unsafe { thir_get_item_type(view(*thir), impl_it) };
+    if (self_ty_ptr as usize) != 0 && (unsafe { (*self_ty_ptr).v }) != 0u32 {
+        if unsafe { type_matches_impl_self_exact(view(*thir), view(*str_in), impl_it, (TypeId { v: recv_v })) } {
+            return true;
+        }
+        let peeled = mb_peel_receiver_ty(thir, (TypeId { v: recv_v }));
+        if peeled.v != 0u32 && peeled.v != recv_v {
+            if unsafe { type_matches_impl_self_exact(view(*thir), view(*str_in), impl_it, peeled) } {
+                return true;
+            }
+        }
+        return false;
+    }
+    unsafe { impl_matches_receiver(view((*thir).interner), view(*str_in), impl_it, (TypeId { v: recv_v })) }
+}
+
 // Binds the call in `bb` (currently to the fn symbol `sym_v`) to the same-named member of the impl
 // for the coroutine type `coro_v`; returns that member, or null when there is none.
 fn mb_coroutine_method(
@@ -12953,7 +13002,7 @@ fn mb_coroutine_method(
     while (iit as usize) != 0 {
         if (unsafe { (*iit).kind }) == HIR_ITEM_IMPL && (unsafe { (*iit).trait_path as usize }) != 0 {
             let recv = TypeId { v: coro_v };
-            if unsafe { impl_matches_receiver(view((*thir).interner), view(*str_in), iit, recv) } {
+            if mb_impl_matches_receiver_exact(thir as *const Thir, str_in as *const StrInterner, iit as *const HirItem, recv) {
                 let mut im: *mut HirItem = unsafe { (*iit).members };
                 while (im as usize) != 0 {
                     if (unsafe { (*im).kind }) == HIR_ITEM_FN && mb_orig_fn_name_v(thir as *const Thir, im as *const HirItem) == name_v {
@@ -13620,9 +13669,13 @@ fn mb_scan_or_rewrite_calls(
                                     }
                                 }
                                 if trait_ok {
-                                    let matches = receiver_ty.v == 0u32 || unsafe {
-                                        impl_matches_receiver(view((*thir).interner), view(*str_in), iit, TypeId { v: receiver_ty.v })
-                                    };
+                                    let matches = receiver_ty.v == 0u32 ||
+                                        mb_impl_matches_receiver_exact(
+                                            thir as *const Thir,
+                                            str_in as *const StrInterner,
+                                            iit as *const HirItem,
+                                            TypeId { v: receiver_ty.v }
+                                        );
                                     if matches {
                                         let mut im: *mut HirItem = unsafe { (*iit).members };
                                         while ((im as usize) != 0) {
@@ -13685,6 +13738,7 @@ fn mb_scan_or_rewrite_calls(
                         if (gt as usize) != 0 && (unsafe { (*gt).kind }) == TY_FN {
                             let acnt = unsafe { (*bb).terminator.arg_count };
                             let pcnt = unsafe { (*gt).param_count };
+                            let mut arg0_ty_v: u32 = 0u32;
                             let mut a: usize = 0;
                             while (a < acnt && a < pcnt) {
                                 let arg_op = unsafe { mir_op_at((*bb).terminator.args, a) };
@@ -13701,6 +13755,9 @@ fn mb_scan_or_rewrite_calls(
                                         }
                                     }
                                 }
+                                if a == 0 {
+                                    arg0_ty_v = arg_ty.v;
+                                }
                                 if arg_ty.v != 0u32 {
                                     let gp_ty = TypeId { v: unsafe { (*typeid_at((*gt).param_types, a)).v } };
                                     unsafe {
@@ -13708,6 +13765,29 @@ fn mb_scan_or_rewrite_calls(
                                     }
                                 }
                                 a = a + 1;
+                            }
+                            if arg0_ty_v != 0u32 {
+                                let enc_impl = mb_find_enclosing_generic_impl(
+                                    thir as *const Thir,
+                                    hir,
+                                    str_in as *const StrInterner,
+                                    callee as *const HirItem
+                                );
+                                if (enc_impl as usize) != 0 {
+                                    let ipty = unsafe { thir_get_item_type(view(*thir), enc_impl as *const HirItem) };
+                                    if (ipty as usize) != 0 && (unsafe { (*ipty).v }) != 0u32 {
+                                        let iself_v = unsafe { (*ipty).v };
+                                        unsafe {
+                                            deduce_args(TypeId { v: iself_v }, TypeId { v: arg0_ty_v }, view((*thir).interner), d_args, gcount);
+                                        }
+                                        let peeled0 = mb_peel_receiver_ty(thir as *const Thir, TypeId { v: arg0_ty_v });
+                                        if peeled0.v != 0u32 && peeled0.v != arg0_ty_v {
+                                            unsafe {
+                                                deduce_args(TypeId { v: iself_v }, peeled0, view((*thir).interner), d_args, gcount);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             if (unsafe { (*bb).terminator.has_destination }) && (unsafe { (*bb).terminator.destination.local.v as usize }) < (unsafe { (*body).local_count }) {
                                 let ret_ty = unsafe { mir_drop_place_type(view(*body), view(*thir), view((*bb).terminator.destination)) };
@@ -13778,6 +13858,21 @@ fn mb_dedup_rename(cnt: mut_view<PtrU32Map>, x: *mut HirItem, name_v: u32) {
         mb_dedup_bump(mut_view(*cnt), (name_v as usize) << 1, unsafe { *k }, 0u32);
     }
     unsafe { (*x).name.v = name_v; }
+    let pb = mir_prebuilt_get(x as *const HirItem);
+    if (pb as usize) != 0 {
+        unsafe { (*pb).fn_name.v = name_v; }
+    }
+}
+
+fn mb_preserve_orig_item_name(thir: *mut Thir, it: *const HirItem) {
+    if (thir as usize) == 0 || (it as usize) == 0 {
+        return;
+    }
+    if (unsafe { thir_get_orig_item_name(view(*thir), it) } as usize) == 0 {
+        unsafe {
+            thir_set_orig_item_name(mut_view(*thir), it, (*it).name.v);
+        }
+    }
 }
 
 fn mb_dedup_mono_names(
@@ -13832,7 +13927,7 @@ fn mb_dedup_mono_names(
                         (*w).mangled_name.v = new_name.v;
                         let w_new = (*w).new_item;
                         if (w_new as usize) != 0 {
-                            thir_set_orig_item_name(mut_view(*thir), w_new as *const HirItem, (*w_new).name.v);
+                            mb_preserve_orig_item_name(thir, w_new as *const HirItem);
                             mb_dedup_rename(mut_view(cnt), w_new, new_name.v);
                         }
                         let keep_orig_name = (w_new as usize) != 0 && (w_new as usize) != (w_orig as usize) &&
@@ -13844,7 +13939,7 @@ fn mb_dedup_mono_names(
                                 w_orig as *const HirItem
                             ) as usize) != 0;
                         if !keep_orig_name {
-                            thir_set_orig_item_name(mut_view(*thir), w_orig as *const HirItem, (*w_orig).name.v);
+                            mb_preserve_orig_item_name(thir, w_orig as *const HirItem);
                             mb_dedup_rename(mut_view(cnt), w_orig, new_name.v);
                         }
                     }
@@ -13852,7 +13947,7 @@ fn mb_dedup_mono_names(
                     if (n_sym as usize) != 0 && (unsafe { *n_sym }) == 1u32 {
                         ix_it = (unsafe { *ptr_itemmap_get(view(ix), w_sym_v as usize) }) as *mut HirItem;
                         unsafe {
-                            thir_set_orig_item_name(mut_view(*thir), ix_it as *const HirItem, (*ix_it).name.v);
+                            mb_preserve_orig_item_name(thir, ix_it as *const HirItem);
                             mb_dedup_rename(mut_view(cnt), ix_it, new_name.v);
                         }
                     }
@@ -13861,7 +13956,7 @@ fn mb_dedup_mono_names(
                         let ik = unsafe { (*it).kind };
                         if ik == HIR_ITEM_FN && (unsafe { (*it).symbol.v }) == w_sym_v {
                             unsafe {
-                                thir_set_orig_item_name(mut_view(*thir), it as *const HirItem, (*it).name.v);
+                                mb_preserve_orig_item_name(thir, it as *const HirItem);
                                 mb_dedup_rename(mut_view(cnt), it, new_name.v);
                             }
                         }
@@ -13870,7 +13965,7 @@ fn mb_dedup_mono_names(
                             while ((m as usize) != 0) {
                                 if (unsafe { (*m).kind }) == HIR_ITEM_FN && (unsafe { (*m).symbol.v }) == w_sym_v {
                                     unsafe {
-                                        thir_set_orig_item_name(mut_view(*thir), m as *const HirItem, (*m).name.v);
+                                        mb_preserve_orig_item_name(thir, m as *const HirItem);
                                         mb_dedup_rename(mut_view(cnt), m, new_name.v);
                                     }
                                 }
@@ -13888,7 +13983,66 @@ fn mb_dedup_mono_names(
     ptr_itemmap_free(mut_view(ix));
 }
 
-fn mb_prepare_mono(
+pub fn mir_drain_mono_worklist(
+    mir_arena: *mut Arena,
+    thir: *mut Thir,
+    hir: *const HirFile,
+    str_in: *mut StrInterner,
+    db: *const SourceDatabase,
+    mono: *mut MonoEngine
+) -> bool {
+    if (thir as usize) == 0 || (hir as usize) == 0 || (mono as usize) == 0 {
+        return false;
+    }
+    if ((unsafe { (*mono).work_head }) as usize) == 0 {
+        return false;
+    }
+    let mut drained = false;
+    let mut tmp_arena = arena_new();
+    while (((unsafe { (*mono).work_head }) as usize) != 0) {
+        drained = true;
+        let w: *mut MonoInstance = unsafe { (*mono).work_head };
+        unsafe {
+            (*mono).work_head = (*w).work_next;
+            (*w).work_next = 0 as *mut MonoInstance;
+            (*w).in_worklist = false;
+        }
+        let w_orig = unsafe { (*w).orig_item };
+        let w_new = unsafe { (*w).new_item };
+        let mut pre_w = if (w_new as usize) != 0 {
+            mir_prebuilt_get(w_new as *const HirItem)
+        } else {
+            0 as *mut MirBody
+        };
+        if (pre_w as usize) == 0 && (w_orig as usize) != 0 {
+            pre_w = mir_prebuilt_get(w_orig as *const HirItem);
+        }
+        if (pre_w as usize) != 0 {
+            unsafe { (*w).mir_body = 1; }
+            mb_scan_or_rewrite_calls(pre_w, thir, hir, str_in, db, mono, mir_arena);
+        } else {
+            let w_body = mir_build_fn_subst(
+                mut_view(tmp_arena),
+                w_orig,
+                thir,
+                hir,
+                str_in,
+                db,
+                0 as *mut MonoEngine,
+                unsafe { view((*w).args) }
+            );
+            if (w_body as usize) != 0 {
+                unsafe { (*w).mir_body = 1; }
+                mb_scan_or_rewrite_calls(w_body, thir, hir, str_in, db, mono, 0 as *mut Arena);
+            }
+        }
+    }
+    arena_destroy(mut_view(tmp_arena));
+    drained
+}
+
+fn mb_prepare_mono_no_dedup(
+    mir_arena: *mut Arena,
     thir: *mut Thir,
     hir: *const HirFile,
     str_in: *mut StrInterner,
@@ -13946,32 +14100,354 @@ fn mb_prepare_mono(
         }
         it = unsafe { (*it).next };
     }
-    let mut tmp_arena = arena_new();
-    while (((unsafe { (*mono).work_head }) as usize) != 0) {
-        let w: *mut MonoInstance = unsafe { (*mono).work_head };
-        unsafe {
-            (*mono).work_head = (*w).work_next;
-            (*w).work_next = 0 as *mut MonoInstance;
-            (*w).in_worklist = false;
-        }
-        let w_orig = unsafe { (*w).orig_item };
-        let w_body = mir_build_fn_subst(
-            mut_view(tmp_arena),
-            w_orig,
-            thir,
+    let _ = mir_drain_mono_worklist(mir_arena, thir, hir, str_in, db, mono);
+}
+
+fn mb_prepare_mono(
+    thir: *mut Thir,
+    hir: *const HirFile,
+    str_in: *mut StrInterner,
+    db: *const SourceDatabase,
+    mono: *mut MonoEngine
+) {
+    mb_prepare_mono_no_dedup(0 as *mut Arena, thir, hir, str_in, db, mono);
+    mb_dedup_mono_names(mono, thir, hir, str_in);
+}
+
+pub fn mir_item_generic_param_count(
+    thir: *const Thir,
+    hir: *const HirFile,
+    str_in: *const StrInterner,
+    it: *const HirItem
+) -> usize {
+    mb_count_generic_params_in_hir(thir, hir, str_in, it)
+}
+
+pub fn mir_prepare_mono_for_async(
+    mir_arena: mut_view<Arena>,
+    thir: *mut Thir,
+    hir: *const HirFile,
+    str_in: *mut StrInterner,
+    db: *const SourceDatabase,
+    mono: *mut MonoEngine
+) -> bool {
+    if (thir as usize) == 0 || (hir as usize) == 0 || (mono as usize) == 0 {
+        return false;
+    }
+    if unsafe { thir_is_mono_prepared(view(*thir)) } {
+        return false;
+    }
+    let arena_ptr = unsafe { address_of_mut(mir_arena.head) as *mut Arena };
+    mb_prepare_mono_no_dedup(arena_ptr, thir, hir, str_in, db, mono);
+    true
+}
+
+pub fn mir_finish_mono_for_async(
+    thir: *mut Thir,
+    hir: *const HirFile,
+    str_in: *mut StrInterner,
+    mono: *mut MonoEngine
+) {
+    if (thir as usize) == 0 || (hir as usize) == 0 || (mono as usize) == 0 {
+        return;
+    }
+    mb_dedup_mono_names(mono, thir, hir, str_in);
+}
+
+pub fn mir_build_async_pre_body(
+    arena: mut_view<Arena>,
+    func: *mut HirItem,
+    thir: *mut Thir,
+    hir: *const HirFile,
+    str_in: *mut StrInterner,
+    db: *const SourceDatabase,
+    mono: *mut MonoEngine
+) -> *mut MirBody {
+    let pre = mir_prebuilt_get(func as *const HirItem);
+    if (pre as usize) != 0 {
+        return pre;
+    }
+    let empty_subst = GenericArgsSlice {
+        args: 0 as *mut TypeId,
+        count: 0,
+    };
+    let mut inst: *mut MonoInstance = 0 as *mut MonoInstance;
+    if (mono as usize) != 0 && (thir as usize) != 0 {
+        inst = mb_find_inst_by_new_item(
+            mono as *const MonoEngine,
+            thir as *const Thir,
             hir,
-            str_in,
-            db,
-            0 as *mut MonoEngine,
-            unsafe { view((*w).args) }
+            str_in as *const StrInterner,
+            func as *const HirItem
         );
-        if (w_body as usize) != 0 {
-            unsafe { (*w).mir_body = 1; }
-            mb_scan_or_rewrite_calls(w_body, thir, hir, str_in, db, mono, 0 as *mut Arena);
+    }
+    let arena_ptr = unsafe { address_of_mut(arena.head) as *mut Arena };
+    let body = if (inst as usize) != 0 && (unsafe { (*inst).args.count }) > 0 {
+        mir_build_fn_subst(mut_view(*arena), func, thir, hir, str_in, db, 0 as *mut MonoEngine, unsafe { view((*inst).args) })
+    } else {
+        mir_build_fn_subst(mut_view(*arena), func, thir, hir, str_in, db, 0 as *mut MonoEngine, view(empty_subst))
+    };
+    if (body as usize) != 0 && (mono as usize) != 0 {
+        let gcnt = mb_count_generic_params_in_hir(thir as *const Thir, hir, str_in as *const StrInterner, func as *const HirItem);
+        if gcnt == 0 {
+            mb_scan_or_rewrite_calls(body, thir, hir, str_in, db, mono, arena_ptr);
         }
     }
-    arena_destroy(mut_view(tmp_arena));
-    mb_dedup_mono_names(mono, thir, hir, str_in);
+    body
+}
+
+pub fn mir_register_synth_poll_inst(
+    eng: *mut MonoEngine,
+    thir: *mut Thir,
+    hir: *const HirFile,
+    str_in: *const StrInterner,
+    poll_member: *mut HirItem,
+    poll_it: *mut HirItem,
+    poll_body: *mut MirBody
+) {
+    if (eng as usize) == 0 || (poll_it as usize) == 0 {
+        return;
+    }
+    let existing = mb_find_inst_by_new_item(
+        eng as *const MonoEngine,
+        thir as *const Thir,
+        hir,
+        str_in,
+        poll_it as *const HirItem
+    );
+    if (existing as usize) != 0 {
+        return;
+    }
+    let is_clone_poll = (unsafe { (*poll_it).span.file.v }) == 0xFFFFFFFEu32 && (poll_member as usize) != 0;
+    let mut m_sym_v = unsafe { (*poll_it).symbol.v };
+    if (is_clone_poll || m_sym_v == 0u32) && (unsafe { (*eng).next_sym_id }) != 0u32 {
+        m_sym_v = unsafe { (*eng).next_sym_id };
+        unsafe {
+            (*eng).next_sym_id = m_sym_v + 1u32;
+            (*poll_it).symbol.v = m_sym_v;
+            if (poll_member as usize) != 0 {
+                (*poll_member).symbol.v = m_sym_v;
+            }
+            if (poll_body as usize) != 0 {
+                (*poll_body).sym.v = m_sym_v;
+                (*poll_body).fn_sym.v = m_sym_v;
+            }
+        }
+    }
+    let orig_it: *mut HirItem = if is_clone_poll { poll_member } else { poll_it };
+    let arena_ptr = unsafe { (*eng).arena };
+    let inst = unsafe {
+        arena_alloc_raw(mut_view(*arena_ptr), size_of<MonoInstance>(), align_of<MonoInstance>()) as *mut MonoInstance
+    };
+    let m_name_v = unsafe { (*poll_it).name.v };
+    unsafe {
+        (*inst).orig_item = orig_it;
+        (*inst).new_item = poll_it;
+        (*inst).args.args = 0 as *mut TypeId;
+        (*inst).args.count = 0;
+        (*inst).mangled_sym.v = m_sym_v;
+        (*inst).mangled_name.v = m_name_v;
+        (*inst).mir_body = 1;
+        (*inst).next = (*eng).instances_head;
+        (*eng).instances_head = inst;
+        if ((*eng).instances_tail as usize) == 0 {
+            (*eng).instances_tail = inst;
+        }
+        (*eng).instance_count = (*eng).instance_count + 1;
+        (*inst).work_next = 0 as *mut MonoInstance;
+        (*inst).in_worklist = false;
+    }
+    let ic = mb_item_cache(thir as *const Thir, hir, str_in);
+    if (ic as usize) != 0 {
+        let ep = unsafe { ptr_itemmap_get(view(*ic), 7usize) };
+        if (ep as usize) != 0 && ((unsafe { *ep }) as usize) == (eng as usize) {
+            unsafe {
+                ptr_itemmap_insert(mut_view(*ic), (poll_it as usize) | 7usize, inst as *const HirItem);
+                if (poll_member as usize) != 0 {
+                    ptr_itemmap_insert(mut_view(*ic), (poll_member as usize) | 7usize, inst as *const HirItem);
+                }
+                if m_sym_v != 0u32 {
+                    let sk = (1usize << 62usize) | ((m_sym_v as usize) << 4usize) | 7usize;
+                    ptr_itemmap_insert(mut_view(*ic), sk, inst as *const HirItem);
+                }
+            }
+        }
+    }
+}
+
+pub fn mir_scan_async_poll_body(
+    arena: mut_view<Arena>,
+    poll_body: *mut MirBody,
+    coro_ty: TypeId,
+    thir: *mut Thir,
+    hir: *const HirFile,
+    str_in: *mut StrInterner,
+    db: *const SourceDatabase,
+    mono: *mut MonoEngine
+) {
+    if (mono as usize) == 0 || (thir as usize) == 0 || (hir as usize) == 0 {
+        return;
+    }
+    if coro_ty.v != 0u32 {
+        mb_enqueue_drop_insts_for_ty(coro_ty, thir, hir, str_in, db, mono);
+    }
+    if (poll_body as usize) != 0 {
+        let arena_ptr = unsafe { address_of_mut(arena.head) as *mut Arena };
+        mb_scan_or_rewrite_calls(poll_body, thir, hir, str_in, db, mono, arena_ptr);
+    }
+}
+
+pub fn mir_resolve_poll_callee_mono(
+    body: *mut MirBody,
+    bb: *mut MirBb,
+    fut_trait: *const HirItem,
+    poll_method_name_v: u32,
+    recv_ty: TypeId,
+    thir: *mut Thir,
+    hir: *const HirFile,
+    str_in: *mut StrInterner,
+    db: *const SourceDatabase,
+    eng: *mut MonoEngine
+) -> bool {
+    let _ = body;
+    let recv_v = recv_ty.v;
+    if (bb as usize) == 0 || (thir as usize) == 0 || (hir as usize) == 0 || (str_in as usize) == 0 ||
+       recv_v == 0u32 || poll_method_name_v == 0u32 {
+        return false;
+    }
+    let max_passes: u32 = if (fut_trait as usize) != 0 { 2u32 } else { 1u32 };
+    let mut pass: u32 = 0u32;
+    let mut matched_impl: *mut HirItem = 0 as *mut HirItem;
+    let mut callee: *mut HirItem = 0 as *mut HirItem;
+    while pass < max_passes && (callee as usize) == 0 {
+        let mut iit: *mut HirItem = unsafe { (*hir).items };
+        while (iit as usize) != 0 {
+            let tp: *mut HirType = unsafe { (*iit).trait_path };
+            if (unsafe { (*iit).kind }) == HIR_ITEM_IMPL && (tp as usize) != 0 && !(unsafe { (*iit).is_negative }) {
+                let mut trait_ok = true;
+                if pass == 0u32 && (fut_trait as usize) != 0 {
+                    if (db as usize) != 0 {
+                        let itr = unsafe { find_trait_by_type_path(view(*hir), tp, view(*str_in), view(*db)) };
+                        trait_ok = (itr as usize) == (fut_trait as usize);
+                    } else if (unsafe { (*tp).kind }) == HIR_TYPE_PATH {
+                        let tp_sym = unsafe { (*tp).path.symbol.v };
+                        let ft_sym = unsafe { (*fut_trait).symbol.v };
+                        let tp_name = unsafe { (*tp).path.name.v };
+                        let ft_name = unsafe { (*fut_trait).name.v };
+                        trait_ok = (tp_sym != 0u32 && tp_sym == ft_sym) || (tp_name != 0u32 && tp_name == ft_name);
+                    } else {
+                        trait_ok = false;
+                    }
+                }
+                if trait_ok && mb_impl_matches_receiver_exact(thir as *const Thir, str_in as *const StrInterner, iit as *const HirItem, (TypeId { v: recv_v })) {
+                    let mut im: *mut HirItem = unsafe { (*iit).members };
+                    while (im as usize) != 0 {
+                        if (unsafe { (*im).kind }) == HIR_ITEM_FN &&
+                           mb_orig_fn_name_v(thir as *const Thir, im as *const HirItem) == poll_method_name_v {
+                            callee = im;
+                            matched_impl = iit;
+                            break;
+                        }
+                        im = unsafe { (*im).next };
+                    }
+                    if (callee as usize) != 0 {
+                        break;
+                    }
+                }
+            }
+            iit = unsafe { (*iit).next };
+        }
+        pass = pass + 1u32;
+    }
+    if (callee as usize) == 0 {
+        return false;
+    }
+    let gcount = mb_count_generic_params_in_hir(thir as *const Thir, hir, str_in as *const StrInterner, callee as *const HirItem);
+    if (eng as usize) != 0 && gcount > 0 && !mb_has_intrinsic_attr(str_in, db, callee) {
+        let arena_ptr = unsafe { (*eng).arena };
+        let dbytes = mir_mul_usize(gcount, size_of<TypeId>());
+        let d_args = unsafe {
+            arena_alloc_raw(mut_view(*arena_ptr), dbytes, align_of<TypeId>()) as *mut TypeId
+        };
+        let mut zi: usize = 0;
+        while zi < gcount {
+            unsafe { (*typeid_at(d_args, zi)).v = 0u32; }
+            zi = zi + 1;
+        }
+        if (matched_impl as usize) != 0 {
+            let ipty = unsafe { thir_get_item_type(view(*thir), matched_impl as *const HirItem) };
+            if (ipty as usize) != 0 && (unsafe { (*ipty).v }) != 0u32 {
+                let iself_v = unsafe { (*ipty).v };
+                unsafe {
+                    deduce_args(TypeId { v: iself_v }, TypeId { v: recv_v }, view((*thir).interner), d_args, gcount);
+                }
+                let peeled_r = mb_peel_receiver_ty(thir as *const Thir, TypeId { v: recv_v });
+                if peeled_r.v != 0u32 && peeled_r.v != recv_v {
+                    unsafe {
+                        deduce_args(TypeId { v: iself_v }, peeled_r, view((*thir).interner), d_args, gcount);
+                    }
+                }
+            }
+        }
+        let pty = unsafe { thir_get_item_type(view(*thir), callee as *const HirItem) };
+        if (pty as usize) != 0 && (unsafe { (*pty).v }) != 0u32 {
+            let gen_ty_v = unsafe { (*pty).v };
+            let spec_ty = TypeId { v: unsafe { (*bb).terminator.func.constant.ty.v } };
+            unsafe {
+                deduce_args(TypeId { v: gen_ty_v }, spec_ty, view((*thir).interner), d_args, gcount);
+            }
+            let gt = unsafe { type_get(view((*thir).interner), TypeId { v: gen_ty_v }) };
+            if (gt as usize) != 0 && (unsafe { (*gt).kind }) == TY_FN && (unsafe { (*gt).param_count }) > 0 {
+                let gp0 = TypeId { v: unsafe { (*typeid_at((*gt).param_types, 0)).v } };
+                unsafe {
+                    deduce_args(gp0, TypeId { v: recv_v }, view((*thir).interner), d_args, gcount);
+                }
+            }
+        }
+        let gslice = GenericArgsSlice { args: d_args, count: gcount };
+        if unsafe { mono_has_concrete_args(view(gslice), view((*thir).interner)) } {
+            let c_inst = mb_mono_find_or_create(eng, thir, hir, str_in, callee, view(gslice));
+            if (c_inst as usize) != 0 {
+                let msv = unsafe { (*c_inst).mangled_sym.v };
+                unsafe {
+                    (*bb).terminator.func.constant.sym.v = msv;
+                    (*bb).terminator.func.constant.val = msv as u64;
+                }
+                let inst_ty = unsafe { thir_get_item_type(view(*thir), (*c_inst).new_item as *const HirItem) };
+                if (inst_ty as usize) != 0 && (unsafe { (*inst_ty).v }) != 0u32 {
+                    unsafe { (*bb).terminator.func.constant.ty.v = (*inst_ty).v; }
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+    if (eng as usize) != 0 && gcount == 0 {
+        let empty_g = GenericArgsSlice { args: 0 as *mut TypeId, count: 0 };
+        let c_inst = mb_mono_find_or_create(eng, thir, hir, str_in, callee, view(empty_g));
+        if (c_inst as usize) != 0 {
+            let msv = unsafe { (*c_inst).mangled_sym.v };
+            unsafe {
+                (*bb).terminator.func.constant.sym.v = msv;
+                (*bb).terminator.func.constant.val = msv as u64;
+            }
+            let inst_ty = unsafe { thir_get_item_type(view(*thir), (*c_inst).new_item as *const HirItem) };
+            if (inst_ty as usize) != 0 && (unsafe { (*inst_ty).v }) != 0u32 {
+                unsafe { (*bb).terminator.func.constant.ty.v = (*inst_ty).v; }
+            }
+            return true;
+        }
+    }
+    let im_sym = unsafe { (*callee).symbol.v };
+    unsafe {
+        (*bb).terminator.func.constant.sym.v = im_sym;
+        (*bb).terminator.func.constant.val = im_sym as u64;
+    }
+    let im_ty = unsafe { thir_get_item_type(view(*thir), callee as *const HirItem) };
+    if (im_ty as usize) != 0 && (unsafe { (*im_ty).v }) != 0u32 {
+        unsafe { (*bb).terminator.func.constant.ty.v = (*im_ty).v; }
+    }
+    true
 }
 
 pub fn mir_build_fn(
@@ -14006,7 +14482,7 @@ pub fn mir_build_fn(
             );
             let gcnt = mb_count_generic_params_in_hir(thir as *const Thir, hir, str_in as *const StrInterner, func as *const HirItem);
             if gcnt > 0 && (inst as usize) == 0 {
-                if (mono as usize) == 0 {
+                if (mono as usize) == 0 || (unsafe { (*func).is_async }) {
                     return 0 as *mut MirBody;
                 }
                 return mir_build_fn_subst(arena, func, thir, hir, str_in, db, 0 as *mut MonoEngine, view(empty_subst));

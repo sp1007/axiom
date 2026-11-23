@@ -8,15 +8,16 @@ model: opus
 gate_model: sonnet
 depends: [T422c]
 priority: 15
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 480
 paths: [compiler/mir/builder.ax, compiler/mir/async_lower.ax, compiler/own_mir_verify/session.ax, compiler/types/typeck.ax, compiler/traits/mono.ax, compiler/traits/solver.ax, tests/run/await_generic_future, tests/std/async/structured]
 locks: []
 spec: [spec/SPEC-34-executors-fibers.md]
 covers: [REQ-TST-072]
-started: 2026-11-22 17:09:49
+started: 2026-11-23 10:31:23
 unblocks: 1
+finished: 2026-11-23 13:08:34
 ---
 # T422d — native `.await` on a generic `Future` impl
 
@@ -62,3 +63,5 @@ Attempt 1 (`_workspaces/reports/T422d-report.md`) made no source or test edits a
 - 2026-11-22 17:09:49 started (attempt 1) t422d-impl
 - 2026-11-22 17:33:16 block: needs paths widened: compiler/mir/async_lower.ax, compiler/own_mir_verify/session.ax, compiler/traits/mono.ax, compiler/traits/solver.ax, tests/std/async/structured
 - 2026-11-22 17:40:12 unblocked (cycle 1) 
+- 2026-11-23 10:31:23 started (attempt 1) axiom-semantics
+- 2026-11-23 13:08:34 accepted by QA -> done

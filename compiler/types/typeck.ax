@@ -376,6 +376,8 @@ use compiler.types.types.ptr_substmap_insert
 use compiler.types.types.ptr_trymap_insert
 use compiler.types.types.ptr_typemap_get
 use compiler.types.types.ptr_typemap_insert
+use compiler.types.types.typemap_get
+use compiler.types.types.typemap_insert
 use compiler.types.types.ptr_u32map_get
 use compiler.types.types.ptr_u32map_insert
 use compiler.types.types.subst_type_with_vars
@@ -10546,7 +10548,11 @@ fn finalize_types(cx: mut_view<TypeckCtx>) {
                 } else if k == TY_COROUTINE {
                     let old_ret = (*t).ret_type.v;
                     let r_ret = resolve_deep_ty(mut_view(*cx), (TypeId { v: old_ret }));
-                    (*t).ret_type.v = r_ret.v;
+                    let mut coro_changed = false;
+                    if r_ret.v != old_ret {
+                        (*t).ret_type.v = r_ret.v;
+                        coro_changed = true;
+                    }
                     let ac = (*t).arg_count;
                     let aptr = (*t).args;
                     let mut j: usize = 0;
@@ -10554,8 +10560,17 @@ fn finalize_types(cx: mut_view<TypeckCtx>) {
                         let ap = typeid_at(aptr, j);
                         let old_v = (*ap).v;
                         let r_ty = resolve_deep_ty(mut_view(*cx), (TypeId { v: old_v }));
-                        (*ap).v = r_ty.v;
+                        if r_ty.v != old_v {
+                            (*ap).v = r_ty.v;
+                            coro_changed = true;
+                        }
                         j = j + 1;
+                    }
+                    if coro_changed {
+                        let ex_coro = typemap_get(view((*thir_ptr).interner.map), view(*t));
+                        if (ex_coro as usize) == 0 {
+                            typemap_insert(mut_view((*thir_ptr).interner.map), t, (TypeId { v: (i + 1) as u32 }));
+                        }
                     }
                 }
             }
@@ -12456,13 +12471,58 @@ fn register_item_sig(cx: mut_view<TypeckCtx>, it: *mut HirItem, parent_impl: *co
             (TypeId { v: uv })
         };
         let fn_ret_ty = if unsafe { (*it).is_async } {
+            let impl_n_c = if (cx.current_impl as usize) != 0 && (cx.current_fn as usize) != (cx.current_impl as usize) {
+                tc_item_generic_count(cx.current_impl)
+            } else {
+                0
+            };
+            let own_n_c = tc_item_generic_count(it);
+            let total_coro_g = impl_n_c + own_n_c;
+            let mut coro_gargs: *mut TypeId = 0 as *mut TypeId;
+            if total_coro_g > 0 {
+                let cg_bytes = mul_usize(total_coro_g, size_of<TypeId>());
+                coro_gargs = unsafe {
+                    arena_alloc_raw(mut_view((*cx.thir).interner.arena), cg_bytes, align_of<TypeId>()) as *mut TypeId
+                };
+                let mut cg_idx: usize = 0;
+                if impl_n_c > 0 && (cx.current_impl as usize) != 0 {
+                    let gps_ci: *mut HirGenericParams = unsafe { (*cx.current_impl).generic_params };
+                    if (gps_ci as usize) != 0 {
+                        let mut gp_ci: *mut HirGenericParam = unsafe { (*gps_ci).params };
+                        while ((gp_ci as usize) != 0) && cg_idx < impl_n_c {
+                            let gname_ci = unsafe { (*gp_ci).name.v };
+                            let pid_ci = unsafe {
+                                intern_param_ty(mut_view((*cx.thir).interner), (StrId { v: gname_ci }), cg_idx as u32)
+                            };
+                            unsafe { (*typeid_at(coro_gargs, cg_idx)).v = pid_ci.v; }
+                            cg_idx = cg_idx + 1;
+                            gp_ci = unsafe { (*gp_ci).next };
+                        }
+                    }
+                }
+                if own_n_c > 0 {
+                    let gps_cf: *mut HirGenericParams = unsafe { (*it).generic_params };
+                    if (gps_cf as usize) != 0 {
+                        let mut gp_cf: *mut HirGenericParam = unsafe { (*gps_cf).params };
+                        while ((gp_cf as usize) != 0) && cg_idx < total_coro_g {
+                            let gname_cf = unsafe { (*gp_cf).name.v };
+                            let pid_cf = unsafe {
+                                intern_param_ty(mut_view((*cx.thir).interner), (StrId { v: gname_cf }), cg_idx as u32)
+                            };
+                            unsafe { (*typeid_at(coro_gargs, cg_idx)).v = pid_cf.v; }
+                            cg_idx = cg_idx + 1;
+                            gp_cf = unsafe { (*gp_cf).next };
+                        }
+                    }
+                }
+            }
             unsafe {
                 intern_coroutine_ty(
                     mut_view((*cx.thir).interner),
                     it,
                     (TypeId { v: ret_ty.v }),
-                    0 as *mut TypeId,
-                    0
+                    coro_gargs,
+                    total_coro_g
                 )
             }
         } else {
@@ -15292,6 +15352,130 @@ fn find_param_future_bound_output_in_item(
     (TypeId { v: 0u32 })
 }
 
+fn tc_deduce_impl_args(
+    cx: mut_view<TypeckCtx>,
+    pat_ty: TypeId,
+    target_ty: TypeId,
+    out_args: *mut TypeId,
+    arg_count: usize,
+    depth: usize
+) {
+    if depth > 32 || pat_ty.v == 0u32 || target_ty.v == 0u32 || (out_args as usize) == 0 {
+        return;
+    }
+    let target_r = resolve_ty(mut_view(*cx), (TypeId { v: target_ty.v }));
+    if target_r.v == 0u32 {
+        return;
+    }
+    let pt = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: pat_ty.v })) };
+    let tt = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: target_r.v })) };
+    if (pt as usize) == 0 || (tt as usize) == 0 {
+        return;
+    }
+    let pk = unsafe { (*pt).kind };
+    let tk = unsafe { (*tt).kind };
+    if pk == TY_PARAM {
+        let idx = (unsafe { (*pt).param_index }) as usize;
+        if idx < arg_count && tk != TY_ERROR {
+            unsafe { (*typeid_at(out_args, idx)).v = target_r.v; }
+        }
+        return;
+    }
+    if pk != tk {
+        return;
+    }
+    if pk == TY_STRUCT || pk == TY_ENUM || pk == TY_COROUTINE {
+        let sdef = unsafe { (*pt).def as usize };
+        let bdef = unsafe { (*tt).def as usize };
+        if sdef != bdef {
+            return;
+        }
+        if pk == TY_COROUTINE {
+            tc_deduce_impl_args(
+                mut_view(*cx),
+                unsafe { (*pt).ret_type },
+                unsafe { (*tt).ret_type },
+                out_args,
+                arg_count,
+                depth + 1
+            );
+        }
+        let sac = unsafe { (*pt).arg_count };
+        let bac = unsafe { (*tt).arg_count };
+        let sargs = unsafe { (*pt).args };
+        let bargs = unsafe { (*tt).args };
+        let mut i: usize = 0;
+        while i < sac && i < bac {
+            let sa = unsafe { *typeid_at(sargs, i) };
+            let ba = unsafe { *typeid_at(bargs, i) };
+            tc_deduce_impl_args(mut_view(*cx), sa, ba, out_args, arg_count, depth + 1);
+            i = i + 1;
+        }
+        return;
+    }
+    if pk == TY_VIEW || pk == TY_MUT_VIEW || pk == TY_PTR {
+        tc_deduce_impl_args(
+            mut_view(*cx),
+            unsafe { (*pt).pointee },
+            unsafe { (*tt).pointee },
+            out_args,
+            arg_count,
+            depth + 1
+        );
+        return;
+    }
+    if pk == TY_ARRAY || pk == TY_SLICE {
+        tc_deduce_impl_args(
+            mut_view(*cx),
+            unsafe { (*pt).elem },
+            unsafe { (*tt).elem },
+            out_args,
+            arg_count,
+            depth + 1
+        );
+        return;
+    }
+    if pk == TY_TUPLE {
+        let sfc = unsafe { (*pt).field_count };
+        let bfc = unsafe { (*tt).field_count };
+        if sfc == bfc {
+            let sf = unsafe { (*pt).fields };
+            let bf = unsafe { (*tt).fields };
+            let mut i: usize = 0;
+            while i < sfc {
+                let sfi = unsafe { *typeid_at(sf, i) };
+                let bfi = unsafe { *typeid_at(bf, i) };
+                tc_deduce_impl_args(mut_view(*cx), sfi, bfi, out_args, arg_count, depth + 1);
+                i = i + 1;
+            }
+        }
+        return;
+    }
+    if pk == TY_FN {
+        let spc = unsafe { (*pt).param_count };
+        let bpc = unsafe { (*tt).param_count };
+        if spc == bpc {
+            let sp = unsafe { (*pt).param_types };
+            let bp = unsafe { (*tt).param_types };
+            let mut i: usize = 0;
+            while i < spc {
+                let spi = unsafe { *typeid_at(sp, i) };
+                let bpi = unsafe { *typeid_at(bp, i) };
+                tc_deduce_impl_args(mut_view(*cx), spi, bpi, out_args, arg_count, depth + 1);
+                i = i + 1;
+            }
+            tc_deduce_impl_args(
+                mut_view(*cx),
+                unsafe { (*pt).ret_type },
+                unsafe { (*tt).ret_type },
+                out_args,
+                arg_count,
+                depth + 1
+            );
+        }
+    }
+}
+
 fn resolve_future_output_ty(cx: mut_view<TypeckCtx>, fut_ty: TypeId) -> TypeId {
     let r_ty = resolve_ty(mut_view(*cx), (TypeId { v: fut_ty.v }));
     if r_ty.v == 0u32 || is_error(mut_view(*cx), (TypeId { v: r_ty.v })) {
@@ -15349,19 +15533,42 @@ fn resolve_future_output_ty(cx: mut_view<TypeckCtx>, fut_ty: TypeId) -> TypeId {
                                     cx.current_impl = save_impl;
                                     cx.self_ty.v = save_self.v;
                                 }
-                                if (unsafe { (*ft).arg_count }) > 0 && ((unsafe { (*ft).args }) as usize) != 0 {
+                                let imp_n = tc_item_generic_count(it);
+                                if imp_n > 0 {
+                                    let dbytes = mul_usize(imp_n, size_of<TypeId>());
+                                    let d_args = unsafe {
+                                        arena_alloc_raw(mut_view((*cx.thir).interner.arena), dbytes, align_of<TypeId>()) as *mut TypeId
+                                    };
+                                    let mut zi: usize = 0;
+                                    while zi < imp_n {
+                                        unsafe { (*typeid_at(d_args, zi)).v = 0u32; }
+                                        zi = zi + 1;
+                                    }
+                                    let imp_self_ty = unsafe { thir_get_item_type(view(*cx.thir), it) };
+                                    if imp_self_ty.v != 0u32 {
+                                        tc_deduce_impl_args(mut_view(*cx), imp_self_ty, (TypeId { v: r_ty.v }), d_args, imp_n, 0);
+                                    }
+                                    if (unsafe { (*ft).arg_count }) == imp_n && ((unsafe { (*ft).args }) as usize) != 0 {
+                                        let mut ai: usize = 0;
+                                        while ai < imp_n {
+                                            let dst_p = unsafe { typeid_at(d_args, ai) };
+                                            if (unsafe { (*dst_p).v }) == 0u32 {
+                                                unsafe { (*dst_p).v = (*typeid_at((*ft).args, ai)).v; }
+                                            }
+                                            ai = ai + 1;
+                                        }
+                                    }
                                     let gslice = GenericArgsSlice {
-                                        args: unsafe { (*ft).args },
-                                        count: unsafe { (*ft).arg_count },
+                                        args: d_args,
+                                        count: imp_n,
                                     };
-                                    m_ty = unsafe {
-                                        subst_ty_with_vars(
-                                            mut_view((*cx.thir).interner),
-                                            mut_view(cx.type_vars),
-                                            m_ty,
-                                            view(gslice)
-                                        )
+                                    m_ty = tc_subst_ty_and_self(mut_view(*cx), m_ty, view(gslice), r_ty.v);
+                                } else {
+                                    let empty_g = GenericArgsSlice {
+                                        args: 0 as *mut TypeId,
+                                        count: 0,
                                     };
+                                    m_ty = tc_subst_ty_and_self(mut_view(*cx), m_ty, view(empty_g), r_ty.v);
                                 }
                                 return resolve_ty(mut_view(*cx), m_ty);
                             }

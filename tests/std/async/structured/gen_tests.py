@@ -66,8 +66,6 @@ LOCAL_EXAMPLE_SOURCES = ASYNC_CORE + [
 ]
 
 # name -> (expected stdout, std sources, timeout seconds[, extra header directive])
-# `native-after: T422d`: native `.await` on a generic `Future` impl (TaskHandle<T>, GroupJoinAll<T>)
-# links to an undefined or wrong `poll` (T422c report, follow-up); interp runs meanwhile.
 TESTS = {
     "cancel_token_tree": ("OK cancel_token_tree 2341 4\\n", CANCEL_SOURCES, 60),
     "deadline_timeout": ("OK deadline_timeout 5 5\\n", TIMEOUT_SOURCES, 60),
@@ -81,8 +79,8 @@ TESTS = {
     "group_deadline": ("OK group_deadline 3 0\\n", GROUP_SOURCES, 60),
     "group_generic_output": ("OK group_generic_output 100 11\\n", GROUP_SOURCES, 60),
     "qa_nested_groups_races": ("OK qa_nested_groups_races 0\\n", GROUP_SOURCES, 60),
-    "spec34_task_group_example": ("OK spec34_task_group_example 30\\n", GROUP_SOURCES, 60, "native-after: T422d"),
-    "spec34_local_executor_example": ("OK spec34_local_executor_example 40\\n", LOCAL_EXAMPLE_SOURCES, 60, "native-after: T422d"),
+    "spec34_task_group_example": ("OK spec34_task_group_example 30\\n", GROUP_SOURCES, 60),
+    "spec34_local_executor_example": ("OK spec34_local_executor_example 40\\n", LOCAL_EXAMPLE_SOURCES, 60),
     "group_two_output_types": ("OK group_two_output_types 30 100 33 0\\n", GROUP_SOURCES, 60),
     "qa_t422c_drop_edges": ("OK qa_t422c_drop_edges 1 3 40 50 1 0\\n", GROUP_SOURCES, 90),
 }

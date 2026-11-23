@@ -151,7 +151,12 @@ use compiler.mir.mir.mir_add_local
 use compiler.mir.mir.mir_bb_push_stmt
 use compiler.mir.drop.mir_drop_place_type
 use compiler.mir.drop.mir_type_needs_drop
-use compiler.traits.solver.impl_matches_receiver
+use compiler.types.types.TY_PTR
+use compiler.types.types.TY_SLICE
+use compiler.types.types.TY_TUPLE
+use compiler.types.types.TY_PARAM
+use compiler.traits.mono.MonoEngine
+use compiler.mir.builder.mir_resolve_poll_callee_mono
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 @intrinsic fn align_of<T>() -> usize { 0 }
@@ -984,6 +989,119 @@ fn clone_mir_body(arena: mut_view<Arena>, src: *const MirBody) -> *mut MirBody {
 
 // ---- Main Lowering Entry Point ----
 
+fn al_types_structurally_eq(ti: view<TypeInterner>, a: TypeId, b: TypeId, depth: usize) -> bool {
+    let av = a.v;
+    let bv = b.v;
+    if av == bv {
+        return true;
+    }
+    if depth > 32 || av == 0u32 || bv == 0u32 {
+        return false;
+    }
+    let ta: *mut AxType = type_get(ti, (TypeId { v: av }));
+    let tb: *mut AxType = type_get(ti, (TypeId { v: bv }));
+    if (ta as usize) == 0 || (tb as usize) == 0 {
+        return false;
+    }
+    let ka = unsafe { (*ta).kind };
+    let kb = unsafe { (*tb).kind };
+    if ka != kb {
+        return false;
+    }
+    if ka == TY_PARAM {
+        return (unsafe { (*ta).param_index }) == (unsafe { (*tb).param_index });
+    }
+    if ka == TY_STRUCT || ka == TY_ENUM || ka == TY_COROUTINE {
+        let da = unsafe { (*ta).def as usize };
+        let db = unsafe { (*tb).def as usize };
+        if da == 0 || da != db {
+            return false;
+        }
+        if ka == TY_COROUTINE {
+            let ra_v = unsafe { (*ta).ret_type.v };
+            let rb_v = unsafe { (*tb).ret_type.v };
+            if !al_types_structurally_eq(ti, (TypeId { v: ra_v }), (TypeId { v: rb_v }), depth + 1) {
+                return false;
+            }
+        }
+        let aca = unsafe { (*ta).arg_count };
+        let acb = unsafe { (*tb).arg_count };
+        if aca != acb {
+            return false;
+        }
+        let args_a: *mut TypeId = unsafe { (*ta).args };
+        let args_b: *mut TypeId = unsafe { (*tb).args };
+        let mut i: usize = 0;
+        while i < aca {
+            let aa_v = unsafe { (*typeid_at(args_a, i)).v };
+            let ab_v = unsafe { (*typeid_at(args_b, i)).v };
+            if !al_types_structurally_eq(ti, (TypeId { v: aa_v }), (TypeId { v: ab_v }), depth + 1) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+    if ka == TY_TUPLE {
+        let fca = unsafe { (*ta).field_count };
+        let fcb = unsafe { (*tb).field_count };
+        if fca != fcb {
+            return false;
+        }
+        let fa: *mut TypeId = unsafe { (*ta).fields };
+        let fb: *mut TypeId = unsafe { (*tb).fields };
+        let mut i: usize = 0;
+        while i < fca {
+            let fa_v = unsafe { (*typeid_at(fa, i)).v };
+            let fb_v = unsafe { (*typeid_at(fb, i)).v };
+            if !al_types_structurally_eq(ti, (TypeId { v: fa_v }), (TypeId { v: fb_v }), depth + 1) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+    if ka == TY_VIEW || ka == TY_MUT_VIEW || ka == TY_PTR {
+        if ka == TY_PTR && (unsafe { (*ta).is_mut }) != (unsafe { (*tb).is_mut }) {
+            return false;
+        }
+        let pa_v = unsafe { (*ta).pointee.v };
+        let pb_v = unsafe { (*tb).pointee.v };
+        return al_types_structurally_eq(ti, (TypeId { v: pa_v }), (TypeId { v: pb_v }), depth + 1);
+    }
+    if ka == TY_ARRAY || ka == TY_SLICE {
+        if ka == TY_ARRAY && (unsafe { (*ta).array_len }) != (unsafe { (*tb).array_len }) {
+            return false;
+        }
+        let ea_v = unsafe { (*ta).elem.v };
+        let eb_v = unsafe { (*tb).elem.v };
+        return al_types_structurally_eq(ti, (TypeId { v: ea_v }), (TypeId { v: eb_v }), depth + 1);
+    }
+    if ka == TY_FN {
+        if (unsafe { (*ta).is_unsafe }) != (unsafe { (*tb).is_unsafe }) ||
+           (unsafe { (*ta).abi.v }) != (unsafe { (*tb).abi.v }) ||
+           (unsafe { (*ta).param_count }) != (unsafe { (*tb).param_count }) {
+            return false;
+        }
+        let pc = unsafe { (*ta).param_count };
+        let pa: *mut TypeId = unsafe { (*ta).param_types };
+        let pb: *mut TypeId = unsafe { (*tb).param_types };
+        let mut i: usize = 0;
+        while i < pc {
+            let pai_v = unsafe { (*typeid_at(pa, i)).v };
+            let pbi_v = unsafe { (*typeid_at(pb, i)).v };
+            if !al_types_structurally_eq(ti, (TypeId { v: pai_v }), (TypeId { v: pbi_v }), depth + 1) {
+                return false;
+            }
+            i = i + 1;
+        }
+        let ra_v = unsafe { (*ta).ret_type.v };
+        let rb_v = unsafe { (*tb).ret_type.v };
+        return al_types_structurally_eq(ti, (TypeId { v: ra_v }), (TypeId { v: rb_v }), depth + 1);
+    }
+    false
+}
+
 pub fn mir_lower_async_body(
     arena: mut_view<Arena>,
     func: *mut HirItem,
@@ -1150,8 +1268,6 @@ pub fn mir_lower_async_body(
     unsafe {
         (*coro_mut).fields = fields;
         (*coro_mut).field_count = total_fields;
-        (*coro_mut).args = fields;
-        (*coro_mut).arg_count = total_fields;
     }
 
     // 4. Setup per-state Drop field indices
@@ -1258,6 +1374,28 @@ pub fn mir_lower_async_body(
         (*layout_data).live_counts = live_counts;
         (*coro_mut).captures = layout_data as *mut ClosureCapture;
         (*coro_mut).capture_count = sp_count;
+    }
+
+    // Keep any post-inference duplicate `TY_COROUTINE` entries with the same structural key in sync.
+    let ti_len: usize = unsafe { (*thir).interner.len };
+    let mut ti_idx: usize = 1;
+    while ti_idx <= ti_len {
+        let other_t: *mut AxType = unsafe { type_get(view((*thir).interner), (TypeId { v: ti_idx as u32 })) };
+        if (other_t as usize) != 0 && (other_t as usize) != (coro_mut as usize) &&
+           (unsafe { (*other_t).kind }) == TY_COROUTINE {
+            if unsafe { al_types_structurally_eq(view((*thir).interner), (TypeId { v: ti_idx as u32 }), (TypeId { v: coro_id_v }), 0) } {
+                unsafe {
+                    (*other_t).fields = fields;
+                    (*other_t).field_count = total_fields;
+                    (*other_t).variant_count = state_count;
+                    (*other_t).variant_field_counts = state_counts;
+                    (*other_t).variant_fields = state_fields as *mut *mut TypeId;
+                    (*other_t).captures = layout_data as *mut ClosureCapture;
+                    (*other_t).capture_count = sp_count;
+                }
+            }
+        }
+        ti_idx = ti_idx + 1;
     }
 
     // 5. Clone original body before transforming into constructor
@@ -1392,9 +1530,22 @@ pub fn mir_lower_async_body(
     let p_name = interner_intern_bytes(unsafe { mut_view(*str_in) }, p_buf as *const u8, p_len);
     let poll_method_name = interner_intern_bytes(unsafe { mut_view(*str_in) }, unsafe { (p_buf + 5) as *const u8 }, 4);
 
+    let mut poll_sym_alloc: u32 = 0u32;
+    let head_it: *mut HirItem = if (hir as usize) != 0 { unsafe { (*hir).items } } else { 0 as *mut HirItem };
+    if (unsafe { (*func).span.file.v }) != 0xFFFFFFFEu32 && (head_it as usize) != 0 && (unsafe { (*head_it).resolve_next_sym_v }) != 0u32 {
+        let nxt_s = (unsafe { (*head_it).resolve_next_sym_v }) + 1u32;
+        unsafe { (*head_it).resolve_next_sym_v = nxt_s; }
+        poll_sym_alloc = nxt_s;
+    } else {
+        poll_sym_alloc = (unsafe { (*func).symbol.v }) ^ 0x40000000u32;
+        if poll_sym_alloc == 0u32 {
+            poll_sym_alloc = 0x55AA1234u32;
+        }
+    }
+
     unsafe {
-        (*poll_body).sym.v = (func as usize ^ 0x55AA1234) as u32;
-        (*poll_body).fn_sym.v = (*poll_body).sym.v;
+        (*poll_body).sym.v = poll_sym_alloc;
+        (*poll_body).fn_sym.v = poll_sym_alloc;
         (*poll_body).fn_name = p_name;
         (*poll_body).span = (*func).span;
         (*poll_body).arg_count = 2; // self, cx
@@ -2167,31 +2318,42 @@ fn sv_is_poll(sv: view<StrView>) -> bool {
 }
 
 // Resolves the `Future.poll` trait-method calls of a synthesized `poll` body to the `poll` of the
-// implementing type of each awaited sub-future (user futures and lowered `async fn` state machines).
-// Run once every `async fn` is lowered, so the synthesized `impl Future` blocks all exist (T088).
-pub fn async_resolve_poll_calls(body: *mut MirBody, thir: *mut Thir, hir: *const HirFile, str_in: *mut StrInterner) {
+// implementing type of each awaited sub-future (user futures and lowered `async fn` state machines),
+// instantiating concrete `MonoInstance`s for generic `impl<...> Future for ...` receivers when `mono`
+// is active (T088, T422d).
+pub fn async_resolve_poll_calls_mono(
+    body: *mut MirBody,
+    thir: *mut Thir,
+    hir: *const HirFile,
+    str_in: *mut StrInterner,
+    db: *const SourceDatabase,
+    mono: *mut MonoEngine
+) -> bool {
     if (body as usize) == 0 || (thir as usize) == 0 || (hir as usize) == 0 || (str_in as usize) == 0 {
-        return;
+        return false;
     }
     let fut_trait = find_future_trait(hir, str_in as *const StrInterner);
     if (fut_trait as usize) == 0 {
-        return;
+        return false;
     }
     let mut tp_sym: u32 = 0u32;
+    let mut poll_name_v: u32 = 0u32;
     let mut m: *mut HirItem = unsafe { (*fut_trait).members };
     while (m as usize) != 0 {
         if (unsafe { (*m).kind }) == HIR_ITEM_FN {
             let sv = interner_get(unsafe { view(*str_in) }, StrId { v: unsafe { (*m).name.v } });
             if sv_is_poll(view(sv)) {
                 tp_sym = unsafe { (*m).symbol.v };
+                poll_name_v = unsafe { (*m).name.v };
                 break;
             }
         }
         m = unsafe { (*m).next };
     }
-    if tp_sym == 0u32 {
-        return;
+    if tp_sym == 0u32 || poll_name_v == 0u32 {
+        return false;
     }
+    let mut resolved_any = false;
     let bc = unsafe { (*body).bb_count };
     let mut b: usize = 0;
     while b < bc {
@@ -2205,45 +2367,35 @@ pub fn async_resolve_poll_calls(body: *mut MirBody, thir: *mut Thir, hir: *const
             let a0 = unsafe { mir_op_at((*bb).terminator.args, 0) };
             let l0 = (unsafe { (*a0).place.local.v }) as usize;
             if (unsafe { (*a0).kind }) != MIR_OP_CONST && l0 < (unsafe { (*body).local_count }) {
-                let recv = TypeId { v: unsafe { (*mir_local_at((*body).locals, l0)).ty.v } };
-                let mut it: *mut HirItem = unsafe { (*hir).items };
-                let mut done = false;
-                while (it as usize) != 0 && !done {
-                    let recv_c = TypeId { v: recv.v };
-                    if (unsafe { (*it).kind }) == HIR_ITEM_IMPL && (unsafe { (*it).trait_path as usize }) != 0 &&
-                        impl_matches_receiver(unsafe { view((*thir).interner) }, unsafe { view(*str_in) }, it, recv_c) {
-                        let mut im: *mut HirItem = unsafe { (*it).members };
-                        while (im as usize) != 0 {
-                            if (unsafe { (*im).kind }) == HIR_ITEM_FN {
-                                let mut im_name_v = unsafe { (*im).name.v };
-                                let onp = unsafe { thir_get_orig_item_name(view(*thir), im as *const HirItem) };
-                                if (onp as usize) != 0 {
-                                    im_name_v = unsafe { *onp };
-                                }
-                                let isv = interner_get(unsafe { view(*str_in) }, StrId { v: im_name_v });
-                                if sv_is_poll(view(isv)) {
-                                    let im_sym = unsafe { (*im).symbol.v };
-                                    unsafe {
-                                        (*bb).terminator.func.constant.sym.v = im_sym;
-                                        (*bb).terminator.func.constant.val = im_sym as u64;
-                                    }
-                                    let im_ty = unsafe { thir_get_item_type(view(*thir), im as *const HirItem) };
-                                    if (im_ty as usize) != 0 && (unsafe { (*im_ty).v }) != 0u32 {
-                                        unsafe { (*bb).terminator.func.constant.ty.v = (*im_ty).v; }
-                                    }
-                                    done = true;
-                                    break;
-                                }
-                            }
-                            im = unsafe { (*im).next };
-                        }
+                let mut recv = unsafe { mir_drop_place_type(view(*body), view(*thir), view((*a0).place)) };
+                if recv.v == 0u32 {
+                    recv = TypeId { v: unsafe { (*mir_local_at((*body).locals, l0)).ty.v } };
+                }
+                if mir_resolve_poll_callee_mono(
+                    body,
+                    bb,
+                    fut_trait as *const HirItem,
+                    poll_name_v,
+                    recv,
+                    thir,
+                    hir,
+                    str_in,
+                    db,
+                    mono
+                ) {
+                    if (unsafe { (*bb).terminator.func.constant.sym.v }) != tp_sym {
+                        resolved_any = true;
                     }
-                    it = unsafe { (*it).next };
                 }
             }
         }
         b = b + 1;
     }
+    resolved_any
+}
+
+pub fn async_resolve_poll_calls(body: *mut MirBody, thir: *mut Thir, hir: *const HirFile, str_in: *mut StrInterner) {
+    let _ = async_resolve_poll_calls_mono(body, thir, hir, str_in, 0 as *const SourceDatabase, 0 as *mut MonoEngine);
 }
 
 fn diag_push_lit(b: mut_view<DiagBuffer>, s: str) {
@@ -2341,7 +2493,7 @@ fn emit_async_layout_for_fn(
         return;
     }
     let coro_t: *mut AxType = unsafe { type_get(view(thir.interner), TypeId { v: coro_id.v }) };
-    if (coro_t as usize) == 0 || (unsafe { (*coro_t).kind }) != TY_COROUTINE {
+    if (coro_t as usize) == 0 || (unsafe { (*coro_t).kind }) != TY_COROUTINE || (unsafe { (*coro_t).field_count }) == 0 {
         return;
     }
 
