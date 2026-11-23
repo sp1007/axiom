@@ -8,13 +8,15 @@ model: sonnet
 gate_model: sonnet
 depends: [T452]
 priority: 145
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 600
 paths: [tests/opt/bit_intrinsics_fold]
 locks: [compiler/opt, compiler/mir/builder.ax, compiler/mir/mir.ax, compiler/interp, compiler/lir/builder.ax]
 spec: [spec/decisions/ADR-0042-architect-inbox-1-baseline-admissions-and-followups.md, spec/SPEC-40-integers.md]
 covers: [REQ-SIMD-177, REQ-SIMD-265]
+started: 2026-11-23 06:54:06
+agent: t484-impl
 ---
 # T484 — -O1 folding of bit intrinsics
 
@@ -45,3 +47,4 @@ T452-qa FINDING-2; ADR-0042 §4), with results identical to the oracle.
 
 ## Log
 - 2026-11-13 created by axiom-architect (ADR-0042 §4; T452-qa FINDING-2)
+- 2026-11-23 06:54:06 started (attempt 1) t484-impl

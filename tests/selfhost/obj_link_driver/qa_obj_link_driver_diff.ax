@@ -29413,6 +29413,188 @@ fn subst_ty_with_vars(
     subst_type_with_vars((TypeId { v: ty.v }), args, tv, ti)
 }
 
+fn tc_type_has_self_param(ti: view<TypeInterner>, ty: TypeId) -> bool {
+    if ty.v == 0u32 {
+        return false;
+    }
+    let t = type_get(ti, (TypeId { v: ty.v }));
+    if (t as usize) == 0 {
+        return false;
+    }
+    let tk = unsafe { (*t).kind };
+    if tk == TY_PARAM {
+        return (unsafe { (*t).param_index }) == TC_SELF_PARAM_INDEX;
+    }
+    if tk == TY_VIEW || tk == TY_MUT_VIEW || tk == TY_PTR {
+        let pt_v = unsafe { (*t).pointee.v };
+        return tc_type_has_self_param(ti, (TypeId { v: pt_v }));
+    }
+    if tk == TY_ARRAY || tk == TY_SLICE {
+        let el_v = unsafe { (*t).elem.v };
+        return tc_type_has_self_param(ti, (TypeId { v: el_v }));
+    }
+    if tk == TY_TUPLE {
+        let fcnt = unsafe { (*t).field_count };
+        let flds = unsafe { (*t).fields };
+        if (flds as usize) == 0 {
+            return false;
+        }
+        let mut i: usize = 0;
+        while i < fcnt {
+            let fv = unsafe { (*typeid_at(flds, i)).v };
+            if tc_type_has_self_param(ti, (TypeId { v: fv })) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+    if tk == TY_FN {
+        let pcnt = unsafe { (*t).param_count };
+        let params = unsafe { (*t).param_types };
+        if (params as usize) != 0 {
+            let mut i: usize = 0;
+            while i < pcnt {
+                let pv = unsafe { (*typeid_at(params, i)).v };
+                if tc_type_has_self_param(ti, (TypeId { v: pv })) {
+                    return true;
+                }
+                i = i + 1;
+            }
+        }
+        let rv = unsafe { (*t).ret_type.v };
+        return tc_type_has_self_param(ti, (TypeId { v: rv }));
+    }
+    if tk == TY_STRUCT || tk == TY_ENUM {
+        let acnt = unsafe { (*t).arg_count };
+        let args = unsafe { (*t).args };
+        if (args as usize) == 0 {
+            return false;
+        }
+        let mut i: usize = 0;
+        while i < acnt {
+            let av = unsafe { (*typeid_at(args, i)).v };
+            if tc_type_has_self_param(ti, (TypeId { v: av })) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+    if tk == TY_COROUTINE {
+        let rv = unsafe { (*t).ret_type.v };
+        if tc_type_has_self_param(ti, (TypeId { v: rv })) {
+            return true;
+        }
+        let acnt = unsafe { (*t).arg_count };
+        let args = unsafe { (*t).args };
+        if (args as usize) != 0 {
+            let mut i: usize = 0;
+            while i < acnt {
+                let av = unsafe { (*typeid_at(args, i)).v };
+                if tc_type_has_self_param(ti, (TypeId { v: av })) {
+                    return true;
+                }
+                i = i + 1;
+            }
+        }
+        return false;
+    }
+    if tk == TY_CLOSURE {
+        let ccnt = unsafe { (*t).capture_count };
+        let caps = unsafe { (*t).captures };
+        if (caps as usize) != 0 {
+            let mut c: usize = 0;
+            while c < ccnt {
+                let cap = unsafe { capture_at(caps, c) };
+                let cv = unsafe { (*cap).ty.v };
+                if tc_type_has_self_param(ti, (TypeId { v: cv })) {
+                    return true;
+                }
+                c = c + 1;
+            }
+        }
+        let pcnt = unsafe { (*t).param_count };
+        let params = unsafe { (*t).param_types };
+        if (params as usize) != 0 {
+            let mut i: usize = 0;
+            while i < pcnt {
+                let pv = unsafe { (*typeid_at(params, i)).v };
+                if tc_type_has_self_param(ti, (TypeId { v: pv })) {
+                    return true;
+                }
+                i = i + 1;
+            }
+        }
+        let rv = unsafe { (*t).ret_type.v };
+        return tc_type_has_self_param(ti, (TypeId { v: rv }));
+    }
+    false
+}
+
+fn tc_deep_resolve_vars(cx: mut_view<TypeckCtx>, ty: TypeId) -> TypeId {
+    if ty.v == 0u32 {
+        return TypeId { v: 0u32 };
+    }
+    let zero_ptr = unsafe {
+        arena_alloc_raw(mut_view((*cx.thir).interner.arena), size_of<TypeId>(), align_of<TypeId>()) as *mut TypeId
+    };
+    unsafe { (*zero_ptr).v = 0u32; }
+    let vars_only = GenericArgsSlice { args: zero_ptr, count: 1 };
+    unsafe {
+        subst_ty_with_vars(mut_view((*cx.thir).interner), mut_view(cx.type_vars), (TypeId { v: ty.v }), view(vars_only))
+    }
+}
+
+// T423d (QA F1): substitutes callee `TY_PARAM`s `[0..args.count)` FIRST via `subst_ty_with_vars`
+// (leaving `TC_SELF_PARAM_INDEX` / `MONO_SELF_PARAM_INDEX` untouched) and THEN replaces `Self`
+// via `subst_ty_self` with an empty `GenericArgsSlice`, so caller `TY_PARAM`s inside `args` or
+// `self_v` are never re-substituted. If both `ty` and `args` mention `TC_SELF_PARAM_INDEX`, falls
+// back to a single simultaneous `subst_ty_self` pass before resolving bound `TY_VAR`s.
+fn tc_subst_ty_and_self(
+    cx: mut_view<TypeckCtx>,
+    ty: TypeId,
+    args: view<GenericArgsSlice>,
+    self_v: u32
+) -> TypeId {
+    if ty.v == 0u32 {
+        return TypeId { v: 0u32 };
+    }
+    let has_self = self_v != 0u32 && unsafe { tc_type_has_self_param(view((*cx.thir).interner), (TypeId { v: ty.v })) };
+    let mut args_have_self = false;
+    if has_self && args.count > 0 && (args.args as usize) != 0 {
+        let mut i: usize = 0;
+        while i < args.count {
+            let av = unsafe { (*typeid_at(args.args, i)).v };
+            let resolved_a = tc_deep_resolve_vars(mut_view(*cx), (TypeId { v: av }));
+            if unsafe { tc_type_has_self_param(view((*cx.thir).interner), resolved_a) } {
+                args_have_self = true;
+                break;
+            }
+            i = i + 1;
+        }
+    }
+    let mut sub_ty = TypeId { v: ty.v };
+    if has_self && args_have_self {
+        sub_ty = unsafe {
+            subst_ty_self(mut_view((*cx.thir).interner), (TypeId { v: ty.v }), args, self_v)
+        };
+    } else {
+        if args.count > 0 && (args.args as usize) != 0 {
+            sub_ty = unsafe {
+                subst_ty_with_vars(mut_view((*cx.thir).interner), mut_view(cx.type_vars), (TypeId { v: ty.v }), args)
+            };
+        }
+        if has_self {
+            let no_args = GenericArgsSlice { args: 0 as *mut TypeId, count: 0 };
+            sub_ty = unsafe {
+                subst_ty_self(mut_view((*cx.thir).interner), (TypeId { v: sub_ty.v }), view(no_args), self_v)
+            };
+        }
+    }
+    tc_deep_resolve_vars(mut_view(*cx), sub_ty)
+}
+
 pub fn intern_fn_ty_full(
     ti: mut_view<TypeInterner>,
     is_unsafe: bool,
@@ -32912,10 +33094,11 @@ fn tc_item_generic_count(it: *const HirItem) -> usize {
     n
 }
 
-fn tc_enclosing_impl_generic_count(hir: *const HirFile, method_item: *const HirItem) -> usize {
+fn tc_fn_enclosing_impl(hir: *const HirFile, method_item: *const HirItem) -> *const HirItem {
     if (hir as usize) == 0 || (method_item as usize) == 0 {
-        return 0;
+        return 0 as *const HirItem;
     }
+    let is_def_inst = tc_is_default_inst(method_item);
     let sym_v = unsafe { (*method_item).symbol.v };
     let mut it: *mut HirItem = unsafe { (*hir).items };
     while (it as usize) != 0 {
@@ -32923,15 +33106,98 @@ fn tc_enclosing_impl_generic_count(hir: *const HirFile, method_item: *const HirI
             let mut m: *mut HirItem = unsafe { (*it).members };
             while (m as usize) != 0 {
                 if (m as usize) == (method_item as usize) ||
-                   (sym_v != 0u32 && (unsafe { (*m).kind }) == HIR_ITEM_FN && (unsafe { (*m).symbol.v }) == sym_v) {
-                    return tc_item_generic_count(it as *const HirItem);
+                   (!is_def_inst && sym_v != 0u32 && (unsafe { (*m).kind }) == HIR_ITEM_FN && (unsafe { (*m).symbol.v }) == sym_v) {
+                    return it as *const HirItem;
                 }
                 m = unsafe { (*m).next };
             }
         }
         it = unsafe { (*it).next };
     }
-    0
+    it = unsafe { (*hir).items };
+    while (it as usize) != 0 {
+        if (unsafe { (*it).kind }) == HIR_ITEM_TRAIT {
+            let mut m: *mut HirItem = unsafe { (*it).members };
+            while (m as usize) != 0 {
+                if (m as usize) == (method_item as usize) ||
+                   (!is_def_inst && sym_v != 0u32 && (unsafe { (*m).kind }) == HIR_ITEM_FN && (unsafe { (*m).symbol.v }) == sym_v) {
+                    return it as *const HirItem;
+                }
+                m = unsafe { (*m).next };
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+    0 as *const HirItem
+}
+
+fn tc_enclosing_impl_generic_count(hir: *const HirFile, method_item: *const HirItem) -> usize {
+    let enc = tc_fn_enclosing_impl(hir, method_item);
+    if (enc as usize) == 0 {
+        return 0;
+    }
+    tc_item_generic_count(enc)
+}
+
+fn tc_bound_arg_typeid(cx: mut_view<TypeckCtx>, gty: *mut HirType) -> TypeId {
+    if (gty as usize) == 0 {
+        return (TypeId { v: 0u32 });
+    }
+    let cached = unsafe { ptr_typemap_get(view((*cx.thir).item_types), gty as usize) };
+    if (cached as usize) != 0 {
+        return TypeId { v: unsafe { (*cached).v } };
+    }
+    let computed = hir_type_to_typeid(mut_view(*cx), gty);
+    unsafe {
+        ptr_typemap_insert(mut_view((*cx.thir).item_types), gty as usize, (TypeId { v: computed.v }));
+    }
+    computed
+}
+
+fn tc_check_bound_list_types(cx: mut_view<TypeckCtx>, bounds: *mut HirType) {
+    let mut b: *mut HirType = bounds;
+    while (b as usize) != 0 {
+        if (unsafe { (*b).kind }) == HIR_TYPE_PATH {
+            let hga: *mut HirGenericArgs = unsafe { (*b).path.generic_args };
+            if (hga as usize) != 0 {
+                let mut ga: *mut HirGenericArg = unsafe { (*hga).args };
+                while (ga as usize) != 0 {
+                    let gty: *mut HirType = unsafe { (*ga).ty };
+                    if (gty as usize) != 0 {
+                        let _ = tc_bound_arg_typeid(mut_view(*cx), gty);
+                    }
+                    ga = unsafe { (*ga).next };
+                }
+            }
+        }
+        b = unsafe { (*b).next };
+    }
+}
+
+fn tc_check_item_bound_types(cx: mut_view<TypeckCtx>, it: *const HirItem) {
+    if (it as usize) == 0 || (cx.str_in as usize) == 0 || (unsafe { (*it).span.file.v }) == 0xFFFFFFFEu32 {
+        return;
+    }
+    let gps: *mut HirGenericParams = unsafe { (*it).generic_params };
+    if (gps as usize) != 0 {
+        let mut gp: *mut HirGenericParam = unsafe { (*gps).params };
+        while (gp as usize) != 0 {
+            tc_check_bound_list_types(mut_view(*cx), unsafe { (*gp).bounds });
+            gp = unsafe { (*gp).next };
+        }
+    }
+    let wc: *mut HirWhereClause = unsafe { (*it).where_clause };
+    if (wc as usize) != 0 {
+        let mut wp: *mut HirWherePred = unsafe { (*wc).preds };
+        while (wp as usize) != 0 {
+            let wty: *mut HirType = unsafe { (*wp).ty };
+            if (wty as usize) != 0 {
+                let _ = tc_bound_arg_typeid(mut_view(*cx), wty);
+            }
+            tc_check_bound_list_types(mut_view(*cx), unsafe { (*wp).bounds });
+            wp = unsafe { (*wp).next };
+        }
+    }
 }
 
 fn tc_resolve_generic_param_sym(cx: mut_view<TypeckCtx>, it: *const HirItem, sym_v: u32, base_idx: u32) -> TypeId {
@@ -36029,7 +36295,23 @@ fn check_call_rest(
     if ck == TY_PARAM {
         let p_idx = unsafe { (*ct).param_index as usize };
         let p_name_v = unsafe { (*ct).name.v };
-        let cb = tc_find_callable_bound_in_item(view(*cx), cx.current_fn, p_idx, p_name_v);
+        let impl_n_call = if (cx.current_impl as usize) != 0 && (cx.current_fn as usize) != (cx.current_impl as usize) {
+            tc_item_generic_count(cx.current_impl)
+        } else {
+            0
+        };
+        let mut cb: *const HirType = 0 as *const HirType;
+        if (cx.current_fn as usize) != 0 && p_idx >= impl_n_call {
+            cb = tc_find_callable_bound_in_item(view(*cx), cx.current_fn, p_idx - impl_n_call, p_name_v);
+        }
+        if (cb as usize) == 0 && (cx.current_impl as usize) != 0 && p_idx < impl_n_call {
+            if (cx.current_fn as usize) != 0 && (cx.current_fn as usize) != (cx.current_impl as usize) {
+                cb = tc_find_callable_bound_in_where(view(*cx), cx.current_fn, 0u32, p_name_v);
+            }
+            if (cb as usize) == 0 {
+                cb = tc_find_callable_bound_in_item(view(*cx), cx.current_impl, p_idx, p_name_v);
+            }
+        }
         if (cb as usize) != 0 {
             let hga: *mut HirGenericArgs = unsafe { (*cb).path.generic_args };
             if (hga as usize) != 0 && ((unsafe { (*hga).args }) as usize) != 0 {
@@ -36054,7 +36336,7 @@ fn check_call_rest(
                     let mut j: usize = 0;
                     while j < exp_argc && ((a as usize) != 0) && ((ga as usize) != 0) {
                         let gty: *mut HirType = unsafe { (*ga).ty };
-                        let pty = if (gty as usize) != 0 { hir_type_to_typeid(mut_view(*cx), gty) } else { TypeId { v: 0u32 } };
+                        let pty = if (gty as usize) != 0 { tc_bound_arg_typeid(mut_view(*cx), gty) } else { TypeId { v: 0u32 } };
                         check_expr(mut_view(*cx), a, pty);
                         j = j + 1;
                         a = unsafe { (*a).next };
@@ -36063,7 +36345,7 @@ fn check_call_rest(
                     if (ga as usize) != 0 {
                         let r_ht: *mut HirType = unsafe { (*ga).ty };
                         if (r_ht as usize) != 0 {
-                            let r_tid = hir_type_to_typeid(mut_view(*cx), r_ht);
+                            let r_tid = tc_bound_arg_typeid(mut_view(*cx), r_ht);
                             return resolve_ty(mut_view(*cx), r_tid);
                         }
                     }
@@ -36119,7 +36401,7 @@ fn check_call_rest(
     while ((a as usize) != 0) {
         let pv = unsafe { (*typeid_at(params, i)).v };
         if (unsafe { (*a).kind }) == HIR_EXPR_CLOSURE && (call_substs as usize) != 0 {
-            let hint_ty = tc_build_callable_hint_ty(mut_view(*cx), fn_def_item, call_substs, (TypeId { v: pv }));
+            let hint_ty = tc_build_callable_hint_ty(mut_view(*cx), fn_def_item, call_substs, 0u32, (TypeId { v: pv }));
             if hint_ty.v != 0u32 {
                 let clos_ty = check_expr_closure(mut_view(*cx), a, (TypeId { v: hint_ty.v }));
                 unsafe { thir_set_expr_type(mut_view(*cx.thir), a, (TypeId { v: clos_ty.v })); }
@@ -36143,12 +36425,21 @@ fn check_call_rest(
             mut_view(*cx),
             fn_def_item,
             call_substs,
+            0u32,
             Span { file: (FileId { v: sp_f }), start: sp_s, end: sp_e }
         );
         check_callable_bound_outputs_for_call(
             mut_view(*cx),
             fn_def_item,
             call_substs,
+            0u32,
+            Span { file: (FileId { v: sp_f }), start: sp_s, end: sp_e }
+        );
+        tc_check_generic_trait_bounds_for_call(
+            mut_view(*cx),
+            fn_def_item,
+            call_substs,
+            0u32,
             Span { file: (FileId { v: sp_f }), start: sp_s, end: sp_e }
         );
     }
@@ -37917,6 +38208,8 @@ fn check_expr_method_call(cx: mut_view<TypeckCtx>, expr: *const HirExpr, expecte
             }
         }
         let mut fn_ty_id = unsafe { thir_get_item_type(view(*cx.thir), method_item) };
+        let mut call_bound_substs: *mut GenericArgsSlice = 0 as *mut GenericArgsSlice;
+        let mut fn_sig_subbed = false;
         let gps: *mut HirGenericParams = unsafe { (*method_item).generic_params };
         if unsafe { (*method_item).kind } == HIR_ITEM_FN && (gps as usize) != 0 {
             let mut param_count: usize = 0;
@@ -37959,67 +38252,85 @@ fn check_expr_method_call(cx: mut_view<TypeckCtx>, expr: *const HirExpr, expecte
                     ptr_itemmap_insert(mut_view((*cx.thir).expr_methods), (expr as usize) | 1usize, cx.current_fn);
                     ptr_itemmap_insert(mut_view((*cx.thir).expr_methods), (expr as usize) | 3usize, cx.current_impl);
                 }
-                let impl_n = tc_enclosing_impl_generic_count(cx.hir, method_item as *const HirItem);
+                let enc_impl = tc_fn_enclosing_impl(cx.hir, method_item as *const HirItem);
+                let impl_n = if (enc_impl as usize) != 0 { tc_item_generic_count(enc_impl) } else { 0 };
                 if impl_n > 0 {
-                    let tot_cnt = impl_n + param_count;
-                    let tot_bytes = mul_usize(tot_cnt, size_of<TypeId>());
-                    let comb_arr = unsafe { arena_alloc_raw(mut_view((*cx.thir).interner.arena), tot_bytes, align_of<TypeId>()) as *mut TypeId };
-                    let recv_ac = if (t as usize) != 0 { unsafe { (*t).arg_count } } else { 0 };
-                    let recv_args = if (t as usize) != 0 { unsafe { (*t).args } } else { 0 as *mut TypeId };
-                    let mut ii: usize = 0;
-                    while ii < impl_n {
-                        let iv = if ii < recv_ac && (recv_args as usize) != 0 {
-                            unsafe { (*typeid_at(recv_args, ii)).v }
-                        } else {
-                            unsafe { new_ty_var(mut_view(*cx), view((*expr).span)).v }
-                        };
-                        unsafe { (*typeid_at(comb_arr, ii)).v = iv; }
-                        ii = ii + 1;
-                    }
-                    let mut mi: usize = 0;
-                    while mi < param_count {
-                        let mv = unsafe { (*typeid_at(gargs_arr, mi)).v };
-                        unsafe { (*typeid_at(comb_arr, impl_n + mi)).v = mv; }
-                        mi = mi + 1;
-                    }
-                    let comb_slice = (GenericArgsSlice { args: comb_arr, count: tot_cnt });
-                    let self_sub = unsafe { subst_ty_self(mut_view((*cx.thir).interner), (TypeId { v: fn_ty_id.v }), view(comb_slice), base_ty.v) };
-                    let sub_fn = unsafe { subst_ty_with_vars(mut_view((*cx.thir).interner), mut_view(cx.type_vars), (TypeId { v: self_sub.v }), view(comb_slice)) };
+                    let comb_ptr = tc_build_method_call_comb_substs(
+                        mut_view(*cx),
+                        expr,
+                        enc_impl,
+                        impl_n,
+                        (TypeId { v: receiver_ty.v }),
+                        (TypeId { v: base_ty.v }),
+                        t,
+                        gargs_arr,
+                        param_count
+                    );
+                    call_bound_substs = comb_ptr;
+                    let sub_fn = unsafe { tc_subst_ty_and_self(mut_view(*cx), (TypeId { v: fn_ty_id.v }), view(*comb_ptr), base_ty.v) };
                     fn_ty_id.v = sub_fn.v;
                 } else {
-                    let sub_fn = unsafe { subst_ty_with_vars(mut_view((*cx.thir).interner), mut_view(cx.type_vars), (TypeId { v: fn_ty_id.v }), view(gslice)) };
+                    let sub_fn = tc_subst_ty_and_self(mut_view(*cx), (TypeId { v: fn_ty_id.v }), view(gslice), base_ty.v);
                     fn_ty_id.v = sub_fn.v;
                 }
+                fn_sig_subbed = true;
             }
         }
         // T161: in the signature of a trait member, `Self` is the receiver's type.
-        if (gps as usize) == 0 && (t as usize) != 0 && unsafe { (*t).arg_count } > 0 && (unsafe { (*t).args as usize }) != 0 {
-            let impl_gslice = (GenericArgsSlice { args: unsafe { (*t).args }, count: unsafe { (*t).arg_count } });
-            let self_sub = unsafe { subst_ty_self(mut_view((*cx.thir).interner), (TypeId { v: fn_ty_id.v }), view(impl_gslice), base_ty.v) };
-            let var_sub = unsafe { subst_ty_with_vars(mut_view((*cx.thir).interner), mut_view(cx.type_vars), (TypeId { v: self_sub.v }), view(impl_gslice)) };
-            fn_ty_id.v = var_sub.v;
-        } else if (gps as usize) == 0 && tc_sv_is_4(view(mname), 112u8, 111u8, 108u8, 108u8) {
-            let mut inner_recv_v: u32 = base_ty.v;
-            if (t as usize) != 0 && (unsafe { (*t).kind } == TY_VIEW || unsafe { (*t).kind } == TY_MUT_VIEW) {
-                inner_recv_v = unsafe { (*t).pointee.v };
-            }
-            let fut_out = resolve_future_output_ty(mut_view(*cx), (TypeId { v: inner_recv_v }));
-            if fut_out.v != 0u32 {
-                let out_slot = unsafe { arena_alloc_raw(mut_view((*cx.thir).interner.arena), size_of<TypeId>(), align_of<TypeId>()) as *mut TypeId };
-                unsafe { (*out_slot).v = fut_out.v; }
-                let fut_gslice = (GenericArgsSlice { args: out_slot, count: 1 });
-                let self_sub = unsafe { subst_ty_self(mut_view((*cx.thir).interner), (TypeId { v: fn_ty_id.v }), view(fut_gslice), inner_recv_v) };
-                let var_sub = unsafe { subst_ty_with_vars(mut_view((*cx.thir).interner), mut_view(cx.type_vars), (TypeId { v: self_sub.v }), view(fut_gslice)) };
+        if !fn_sig_subbed {
+            let enc_for_nongeneric = tc_fn_enclosing_impl(cx.hir, method_item as *const HirItem);
+            let enc_ng_n = if (enc_for_nongeneric as usize) != 0 {
+                tc_item_generic_count(enc_for_nongeneric)
+            } else {
+                0
+            };
+            if (enc_for_nongeneric as usize) != 0 &&
+               (unsafe { (*enc_for_nongeneric).kind }) == HIR_ITEM_TRAIT && enc_ng_n > 0 &&
+               (t as usize) != 0 && (unsafe { (*t).kind }) == TY_PARAM {
+                let trait_gslice = unsafe { tc_extract_param_trait_args(mut_view(*cx), t, enc_for_nongeneric, enc_ng_n, view((*expr).span)) };
+                let var_sub = tc_subst_ty_and_self(mut_view(*cx), (TypeId { v: fn_ty_id.v }), view(trait_gslice), base_ty.v);
                 fn_ty_id.v = var_sub.v;
+            } else if (enc_for_nongeneric as usize) != 0 &&
+                      (unsafe { (*enc_for_nongeneric).kind }) == HIR_ITEM_IMPL && enc_ng_n > 0 {
+                let comb_ng = tc_build_method_call_comb_substs(
+                    mut_view(*cx),
+                    expr,
+                    enc_for_nongeneric,
+                    enc_ng_n,
+                    (TypeId { v: receiver_ty.v }),
+                    (TypeId { v: base_ty.v }),
+                    t,
+                    0 as *mut TypeId,
+                    0
+                );
+                let var_sub = unsafe { tc_subst_ty_and_self(mut_view(*cx), (TypeId { v: fn_ty_id.v }), view(*comb_ng), base_ty.v) };
+                fn_ty_id.v = var_sub.v;
+            } else if (t as usize) != 0 && unsafe { (*t).arg_count } > 0 && (unsafe { (*t).args as usize }) != 0 {
+                let impl_gslice = (GenericArgsSlice { args: unsafe { (*t).args }, count: unsafe { (*t).arg_count } });
+                let var_sub = tc_subst_ty_and_self(mut_view(*cx), (TypeId { v: fn_ty_id.v }), view(impl_gslice), base_ty.v);
+                fn_ty_id.v = var_sub.v;
+            } else if tc_sv_is_4(view(mname), 112u8, 111u8, 108u8, 108u8) {
+                let mut inner_recv_v: u32 = base_ty.v;
+                if (t as usize) != 0 && (unsafe { (*t).kind } == TY_VIEW || unsafe { (*t).kind } == TY_MUT_VIEW) {
+                    inner_recv_v = unsafe { (*t).pointee.v };
+                }
+                let fut_out = resolve_future_output_ty(mut_view(*cx), (TypeId { v: inner_recv_v }));
+                if fut_out.v != 0u32 {
+                    let out_slot = unsafe { arena_alloc_raw(mut_view((*cx.thir).interner.arena), size_of<TypeId>(), align_of<TypeId>()) as *mut TypeId };
+                    unsafe { (*out_slot).v = fut_out.v; }
+                    let fut_gslice = (GenericArgsSlice { args: out_slot, count: 1 });
+                    let var_sub = tc_subst_ty_and_self(mut_view(*cx), (TypeId { v: fn_ty_id.v }), view(fut_gslice), inner_recv_v);
+                    fn_ty_id.v = var_sub.v;
+                } else {
+                    let no_args = (GenericArgsSlice { args: 0 as *mut TypeId, count: 0 });
+                    let self_sub = tc_subst_ty_and_self(mut_view(*cx), (TypeId { v: fn_ty_id.v }), view(no_args), base_ty.v);
+                    fn_ty_id.v = self_sub.v;
+                }
             } else {
                 let no_args = (GenericArgsSlice { args: 0 as *mut TypeId, count: 0 });
-                let self_sub = unsafe { subst_ty_self(mut_view((*cx.thir).interner), (TypeId { v: fn_ty_id.v }), view(no_args), base_ty.v) };
+                let self_sub = tc_subst_ty_and_self(mut_view(*cx), (TypeId { v: fn_ty_id.v }), view(no_args), base_ty.v);
                 fn_ty_id.v = self_sub.v;
             }
-        } else {
-            let no_args = (GenericArgsSlice { args: 0 as *mut TypeId, count: 0 });
-            let self_sub = unsafe { subst_ty_self(mut_view((*cx.thir).interner), (TypeId { v: fn_ty_id.v }), view(no_args), base_ty.v) };
-            fn_ty_id.v = self_sub.v;
         }
 
         let fn_ty = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: fn_ty_id.v })) };
@@ -38072,6 +38383,11 @@ fn check_expr_method_call(cx: mut_view<TypeckCtx>, expr: *const HirExpr, expecte
             let _ = unify_ty(mut_view(*cx), (TypeId { v: ret_v }), (TypeId { v: expected.v }));
         }
         let method_substs = unsafe { ptr_substmap_get(view((*cx.thir).expr_substs), expr as usize) };
+        let bound_substs: *mut GenericArgsSlice = if (call_bound_substs as usize) != 0 {
+            call_bound_substs
+        } else {
+            method_substs
+        };
         let mut i: usize = if pass_receiver { 1 } else { 0 };
         let mut a = args_head;
         while ((a as usize) != 0) {
@@ -38079,8 +38395,8 @@ fn check_expr_method_call(cx: mut_view<TypeckCtx>, expr: *const HirExpr, expecte
             let arg_expected = resolve_ty(mut_view(*cx), (TypeId { v: raw_arg_exp_v }));
             let arg_expected_v = arg_expected.v;
             let mut arg_ty = (TypeId { v: 0u32 });
-            if (unsafe { (*a).kind }) == HIR_EXPR_CLOSURE && (method_substs as usize) != 0 {
-                let hint_ty = tc_build_callable_hint_ty(mut_view(*cx), method_item, method_substs, (TypeId { v: arg_expected_v }));
+            if (unsafe { (*a).kind }) == HIR_EXPR_CLOSURE && (bound_substs as usize) != 0 {
+                let hint_ty = tc_build_callable_hint_ty(mut_view(*cx), method_item, bound_substs, base_ty.v, (TypeId { v: arg_expected_v }));
                 if hint_ty.v != 0u32 {
                     arg_ty = check_expr_closure(mut_view(*cx), a, hint_ty);
                     unsafe { thir_set_expr_type(mut_view(*cx.thir), a, (TypeId { v: arg_ty.v })); }
@@ -38096,27 +38412,44 @@ fn check_expr_method_call(cx: mut_view<TypeckCtx>, expr: *const HirExpr, expecte
             i = i + 1;
             a = unsafe { (*a).next };
         }
-        if (method_substs as usize) != 0 && (unsafe { (*method_substs).count }) > 0 {
+        if (bound_substs as usize) != 0 && (unsafe { (*bound_substs).count }) > 0 {
             let msp_f = unsafe { (*expr).span.file.v };
             let msp_s = unsafe { (*expr).span.start };
             let msp_e = unsafe { (*expr).span.end };
-            // T448 (T421 FU-5): `exec.spawn(Child {..}, f)` with `spawn<F: Future<Output = T>, T>` infers `T`
-            // from `Child`'s `Future` impl, as a free-function call does. `method_substs` holds the method's own
-            // parameters only, which is what the callee's bounds index when its impl has no generics.
-            if tc_enclosing_impl_generic_count(cx.hir, method_item as *const HirItem) == 0 {
-                check_future_bound_outputs_for_call(
-                    mut_view(*cx),
-                    method_item,
-                    method_substs,
-                    Span { file: (FileId { v: msp_f }), start: msp_s, end: msp_e }
-                );
-            }
+            check_future_bound_outputs_for_call(
+                mut_view(*cx),
+                method_item,
+                bound_substs,
+                base_ty.v,
+                Span { file: (FileId { v: msp_f }), start: msp_s, end: msp_e }
+            );
             check_callable_bound_outputs_for_call(
                 mut_view(*cx),
                 method_item,
-                method_substs,
+                bound_substs,
+                base_ty.v,
                 Span { file: (FileId { v: msp_f }), start: msp_s, end: msp_e }
             );
+            tc_check_generic_trait_bounds_for_call(
+                mut_view(*cx),
+                method_item,
+                bound_substs,
+                base_ty.v,
+                Span { file: (FileId { v: msp_f }), start: msp_s, end: msp_e }
+            );
+            ret_v = tc_deep_resolve_vars(mut_view(*cx), (TypeId { v: ret_v })).v;
+            base_ty = tc_deep_resolve_vars(mut_view(*cx), (TypeId { v: base_ty.v }));
+            if (method_substs as usize) != 0 {
+                let mcnt = unsafe { (*method_substs).count };
+                let margs = unsafe { (*method_substs).args };
+                let mut mk: usize = 0;
+                while mk < mcnt && (margs as usize) != 0 {
+                    let mv = unsafe { (*typeid_at(margs, mk)).v };
+                    let rmv = tc_deep_resolve_vars(mut_view(*cx), (TypeId { v: mv }));
+                    unsafe { (*typeid_at(margs, mk)).v = rmv.v; }
+                    mk = mk + 1;
+                }
+            }
         }
         let r_ret = resolve_ty(mut_view(*cx), (TypeId { v: ret_v }));
         ret_v = r_ret.v;
@@ -40973,6 +41306,9 @@ fn register_item_sig(cx: mut_view<TypeckCtx>, it: *mut HirItem, parent_impl: *co
             idx = idx + 1;
             p = unsafe { (*p).next };
         }
+        if !tc_is_default_inst(it as *const HirItem) {
+            tc_check_item_bound_types(mut_view(*cx), it as *const HirItem);
+        }
         let is_u = unsafe { (*it).is_unsafe };
         let abi_v = unsafe { (*it).abi.v };
         let fn_ty = unsafe {
@@ -41913,6 +42249,7 @@ fn typeck_pass1b_and_2(
             let impl_self_ty = hir_type_to_typeid(mut_view(*cx), self_ty_node);
             unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: impl_self_ty.v })); }
             cx.self_ty.v = impl_self_ty.v;
+            tc_check_item_bound_types(mut_view(*cx), top_it as *const HirItem);
 
             let mut m: *mut HirItem = unsafe { (*top_it).members };
             while ((m as usize) != 0) {
@@ -41950,7 +42287,9 @@ fn typeck_pass1b_and_2(
             }
         } else if tk == HIR_ITEM_TRAIT {
             cx.current_impl = top_it;
+            cx.current_fn = 0 as *const HirItem;
             cx.self_ty.v = 0u32;
+            tc_check_item_bound_types(mut_view(*cx), top_it as *const HirItem);
             let mut m: *mut HirItem = unsafe { (*top_it).members };
             while ((m as usize) != 0) {
                 register_item_sig(mut_view(*cx), m, top_it);
@@ -42050,7 +42389,9 @@ fn typeck_pass1b_and_2(
             cx.self_ty.v = 0u32;
         } else if tk == HIR_ITEM_TRAIT {
             cx.current_impl = top_it;
+            cx.current_fn = 0 as *const HirItem;
             cx.self_ty.v = 0u32;
+            tc_check_item_bound_types(mut_view(*cx), top_it as *const HirItem);
             let mut m: *mut HirItem = unsafe { (*top_it).members };
             while ((m as usize) != 0) {
                 check_item_body(mut_view(*cx), m, top_it);
@@ -43667,7 +44008,7 @@ fn extract_future_bound_output_ty(cx: mut_view<TypeckCtx>, b: *const HirType) ->
         let ga: *mut HirGenericArg = unsafe { (*hga).args };
         let gty: *mut HirType = unsafe { (*ga).ty };
         if (gty as usize) != 0 {
-            return hir_type_to_typeid(mut_view(*cx), gty);
+            return tc_bound_arg_typeid(mut_view(*cx), gty);
         }
     }
     (TypeId { v: unit_v })
@@ -43861,10 +44202,23 @@ fn fn_item_has_any_future_bound(cx: view<TypeckCtx>, fn_def: *const HirItem) -> 
     false
 }
 
+fn tc_enter_callee_bound_scope(cx: mut_view<TypeckCtx>, fn_def: *const HirItem) {
+    let enc_impl = tc_fn_enclosing_impl(cx.hir, fn_def);
+    cx.current_fn = fn_def;
+    cx.current_impl = enc_impl;
+    if (enc_impl as usize) != 0 && (unsafe { (*enc_impl).kind }) == HIR_ITEM_IMPL {
+        let st = unsafe { thir_get_item_type(view(*cx.thir), enc_impl) };
+        cx.self_ty.v = st.v;
+    } else {
+        cx.self_ty.v = 0u32;
+    }
+}
+
 fn check_future_bound_outputs_for_call(
     cx: mut_view<TypeckCtx>,
     fn_def: *const HirItem,
     substs: *const GenericArgsSlice,
+    callee_self_v: u32,
     call_span: Span
 ) {
     if (fn_def as usize) == 0 || (substs as usize) == 0 {
@@ -43879,6 +44233,10 @@ fn check_future_bound_outputs_for_call(
     if (gps as usize) == 0 || !fn_item_has_any_future_bound(view(*cx), fn_def) {
         return;
     }
+    let enc_impl = tc_fn_enclosing_impl(cx.hir, fn_def);
+    let impl_n = if (enc_impl as usize) != 0 { tc_item_generic_count(enc_impl) } else { 0 };
+    let own_n = tc_item_generic_count(fn_def);
+    let base_offset = if cnt == impl_n + own_n { impl_n } else { 0 };
     // T448 (T422 FU-D): the type arguments belong to the caller. When one is a generic parameter of the
     // caller (`F` with `F: Future<Output = i64>`), its output comes from the caller's bounds, so resolve every
     // argument's `Future` output before switching to the callee's generic scope below.
@@ -43893,31 +44251,20 @@ fn check_future_bound_outputs_for_call(
     }
     let save_fn = cx.current_fn;
     let save_impl = cx.current_impl;
-    let mut dummy_cnt: usize = 0;
-    let _ = build_item_generic_param_args(mut_view(*cx), fn_def, mut_view(dummy_cnt));
-    cx.current_fn = fn_def;
-    // The callee's parameters are numbered from 0 in `substs` (a free function, or a method of an impl without
-    // generics); the caller's generic impl must not shift them (`impl_n + i`) while its bounds are read.
-    if tc_enclosing_impl_generic_count(cx.hir, fn_def) == 0 {
-        cx.current_impl = 0 as *const HirItem;
-    }
+    let save_self_v = cx.self_ty.v;
+    tc_enter_callee_bound_scope(mut_view(*cx), fn_def);
 
-    let mut idx: usize = 0;
+    let mut m_idx: usize = 0;
     let mut gp: *mut HirGenericParam = unsafe { (*gps).params };
-    while ((gp as usize) != 0) && idx < cnt {
-        let actual_out = TypeId { v: unsafe { (*typeid_at(outs, idx)).v } };
+    while ((gp as usize) != 0) && m_idx < own_n && (base_offset + m_idx) < cnt {
+        let actual_out = TypeId { v: unsafe { (*typeid_at(outs, base_offset + m_idx)).v } };
         if actual_out.v != 0u32 {
             let mut b: *mut HirType = unsafe { (*gp).bounds };
             while ((b as usize) != 0) {
                 if tc_bound_is_future(view(*cx), b) && ((unsafe { (*b).path.generic_args }) as usize) != 0 {
                     let raw_exp = extract_future_bound_output_ty(mut_view(*cx), b);
                     let exp_out = unsafe {
-                        subst_ty_with_vars(
-                            mut_view((*cx.thir).interner),
-                            mut_view(cx.type_vars),
-                            raw_exp,
-                            view(*substs)
-                        )
+                        tc_subst_ty_and_self(mut_view(*cx), raw_exp, view(*substs), callee_self_v)
                     };
                     let _ = coerce(mut_view(*cx), (TypeId { v: actual_out.v }), exp_out, view(call_span));
                 }
@@ -43938,12 +44285,7 @@ fn check_future_bound_outputs_for_call(
                                 if tc_bound_is_future(view(*cx), wb) && ((unsafe { (*wb).path.generic_args }) as usize) != 0 {
                                     let raw_exp2 = extract_future_bound_output_ty(mut_view(*cx), wb);
                                     let exp_out2 = unsafe {
-                                        subst_ty_with_vars(
-                                            mut_view((*cx.thir).interner),
-                                            mut_view(cx.type_vars),
-                                            raw_exp2,
-                                            view(*substs)
-                                        )
+                                        tc_subst_ty_and_self(mut_view(*cx), raw_exp2, view(*substs), callee_self_v)
                                     };
                                     let _ = coerce(mut_view(*cx), (TypeId { v: actual_out.v }), exp_out2, view(call_span));
                                 }
@@ -43955,32 +44297,29 @@ fn check_future_bound_outputs_for_call(
                 }
             }
         }
-        idx = idx + 1;
+        m_idx = m_idx + 1;
         gp = unsafe { (*gp).next };
     }
 
     cx.current_fn = save_fn;
     cx.current_impl = save_impl;
-    if (save_fn as usize) != 0 {
-        let mut restore_cnt: usize = 0;
-        let _ = build_item_generic_param_args(mut_view(*cx), save_fn, mut_view(restore_cnt));
-    }
+    cx.self_ty.v = save_self_v;
 }
 
-fn tc_bound_is_callable(cx: view<TypeckCtx>, b: *const HirType) -> bool {
+fn tc_bound_base_name_sv(cx: view<TypeckCtx>, b: *const HirType) -> StrView {
     if (b as usize) == 0 || (unsafe { (*b).kind }) != HIR_TYPE_PATH {
-        return false;
+        return StrView { ptr: 0 as *const u8, len: 0 };
     }
     let raw_bname = unsafe { tc_path_name_sv(cx, view((*b).path)) };
     if raw_bname.len == 0 || (raw_bname.ptr as usize) == 0 {
-        return false;
+        return StrView { ptr: 0 as *const u8, len: 0 };
     }
     let mut start: usize = 0;
     let mut end: usize = raw_bname.len;
     let mut k: usize = 0;
     while k < raw_bname.len {
         let ch = unsafe { *(raw_bname.ptr + k) };
-        if ch == 60u8 {
+        if ch == 60u8 || ch == 32u8 {
             end = k;
             break;
         }
@@ -43990,13 +44329,62 @@ fn tc_bound_is_callable(cx: view<TypeckCtx>, b: *const HirType) -> bool {
         k = k + 1;
     }
     if end <= start {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    StrView { ptr: unsafe { raw_bname.ptr + start }, len: end - start }
+}
+
+fn tc_bound_is_callable(cx: view<TypeckCtx>, b: *const HirType) -> bool {
+    let bname = tc_bound_base_name_sv(cx, b);
+    if bname.len == 0 {
         return false;
     }
-    let bname = StrView { ptr: unsafe { raw_bname.ptr + start }, len: end - start };
     tc_sv_is_2(view(bname), 70u8, 110u8) ||
     tc_sv_is_5(view(bname), 70u8, 110u8, 77u8, 117u8, 116u8) ||
     tc_sv_is_6(view(bname), 70u8, 110u8, 79u8, 110u8, 99u8, 101u8) ||
     tc_sv_is_8(view(bname), 67u8, 97u8, 108u8, 108u8, 97u8, 98u8, 108u8, 101u8)
+}
+
+fn tc_find_callable_bound_in_where(
+    cx: view<TypeckCtx>,
+    item: *const HirItem,
+    actual_sym_v: u32,
+    actual_name_v: u32
+) -> *const HirType {
+    if (item as usize) == 0 {
+        return 0 as *const HirType;
+    }
+    let wc: *mut HirWhereClause = unsafe { (*item).where_clause };
+    if (wc as usize) == 0 {
+        return 0 as *const HirType;
+    }
+    let p_sv = if (cx.str_in as usize) != 0 && actual_name_v != 0u32 {
+        unsafe { interner_get(view(*cx.str_in), (StrId { v: actual_name_v })) }
+    } else {
+        StrView { ptr: 0 as *const u8, len: 0 }
+    };
+    let mut wp: *mut HirWherePred = unsafe { (*wc).preds };
+    while ((wp as usize) != 0) {
+        let wty: *mut HirType = unsafe { (*wp).ty };
+        if (wty as usize) != 0 && (unsafe { (*wty).kind }) == HIR_TYPE_PATH &&
+           ((unsafe { (*wty).path.generic_args }) as usize) == 0 {
+            let wsym_v = unsafe { (*wty).path.symbol.v };
+            let wname = unsafe { tc_path_name_sv(cx, view((*wty).path)) };
+            let matched = (actual_sym_v != 0u32 && wsym_v == actual_sym_v) ||
+                          (p_sv.len > 0 && sv_eq(view(wname), view(p_sv)));
+            if matched {
+                let mut wb: *mut HirType = unsafe { (*wp).bounds };
+                while ((wb as usize) != 0) {
+                    if tc_bound_is_callable(cx, wb) {
+                        return wb;
+                    }
+                    wb = unsafe { (*wb).next };
+                }
+            }
+        }
+        wp = unsafe { (*wp).next };
+    }
+    0 as *const HirType
 }
 
 fn tc_find_callable_bound_in_item(
@@ -44010,58 +44398,46 @@ fn tc_find_callable_bound_in_item(
     }
     let mut actual_name_v: u32 = p_name_v;
     let mut actual_sym_v: u32 = 0u32;
+    let mut target_gp: *mut HirGenericParam = 0 as *mut HirGenericParam;
     let gps: *mut HirGenericParams = unsafe { (*item).generic_params };
     if (gps as usize) != 0 {
         let mut idx: usize = 0;
         let mut gp: *mut HirGenericParam = unsafe { (*gps).params };
         while ((gp as usize) != 0) {
-            let gname_v = unsafe { (*gp).name.v };
             if idx == p_idx {
-                if gname_v != 0u32 { actual_name_v = gname_v; }
-                actual_sym_v = unsafe { (*gp).symbol.v };
-            }
-            if idx == p_idx || (gname_v != 0u32 && gname_v == p_name_v) {
-                let mut b: *mut HirType = unsafe { (*gp).bounds };
-                while ((b as usize) != 0) {
-                    if tc_bound_is_callable(cx, b) {
-                        return b;
-                    }
-                    b = unsafe { (*b).next };
-                }
+                target_gp = gp;
+                break;
             }
             idx = idx + 1;
             gp = unsafe { (*gp).next };
         }
-    }
-    let wc: *mut HirWhereClause = unsafe { (*item).where_clause };
-    if (wc as usize) != 0 {
-        let p_sv = if (cx.str_in as usize) != 0 && actual_name_v != 0u32 {
-            unsafe { interner_get(view(*cx.str_in), (StrId { v: actual_name_v })) }
-        } else {
-            StrView { ptr: 0 as *const u8, len: 0 }
-        };
-        let mut wp: *mut HirWherePred = unsafe { (*wc).preds };
-        while ((wp as usize) != 0) {
-            let wty: *mut HirType = unsafe { (*wp).ty };
-            if (wty as usize) != 0 && (unsafe { (*wty).kind }) == HIR_TYPE_PATH {
-                let wsym_v = unsafe { (*wty).path.symbol.v };
-                let wname = unsafe { tc_path_name_sv(cx, view((*wty).path)) };
-                let matched = (actual_sym_v != 0u32 && wsym_v == actual_sym_v) ||
-                              (p_sv.len > 0 && sv_eq(view(wname), view(p_sv)));
-                if matched {
-                    let mut wb: *mut HirType = unsafe { (*wp).bounds };
-                    while ((wb as usize) != 0) {
-                        if tc_bound_is_callable(cx, wb) {
-                            return wb;
-                        }
-                        wb = unsafe { (*wb).next };
-                    }
+        if (target_gp as usize) == 0 && p_name_v != 0u32 {
+            gp = unsafe { (*gps).params };
+            while ((gp as usize) != 0) {
+                let gname_v = unsafe { (*gp).name.v };
+                if gname_v != 0u32 && gname_v == p_name_v {
+                    target_gp = gp;
+                    break;
                 }
+                gp = unsafe { (*gp).next };
             }
-            wp = unsafe { (*wp).next };
+        }
+        if (target_gp as usize) != 0 {
+            let gname_v = unsafe { (*target_gp).name.v };
+            if gname_v != 0u32 {
+                actual_name_v = gname_v;
+            }
+            actual_sym_v = unsafe { (*target_gp).symbol.v };
+            let mut b: *mut HirType = unsafe { (*target_gp).bounds };
+            while ((b as usize) != 0) {
+                if tc_bound_is_callable(cx, b) {
+                    return b;
+                }
+                b = unsafe { (*b).next };
+            }
         }
     }
-    0 as *const HirType
+    tc_find_callable_bound_in_where(cx, item, actual_sym_v, actual_name_v)
 }
 
 fn fn_item_has_any_callable_bound_with_args(cx: view<TypeckCtx>, fn_def: *const HirItem) -> bool {
@@ -44103,6 +44479,7 @@ fn tc_callable_bound_to_subst_fn_ty(
     cx: mut_view<TypeckCtx>,
     fn_def: *const HirItem,
     substs: *const GenericArgsSlice,
+    callee_self_v: u32,
     cb: *const HirType
 ) -> TypeId {
     if (cb as usize) == 0 || (substs as usize) == 0 {
@@ -44122,9 +44499,9 @@ fn tc_callable_bound_to_subst_fn_ty(
         return (TypeId { v: 0u32 });
     }
     let save_fn = cx.current_fn;
-    let mut dummy_cnt: usize = 0;
-    let _ = build_item_generic_param_args(mut_view(*cx), fn_def, mut_view(dummy_cnt));
-    cx.current_fn = fn_def;
+    let save_impl = cx.current_impl;
+    let save_self_v = cx.self_ty.v;
+    tc_enter_callee_bound_scope(mut_view(*cx), fn_def);
 
     let pcount = gcount - 1;
     let mut ptypes: *mut TypeId = 0 as *mut TypeId;
@@ -44137,14 +44514,9 @@ fn tc_callable_bound_to_subst_fn_ty(
     ga = unsafe { (*hga).args };
     while ((ga as usize) != 0) {
         let gty: *mut HirType = unsafe { (*ga).ty };
-        let raw_t = if (gty as usize) != 0 { hir_type_to_typeid(mut_view(*cx), gty) } else { TypeId { v: ret_ty.v } };
+        let raw_t = if (gty as usize) != 0 { tc_bound_arg_typeid(mut_view(*cx), gty) } else { TypeId { v: ret_ty.v } };
         let sub_t = unsafe {
-            subst_ty_with_vars(
-                mut_view((*cx.thir).interner),
-                mut_view(cx.type_vars),
-                raw_t,
-                view(*substs)
-            )
+            tc_subst_ty_and_self(mut_view(*cx), raw_t, view(*substs), callee_self_v)
         };
         if j < pcount {
             let dst = unsafe { typeid_at(ptypes, j) };
@@ -44157,14 +44529,8 @@ fn tc_callable_bound_to_subst_fn_ty(
     }
 
     cx.current_fn = save_fn;
-    if (cx.current_impl as usize) != 0 {
-        let mut r_impl: usize = 0;
-        let _ = build_item_generic_param_args(mut_view(*cx), cx.current_impl, mut_view(r_impl));
-    }
-    if (save_fn as usize) != 0 {
-        let mut r_fn: usize = 0;
-        let _ = build_item_generic_param_args(mut_view(*cx), save_fn, mut_view(r_fn));
-    }
+    cx.current_impl = save_impl;
+    cx.self_ty.v = save_self_v;
     unsafe { intern_fn_ty(mut_view((*cx.thir).interner), false, (StrId { v: 0u32 }), ptypes, pcount, (TypeId { v: ret_ty.v })) }
 }
 
@@ -44172,6 +44538,7 @@ fn tc_build_callable_hint_ty(
     cx: mut_view<TypeckCtx>,
     fn_def: *const HirItem,
     substs: *const GenericArgsSlice,
+    callee_self_v: u32,
     param_ty: TypeId
 ) -> TypeId {
     if (fn_def as usize) == 0 || (substs as usize) == 0 || !fn_item_has_any_callable_bound_with_args(view(*cx), fn_def) {
@@ -44180,16 +44547,20 @@ fn tc_build_callable_hint_ty(
     let r_param = resolve_ty(mut_view(*cx), param_ty);
     let cnt = unsafe { (*substs).count };
     let args = unsafe { (*substs).args };
-    let mut idx: usize = 0;
-    while idx < cnt {
-        let g_var = resolve_ty(mut_view(*cx), unsafe { *typeid_at(args, idx) });
+    let enc_impl = tc_fn_enclosing_impl(cx.hir, fn_def);
+    let impl_n = if (enc_impl as usize) != 0 { tc_item_generic_count(enc_impl) } else { 0 };
+    let own_n = tc_item_generic_count(fn_def);
+    let base_offset = if cnt == impl_n + own_n { impl_n } else { 0 };
+    let mut m_idx: usize = 0;
+    while m_idx < own_n && (base_offset + m_idx) < cnt {
+        let g_var = resolve_ty(mut_view(*cx), unsafe { *typeid_at(args, base_offset + m_idx) });
         if g_var.v == r_param.v {
-            let cb = tc_find_callable_bound_in_item(view(*cx), fn_def, idx, 0u32);
+            let cb = tc_find_callable_bound_in_item(view(*cx), fn_def, m_idx, 0u32);
             if (cb as usize) != 0 {
-                return tc_callable_bound_to_subst_fn_ty(mut_view(*cx), fn_def, substs, cb);
+                return tc_callable_bound_to_subst_fn_ty(mut_view(*cx), fn_def, substs, callee_self_v, cb);
             }
         }
-        idx = idx + 1;
+        m_idx = m_idx + 1;
     }
     (TypeId { v: 0u32 })
 }
@@ -44198,6 +44569,7 @@ fn check_callable_bound_outputs_for_call(
     cx: mut_view<TypeckCtx>,
     fn_def: *const HirItem,
     substs: *const GenericArgsSlice,
+    callee_self_v: u32,
     call_span: Span
 ) {
     if (fn_def as usize) == 0 || (substs as usize) == 0 || !fn_item_has_any_callable_bound_with_args(view(*cx), fn_def) {
@@ -44205,25 +44577,34 @@ fn check_callable_bound_outputs_for_call(
     }
     let cnt = unsafe { (*substs).count };
     let args = unsafe { (*substs).args };
-    let mut idx: usize = 0;
-    while idx < cnt {
-        let arg_ty = resolve_ty(mut_view(*cx), unsafe { *typeid_at(args, idx) });
+    let enc_impl = tc_fn_enclosing_impl(cx.hir, fn_def);
+    let impl_n = if (enc_impl as usize) != 0 { tc_item_generic_count(enc_impl) } else { 0 };
+    let own_n = tc_item_generic_count(fn_def);
+    let base_offset = if cnt == impl_n + own_n { impl_n } else { 0 };
+    let mut m_idx: usize = 0;
+    while m_idx < own_n && (base_offset + m_idx) < cnt {
+        let arg_ty = resolve_ty(mut_view(*cx), unsafe { *typeid_at(args, base_offset + m_idx) });
         let at = unsafe { type_get(view((*cx.thir).interner), arg_ty) };
         if (at as usize) != 0 && (unsafe { (*at).kind == TY_CLOSURE || (*at).kind == TY_FN }) {
-            let cb = tc_find_callable_bound_in_item(view(*cx), fn_def, idx, 0u32);
+            let cb = tc_find_callable_bound_in_item(view(*cx), fn_def, m_idx, 0u32);
             if (cb as usize) != 0 {
-                let sig_ty = tc_callable_bound_to_subst_fn_ty(mut_view(*cx), fn_def, substs, cb);
+                let sig_ty = tc_callable_bound_to_subst_fn_ty(mut_view(*cx), fn_def, substs, callee_self_v, cb);
                 let st = unsafe { type_get(view((*cx.thir).interner), sig_ty) };
                 if (st as usize) != 0 && unsafe { (*st).kind == TY_FN } {
                     let act_pcnt = unsafe { (*at).param_count };
                     let exp_pcnt = unsafe { (*st).param_count };
-                    let min_p = if act_pcnt < exp_pcnt { act_pcnt } else { exp_pcnt };
-                    let mut p: usize = 0;
-                    while p < min_p {
-                        let ap = unsafe { *typeid_at((*at).param_types, p) };
-                        let ep = unsafe { *typeid_at((*st).param_types, p) };
-                        let _ = unify_ty(mut_view(*cx), ap, ep);
-                        p = p + 1;
+                    if act_pcnt != exp_pcnt {
+                        let _ = type_error(mut_view(*cx), view(call_span), AX_TYPE_MISMATCH);
+                    } else {
+                        let mut p: usize = 0;
+                        while p < exp_pcnt {
+                            let ap = resolve_ty(mut_view(*cx), unsafe { *typeid_at((*at).param_types, p) });
+                            let ep = resolve_ty(mut_view(*cx), unsafe { *typeid_at((*st).param_types, p) });
+                            if ap.v != 0u32 && ep.v != 0u32 {
+                                let _ = coerce(mut_view(*cx), ap, ep, view(call_span));
+                            }
+                            p = p + 1;
+                        }
                     }
                     let act_ret = resolve_ty(mut_view(*cx), unsafe { (*at).ret_type });
                     let exp_ret = resolve_ty(mut_view(*cx), unsafe { (*st).ret_type });
@@ -44233,7 +44614,663 @@ fn check_callable_bound_outputs_for_call(
                 }
             }
         }
-        idx = idx + 1;
+        m_idx = m_idx + 1;
+    }
+}
+
+fn tc_bound_matches_trait_item(cx: view<TypeckCtx>, b: *const HirType, trait_it: *const HirItem) -> bool {
+    if (b as usize) == 0 || (trait_it as usize) == 0 || (unsafe { (*b).kind }) != HIR_TYPE_PATH {
+        return false;
+    }
+    let bsym = unsafe { (*b).path.symbol.v };
+    let tsym = unsafe { (*trait_it).symbol.v };
+    if bsym != 0u32 && tsym != 0u32 && bsym == tsym {
+        return true;
+    }
+    if (cx.str_in as usize) == 0 {
+        return false;
+    }
+    let tname_id = unsafe { (*trait_it).name.v };
+    if tname_id == 0u32 {
+        return false;
+    }
+    let tname = unsafe { interner_get(view(*cx.str_in), (StrId { v: tname_id })) };
+    let bname = tc_bound_base_name_sv(cx, b);
+    bname.len > 0 && sv_eq(view(bname), view(tname))
+}
+
+fn tc_find_trait_bound_in_item(
+    cx: view<TypeckCtx>,
+    item: *const HirItem,
+    p_idx: usize,
+    p_name_v: u32,
+    trait_it: *const HirItem
+) -> *const HirType {
+    if (item as usize) == 0 || (trait_it as usize) == 0 {
+        return 0 as *const HirType;
+    }
+    let mut actual_name_v: u32 = p_name_v;
+    let mut actual_sym_v: u32 = 0u32;
+    let mut target_gp: *mut HirGenericParam = 0 as *mut HirGenericParam;
+    let gps: *mut HirGenericParams = unsafe { (*item).generic_params };
+    if (gps as usize) != 0 {
+        let mut idx: usize = 0;
+        let mut gp: *mut HirGenericParam = unsafe { (*gps).params };
+        while ((gp as usize) != 0) {
+            if idx == p_idx {
+                target_gp = gp;
+                break;
+            }
+            idx = idx + 1;
+            gp = unsafe { (*gp).next };
+        }
+        if (target_gp as usize) == 0 && p_name_v != 0u32 {
+            gp = unsafe { (*gps).params };
+            while ((gp as usize) != 0) {
+                let gname_v = unsafe { (*gp).name.v };
+                if gname_v != 0u32 && gname_v == p_name_v {
+                    target_gp = gp;
+                    break;
+                }
+                gp = unsafe { (*gp).next };
+            }
+        }
+        if (target_gp as usize) != 0 {
+            let gname_v = unsafe { (*target_gp).name.v };
+            if gname_v != 0u32 {
+                actual_name_v = gname_v;
+            }
+            actual_sym_v = unsafe { (*target_gp).symbol.v };
+            let mut b: *mut HirType = unsafe { (*target_gp).bounds };
+            while ((b as usize) != 0) {
+                if tc_bound_matches_trait_item(cx, b, trait_it) {
+                    return b;
+                }
+                b = unsafe { (*b).next };
+            }
+        }
+    }
+    let wc: *mut HirWhereClause = unsafe { (*item).where_clause };
+    if (wc as usize) != 0 {
+        let p_sv = if (cx.str_in as usize) != 0 && actual_name_v != 0u32 {
+            unsafe { interner_get(view(*cx.str_in), (StrId { v: actual_name_v })) }
+        } else {
+            StrView { ptr: 0 as *const u8, len: 0 }
+        };
+        let mut wp: *mut HirWherePred = unsafe { (*wc).preds };
+        while ((wp as usize) != 0) {
+            let wty: *mut HirType = unsafe { (*wp).ty };
+            if (wty as usize) != 0 && (unsafe { (*wty).kind }) == HIR_TYPE_PATH &&
+               ((unsafe { (*wty).path.generic_args }) as usize) == 0 {
+                let wsym_v = unsafe { (*wty).path.symbol.v };
+                let wname = unsafe { tc_path_name_sv(cx, view((*wty).path)) };
+                let matched = (actual_sym_v != 0u32 && wsym_v == actual_sym_v) ||
+                              (p_sv.len > 0 && sv_eq(view(wname), view(p_sv)));
+                if matched {
+                    let mut wb: *mut HirType = unsafe { (*wp).bounds };
+                    while ((wb as usize) != 0) {
+                        if tc_bound_matches_trait_item(cx, wb, trait_it) {
+                            return wb;
+                        }
+                        wb = unsafe { (*wb).next };
+                    }
+                }
+            }
+            wp = unsafe { (*wp).next };
+        }
+    }
+    0 as *const HirType
+}
+
+fn tc_extract_param_trait_args(
+    cx: mut_view<TypeckCtx>,
+    param_t: *const AxType,
+    trait_it: *const HirItem,
+    trait_n: usize,
+    sp: view<Span>
+) -> GenericArgsSlice {
+    let bytes = mul_usize(trait_n, size_of<TypeId>());
+    let arr = unsafe { arena_alloc_raw(mut_view((*cx.thir).interner.arena), bytes, align_of<TypeId>()) as *mut TypeId };
+    let mut i: usize = 0;
+    while i < trait_n {
+        unsafe { (*typeid_at(arr, i)).v = 0u32; }
+        i = i + 1;
+    }
+    if (param_t as usize) != 0 {
+        let p_idx = unsafe { (*param_t).param_index as usize };
+        let p_name_v = unsafe { (*param_t).name.v };
+        let impl_n = if (cx.current_impl as usize) != 0 && (cx.current_fn as usize) != (cx.current_impl as usize) {
+            tc_item_generic_count(cx.current_impl)
+        } else {
+            0
+        };
+        let mut tb: *const HirType = 0 as *const HirType;
+        if (cx.current_fn as usize) != 0 && p_idx >= impl_n {
+            tb = tc_find_trait_bound_in_item(view(*cx), cx.current_fn, p_idx - impl_n, p_name_v, trait_it);
+        }
+        if (tb as usize) == 0 && (cx.current_impl as usize) != 0 && p_idx < impl_n {
+            if (cx.current_fn as usize) != 0 && (cx.current_fn as usize) != (cx.current_impl as usize) {
+                tb = tc_find_trait_bound_in_item(view(*cx), cx.current_fn, 0xFFFFFFFFusize, p_name_v, trait_it);
+            }
+            if (tb as usize) == 0 {
+                tb = tc_find_trait_bound_in_item(view(*cx), cx.current_impl, p_idx, p_name_v, trait_it);
+            }
+        }
+        if (tb as usize) != 0 {
+            let hga: *mut HirGenericArgs = unsafe { (*tb).path.generic_args };
+            if (hga as usize) != 0 {
+                let mut ga: *mut HirGenericArg = unsafe { (*hga).args };
+                let mut k: usize = 0;
+                while (ga as usize) != 0 && k < trait_n {
+                    if (unsafe { (*ga).name.v }) == 0u32 {
+                        let gty: *mut HirType = unsafe { (*ga).ty };
+                        if (gty as usize) != 0 {
+                            let tid = tc_bound_arg_typeid(mut_view(*cx), gty);
+                            unsafe { (*typeid_at(arr, k)).v = tid.v; }
+                        }
+                        k = k + 1;
+                    }
+                    ga = unsafe { (*ga).next };
+                }
+            }
+        }
+    }
+    i = 0;
+    while i < trait_n {
+        if (unsafe { (*typeid_at(arr, i)).v }) == 0u32 {
+            let tv = new_ty_var(mut_view(*cx), sp);
+            unsafe { (*typeid_at(arr, i)).v = tv.v; }
+        }
+        i = i + 1;
+    }
+    GenericArgsSlice { args: arr, count: trait_n }
+}
+
+fn tc_impl_self_is_identity_params(cx: view<TypeckCtx>, impl_self_ty: TypeId, impl_n: usize) -> bool {
+    if impl_self_ty.v == 0u32 || impl_n == 0 {
+        return false;
+    }
+    let st = unsafe { type_get(view((*cx.thir).interner), impl_self_ty) };
+    if (st as usize) == 0 {
+        return false;
+    }
+    let sk = unsafe { (*st).kind };
+    if (sk != TY_STRUCT && sk != TY_ENUM) || (unsafe { (*st).arg_count }) != impl_n || ((unsafe { (*st).args }) as usize) == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < impl_n {
+        let a_id = unsafe { *typeid_at((*st).args, i) };
+        let a_t = unsafe { type_get(view((*cx.thir).interner), a_id) };
+        if (a_t as usize) == 0 || (unsafe { (*a_t).kind }) != TY_PARAM || (unsafe { (*a_t).param_index as usize }) != i {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn tc_build_method_call_comb_substs(
+    cx: mut_view<TypeckCtx>,
+    expr: *const HirExpr,
+    enc_impl: *const HirItem,
+    impl_n: usize,
+    receiver_ty: TypeId,
+    base_ty: TypeId,
+    base_t: *mut AxType,
+    method_args: *mut TypeId,
+    method_argc: usize
+) -> *mut GenericArgsSlice {
+    let tot_cnt = impl_n + method_argc;
+    let tot_bytes = mul_usize(tot_cnt, size_of<TypeId>());
+    let comb_arr = unsafe { arena_alloc_raw(mut_view((*cx.thir).interner.arena), tot_bytes, align_of<TypeId>()) as *mut TypeId };
+    let recv_ac = if (base_t as usize) != 0 { unsafe { (*base_t).arg_count } } else { 0 };
+    let recv_args = if (base_t as usize) != 0 { unsafe { (*base_t).args } } else { 0 as *mut TypeId };
+    if (enc_impl as usize) != 0 && (unsafe { (*enc_impl).kind }) == HIR_ITEM_IMPL {
+        let impl_self_ty = unsafe { thir_get_item_type(view(*cx.thir), enc_impl) };
+        if tc_impl_self_is_identity_params(view(*cx), (TypeId { v: impl_self_ty.v }), impl_n) && recv_ac == impl_n && (recv_args as usize) != 0 {
+            let mut ii: usize = 0;
+            while ii < impl_n {
+                unsafe { (*typeid_at(comb_arr, ii)).v = (*typeid_at(recv_args, ii)).v; }
+                ii = ii + 1;
+            }
+        } else {
+            let mut ii: usize = 0;
+            while ii < impl_n {
+                let tv = unsafe { new_ty_var(mut_view(*cx), view((*expr).span)) };
+                unsafe { (*typeid_at(comb_arr, ii)).v = tv.v; }
+                ii = ii + 1;
+            }
+            if impl_self_ty.v != 0u32 && !is_error(mut_view(*cx), (TypeId { v: impl_self_ty.v })) {
+                let imp_only = GenericArgsSlice { args: comb_arr, count: impl_n };
+                let sub_self = unsafe {
+                    subst_ty_with_vars(mut_view((*cx.thir).interner), mut_view(cx.type_vars), (TypeId { v: impl_self_ty.v }), view(imp_only))
+                };
+                let sub_self_t = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: sub_self.v })) };
+                let r_recv = resolve_ty(mut_view(*cx), (TypeId { v: receiver_ty.v }));
+                let r_recv_t = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: r_recv.v })) };
+                if (sub_self_t as usize) != 0 {
+                    let ssk = unsafe { (*sub_self_t).kind };
+                    let rrk = if (r_recv_t as usize) != 0 { unsafe { (*r_recv_t).kind } } else { 0u8 };
+                    if (ssk == TY_VIEW || ssk == TY_MUT_VIEW || ssk == TY_PTR) && ssk == rrk {
+                        let _ = unify_ty(mut_view(*cx), (TypeId { v: sub_self.v }), (TypeId { v: r_recv.v }));
+                    } else if ssk == TY_VIEW || ssk == TY_MUT_VIEW || ssk == TY_PTR {
+                        let spt_v = unsafe { (*sub_self_t).pointee.v };
+                        let _ = unify_ty(mut_view(*cx), (TypeId { v: spt_v }), (TypeId { v: base_ty.v }));
+                    } else {
+                        let _ = unify_ty(mut_view(*cx), (TypeId { v: sub_self.v }), (TypeId { v: base_ty.v }));
+                    }
+                }
+            }
+        }
+    } else if (enc_impl as usize) != 0 && (unsafe { (*enc_impl).kind }) == HIR_ITEM_TRAIT &&
+              (base_t as usize) != 0 && (unsafe { (*base_t).kind }) == TY_PARAM {
+        let tg = unsafe { tc_extract_param_trait_args(mut_view(*cx), base_t, enc_impl, impl_n, view((*expr).span)) };
+        let mut ii: usize = 0;
+        while ii < impl_n {
+            unsafe { (*typeid_at(comb_arr, ii)).v = (*typeid_at(tg.args, ii)).v; }
+            ii = ii + 1;
+        }
+    } else {
+        let mut ii: usize = 0;
+        while ii < impl_n {
+            let iv = if ii < recv_ac && (recv_args as usize) != 0 {
+                unsafe { (*typeid_at(recv_args, ii)).v }
+            } else {
+                unsafe { new_ty_var(mut_view(*cx), view((*expr).span)).v }
+            };
+            unsafe { (*typeid_at(comb_arr, ii)).v = iv; }
+            ii = ii + 1;
+        }
+    }
+    let mut mi: usize = 0;
+    while mi < method_argc {
+        unsafe { (*typeid_at(comb_arr, impl_n + mi)).v = (*typeid_at(method_args, mi)).v; }
+        mi = mi + 1;
+    }
+    let slice_ptr = unsafe {
+        arena_alloc_raw(mut_view((*cx.thir).interner.arena), size_of<GenericArgsSlice>(), align_of<GenericArgsSlice>()) as *mut GenericArgsSlice
+    };
+    unsafe {
+        (*slice_ptr).args = comb_arr;
+        (*slice_ptr).count = tot_cnt;
+    }
+    slice_ptr
+}
+
+fn tc_bound_is_generic_user_trait(cx: view<TypeckCtx>, b: *const HirType) -> bool {
+    if (b as usize) == 0 || (unsafe { (*b).kind }) != HIR_TYPE_PATH {
+        return false;
+    }
+    let hga: *mut HirGenericArgs = unsafe { (*b).path.generic_args };
+    if (hga as usize) == 0 || ((unsafe { (*hga).args }) as usize) == 0 {
+        return false;
+    }
+    if tc_bound_is_callable(cx, b) || tc_bound_is_future(cx, b) {
+        return false;
+    }
+    let mut ga: *mut HirGenericArg = unsafe { (*hga).args };
+    while (ga as usize) != 0 {
+        if (unsafe { (*ga).name.v }) == 0u32 && ((unsafe { (*ga).ty }) as usize) != 0 {
+            return true;
+        }
+        ga = unsafe { (*ga).next };
+    }
+    false
+}
+
+fn fn_item_has_any_generic_trait_bound(cx: view<TypeckCtx>, fn_def: *const HirItem) -> bool {
+    if (fn_def as usize) == 0 {
+        return false;
+    }
+    let gps: *mut HirGenericParams = unsafe { (*fn_def).generic_params };
+    if (gps as usize) != 0 {
+        let mut gp: *mut HirGenericParam = unsafe { (*gps).params };
+        while (gp as usize) != 0 {
+            let mut b: *mut HirType = unsafe { (*gp).bounds };
+            while (b as usize) != 0 {
+                if tc_bound_is_generic_user_trait(cx, b) {
+                    return true;
+                }
+                b = unsafe { (*b).next };
+            }
+            gp = unsafe { (*gp).next };
+        }
+    }
+    let wc: *mut HirWhereClause = unsafe { (*fn_def).where_clause };
+    if (wc as usize) != 0 {
+        let mut wp: *mut HirWherePred = unsafe { (*wc).preds };
+        while (wp as usize) != 0 {
+            let mut wb: *mut HirType = unsafe { (*wp).bounds };
+            while (wb as usize) != 0 {
+                if tc_bound_is_generic_user_trait(cx, wb) {
+                    return true;
+                }
+                wb = unsafe { (*wb).next };
+            }
+            wp = unsafe { (*wp).next };
+        }
+    }
+    false
+}
+
+fn tc_impl_trait_matches_bound(cx: view<TypeckCtx>, imp_tp: *const HirType, b: *const HirType) -> bool {
+    if (imp_tp as usize) == 0 || (b as usize) == 0 ||
+       (unsafe { (*imp_tp).kind }) != HIR_TYPE_PATH || (unsafe { (*b).kind }) != HIR_TYPE_PATH {
+        return false;
+    }
+    let isym = unsafe { (*imp_tp).path.symbol.v };
+    let bsym = unsafe { (*b).path.symbol.v };
+    if isym != 0u32 && bsym != 0u32 {
+        return isym == bsym;
+    }
+    let iname = tc_bound_base_name_sv(cx, imp_tp);
+    let bname = tc_bound_base_name_sv(cx, b);
+    iname.len > 0 && sv_eq(view(iname), view(bname))
+}
+
+fn tc_check_single_generic_trait_bound(
+    cx: mut_view<TypeckCtx>,
+    fn_def: *const HirItem,
+    substs: *const GenericArgsSlice,
+    callee_self_v: u32,
+    arg_ty: TypeId,
+    b: *const HirType,
+    call_span: Span
+) {
+    let arg_ty_v = arg_ty.v;
+    if !tc_bound_is_generic_user_trait(view(*cx), b) {
+        return;
+    }
+    if !unsafe { satisfies_bound(view(*cx.hir), view(*cx.thir), (TypeId { v: arg_ty_v }), b, view(*cx.str_in), view(*cx.db)) } {
+        return;
+    }
+    let hga: *mut HirGenericArgs = unsafe { (*b).path.generic_args };
+    let mut b_argc: usize = 0;
+    let mut ga: *mut HirGenericArg = unsafe { (*hga).args };
+    while (ga as usize) != 0 {
+        if (unsafe { (*ga).name.v }) == 0u32 && ((unsafe { (*ga).ty }) as usize) != 0 {
+            b_argc = b_argc + 1;
+        }
+        ga = unsafe { (*ga).next };
+    }
+    if b_argc == 0 {
+        return;
+    }
+    let ebytes = mul_usize(b_argc, size_of<TypeId>());
+    let exp_args = unsafe { arena_alloc_raw(mut_view((*cx.thir).interner.arena), ebytes, align_of<TypeId>()) as *mut TypeId };
+    let save_fn = cx.current_fn;
+    let save_impl = cx.current_impl;
+    let save_self_v = cx.self_ty.v;
+    tc_enter_callee_bound_scope(mut_view(*cx), fn_def);
+    let mut k: usize = 0;
+    let mut any_err = false;
+    ga = unsafe { (*hga).args };
+    while (ga as usize) != 0 {
+        if (unsafe { (*ga).name.v }) == 0u32 && ((unsafe { (*ga).ty }) as usize) != 0 {
+            let raw_t = tc_bound_arg_typeid(mut_view(*cx), unsafe { (*ga).ty });
+            let sub_t = unsafe {
+                tc_subst_ty_and_self(mut_view(*cx), raw_t, view(*substs), callee_self_v)
+            };
+            let res_t = resolve_ty(mut_view(*cx), sub_t);
+            let res_t_v = res_t.v;
+            if is_error(mut_view(*cx), (TypeId { v: res_t_v })) {
+                any_err = true;
+            }
+            unsafe { (*typeid_at(exp_args, k)).v = res_t_v; }
+            k = k + 1;
+        }
+        ga = unsafe { (*ga).next };
+    }
+    cx.current_fn = save_fn;
+    cx.current_impl = save_impl;
+    cx.self_ty.v = save_self_v;
+    if any_err {
+        return;
+    }
+
+    let mut cand_count: usize = 0;
+    let mut single_imp: *mut HirItem = 0 as *mut HirItem;
+    let mut it: *mut HirItem = unsafe { (*cx.hir).items };
+    while (it as usize) != 0 {
+        if (unsafe { (*it).kind }) == HIR_ITEM_IMPL && !(unsafe { (*it).is_negative }) {
+            let tp: *mut HirType = unsafe { (*it).trait_path };
+            if tc_impl_trait_matches_bound(view(*cx), tp, b) {
+                if unsafe { type_matches_impl_self_exact(view(*cx.thir), view(*cx.str_in), it, (TypeId { v: arg_ty_v })) } {
+                    cand_count = cand_count + 1;
+                    single_imp = it;
+                }
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+    if cand_count == 0 {
+        return;
+    }
+    if cand_count == 1 {
+        let imp = single_imp;
+        let tp: *mut HirType = unsafe { (*imp).trait_path };
+        let tp_hga: *mut HirGenericArgs = unsafe { (*tp).path.generic_args };
+        if (tp_hga as usize) == 0 {
+            return;
+        }
+        let imp_n = tc_item_generic_count(imp);
+        let mut imp_vars: *mut TypeId = 0 as *mut TypeId;
+        if imp_n > 0 {
+            let ibytes = mul_usize(imp_n, size_of<TypeId>());
+            imp_vars = unsafe { arena_alloc_raw(mut_view((*cx.thir).interner.arena), ibytes, align_of<TypeId>()) as *mut TypeId };
+            let mut ii: usize = 0;
+            while ii < imp_n {
+                let tv_idx = cx.type_vars.len;
+                let tv = new_ty_var(mut_view(*cx), view(call_span));
+                if tv_idx < cx.type_vars.len {
+                    let tve = unsafe { typevar_at(cx.type_vars.items, tv_idx) };
+                    unsafe { (*tve).is_generic = false; }
+                }
+                unsafe { (*typeid_at(imp_vars, ii)).v = tv.v; }
+                ii = ii + 1;
+            }
+            let imp_self_ty = unsafe { thir_get_item_type(view(*cx.thir), imp) };
+            if imp_self_ty.v != 0u32 {
+                let islice = GenericArgsSlice { args: imp_vars, count: imp_n };
+                let sub_iself = unsafe {
+                    subst_ty_with_vars(mut_view((*cx.thir).interner), mut_view(cx.type_vars), imp_self_ty, view(islice))
+                };
+                let _ = unify_ty(mut_view(*cx), sub_iself, (TypeId { v: arg_ty_v }));
+            }
+        }
+        let islice2 = GenericArgsSlice { args: imp_vars, count: imp_n };
+        let s_fn = cx.current_fn;
+        let s_im = cx.current_impl;
+        let s_sf = cx.self_ty.v;
+        cx.current_fn = 0 as *const HirItem;
+        cx.current_impl = imp;
+        cx.self_ty = unsafe { thir_get_item_type(view(*cx.thir), imp) };
+        let mut tga: *mut HirGenericArg = unsafe { (*tp_hga).args };
+        let mut ti: usize = 0;
+        let mut ok = true;
+        while (tga as usize) != 0 && ti < b_argc {
+            if (unsafe { (*tga).name.v }) == 0u32 && ((unsafe { (*tga).ty }) as usize) != 0 {
+                let raw_it = tc_bound_arg_typeid(mut_view(*cx), unsafe { (*tga).ty });
+                let sub_it = if imp_n > 0 {
+                    unsafe { subst_ty_with_vars(mut_view((*cx.thir).interner), mut_view(cx.type_vars), raw_it, view(islice2)) }
+                } else {
+                    raw_it
+                };
+                let exp_k_v = unsafe { (*typeid_at(exp_args, ti)).v };
+                if !unify_ty(mut_view(*cx), sub_it, (TypeId { v: exp_k_v })) {
+                    ok = false;
+                }
+                ti = ti + 1;
+            }
+            tga = unsafe { (*tga).next };
+        }
+        cx.current_fn = s_fn;
+        cx.current_impl = s_im;
+        cx.self_ty.v = s_sf;
+        if !ok {
+            let _ = type_error(mut_view(*cx), view(call_span), AX_TRAIT_UNSATISFIED_BOUND);
+        }
+        return;
+    }
+
+    // Multiple candidate impls of the same generic trait for `arg_ty` (e.g. `impl Into<i64> for X` and
+    // `impl Into<bool> for X`): verify that when expected args are concrete, at least one candidate matches.
+    let mut ki: usize = 0;
+    while ki < b_argc {
+        let ek = resolve_ty(mut_view(*cx), unsafe { *typeid_at(exp_args, ki) });
+        let ek_v = ek.v;
+        let ekt = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: ek_v })) };
+        if (ekt as usize) == 0 {
+            return;
+        }
+        let ekk = unsafe { (*ekt).kind };
+        if ekk == TY_VAR || ekk == TY_INT_VAR || ekk == TY_PARAM || ekk == TY_ERROR {
+            return;
+        }
+        unsafe { (*typeid_at(exp_args, ki)).v = ek_v; }
+        ki = ki + 1;
+    }
+    let mut matched_any = false;
+    it = unsafe { (*cx.hir).items };
+    while (it as usize) != 0 && !matched_any {
+        if (unsafe { (*it).kind }) == HIR_ITEM_IMPL && !(unsafe { (*it).is_negative }) && tc_item_generic_count(it) == 0 {
+            let tp: *mut HirType = unsafe { (*it).trait_path };
+            if tc_impl_trait_matches_bound(view(*cx), tp, b) &&
+               unsafe { type_matches_impl_self_exact(view(*cx.thir), view(*cx.str_in), it, (TypeId { v: arg_ty_v })) } {
+                let tp_hga: *mut HirGenericArgs = unsafe { (*tp).path.generic_args };
+                if (tp_hga as usize) != 0 {
+                    let s_fn2 = cx.current_fn;
+                    let s_im2 = cx.current_impl;
+                    let s_sf2 = cx.self_ty.v;
+                    cx.current_fn = 0 as *const HirItem;
+                    cx.current_impl = it;
+                    cx.self_ty = unsafe { thir_get_item_type(view(*cx.thir), it) };
+                    let mut tga2: *mut HirGenericArg = unsafe { (*tp_hga).args };
+                    let mut ti2: usize = 0;
+                    let mut all_eq = true;
+                    while (tga2 as usize) != 0 && ti2 < b_argc {
+                        if (unsafe { (*tga2).name.v }) == 0u32 && ((unsafe { (*tga2).ty }) as usize) != 0 {
+                            let raw_cand = tc_bound_arg_typeid(mut_view(*cx), unsafe { (*tga2).ty });
+                            let cand_tid = resolve_ty(mut_view(*cx), raw_cand);
+                            let exp_tid_v = unsafe { (*typeid_at(exp_args, ti2)).v };
+                            if cand_tid.v != exp_tid_v {
+                                all_eq = false;
+                            }
+                            ti2 = ti2 + 1;
+                        }
+                        tga2 = unsafe { (*tga2).next };
+                    }
+                    cx.current_fn = s_fn2;
+                    cx.current_impl = s_im2;
+                    cx.self_ty.v = s_sf2;
+                    if all_eq && ti2 == b_argc {
+                        matched_any = true;
+                    }
+                } else {
+                    return;
+                }
+            }
+        } else if (unsafe { (*it).kind }) == HIR_ITEM_IMPL && !(unsafe { (*it).is_negative }) && tc_item_generic_count(it) > 0 {
+            let tp: *mut HirType = unsafe { (*it).trait_path };
+            if tc_impl_trait_matches_bound(view(*cx), tp, b) &&
+               unsafe { type_matches_impl_self_exact(view(*cx.thir), view(*cx.str_in), it, (TypeId { v: arg_ty_v })) } {
+                return;
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+    if !matched_any {
+        let _ = type_error(mut_view(*cx), view(call_span), AX_TRAIT_UNSATISFIED_BOUND);
+    }
+}
+
+fn tc_check_generic_trait_bounds_for_call(
+    cx: mut_view<TypeckCtx>,
+    fn_def: *const HirItem,
+    substs: *const GenericArgsSlice,
+    callee_self_v: u32,
+    call_span: Span
+) {
+    if (fn_def as usize) == 0 || (substs as usize) == 0 ||
+       (cx.hir as usize) == 0 || (cx.str_in as usize) == 0 || (cx.db as usize) == 0 ||
+       !fn_item_has_any_generic_trait_bound(view(*cx), fn_def) {
+        return;
+    }
+    let cs_f = call_span.file.v;
+    let cs_s = call_span.start;
+    let cs_e = call_span.end;
+    let cnt = unsafe { (*substs).count };
+    let args = unsafe { (*substs).args };
+    let gps: *mut HirGenericParams = unsafe { (*fn_def).generic_params };
+    if cnt == 0 || (args as usize) == 0 || (gps as usize) == 0 {
+        return;
+    }
+    let enc_impl = tc_fn_enclosing_impl(cx.hir, fn_def);
+    let impl_n = if (enc_impl as usize) != 0 { tc_item_generic_count(enc_impl) } else { 0 };
+    let own_n = tc_item_generic_count(fn_def);
+    let base_offset = if cnt == impl_n + own_n { impl_n } else { 0 };
+    let mut m_idx: usize = 0;
+    let mut gp: *mut HirGenericParam = unsafe { (*gps).params };
+    while ((gp as usize) != 0) && m_idx < own_n && (base_offset + m_idx) < cnt {
+        let arg_ty = resolve_ty(mut_view(*cx), unsafe { *typeid_at(args, base_offset + m_idx) });
+        let arg_ty_v = arg_ty.v;
+        let at = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: arg_ty_v })) };
+        if (at as usize) != 0 {
+            let ak = unsafe { (*at).kind };
+            if ak != TY_PARAM && ak != TY_VAR && ak != TY_INT_VAR && ak != TY_ERROR {
+                let mut b: *mut HirType = unsafe { (*gp).bounds };
+                while (b as usize) != 0 {
+                    tc_check_single_generic_trait_bound(
+                        mut_view(*cx),
+                        fn_def,
+                        substs,
+                        callee_self_v,
+                        (TypeId { v: arg_ty_v }),
+                        b,
+                        Span { file: (FileId { v: cs_f }), start: cs_s, end: cs_e }
+                    );
+                    b = unsafe { (*b).next };
+                }
+                let wc: *mut HirWhereClause = unsafe { (*fn_def).where_clause };
+                let gname_v = unsafe { (*gp).name.v };
+                let gsym_v = unsafe { (*gp).symbol.v };
+                if (wc as usize) != 0 {
+                    let g_sv = if gname_v != 0u32 {
+                        unsafe { interner_get(view(*cx.str_in), (StrId { v: gname_v })) }
+                    } else {
+                        StrView { ptr: 0 as *const u8, len: 0 }
+                    };
+                    let mut wp: *mut HirWherePred = unsafe { (*wc).preds };
+                    while (wp as usize) != 0 {
+                        let wty: *mut HirType = unsafe { (*wp).ty };
+                        if (wty as usize) != 0 && (unsafe { (*wty).kind }) == HIR_TYPE_PATH &&
+                           ((unsafe { (*wty).path.generic_args }) as usize) == 0 {
+                            let wsym_v = unsafe { (*wty).path.symbol.v };
+                            let wname = unsafe { tc_path_name_sv(view(*cx), view((*wty).path)) };
+                            if (gsym_v != 0u32 && wsym_v == gsym_v) || (g_sv.len > 0 && sv_eq(view(wname), view(g_sv))) {
+                                let mut wb: *mut HirType = unsafe { (*wp).bounds };
+                                while (wb as usize) != 0 {
+                                    tc_check_single_generic_trait_bound(
+                                        mut_view(*cx),
+                                        fn_def,
+                                        substs,
+                                        callee_self_v,
+                                        (TypeId { v: arg_ty_v }),
+                                        wb,
+                                        Span { file: (FileId { v: cs_f }), start: cs_s, end: cs_e }
+                                    );
+                                    wb = unsafe { (*wb).next };
+                                }
+                            }
+                        }
+                        wp = unsafe { (*wp).next };
+                    }
+                }
+            }
+        }
+        m_idx = m_idx + 1;
+        gp = unsafe { (*gp).next };
     }
 }
 
