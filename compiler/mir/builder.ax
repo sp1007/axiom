@@ -160,6 +160,9 @@ use compiler.types.types.const_val_int_hi
 use compiler.types.types.TY_ARRAY
 use compiler.types.types.TY_BOOL
 use compiler.types.types.TY_BUILTIN_ADDRESS_OF
+use compiler.types.types.TY_BUILTIN_FN_ADDR
+use compiler.types.types.TY_BUILTIN_STATIC_ADDR
+use compiler.types.types.TY_BUILTIN_ADDR_OF
 use compiler.types.types.TY_BUILTIN_ADDRESS_OF_MUT
 use compiler.types.types.TY_BUILTIN_ALIGN_OF
 use compiler.types.types.TY_BUILTIN_DROP
@@ -4577,6 +4580,96 @@ fn mb_predeclare_statics_in_block(b: mut_view<MirBuilder>, blk: *mut HirBlock) {
     }
 }
 
+// ---- T501 (REQ-OWNER-008, SPEC-55 AXS-ADR-010/011/020): address intrinsics and fixed-address overlays ----
+
+// `dest = <v> as <to_ty>` with an explicit cast kind (the hidden-slot / pointer casts of fixed-address lowering).
+fn mb_emit_cast_kind(b: mut_view<MirBuilder>, dest: view<MirPlace>, v: view<MirOperand>, kind: u8, to_ty_v: u32, sp: view<Span>) {
+    let mut rv = MirRvalue {
+        kind: MIR_RVALUE_CAST,
+        use_op: mb_intr_copy_op(mir_local_place(0u32)),
+        repeat_count: 0u64,
+        repeat_count_op: 0 as *mut MirOperand,
+        borrow_kind: MIR_BORROW_SHARED,
+        place: mir_local_place(0u32),
+        cast_kind: kind,
+        target_ty: TypeId { v: to_ty_v },
+        bin_op: MIR_BINOP_ADD,
+        lhs: mb_intr_copy_op(mir_local_place(0u32)),
+        rhs: mb_intr_copy_op(mir_local_place(0u32)),
+        un_op: MIR_UNOP_NOT,
+        variant_idx: 0u32,
+        operands: 0 as *mut MirOperand,
+        operand_count: 0,
+    };
+    mir_copy_operand(mut_view(rv.use_op), v);
+    mb_emit_assign(mut_view(*b), dest, view(rv), sp);
+}
+
+// `fn_addr(f)`, `static_addr(s)`, `addr_of(x)`: the `usize` address of a function (its code address, `f as usize`) or
+// of a place (`address_of(place) as usize`: a shared borrow into a `*const T` temporary, then a pointer-to-int cast).
+fn mb_build_addr_intrinsic(b: mut_view<MirBuilder>, expr: *mut HirExpr, dest: view<MirPlace>, sp: view<Span>) {
+    let arg0: *mut HirExpr = unsafe { (*expr).args };
+    let usize_v = unsafe { (*b.thir).interner.t_usize.v };
+    let arg_ty = mb_expr_ty(mut_view(*b), arg0);
+    let at = unsafe { type_get(view((*b.thir).interner), TypeId { v: arg_ty.v }) };
+    if (at as usize) != 0 && (unsafe { (*at).kind }) == TY_FN {
+        let mut fop = mb_intr_copy_op(mir_local_place(0u32));
+        mb_build_expr_as_operand(mut_view(*b), arg0, mut_view(fop));
+        mb_emit_cast_kind(mut_view(*b), dest, view(fop), MIR_CAST_PTR_TO_INT, usize_v, sp);
+        return;
+    }
+    let mut dummy_sl = false;
+    let p = mir_build_lvalue(mut_view(*b), arg0, mut_view(dummy_sl));
+    let ptr_ty = unsafe { intern_ptr_ty(mut_view((*b.thir).interner), TypeId { v: arg_ty.v }, false) };
+    let tmp = mb_new_temp(mut_view(*b), TypeId { v: ptr_ty.v }, sp);
+    let tmp_pl = mir_local_place(tmp.v);
+    let mut ref_rv = MirRvalue {
+        kind: MIR_RVALUE_REF,
+        use_op: mb_intr_copy_op(mir_local_place(0u32)),
+        repeat_count: 0u64,
+        repeat_count_op: 0 as *mut MirOperand,
+        borrow_kind: MIR_BORROW_SHARED,
+        place: mir_local_place(0u32),
+        cast_kind: MIR_CAST_INT_TO_INT,
+        target_ty: TypeId { v: 0u32 },
+        bin_op: MIR_BINOP_ADD,
+        lhs: mb_intr_copy_op(mir_local_place(0u32)),
+        rhs: mb_intr_copy_op(mir_local_place(0u32)),
+        un_op: MIR_UNOP_NOT,
+        variant_idx: 0u32,
+        operands: 0 as *mut MirOperand,
+        operand_count: 0,
+    };
+    mir_copy_place(mut_view(ref_rv.place), view(p));
+    mb_emit_assign(mut_view(*b), view(tmp_pl), view(ref_rv), sp);
+    let pop = mb_intr_copy_op(tmp_pl);
+    mb_emit_cast_kind(mut_view(*b), dest, view(pop), MIR_CAST_PTR_TO_INT, usize_v, sp);
+}
+
+// Place of the fixed-address object whose `usize` address is held by `addr_op`: `*(addr as *mut T)` with a fixed provenance.
+fn mb_build_fixed_place(b: mut_view<MirBuilder>, addr_op: view<MirOperand>, obj_ty: TypeId, sp: view<Span>) -> MirPlace {
+    let ptr_ty = unsafe { intern_ptr_ty(mut_view((*b.thir).interner), TypeId { v: obj_ty.v }, true) };
+    let tmp = mb_new_temp(mut_view(*b), TypeId { v: ptr_ty.v }, sp);
+    let tmp_pl = mir_local_place(tmp.v);
+    mb_emit_cast_kind(mut_view(*b), view(tmp_pl), addr_op, MIR_CAST_INT_TO_PTR, ptr_ty.v, sp);
+    mb_append_proj_deref(mut_view(*b), view(tmp_pl))
+}
+
+// Item-scope `@addr(E) unsafe static [mut] S: T` overlay: `E` is the value of the hidden `const __ax_addr_<n>: usize` item.
+fn mb_build_overlay_static_place(b: mut_view<MirBuilder>, hit: *mut HirItem, obj_ty: TypeId, sp: view<Span>) -> MirPlace {
+    let usize_v = unsafe { (*b.thir).interner.t_usize.v };
+    let src: *mut HirItem = unsafe { (*hit).addr_src };
+    let mut addr: u64 = 0u64;
+    if (src as usize) != 0 {
+        let cv = unsafe { sym_constmap_get(view((*b.thir).symbol_consts), SymbolId { v: (*src).symbol.v }) };
+        if (cv as usize) != 0 && (unsafe { (*cv).kind }) == CONST_INT {
+            addr = unsafe { (*cv).int_val };
+        }
+    }
+    let aop = mb_intr_const_op(usize_v, addr);
+    mb_build_fixed_place(mut_view(*b), view(aop), TypeId { v: obj_ty.v }, sp)
+}
+
 fn mb_predeclare_statics_in_expr(b: mut_view<MirBuilder>, e: *mut HirExpr) {
     if (e as usize) == 0 || (b.hir as usize) == 0 {
         return;
@@ -4589,7 +4682,7 @@ fn mb_predeclare_statics_in_expr(b: mut_view<MirBuilder>, e: *mut HirExpr) {
             let mut is_sl = false;
             if !mb_lookup_sym(view(*b), (SymbolId { v: sym_v }), mut_view(loc_id), mut_view(is_sl)) {
                 let hit = mb_find_item_by_sym_thir(b.thir as *const Thir, b.hir, (SymbolId { v: sym_v }));
-                if (hit as usize) != 0 && (unsafe { (*hit).kind }) == HIR_ITEM_STATIC && !(unsafe { (*hit).is_tls }) {
+                if (hit as usize) != 0 && (unsafe { (*hit).kind }) == HIR_ITEM_STATIC && !(unsafe { (*hit).is_tls }) && (unsafe { (*hit).addr_src } as usize) == 0 {
                     let mut sty = mb_expr_ty(mut_view(*b), e);
                     if sty.v == 0u32 {
                         sty = mb_item_ty(mut_view(*b), hit);
@@ -5525,6 +5618,11 @@ pub fn mir_build_lvalue(b: mut_view<MirBuilder>, expr: *mut HirExpr, out_is_slic
                 if (hit as usize) != 0 && (unsafe { (*hit).is_tls }) {
                     let e_ty = mb_expr_ty(mut_view(*b), expr);
                     return mb_build_tls_local(mut_view(*b), (SymbolId { v: sym.v }), (TypeId { v: e_ty.v }), view(sp));
+                }
+                if (hit as usize) != 0 && (unsafe { (*hit).kind }) == HIR_ITEM_STATIC && (unsafe { (*hit).addr_src } as usize) != 0 {
+                    // T501: fixed-address overlay static; every use goes through `*(addr as *mut T)`.
+                    let ov_ty = mb_expr_ty(mut_view(*b), expr);
+                    return mb_build_overlay_static_place(mut_view(*b), hit, (TypeId { v: ov_ty.v }), view(sp));
                 }
                 if (hit as usize) != 0 && (unsafe { (*hit).kind }) == HIR_ITEM_STATIC {
                     let e_ty = mb_expr_ty(mut_view(*b), expr);
@@ -8092,7 +8190,7 @@ pub fn mir_build_expr(
             };
             if sk == TY_PTR && dk == TY_PTR {
                 ckind = MIR_CAST_PTR_TO_PTR;
-            } else if sk == TY_PTR && dk != TY_PTR {
+            } else if (sk == TY_PTR || sk == TY_FN) && dk != TY_PTR {
                 ckind = MIR_CAST_PTR_TO_INT;
             } else if sk != TY_PTR && dk == TY_PTR {
                 ckind = MIR_CAST_INT_TO_PTR;
@@ -9964,6 +10062,10 @@ fn mb_build_control_or_call_expr(
                     rv.kind = MIR_RVALUE_LEN;
                     mir_copy_place(mut_view(rv.place), view(arg_pl));
                     mb_emit_assign(mut_view(*b), view(*dest), view(rv), view(sp));
+                    return;
+                }
+                if ck == TY_BUILTIN_FN_ADDR || ck == TY_BUILTIN_STATIC_ADDR || ck == TY_BUILTIN_ADDR_OF {
+                    mb_build_addr_intrinsic(mut_view(*b), expr, view(*dest), view(sp));
                     return;
                 }
                 if ck == TY_BUILTIN_ADDRESS_OF || ck == TY_BUILTIN_ADDRESS_OF_MUT {
@@ -11923,6 +12025,30 @@ pub fn mir_build_stmt(b: mut_view<MirBuilder>, stmt: *mut HirStmt) {
         start: unsafe { (*stmt).span.start },
         end: unsafe { (*stmt).span.end },
     };
+
+    if sk == HIR_STMT_LET && (unsafe { (*stmt).addr_sym.v }) != 0u32 && (unsafe { (*stmt).pat } as usize) != 0 {
+        // T501 (SPEC-55 AXS-ADR-011): block-scope `@addr(E) let|static [mut] x: T [= init]`. The parser hoisted `E` into
+        // `let __ax_addr_<n>: usize = E` (the hidden address slot); `x` becomes the place `*(slot as *mut T)` for the rest of the
+        // block, so loads/stores/field projections/borrows of `x` act on the fixed address. An initialiser is stored there.
+        let ov_pat: *mut HirPat = unsafe { (*stmt).pat };
+        let mut slot = MirLocalId { v: 0u32 };
+        let mut slot_sl = false;
+        if mb_lookup_sym(view(*b), (SymbolId { v: unsafe { (*stmt).addr_sym.v } }), mut_view(slot), mut_view(slot_sl)) {
+            let mut ov_ty = mb_pat_ty(mut_view(*b), ov_pat);
+            if ov_ty.v == 0u32 && (unsafe { (*stmt).expr } as usize) != 0 {
+                ov_ty = mb_expr_ty(mut_view(*b), unsafe { (*stmt).expr });
+            }
+            let slot_op = mb_intr_copy_op(mir_local_place(slot.v));
+            let ov_pl = mb_build_fixed_place(mut_view(*b), view(slot_op), (TypeId { v: ov_ty.v }), view(sp));
+            mb_register_guard_place(mut_view(*b), SymbolId { v: unsafe { (*ov_pat).symbol.v } }, StrId { v: 0u32 }, view(ov_pl));
+            let ov_init: *mut HirExpr = unsafe { (*stmt).expr };
+            if (ov_init as usize) != 0 {
+                let mut ov_dest = ov_pl;
+                mir_build_expr(mut_view(*b), ov_init, mut_view(ov_dest), true);
+            }
+            return;
+        }
+    }
 
     if sk == HIR_STMT_LET {
         let pat: *mut HirPat = unsafe {

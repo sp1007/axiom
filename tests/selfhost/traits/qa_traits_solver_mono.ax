@@ -2941,6 +2941,12 @@ pub const AX_SEC_AMBIENT_AUTHORITY_FORBIDDEN: u32 = 186u32;
 pub const AX_SEC_CAPABILITY_FORGERY: u32 = 187u32;
 pub const AX_DRIVER_INVALID_PROFILE: u32 = 217u32;
 pub const AX_DRIVER_INVALID_SAFETY_PROFILE: u32 = 218u32;
+// T501 (REQ-OWNER-008, SPEC-50 AXS-UNS-004, SPEC-55 AXS-ADR-010/011): unsafe trait impls, address intrinsics, `@addr` / `@at`.
+pub const AX_UNSAFE_UNNECESSARY_IMPL: u32 = 211u32;
+pub const AX_UNSAFE_TRAIT_IMPL: u32 = 253u32;
+pub const AX_TYPE_NOT_A_PLACE: u32 = 254u32;
+pub const AX_ADDR_BAD_ARGS: u32 = 255u32;
+pub const AX_ADDR_BAD_TARGET: u32 = 256u32;
 
 pub fn diag_code_name(c: DiagCode) -> Str {
     match c.v {
@@ -3011,6 +3017,11 @@ pub fn diag_code_name(c: DiagCode) -> Str {
         187u32 => "AX_SEC_CAPABILITY_FORGERY",
         217u32 => "AX_DRIVER_INVALID_PROFILE",
         218u32 => "AX_DRIVER_INVALID_SAFETY_PROFILE",
+        211u32 => "AX_UNSAFE_UNNECESSARY_IMPL",
+        253u32 => "AX_UNSAFE_TRAIT_IMPL",
+        254u32 => "AX_TYPE_NOT_A_PLACE",
+        255u32 => "AX_ADDR_BAD_ARGS",
+        256u32 => "AX_ADDR_BAD_TARGET",
         _ => "<unknown>",
     }
 }
@@ -3132,6 +3143,11 @@ pub fn diag_code_default_message(c: DiagCode) -> Str {
         187u32 => "safe capability view or authority token cannot be forged from raw pointers or integer addresses outside unsafe",
         217u32 => "unknown --profile value (expected hosted, freestanding, kernel, or system)",
         218u32 => "unknown --safety-profile value (expected safe, sandbox, or system)",
+        211u32 => "unsafe impl of a trait that is not declared unsafe trait",
+        253u32 => "impl of an unsafe trait must be written unsafe impl",
+        254u32 => "address_of, address_of_mut or addr_of applied to a temporary rather than a place expression",
+        255u32 => "@addr and @at take exactly one address expression of type usize",
+        256u32 => "@addr and @at apply only to static items, fn items and let bindings",
         _ => "",
     }
 }
@@ -7086,6 +7102,8 @@ pub struct AstStmt {
     pub left: *mut AstExpr,
     pub right: *mut AstExpr,
     pub has_semi: bool,
+    // T501 (REQ-OWNER-008): `@addr(E) unsafe static ...` block-scope declaration (the declaration itself is the trust point).
+    pub is_unsafe_decl: bool,
 }
 
 pub struct AstFieldDecl {
@@ -10520,8 +10538,17 @@ fn parse_block(parser: mut_view<Parser>) -> *mut AstBlock {
     let mut tail = 0 as *mut AstStmt;
     while more_before(view(*parser), TOK_RBRACE) {
         let statement = parse_stmt(mut_view(*parser));
+        // T501: a block-scope `@addr(E) let|static` gets its hidden address slot `let __ax_addr_<n>: usize = E;` first.
+        let hidden = make_addr_hidden_stmt(mut_view(*parser), statement);
         unsafe {
-            if tail as usize == 0 {
+            if hidden as usize != 0 {
+                if tail as usize == 0 {
+                    (*block).stmts = hidden;
+                } else {
+                    (*tail).next = hidden;
+                }
+                (*hidden).next = statement;
+            } else if tail as usize == 0 {
                 (*block).stmts = statement;
             } else {
                 (*tail).next = statement;
@@ -10618,6 +10645,22 @@ fn parse_stmt(parser: mut_view<Parser>) -> *mut AstStmt {
                 if consume(mut_view(*parser), TOK_KW_ELSE) {
                     (*stmt).else_block = parse_block(mut_view(*parser));
                 }
+            }
+        } else if (kind == TOK_KW_STATIC || (kind == TOK_KW_UNSAFE && next_kind == TOK_KW_STATIC)) &&
+                  find_addr_attr(view(*parser), (*stmt).attrs) as usize != 0 {
+            // T501 (SPEC-55 AXS-ADR-011): block-scope `@addr(E) [unsafe] static [mut] NAME: T [= init]` is a fixed-address
+            // binding; it shares the representation of `@addr(E) let [mut] NAME: T [= init]`.
+            (*stmt).kind = STMT_LET;
+            (*stmt).is_unsafe_decl = consume(mut_view(*parser), TOK_KW_UNSAFE);
+            consume(mut_view(*parser), TOK_KW_STATIC);
+            let static_pat = alloc_pat(parser.arena, PAT_BINDING, peek_span(view(*parser)));
+            (*static_pat).is_mut = consume(mut_view(*parser), TOK_KW_MUT);
+            (*static_pat).name.v = expect_ident(mut_view(*parser), MSG_EXPECTED_STATIC_NAME).v;
+            (*stmt).pat = static_pat;
+            expect(mut_view(*parser), TOK_COLON, AX_PARSE_EXPECTED_TOKEN, MSG_EXPECTED_COLON);
+            (*stmt).ty = parse_type(mut_view(*parser));
+            if consume(mut_view(*parser), TOK_EQ) {
+                (*stmt).expr = parse_expr(mut_view(*parser));
             }
         } else if is_item_keyword(kind, next_kind) {
             report_here(mut_view(*parser), AX_PARSE_ITEM_IN_BLOCK, MSG_ITEM_IN_BLOCK);
@@ -10726,6 +10769,159 @@ fn parse_attributes(parser: mut_view<Parser>) -> *mut AstAttr {
         }
     }
     head
+}
+
+// ---- T501 (REQ-OWNER-008, SPEC-55 AXS-ADR-011): `@addr(E)` / `@at(E)` address-expression desugaring ----
+//
+// The resolver does not walk attribute arguments, so the parser hands the address expression to a node the resolver does
+// walk. Block-scope `@addr(E) let x: T` / `@addr(E) static [mut] x: T` get a hidden `let __ax_addr_<n>: usize = E;` right
+// before them (the hidden address slot of SPEC-55); item-scope `@addr(E) static|fn` get a hidden `const __ax_addr_<n>: usize = E;`
+// right before them. The attribute keeps `E` (shared node) for diagnostics; HIR lowering links the declaration to the
+// hidden binding. A declaration without exactly one argument is left alone (typeck reports `AX_ADDR_BAD_ARGS`).
+
+// Returns the first `@addr(...)` / `@at(...)` attribute of `attrs`, or null.
+fn find_addr_attr(parser: view<Parser>, attrs: *mut AstAttr) -> *mut AstAttr {
+    let mut cur = attrs;
+    while cur as usize != 0 {
+        let sv = unsafe { interner_get(view(*parser.interner), StrId { v: (*cur).name.v }) };
+        if sv.len == 4 {
+            let hit = unsafe {
+                *(sv.ptr + 0) == 97u8 && *(sv.ptr + 1) == 100u8 && *(sv.ptr + 2) == 100u8 && *(sv.ptr + 3) == 114u8
+            };
+            if hit {
+                return cur;
+            }
+        } else if sv.len == 2 {
+            let hit = unsafe { *(sv.ptr + 0) == 97u8 && *(sv.ptr + 1) == 116u8 };
+            if hit {
+                return cur;
+            }
+        }
+        cur = unsafe { (*cur).next as *mut AstAttr };
+    }
+    0 as *mut AstAttr
+}
+
+// The single argument expression of an `@addr`/`@at` attribute, or null when it has zero or several arguments.
+fn addr_attr_expr(attr: *mut AstAttr) -> *mut AstExpr {
+    let arg: *mut AstAttrArg = unsafe { (*attr).args };
+    if arg as usize == 0 {
+        return 0 as *mut AstExpr;
+    }
+    if unsafe { (*arg).next } as usize != 0 {
+        return 0 as *mut AstExpr;
+    }
+    unsafe { (*arg).expr }
+}
+
+// Interns `__ax_addr_<start>`.
+fn make_addr_hidden_name(parser: mut_view<Parser>, start: u32) -> StrId {
+    let buf = arena_alloc_raw(unsafe { mut_view(*parser.arena) }, 32, 1);
+    unsafe {
+        *(buf + 0) = 95u8;
+        *(buf + 1) = 95u8;
+        *(buf + 2) = 97u8;
+        *(buf + 3) = 120u8;
+        *(buf + 4) = 95u8;
+        *(buf + 5) = 97u8;
+        *(buf + 6) = 100u8;
+        *(buf + 7) = 100u8;
+        *(buf + 8) = 114u8;
+        *(buf + 9) = 95u8;
+    }
+    let mut digits: usize = 1;
+    let mut probe: u32 = start / 10u32;
+    while probe != 0u32 {
+        digits = digits + 1;
+        probe = probe / 10u32;
+    }
+    let mut rest: u32 = start;
+    let mut i: usize = 0;
+    while i < digits {
+        let d = (rest % 10u32) as u8;
+        unsafe { *(buf + 10 + (digits - 1 - i)) = 48u8 + d; }
+        rest = rest / 10u32;
+        i = i + 1;
+    }
+    interner_intern_bytes(unsafe { mut_view(*parser.interner) }, buf as *const u8, 10 + digits)
+}
+
+// A fresh copy of the span `file`/`start`/`end` (a `Span` is moved by value, so every synthesized node takes its own).
+fn addr_span(file_v: u32, start: u32, end: u32) -> Span {
+    Span { file: FileId { v: file_v }, start: start, end: end }
+}
+
+// `usize` as an AST type path. The span is zero-length: typeck reads a path's text from its span when non-empty (primitive
+// names) and falls back to the interned name otherwise, so a synthetic path must not cover the attribute's source text.
+fn make_usize_type(parser: mut_view<Parser>, file_v: u32, start: u32, end: u32) -> *mut AstType {
+    let buf = arena_alloc_raw(unsafe { mut_view(*parser.arena) }, 5, 1);
+    unsafe {
+        *(buf + 0) = 117u8;
+        *(buf + 1) = 115u8;
+        *(buf + 2) = 105u8;
+        *(buf + 3) = 122u8;
+        *(buf + 4) = 101u8;
+    }
+    let name = interner_intern_bytes(unsafe { mut_view(*parser.interner) }, buf as *const u8, 5);
+    let ty = alloc_type(parser.arena, TYPE_PATH, addr_span(file_v, start, end));
+    unsafe { (*ty).segments = alloc_path_seg(parser.arena, addr_span(file_v, start, end), name); }
+    ty
+}
+
+// Hidden `let __ax_addr_<n>: usize = E;` for a block-scope `@addr(E)` declaration; null when there is nothing to hide.
+fn make_addr_hidden_stmt(parser: mut_view<Parser>, statement: *mut AstStmt) -> *mut AstStmt {
+    if statement as usize == 0 || unsafe { (*statement).kind } != STMT_LET {
+        return 0 as *mut AstStmt;
+    }
+    let attr = find_addr_attr(view(*parser), unsafe { (*statement).attrs });
+    if attr as usize == 0 {
+        return 0 as *mut AstStmt;
+    }
+    let expr = addr_attr_expr(attr);
+    if expr as usize == 0 {
+        return 0 as *mut AstStmt;
+    }
+    let file_v = unsafe { (*attr).span.file.v };
+    let start = unsafe { (*attr).span.start };
+    let end = unsafe { (*attr).span.end };
+    let name = make_addr_hidden_name(mut_view(*parser), start);
+    let hidden = alloc_stmt(parser.arena, STMT_LET, addr_span(file_v, start, end));
+    let pat = alloc_pat(parser.arena, PAT_BINDING, addr_span(file_v, start, end));
+    unsafe {
+        (*pat).name.v = name.v;
+        (*hidden).pat = pat;
+        (*hidden).ty = make_usize_type(mut_view(*parser), file_v, start, start);
+        (*hidden).expr = expr;
+    }
+    hidden
+}
+
+// Hidden `const __ax_addr_<n>: usize = E;` for an item-scope `@addr(E)` static/fn; returns the new head of the chain.
+fn make_addr_hidden_item(parser: mut_view<Parser>, item: *mut AstItem) -> *mut AstItem {
+    let kind = unsafe { (*item).kind };
+    if kind != ITEM_STATIC && kind != ITEM_FN {
+        return item;
+    }
+    let attr = find_addr_attr(view(*parser), unsafe { (*item).attrs });
+    if attr as usize == 0 {
+        return item;
+    }
+    let expr = addr_attr_expr(attr);
+    if expr as usize == 0 {
+        return item;
+    }
+    let file_v = unsafe { (*attr).span.file.v };
+    let start = unsafe { (*attr).span.start };
+    let end = unsafe { (*attr).span.end };
+    let name = make_addr_hidden_name(mut_view(*parser), start);
+    let hidden = alloc_item(parser.arena, ITEM_CONST, addr_span(file_v, start, end));
+    unsafe {
+        (*hidden).name.v = name.v;
+        (*hidden).ty = make_usize_type(mut_view(*parser), file_v, start, start);
+        (*hidden).expr = expr;
+        (*hidden).next = item;
+    }
+    hidden
 }
 
 // Parses `pub`, `pub(package)` or `pub(module)` into `dst`.
@@ -11485,8 +11681,10 @@ pub fn ax_parse(
     let mut items = 0 as *mut AstItem;
     let mut tail = 0 as *mut AstItem;
     while !check(view(parser), TOK_EOF) {
-        let item = parse_item(mut_view(parser));
-        if (unsafe { (*item).kind }) != ITEM_ERROR {
+        let parsed = parse_item(mut_view(parser));
+        if (unsafe { (*parsed).kind }) != ITEM_ERROR {
+            // T501: an item-scope `@addr(E) static|fn` gets its hidden `const __ax_addr_<n>: usize = E;` first.
+            let item = make_addr_hidden_item(mut_view(parser), parsed);
             if tail as usize == 0 {
                 items = item;
             } else {
@@ -16038,6 +16236,11 @@ pub struct HirStmt {
     pub left: *mut HirExpr,
     pub right: *mut HirExpr,
     pub has_semi: bool,
+    // T501 (REQ-OWNER-008, SPEC-55 AXS-ADR-020): block-scope `@addr(E)` / `@at(E)` fixed-address binding. `addr_sym` is the
+    // hidden `usize` slot binding (`let __ax_addr_<n>: usize = E`) the parser emitted right before this statement
+    // (0 when the statement carries no placement); `is_unsafe_decl` is the `unsafe static` form of the declaration.
+    pub addr_sym: SymbolId,
+    pub is_unsafe_decl: bool,
 }
 
 pub struct HirFieldDecl {
@@ -16109,6 +16312,9 @@ pub struct HirItem {
     pub ty: *mut HirType,
     pub expr: *mut HirExpr,
     pub resolve_next_sym_v: u32,
+    // T501 (REQ-OWNER-008, SPEC-55 AXS-ADR-020): item-scope `@addr(E)` / `@at(E)` placement. The hidden
+    // `const __ax_addr_<n>: usize = E` item the parser emitted right before this static/fn (null without placement).
+    pub addr_src: *mut HirItem,
 }
 
 pub struct HirFile {
@@ -17524,6 +17730,25 @@ fn lower_attrs(ctx: mut_view<LowerCtx>, arena: mut_view<Arena>, rmap: view<Resol
     head
 }
 
+// T501 (REQ-OWNER-008): true when `a` holds an `@addr(...)` or `@at(...)` attribute.
+fn hir_attrs_have_addr(interner: view<StrInterner>, a: *mut HirAttr) -> bool {
+    let mut cur: *mut HirAttr = a;
+    while (cur as usize) != 0 {
+        let sv = interner_get(interner, StrId { v: unsafe { (*cur).name.v } });
+        if sv.len == 4 {
+            if unsafe { *(sv.ptr + 0) == 97u8 && *(sv.ptr + 1) == 100u8 && *(sv.ptr + 2) == 100u8 && *(sv.ptr + 3) == 114u8 } {
+                return true;
+            }
+        } else if sv.len == 2 {
+            if unsafe { *(sv.ptr + 0) == 97u8 && *(sv.ptr + 1) == 116u8 } {
+                return true;
+            }
+        }
+        cur = unsafe { (*cur).next };
+    }
+    false
+}
+
 fn hir_has_attr_thread_local(interner: view<StrInterner>, a: *mut HirAttr) -> bool {
     let mut cur: *mut HirAttr = a;
     while (cur as usize) != 0 {
@@ -18162,11 +18387,17 @@ fn lower_stmt(ctx: mut_view<LowerCtx>, arena: mut_view<Arena>, rmap: view<Resolv
                 (*hs).attrs = lower_attrs(mut_view(*ctx), mut_view(*arena), view(*rmap), mut_view(*sink), (*cur).attrs);
             }
         }
+        unsafe { (*hs).is_unsafe_decl = (*cur).is_unsafe_decl; }
         if k == STMT_ERROR {
             unsafe { (*hs).kind = HIR_STMT_ERROR; }
         } else if k == STMT_LET {
             unsafe {
                 (*hs).kind = HIR_STMT_LET;
+                // T501: the parser emitted `let __ax_addr_<n>: usize = E` right before an `@addr(E)` / `@at(E)` declaration.
+                if ((*hs).attrs as usize) != 0 && (tail as usize) != 0 && ((*tail).kind == HIR_STMT_LET) && ((*tail).pat as usize) != 0 &&
+                   (ctx.interner as usize) != 0 && hir_attrs_have_addr(view(*ctx.interner), (*hs).attrs) {
+                    (*hs).addr_sym.v = (*(*tail).pat).symbol.v;
+                }
                 let _t62 = lower_pat(mut_view(*ctx), mut_view(*arena), view(*rmap), mut_view(*sink), (*cur).pat);
                 (*hs).pat = _t62;
                 let _t63 = lower_type(mut_view(*ctx), mut_view(*arena), view(*rmap), mut_view(*sink), (*cur).ty);
@@ -18515,6 +18746,14 @@ fn lower_item(ctx: mut_view<LowerCtx>, arena: mut_view<Arena>, rmap: view<Resolv
                     }
                     m = (*m).next;
                 }
+            }
+        }
+        // T501: the parser emitted `const __ax_addr_<n>: usize = E` right before an `@addr(E)` / `@at(E)` static or fn.
+        unsafe {
+            if (tail as usize) != 0 && ((*tail).kind == HIR_ITEM_CONST) && ((*hi).attrs as usize) != 0 &&
+               ((*hi).kind == HIR_ITEM_STATIC || (*hi).kind == HIR_ITEM_FN) &&
+               (ctx.interner as usize) != 0 && hir_attrs_have_addr(view(*ctx.interner), (*hi).attrs) {
+                (*hi).addr_src = tail;
             }
         }
         if (tail as usize) == 0 {
@@ -19371,6 +19610,10 @@ pub const TY_F64: u8 = 52u8;
 pub const TY_FLOAT_VAR: u8 = 53u8;
 pub const TYPEID_F32: u32 = 0x3FFF0F32u32;
 pub const TYPEID_F64: u32 = 0x3FFF0F64u32;
+// T501 (REQ-OWNER-008, SPEC-55 AXS-ADR-010): address introspection intrinsics `fn_addr(f)`, `static_addr(s)`, `addr_of(x)`.
+pub const TY_BUILTIN_FN_ADDR: u8 = 54u8;
+pub const TY_BUILTIN_STATIC_ADDR: u8 = 55u8;
+pub const TY_BUILTIN_ADDR_OF: u8 = 56u8;
 
 pub const CAP_COPY: u8 = 0u8;
 pub const CAP_VIEW: u8 = 1u8;
@@ -22368,9 +22611,9 @@ pub struct IntrinsicRef {
     pub width: u8,
 }
 
-const INTR_TABLE_COUNT: usize = 53;
+const INTR_TABLE_COUNT: usize = 56;
 
-const INTR_NAMES_DATA: [492]u8 = [
+const INTR_NAMES_DATA: [517]u8 = [
     115u8, 105u8, 122u8, 101u8, 95u8, 111u8, 102u8, 97u8, 108u8, 105u8, 103u8, 110u8, 95u8, 111u8, 102u8, 110u8,
     101u8, 101u8, 100u8, 115u8, 95u8, 100u8, 114u8, 111u8, 112u8, 100u8, 114u8, 111u8, 112u8, 95u8, 105u8, 110u8,
     95u8, 112u8, 108u8, 97u8, 99u8, 101u8, 102u8, 111u8, 114u8, 103u8, 101u8, 116u8, 112u8, 116u8, 114u8, 95u8,
@@ -22397,22 +22640,23 @@ const INTR_NAMES_DATA: [492]u8 = [
     114u8, 111u8, 116u8, 97u8, 116u8, 101u8, 95u8, 108u8, 101u8, 102u8, 116u8, 114u8, 111u8, 116u8, 97u8, 116u8,
     101u8, 95u8, 114u8, 105u8, 103u8, 104u8, 116u8, 108u8, 101u8, 97u8, 100u8, 105u8, 110u8, 103u8, 95u8, 122u8,
     101u8, 114u8, 111u8, 115u8, 116u8, 114u8, 97u8, 105u8, 108u8, 105u8, 110u8, 103u8, 95u8, 122u8, 101u8, 114u8,
-    111u8, 115u8, 99u8, 111u8, 117u8, 110u8, 116u8, 95u8, 111u8, 110u8, 101u8, 115u8,
-    115u8, 97u8, 116u8, 117u8, 114u8, 97u8, 116u8, 105u8, 110u8, 103u8, 95u8, 97u8, 100u8, 100u8,
-    115u8, 97u8, 116u8, 117u8, 114u8, 97u8, 116u8, 105u8, 110u8, 103u8, 95u8, 115u8, 117u8, 98u8,
-    115u8, 97u8, 116u8, 117u8, 114u8, 97u8, 116u8, 105u8, 110u8, 103u8, 95u8, 109u8, 117u8, 108u8,
-    115u8, 119u8, 97u8, 112u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8,
-    114u8, 101u8, 118u8, 101u8, 114u8, 115u8, 101u8, 95u8, 98u8, 105u8, 116u8, 115u8,
+    111u8, 115u8, 99u8, 111u8, 117u8, 110u8, 116u8, 95u8, 111u8, 110u8, 101u8, 115u8, 115u8, 97u8, 116u8, 117u8,
+    114u8, 97u8, 116u8, 105u8, 110u8, 103u8, 95u8, 97u8, 100u8, 100u8, 115u8, 97u8, 116u8, 117u8, 114u8, 97u8,
+    116u8, 105u8, 110u8, 103u8, 95u8, 115u8, 117u8, 98u8, 115u8, 97u8, 116u8, 117u8, 114u8, 97u8, 116u8, 105u8,
+    110u8, 103u8, 95u8, 109u8, 117u8, 108u8, 115u8, 119u8, 97u8, 112u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8,
+    114u8, 101u8, 118u8, 101u8, 114u8, 115u8, 101u8, 95u8, 98u8, 105u8, 116u8, 115u8, 102u8, 110u8, 95u8, 97u8,
+    100u8, 100u8, 114u8, 115u8, 116u8, 97u8, 116u8, 105u8, 99u8, 95u8, 97u8, 100u8, 100u8, 114u8, 97u8, 100u8,
+    100u8, 114u8, 95u8, 111u8, 102u8,
 ];
 
-const INTR_NAMES_OFF: [54]u32 = [
+const INTR_NAMES_OFF: [57]u32 = [
     0u32, 7u32, 15u32, 25u32, 38u32, 44u32, 52u32, 75u32, 90u32, 94u32, 102u32, 109u32, 116u32, 123u32, 133u32,
-    147u32, 157u32, 169u32, 178u32, 183u32, 187u32, 191u32, 196u32, 201u32, 210u32, 220u32, 223u32, 230u32, 238u32,
-    242u32, 248u32, 253u32, 261u32, 269u32, 277u32, 286u32, 298u32, 304u32, 309u32, 320u32, 332u32, 344u32, 356u32,
-    368u32, 379u32, 391u32, 404u32, 418u32, 428u32, 442u32, 456u32, 470u32, 480u32, 492u32,
+    147u32, 157u32, 169u32, 178u32, 183u32, 187u32, 191u32, 196u32, 201u32, 210u32, 220u32, 223u32, 230u32, 238u32, 242u32,
+    248u32, 253u32, 261u32, 269u32, 277u32, 286u32, 298u32, 304u32, 309u32, 320u32, 332u32, 344u32, 356u32, 368u32, 379u32,
+    391u32, 404u32, 418u32, 428u32, 442u32, 456u32, 470u32, 480u32, 492u32, 499u32, 510u32, 517u32,
 ];
 
-const INTR_CLS_TABLE: [53]u8 = [
+const INTR_CLS_TABLE: [56]u8 = [
     INTR_TYPE_BUILTIN, INTR_TYPE_BUILTIN, INTR_TYPE_BUILTIN, INTR_TYPE_BUILTIN, INTR_TYPE_BUILTIN,
     INTR_TYPE_BUILTIN, INTR_TYPE_BUILTIN, INTR_TYPE_BUILTIN, INTR_TYPE_BUILTIN, INTR_TYPE_BUILTIN,
     INTR_TYPE_BUILTIN, INTR_TYPE_BUILTIN, INTR_TYPE_BUILTIN, INTR_TYPE_BUILTIN, INTR_TYPE_BUILTIN,
@@ -22425,18 +22669,20 @@ const INTR_CLS_TABLE: [53]u8 = [
     INTR_MIR_OP, INTR_MIR_OP, INTR_MIR_OP, INTR_MIR_OP, INTR_MIR_OP,
     INTR_MIR_OP, INTR_MIR_OP, INTR_MIR_OP, INTR_MIR_OP,
     INTR_MIR_OP, INTR_MIR_OP, INTR_MIR_OP, INTR_MIR_OP, INTR_MIR_OP,
+    INTR_TYPE_BUILTIN, INTR_TYPE_BUILTIN, INTR_TYPE_BUILTIN,
 ];
 
-const INTR_GENERICS_TABLE: [53]u8 = [
+const INTR_GENERICS_TABLE: [56]u8 = [
     1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8,
     0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
     0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
     0u8, 0u8, 0u8,
     0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
     0u8, 0u8, 0u8, 0u8, 0u8,
+    1u8, 1u8, 1u8,
 ];
 
-const INTR_BUILTIN_TY_TABLE: [53]u8 = [
+const INTR_BUILTIN_TY_TABLE: [56]u8 = [
     TY_BUILTIN_SIZE_OF, TY_BUILTIN_ALIGN_OF, TY_BUILTIN_NEEDS_DROP, TY_BUILTIN_DROP_IN_PLACE, TY_BUILTIN_FORGET,
     TY_BUILTIN_PTR_COPY, TY_BUILTIN_PTR_COPY_NONOVERLAPPING, TY_BUILTIN_PTR_WRITE_BYTES, TY_BUILTIN_NULL, TY_BUILTIN_NULL_MUT,
     TY_BUILTIN_IS_NULL, TY_BUILTIN_PTR_ADD, TY_BUILTIN_PTR_SUB, TY_BUILTIN_ADDRESS_OF, TY_BUILTIN_ADDRESS_OF_MUT,
@@ -22449,9 +22695,10 @@ const INTR_BUILTIN_TY_TABLE: [53]u8 = [
     0u8, 0u8, 0u8, 0u8, 0u8,
     0u8, 0u8, 0u8, 0u8,
     0u8, 0u8, 0u8, 0u8, 0u8,
+    TY_BUILTIN_FN_ADDR, TY_BUILTIN_STATIC_ADDR, TY_BUILTIN_ADDR_OF,
 ];
 
-const INTR_OP_TABLE: [53]u8 = [
+const INTR_OP_TABLE: [56]u8 = [
     0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
     0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
     0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
@@ -22459,27 +22706,30 @@ const INTR_OP_TABLE: [53]u8 = [
     INTR_OP_WRAPPING_ADD, INTR_OP_WRAPPING_SUB, INTR_OP_WRAPPING_MUL, INTR_OP_WRAPPING_NEG,
     INTR_OP_ROTATE_LEFT, INTR_OP_ROTATE_RIGHT, INTR_OP_LEADING_ZEROS, INTR_OP_TRAILING_ZEROS, INTR_OP_COUNT_ONES,
     INTR_OP_SATURATING_ADD, INTR_OP_SATURATING_SUB, INTR_OP_SATURATING_MUL, INTR_OP_SWAP_BYTES, INTR_OP_REVERSE_BITS,
+    0u8, 0u8, 0u8,
 ];
 
-const INTR_TERM_TABLE: [53]u8 = [
+const INTR_TERM_TABLE: [56]u8 = [
     0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
     0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
     0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
     INTR_TERM_ASSERT, INTR_TERM_PANIC, INTR_TERM_UNREACHABLE,
     0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
     0u8, 0u8, 0u8, 0u8, 0u8,
+    0u8, 0u8, 0u8,
 ];
 
-const INTR_WIDTH_SUFFIXED_TABLE: [53]u8 = [
+const INTR_WIDTH_SUFFIXED_TABLE: [56]u8 = [
     0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
     0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
     0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
     0u8, 0u8, 0u8,
     1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8,
     1u8, 1u8, 1u8, 1u8, 1u8,
+    0u8, 0u8, 0u8,
 ];
 
-const INTR_SIGS_DATA: [518]u8 = [
+const INTR_SIGS_DATA: [539]u8 = [
     62u8, 117u8, 115u8, 105u8, 122u8, 101u8, 62u8, 117u8, 115u8, 105u8, 122u8, 101u8, 62u8, 98u8, 111u8, 111u8,
     108u8, 42u8, 62u8, 117u8, 110u8, 105u8, 116u8, 42u8, 62u8, 117u8, 110u8, 105u8, 116u8, 42u8, 44u8, 42u8,
     44u8, 117u8, 115u8, 105u8, 122u8, 101u8, 62u8, 117u8, 110u8, 105u8, 116u8, 42u8, 44u8, 42u8, 44u8, 117u8,
@@ -22508,18 +22758,19 @@ const INTR_SIGS_DATA: [518]u8 = [
     54u8, 52u8, 98u8, 111u8, 111u8, 108u8, 62u8, 117u8, 110u8, 105u8, 116u8, 62u8, 117u8, 110u8, 105u8, 116u8,
     124u8, 42u8, 62u8, 117u8, 110u8, 105u8, 116u8, 124u8, 62u8, 110u8, 101u8, 118u8, 101u8, 114u8, 124u8, 42u8,
     62u8, 110u8, 101u8, 118u8, 101u8, 114u8, 62u8, 117u8, 110u8, 105u8, 116u8, 124u8, 62u8, 110u8, 101u8, 118u8,
-    101u8, 114u8, 87u8, 44u8, 87u8, 62u8, 87u8, 87u8, 44u8, 87u8, 62u8, 87u8, 87u8, 44u8, 87u8, 62u8, 87u8,
-    87u8, 62u8, 87u8, 87u8, 44u8, 117u8, 51u8, 50u8, 62u8, 87u8, 87u8, 44u8, 117u8, 51u8, 50u8, 62u8, 87u8,
-    87u8, 62u8, 117u8, 51u8, 50u8, 87u8, 62u8, 117u8, 51u8, 50u8, 87u8, 62u8, 117u8, 51u8, 50u8,
-    87u8, 44u8, 87u8, 62u8, 87u8, 87u8, 44u8, 87u8, 62u8, 87u8, 87u8, 44u8, 87u8, 62u8, 87u8,
-    87u8, 62u8, 87u8, 87u8, 62u8, 87u8,
+    101u8, 114u8, 87u8, 44u8, 87u8, 62u8, 87u8, 87u8, 44u8, 87u8, 62u8, 87u8, 87u8, 44u8, 87u8, 62u8,
+    87u8, 87u8, 62u8, 87u8, 87u8, 44u8, 117u8, 51u8, 50u8, 62u8, 87u8, 87u8, 44u8, 117u8, 51u8, 50u8,
+    62u8, 87u8, 87u8, 62u8, 117u8, 51u8, 50u8, 87u8, 62u8, 117u8, 51u8, 50u8, 87u8, 62u8, 117u8, 51u8,
+    50u8, 87u8, 44u8, 87u8, 62u8, 87u8, 87u8, 44u8, 87u8, 62u8, 87u8, 87u8, 44u8, 87u8, 62u8, 87u8,
+    87u8, 62u8, 87u8, 87u8, 62u8, 87u8, 42u8, 62u8, 117u8, 115u8, 105u8, 122u8, 101u8, 42u8, 62u8, 117u8,
+    115u8, 105u8, 122u8, 101u8, 42u8, 62u8, 117u8, 115u8, 105u8, 122u8, 101u8,
 ];
 
-const INTR_SIGS_OFF: [54]u32 = [
+const INTR_SIGS_OFF: [57]u32 = [
     0u32, 6u32, 12u32, 17u32, 23u32, 29u32, 43u32, 57u32, 72u32, 74u32, 76u32, 82u32, 91u32, 100u32, 103u32,
-    106u32, 121u32, 146u32, 166u32, 173u32, 190u32, 207u32, 224u32, 231u32, 238u32, 244u32, 263u32, 286u32, 299u32,
-    317u32, 330u32, 343u32, 361u32, 374u32, 391u32, 398u32, 402u32, 411u32, 438u32, 450u32, 455u32, 460u32, 465u32,
-    468u32, 475u32, 482u32, 487u32, 492u32, 497u32, 502u32, 507u32, 512u32, 515u32, 518u32,
+    106u32, 121u32, 146u32, 166u32, 173u32, 190u32, 207u32, 224u32, 231u32, 238u32, 244u32, 263u32, 286u32, 299u32, 317u32,
+    330u32, 343u32, 361u32, 374u32, 391u32, 398u32, 402u32, 411u32, 438u32, 450u32, 455u32, 460u32, 465u32, 468u32, 475u32,
+    482u32, 487u32, 492u32, 497u32, 502u32, 507u32, 512u32, 515u32, 518u32, 525u32, 532u32, 539u32,
 ];
 
 const INTR_SUFFIX_DATA: [52]u8 = [
@@ -29801,6 +30052,9 @@ use compiler.diag.code.AX_CAP_CONFLICT_MUT
 use compiler.diag.code.AX_TYPE_CANNOT_INDEX
 use compiler.diag.code.AX_TYPE_DUPLICATE_FIELD
 use compiler.diag.code.AX_TYPE_INVALID_CAST
+use compiler.diag.code.AX_TYPE_NOT_A_PLACE
+use compiler.diag.code.AX_ADDR_BAD_ARGS
+use compiler.diag.code.AX_ADDR_BAD_TARGET
 use compiler.diag.code.AX_TYPE_LITERAL_OUT_OF_RANGE
 use compiler.diag.code.AX_TYPE_MAIN_SIGNATURE
 use compiler.diag.code.AX_TYPE_MISMATCH
@@ -30030,6 +30284,9 @@ use compiler.types.types.TY_ARRAY
 use compiler.types.types.TY_BOOL
 use compiler.types.types.TY_BUILTIN_ADDRESS_OF
 use compiler.types.types.TY_BUILTIN_ADDRESS_OF_MUT
+use compiler.types.types.TY_BUILTIN_FN_ADDR
+use compiler.types.types.TY_BUILTIN_STATIC_ADDR
+use compiler.types.types.TY_BUILTIN_ADDR_OF
 use compiler.types.types.TY_BUILTIN_ALIGN_OF
 use compiler.types.types.TY_BUILTIN_DROP
 use compiler.types.types.TY_BUILTIN_DROP_IN_PLACE
@@ -30238,6 +30495,8 @@ pub struct VarState {
     pub sym: SymbolId,
     pub is_mut: bool,
     pub is_init: bool,
+    // T501 (REQ-OWNER-008): block-scope `@addr(E) let|static` fixed-address binding (valid operand of `static_addr`).
+    pub is_placed: bool,
 }
 
 pub struct LoopEnv {
@@ -31451,6 +31710,7 @@ fn push_var_state(cx: mut_view<TypeckCtx>, sym: SymbolId, is_mut: bool, is_init:
         (*e).sym.v = sym.v;
         (*e).is_mut = is_mut;
         (*e).is_init = is_init;
+        (*e).is_placed = false;
     }
     cx.vars_len = cx.vars_len + 1;
 }
@@ -37222,6 +37482,37 @@ fn count_expr_list(head: *const HirExpr) -> usize {
     c
 }
 
+// T501 (SPEC-55 AXS-ADR-010): `static_addr(s)` operand is a path to a `static` item or to a block-scope `@addr(E)` binding.
+fn tc_expr_is_static_place(cx: view<TypeckCtx>, e: *const HirExpr) -> bool {
+    if (e as usize) == 0 || unsafe { (*e).kind } != HIR_EXPR_PATH { return false; }
+    let sym_v = unsafe { (*e).path.symbol.v };
+    if sym_v == 0u32 { return false; }
+    let mut i: usize = cx.vars_len;
+    while (i > 0) {
+        i = i - 1;
+        let vs = unsafe { varstate_at(cx.vars, i) };
+        if unsafe { (*vs).sym.v } == sym_v {
+            return unsafe { (*vs).is_placed };
+        }
+    }
+    if (cx.hir as usize) == 0 { return false; }
+    let it = unsafe_find_item_by_sym(cx.hir, cx.thir as *const Thir, SymbolId { v: sym_v });
+    if (it as usize) == 0 { return false; }
+    unsafe { (*it).kind } == HIR_ITEM_STATIC
+}
+
+// T501 (SPEC-55 AXS-ADR-010): structural place test for `addr_of(x)` (temporaries such as `addr_of(1 + 2)` are not places).
+fn tc_expr_is_place(e: *const HirExpr) -> bool {
+    if (e as usize) == 0 { return false; }
+    let k = unsafe { (*e).kind };
+    if k == HIR_EXPR_PATH { return true; }
+    if k == HIR_EXPR_FIELD || k == HIR_EXPR_TUPLE_INDEX || k == HIR_EXPR_INDEX {
+        return tc_expr_is_place(unsafe { (*e).base as *const HirExpr });
+    }
+    if k == HIR_EXPR_UNARY && unsafe { (*e).op } == UNOP_DEREF { return true; }
+    false
+}
+
 fn check_call(cx: mut_view<TypeckCtx>, expr: *const HirExpr) -> TypeId {
     let callee: *mut HirExpr = unsafe { (*expr).callee };
     let args_head: *mut HirExpr = unsafe { (*expr).args };
@@ -37320,6 +37611,34 @@ fn check_call(cx: mut_view<TypeckCtx>, expr: *const HirExpr) -> TypeId {
             unify_ty(mut_view(*cx), (TypeId { v: s0_v }), (TypeId { v: arg_ty.v }));
         }
         return unsafe { intern_ptr_ty(mut_view((*cx.thir).interner), (TypeId { v: arg_ty.v }), ck == TY_BUILTIN_ADDRESS_OF_MUT) };
+    }
+    if ck == TY_BUILTIN_FN_ADDR || ck == TY_BUILTIN_STATIC_ADDR || ck == TY_BUILTIN_ADDR_OF {
+        // T501 (REQ-OWNER-008, SPEC-55 AXS-ADR-010): address introspection. All three are safe and return the `usize` address.
+        if argc == 0 { return unsafe { type_error(mut_view(*cx), view((*callee).span), AX_TYPE_ARG_COUNT) }; }
+        let raw_at = check_expr(mut_view(*cx), args_head, (TypeId { v: 0u32 }));
+        let arg_ty = resolve_ty(mut_view(*cx), (TypeId { v: raw_at.v }));
+        if is_error(mut_view(*cx), (TypeId { v: arg_ty.v })) { return (TypeId { v: err_v }); }
+        let substs = unsafe { ptr_substmap_get(view((*cx.thir).expr_substs), callee as usize) };
+        if (substs as usize) != 0 && unsafe { (*substs).count } > 0 {
+            let s0_v = unsafe { (*typeid_at((*substs).args, 0)).v };
+            unify_ty(mut_view(*cx), (TypeId { v: s0_v }), (TypeId { v: arg_ty.v }));
+        }
+        if argc != 1 { return unsafe { type_error(mut_view(*cx), view((*callee).span), AX_TYPE_ARG_COUNT) }; }
+        let at = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: arg_ty.v })) };
+        let atk = if (at as usize) != 0 { unsafe { (*at).kind } } else { TY_ERROR };
+        if ck == TY_BUILTIN_FN_ADDR {
+            // Any `fn` item or `fn(...) -> R` value; closures are rejected (a capturing closure has no code address).
+            if atk != TY_FN {
+                return unsafe { type_error(mut_view(*cx), view((*args_head).span), AX_TYPE_MISMATCH) };
+            }
+        } else if ck == TY_BUILTIN_STATIC_ADDR {
+            if !tc_expr_is_static_place(view(*cx), args_head) {
+                return unsafe { type_error(mut_view(*cx), view((*args_head).span), AX_TYPE_MISMATCH) };
+            }
+        } else if atk != TY_FN && !tc_expr_is_place(args_head) {
+            return unsafe { type_error(mut_view(*cx), view((*args_head).span), AX_TYPE_NOT_A_PLACE) };
+        }
+        return (TypeId { v: usize_v });
     }
     if ck == TY_BUILTIN_IS_NULL {
         if argc != 1 { return unsafe { type_error(mut_view(*cx), view((*callee).span), AX_TYPE_ARG_COUNT) }; }
@@ -38708,6 +39027,9 @@ fn check_expr_flow_or_cast(cx: mut_view<TypeckCtx>, expr: *const HirExpr, expect
         } else if sk == TY_PTR && (dest_ty.v == usize_v || dest_ty.v == isize_v || dest_is_int) {
             is_valid = true;
         } else if (src_ty.v == usize_v || src_ty.v == isize_v || is_intlike(mut_view(*cx), (TypeId { v: src_ty.v })) || src_is_int) && dk == TY_PTR {
+            is_valid = true;
+        } else if sk == TY_FN && dest_ty.v == usize_v {
+            // T501 (REQ-OWNER-008, SPEC-55 AXS-ADR-010): `f as usize` is the code address of a function item / fn pointer.
             is_valid = true;
         }
         if is_valid { return (TypeId { v: dest_ty.v }); }
@@ -40221,6 +40543,9 @@ pub fn check_block(cx: mut_view<TypeckCtx>, block: *const HirBlock, expected: Ty
         }
         tail = 0 as *const HirExpr;
         let sk = unsafe { (*s).kind };
+        if sk != HIR_STMT_LET && (unsafe { (*s).attrs } as usize) != 0 {
+            let _ = tc_validate_addr_stmt(mut_view(*cx), s);
+        }
         if sk == HIR_STMT_LET {
             let lelse: *mut HirBlock = unsafe { (*s).else_block };
             if (lelse as usize) != 0 {
@@ -40263,6 +40588,18 @@ pub fn check_block(cx: mut_view<TypeckCtx>, block: *const HirBlock, expected: Ty
                 }
             }
             check_pat(mut_view(*cx), spat, (TypeId { v: declared.v }), is_init);
+            if (unsafe { (*s).attrs } as usize) != 0 && tc_validate_addr_stmt(mut_view(*cx), s) {
+                // T501: the binding lives at the fixed address, so it is initialised from the start and valid for `static_addr`.
+                let mut vi: usize = cx.vars_len;
+                while (vi > 0) {
+                    vi = vi - 1;
+                    let vs = unsafe { varstate_at(cx.vars, vi) };
+                    if unsafe { (*vs).sym.v } == unsafe { (*spat).symbol.v } {
+                        unsafe { (*vs).is_placed = true; (*vs).is_init = true; }
+                        break;
+                    }
+                }
+            }
             ty.v = unit_v;
         } else if sk == HIR_STMT_ASSIGN {
             if check_stmt_assign(mut_view(*cx), s) { diverges = true; }
@@ -42906,11 +43243,84 @@ fn register_item_sig(cx: mut_view<TypeckCtx>, it: *mut HirItem, parent_impl: *co
     }
 }
 
+// ---- T501 (REQ-OWNER-008, SPEC-55 AXS-ADR-001/011): `@addr(E)` / `@at(E)` placement validation ----
+
+// First `@addr(...)` / `@at(...)` attribute of `attrs`, or null.
+fn tc_find_addr_attr(str_in: view<StrInterner>, attrs: *mut HirAttr) -> *mut HirAttr {
+    let mut cur: *mut HirAttr = attrs;
+    while (cur as usize) != 0 {
+        let aname = unsafe { (*cur).name };
+        if aname.v != 0u32 {
+            let sv = interner_get(str_in, StrId { v: aname.v });
+            if sv.len == 4 {
+                if unsafe { *(sv.ptr + 0) == 97u8 && *(sv.ptr + 1) == 100u8 && *(sv.ptr + 2) == 100u8 && *(sv.ptr + 3) == 114u8 } {
+                    return cur;
+                }
+            } else if sv.len == 2 {
+                if unsafe { *(sv.ptr + 0) == 97u8 && *(sv.ptr + 1) == 116u8 } {
+                    return cur;
+                }
+            }
+        }
+        cur = unsafe { (*cur).next };
+    }
+    0 as *mut HirAttr
+}
+
+// True when `at` carries exactly one argument (the address expression).
+fn tc_addr_attr_has_one_arg(at: *mut HirAttr) -> bool {
+    let arg: *mut HirAttrArg = unsafe { (*at).args };
+    if (arg as usize) == 0 { return false; }
+    (unsafe { (*arg).next } as usize) == 0
+}
+
+// Item-scope placement: `@addr(E) unsafe static [mut] S: T` (overlay) and `@addr(E) unsafe fn f(...)` (placement).
+// The address expression `E` was hoisted by the parser into the hidden `const __ax_addr_<n>: usize = E` item (`addr_src`),
+// which typeck and const evaluation check like any other `usize` constant (`E` of another type is `AX_TYPE_MISMATCH`).
+fn tc_validate_addr_item(cx: mut_view<TypeckCtx>, it: *mut HirItem) {
+    if (cx.str_in as usize) == 0 || (unsafe { (*it).attrs } as usize) == 0 { return; }
+    let at = unsafe { tc_find_addr_attr(view(*cx.str_in), (*it).attrs) };
+    if (at as usize) == 0 { return; }
+    let ik = unsafe { (*it).kind };
+    if ik != HIR_ITEM_STATIC && ik != HIR_ITEM_FN {
+        let _ = unsafe { type_error(mut_view(*cx), view((*at).span), AX_ADDR_BAD_TARGET) };
+        return;
+    }
+    if !tc_addr_attr_has_one_arg(at) || (unsafe { (*it).addr_src } as usize) == 0 {
+        let _ = unsafe { type_error(mut_view(*cx), view((*at).span), AX_ADDR_BAD_ARGS) };
+        return;
+    }
+    // The `unsafe` modifier on the declaration (ADR-0001 section 2) is checked by the unsafe pass (compiler/own/unsafe.ax).
+    if ik == HIR_ITEM_STATIC && (unsafe { (*it).expr } as usize) != 0 {
+        // An initialiser makes the static a pinned placement (ADR-0001 section 1), which needs the object-model support of T526/T528.
+        let _ = unsafe { type_error(mut_view(*cx), view((*at).span), AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP) };
+    }
+}
+
+// Block-scope placement: `@addr(E) let [mut] x: T [= init]` / `@addr(E) [unsafe] static [mut] x: T [= init]`.
+// Returns true when `s` is a valid fixed-address binding (the pattern binding then is a `static_addr` operand).
+fn tc_validate_addr_stmt(cx: mut_view<TypeckCtx>, s: *mut HirStmt) -> bool {
+    if (cx.str_in as usize) == 0 || (unsafe { (*s).attrs } as usize) == 0 { return false; }
+    let at = unsafe { tc_find_addr_attr(view(*cx.str_in), (*s).attrs) };
+    if (at as usize) == 0 { return false; }
+    let spat: *mut HirPat = unsafe { (*s).pat };
+    if unsafe { (*s).kind } != HIR_STMT_LET || (spat as usize) == 0 || unsafe { (*spat).kind } != HIR_PAT_BINDING {
+        let _ = unsafe { type_error(mut_view(*cx), view((*at).span), AX_ADDR_BAD_TARGET) };
+        return false;
+    }
+    if !tc_addr_attr_has_one_arg(at) || unsafe { (*s).addr_sym.v } == 0u32 {
+        let _ = unsafe { type_error(mut_view(*cx), view((*at).span), AX_ADDR_BAD_ARGS) };
+        return false;
+    }
+    true
+}
+
 fn check_item_body(cx: mut_view<TypeckCtx>, it: *mut HirItem, parent_impl: *const HirItem) {
     if (it as usize) == 0 {
         return;
     }
     let ik = unsafe { (*it).kind };
+    tc_validate_addr_item(mut_view(*cx), it);
     if ik == HIR_ITEM_FN {
         if (parent_impl as usize) == 0 {
             check_main_signature(mut_view(*cx), it);
@@ -43915,6 +44325,9 @@ fn typeck_pass1b_and_2(
             cx.current_impl = 0 as *const HirItem;
             cx.self_ty.v = 0u32;
             check_item_body(mut_view(*cx), top_it, 0 as *const HirItem);
+        } else if tk == HIR_ITEM_STRUCT || tk == HIR_ITEM_ENUM || tk == HIR_ITEM_TYPE_ALIAS {
+            // T501: `@addr` / `@at` on a type item is rejected (AX_ADDR_BAD_TARGET).
+            tc_validate_addr_item(mut_view(*cx), top_it);
         }
         top_it = unsafe { (*top_it).next };
     }
