@@ -56,6 +56,10 @@ use compiler.types.types.TY_COROUTINE
 use compiler.types.types.TY_ENUM
 use compiler.types.types.TY_FN
 use compiler.types.types.TY_I128
+use compiler.types.types.TY_F32
+use compiler.types.types.TY_F64
+use compiler.types.types.TYPEID_F32
+use compiler.types.types.TYPEID_F64
 use compiler.types.types.TY_MUT_VIEW
 use compiler.types.types.TY_PTR
 use compiler.types.types.TY_SLICE
@@ -279,6 +283,19 @@ use compiler.lir.lir.LIR_INST_I128_USAT_MUL
 use compiler.lir.lir.LIR_INST_I128_SEXT
 use compiler.lir.lir.LIR_INST_I128_ZEXT
 use compiler.lir.lir.LIR_INST_I128_TRUNC
+use compiler.lir.lir.LIR_INST_FADD
+use compiler.lir.lir.LIR_INST_FSUB
+use compiler.lir.lir.LIR_INST_FMUL
+use compiler.lir.lir.LIR_INST_FDIV
+use compiler.lir.lir.LIR_INST_FREM
+use compiler.lir.lir.LIR_INST_FCMP
+use compiler.lir.lir.LIR_INST_FNEG
+use compiler.lir.lir.LIR_INST_FPEXT
+use compiler.lir.lir.LIR_INST_FPTRUNC
+use compiler.lir.lir.LIR_INST_SITOFP
+use compiler.lir.lir.LIR_INST_UITOFP
+use compiler.lir.lir.LIR_INST_FPTOSI
+use compiler.lir.lir.LIR_INST_FPTOUI
 use compiler.lir.lir.LIR_TERM_ASSERT
 use compiler.lir.lir.LIR_TERM_JMP
 use compiler.lir.lir.LIR_TERM_RETURN
@@ -2144,6 +2161,133 @@ fn operand_is_signed(b: mut_view<LirBuilder>, op: view<MirOperand>, out_ty: *mut
     is_signed
 }
 
+// --- Scalar floating-point lowering (SPEC-41 AXS-FLT-040..044, T459) ---
+
+// 32 / 64 for `f32` / `f64`, 0 for every other type.
+fn lb_float_width(b: view<LirBuilder>, ty_v: u32) -> u32 {
+    if ty_v == 0u32 {
+        return 0u32;
+    }
+    if ty_v == TYPEID_F32 {
+        return 32u32;
+    }
+    if ty_v == TYPEID_F64 {
+        return 64u32;
+    }
+    let t = unsafe { type_get(view(*b.interner), TypeId { v: ty_v }) };
+    if (t as usize) == 0 {
+        return 0u32;
+    }
+    let k = unsafe { (*t).kind };
+    if k == TY_F32 {
+        32u32
+    } else if k == TY_F64 {
+        64u32
+    } else {
+        0u32
+    }
+}
+
+// Bit width of an integer-like type for int <-> float casts (128 for i128/u128, 8..64 otherwise).
+fn lb_int_bit_width(b: view<LirBuilder>, ty_v: u32) -> u32 {
+    if ty_is_int128(b, ty_v) {
+        return 128u32;
+    }
+    let sz = unsafe { type_size(TypeId { v: ty_v }, view(*b.interner)) };
+    if sz == 1u32 || sz == 2u32 || sz == 4u32 || sz == 8u32 {
+        sz * 8u32
+    } else {
+        64u32
+    }
+}
+
+fn lower_float_binop(b: mut_view<LirBuilder>, rv: view<MirRvalue>, dest_ty_v: u32, fw: u32) -> u32 {
+    let lhs = lower_operand(mut_view(*b), view(rv.lhs));
+    let rhs = lower_operand(mut_view(*b), view(rv.rhs));
+    let bop = rv.bin_op;
+    let mut kind: u8 = LIR_INST_FADD;
+    let mut pred: u8 = 0u8;
+    if bop == MIR_BINOP_ADD {
+        kind = LIR_INST_FADD;
+    } else if bop == MIR_BINOP_SUB {
+        kind = LIR_INST_FSUB;
+    } else if bop == MIR_BINOP_MUL {
+        kind = LIR_INST_FMUL;
+    } else if bop == MIR_BINOP_DIV {
+        kind = LIR_INST_FDIV;
+    } else if bop == MIR_BINOP_REM {
+        kind = LIR_INST_FREM;
+    } else if bop == MIR_BINOP_EQ || bop == MIR_BINOP_NE || bop == MIR_BINOP_LT ||
+              bop == MIR_BINOP_LE || bop == MIR_BINOP_GT || bop == MIR_BINOP_GE {
+        kind = LIR_INST_FCMP;
+        pred = lower_binop_checked(mut_view(*b), bop, true);
+    } else {
+        b.has_ice = true;
+    }
+    let dest = make_vreg(mut_view(*b), dest_ty_v);
+    let inst = push_new_inst(mut_view(*b), kind);
+    unsafe {
+        (*inst).dest.v = dest;
+        (*inst).lhs.v = lhs;
+        (*inst).rhs.v = rhs;
+        (*inst).rmw_op = pred;
+        (*inst).bit_width = fw;
+    }
+    dest
+}
+
+// `as` between a float and a float / integer type (MIR_CAST_FLOAT_CONVERT / FLOAT_TO_INT / INT_TO_FLOAT).
+fn lower_float_cast(
+    b: mut_view<LirBuilder>,
+    rv: view<MirRvalue>,
+    dest_ty_v: u32,
+    src_ty_v: u32,
+    src_signed: bool,
+    src_fw: u32,
+    dst_fw: u32
+) -> u32 {
+    let src = lower_operand(mut_view(*b), view(rv.use_op));
+    if src_fw != 0u32 && dst_fw != 0u32 && src_fw == dst_fw {
+        return src;
+    }
+    let mut kind: u8 = LIR_INST_FPEXT;
+    let mut bw: u32 = 0u32;
+    if src_fw != 0u32 && dst_fw != 0u32 {
+        kind = if dst_fw > src_fw { LIR_INST_FPEXT } else { LIR_INST_FPTRUNC };
+    } else if src_fw != 0u32 {
+        let mut dst_signed = false;
+        let t = unsafe { type_get(view(*b.interner), TypeId { v: dest_ty_v }) };
+        if (t as usize) != 0 {
+            let tk = unsafe { (*t).kind };
+            dst_signed = !((tk >= TY_U8 && tk <= TY_USIZE) || tk == TY_U128 || tk == TY_BOOL || tk == TY_PTR);
+        }
+        if ty_is_u128(view(*b), dest_ty_v) {
+            dst_signed = false;
+        } else if ty_is_i128(view(*b), dest_ty_v) {
+            dst_signed = true;
+        }
+        kind = if dst_signed { LIR_INST_FPTOSI } else { LIR_INST_FPTOUI };
+        bw = lb_int_bit_width(view(*b), dest_ty_v);
+    } else {
+        let mut s_signed = src_signed;
+        if ty_is_u128(view(*b), src_ty_v) {
+            s_signed = false;
+        } else if ty_is_i128(view(*b), src_ty_v) {
+            s_signed = true;
+        }
+        kind = if s_signed { LIR_INST_SITOFP } else { LIR_INST_UITOFP };
+        bw = lb_int_bit_width(view(*b), src_ty_v);
+    }
+    let dest = make_vreg(mut_view(*b), dest_ty_v);
+    let inst = push_new_inst(mut_view(*b), kind);
+    unsafe {
+        (*inst).dest.v = dest;
+        (*inst).operand.v = src;
+        (*inst).bit_width = bw;
+    }
+    dest
+}
+
 fn lower_rvalue(b: mut_view<LirBuilder>, rv: view<MirRvalue>, dest_ty_v: u32) -> u32 {
     let rvk = rv.kind;
     if rvk == MIR_RVALUE_USE {
@@ -2235,6 +2379,10 @@ fn lower_rvalue(b: mut_view<LirBuilder>, rv: view<MirRvalue>, dest_ty_v: u32) ->
         let lhs_signed = operand_is_signed(mut_view(*b), view(rv.lhs), unsafe { address_of_mut(lhs_ty_v) });
         let rhs_signed = operand_is_signed(mut_view(*b), view(rv.rhs), unsafe { address_of_mut(rhs_ty_v) });
         let is_shift = bop == MIR_BINOP_SHL || bop == MIR_BINOP_SHR;
+        let lhs_fw = lb_float_width(view(*b), lhs_ty_v);
+        if lhs_fw != 0u32 && !is_shift {
+            return lower_float_binop(mut_view(*b), rv, dest_ty_v, lhs_fw);
+        }
         let lhs_128 = ty_is_int128(view(*b), lhs_ty_v);
         let rhs_128 = !is_shift && ty_is_int128(view(*b), rhs_ty_v);
         let dst_128 = ty_is_int128(view(*b), dest_ty_v);
@@ -2312,6 +2460,18 @@ fn lower_rvalue(b: mut_view<LirBuilder>, rv: view<MirRvalue>, dest_ty_v: u32) ->
     if rvk == MIR_RVALUE_UNARY_OP {
         let mut op_ty_v: u32 = 0u32;
         let _ = operand_is_signed(mut_view(*b), view(rv.use_op), unsafe { address_of_mut(op_ty_v) });
+        let un_fw = lb_float_width(view(*b), op_ty_v);
+        if un_fw != 0u32 && rv.un_op == MIR_UNOP_NEG {
+            let fop = lower_operand(mut_view(*b), view(rv.use_op));
+            let fdest = make_vreg(mut_view(*b), op_ty_v);
+            let finst = push_new_inst(mut_view(*b), LIR_INST_FNEG);
+            unsafe {
+                (*finst).dest.v = fdest;
+                (*finst).operand.v = fop;
+                (*finst).bit_width = un_fw;
+            }
+            return fdest;
+        }
         if ty_is_int128(view(*b), op_ty_v) || ty_is_int128(view(*b), dest_ty_v) {
             let eff_ty = if ty_is_int128(view(*b), dest_ty_v) { dest_ty_v } else { op_ty_v };
             let op = lower_operand_128(mut_view(*b), view(rv.use_op), eff_ty);
@@ -2342,6 +2502,11 @@ fn lower_rvalue(b: mut_view<LirBuilder>, rv: view<MirRvalue>, dest_ty_v: u32) ->
     if rvk == MIR_RVALUE_CAST {
         let mut src_ty_v: u32 = 0u32;
         let src_signed = operand_is_signed(mut_view(*b), view(rv.use_op), unsafe { address_of_mut(src_ty_v) });
+        let src_fw = lb_float_width(view(*b), src_ty_v);
+        let dst_fw = lb_float_width(view(*b), dest_ty_v);
+        if src_fw != 0u32 || dst_fw != 0u32 {
+            return lower_float_cast(mut_view(*b), rv, dest_ty_v, src_ty_v, src_signed, src_fw, dst_fw);
+        }
         let src_128 = ty_is_int128(view(*b), src_ty_v);
         let dst_128 = ty_is_int128(view(*b), dest_ty_v);
         if !src_128 && dst_128 {

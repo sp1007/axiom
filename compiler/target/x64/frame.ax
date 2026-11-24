@@ -60,6 +60,8 @@ use compiler.lir.lir.LIR_INST_ATOMIC_CAS
 use compiler.lir.lir.LIR_INST_FENCE
 use compiler.lir.lir.LIR_INST_PAUSE
 use compiler.lir.lir.LIR_INST_CONST128
+use compiler.lir.lir.lir_kind_is_float_binary
+use compiler.lir.lir.lir_kind_is_float_unary
 use compiler.lir.lir.LIR_INST_PAIR_LO
 use compiler.lir.lir.LIR_INST_PAIR_HI
 use compiler.lir.lir.LIR_INST_PAIR_MAKE
@@ -203,6 +205,35 @@ use compiler.target.x64.encode.X64_MI_LZCNT
 use compiler.target.x64.encode.X64_MI_TZCNT
 use compiler.target.x64.encode.X64_MI_POPCNT
 use compiler.target.x64.encode.X64_MI_UDIV128
+use compiler.target.x64.encode.CC_P
+use compiler.target.x64.encode.REG_XMM1
+use compiler.target.x64.encode.x64_cqo
+use compiler.target.x64.encode.X64_MI_FADD
+use compiler.target.x64.encode.X64_MI_FSUB
+use compiler.target.x64.encode.X64_MI_FMUL
+use compiler.target.x64.encode.X64_MI_FDIV
+use compiler.target.x64.encode.X64_MI_FSQRT
+use compiler.target.x64.encode.X64_MI_UCOMIS
+use compiler.target.x64.encode.X64_MI_CVTSI2F
+use compiler.target.x64.encode.X64_MI_CVTTF2SI
+use compiler.target.x64.encode.X64_MI_CVTF2F
+use compiler.target.x64.encode.X64_MI_FXOR
+use compiler.target.x64.encode.X64_MI_FAND
+use compiler.target.x64.encode.X64_MI_FPREM
+use compiler.target.x64.encode.X64_MI_U128TOF
+use compiler.target.x64.encode.X64_MI_F2I128
+use compiler.target.x64.encode.x64_movdq_xr
+use compiler.target.x64.encode.x64_movdq_rx
+use compiler.target.x64.encode.x64_movs_rm
+use compiler.target.x64.encode.x64_movs_mr
+use compiler.target.x64.encode.x64_sse_arith_rr
+use compiler.target.x64.encode.x64_ucomis_rr
+use compiler.target.x64.encode.x64_cvtsi2f_rr
+use compiler.target.x64.encode.x64_cvttf2si_rr
+use compiler.target.x64.encode.x64_cvtf2f_rr
+use compiler.target.x64.encode.x64_fxor_rr
+use compiler.target.x64.encode.x64_fand_rr
+use compiler.target.x64.encode.x64_emit_fprem_seq
 use compiler.target.x64.encode.X64Mem
 use compiler.target.x64.encode.x64_mov_rr
 use compiler.target.x64.encode.x64_mov_rm
@@ -763,6 +794,14 @@ fn liveness_record_lir_inst(
     } else if kind == LIR_INST_PAIR_LO || kind == LIR_INST_PAIR_HI ||
               kind == LIR_INST_I128_NEG || kind == LIR_INST_I128_BITNOT ||
               kind == LIR_INST_I128_SEXT || kind == LIR_INST_I128_ZEXT || kind == LIR_INST_I128_TRUNC {
+        liveness_record_use(use_bits, def_bits, words_per_bb, b, op_v, vreg_count);
+        liveness_record_def(def_bits, words_per_bb, b, dest_v, vreg_count);
+    } else if lir_kind_is_float_binary(kind) {
+        // Scalar float binary operations (T459): lhs/rhs -> dest
+        liveness_record_use(use_bits, def_bits, words_per_bb, b, lhs_v, vreg_count);
+        liveness_record_use(use_bits, def_bits, words_per_bb, b, rhs_v, vreg_count);
+        liveness_record_def(def_bits, words_per_bb, b, dest_v, vreg_count);
+    } else if lir_kind_is_float_unary(kind) {
         liveness_record_use(use_bits, def_bits, words_per_bb, b, op_v, vreg_count);
         liveness_record_def(def_bits, words_per_bb, b, dest_v, vreg_count);
     } else if kind == LIR_INST_CONST128 {
@@ -1872,6 +1911,55 @@ pub struct X64RegAllocResult {
     pub pad: u32,
 }
 
+// SSE2 scalar float opcodes (`X64_MI_FADD`..`X64_MI_FPREM`, T459): physical def/use masks shared by
+// the register allocator and the peephole optimizer. Operands are always registers (bits 16..31 = XMM).
+fn mi_is_float_opcode(opc: u32) -> bool {
+    opc >= X64_MI_FADD && opc <= X64_MI_F2I128
+}
+
+fn mi_float_def_mask(inst: view<X64MI>) -> u32 {
+    let opc = inst.opcode;
+    if opc == X64_MI_U128TOF {
+        return 0x00030303u32; // RAX | RCX | R8 | R9 | XMM0 | XMM1
+    }
+    if opc == X64_MI_F2I128 {
+        return 0x00020107u32; // RAX | RCX | RDX | R8 | XMM1
+    }
+    if opc == X64_MI_FPREM {
+        return 0x00010001u32; // RAX (x87 status word) | XMM0 (result)
+    }
+    if opc == X64_MI_UCOMIS {
+        return 0u32;
+    }
+    if inst.op_count >= 1u8 && inst.ops[0usize].kind == X64_OP_REG {
+        let r = inst.ops[0usize].reg;
+        if r >= 0 && r < 32 { return 1u32 << (r as u32); }
+    }
+    0u32
+}
+
+fn mi_float_use_mask(inst: view<X64MI>) -> u32 {
+    if inst.opcode == X64_MI_U128TOF {
+        return 0x00000005u32; // RAX | RDX
+    }
+    if inst.opcode == X64_MI_F2I128 {
+        return 0x00010000u32; // XMM0
+    }
+    if inst.opcode == X64_MI_FPREM {
+        return 0x00030000u32; // XMM0 | XMM1
+    }
+    let mut mask: u32 = 0u32;
+    let mut i: usize = 0;
+    while i < 2 && i < (inst.op_count as usize) {
+        if inst.ops[i].kind == X64_OP_REG {
+            let r = inst.ops[i].reg;
+            if r >= 0 && r < 32 { mask = mask | (1u32 << (r as u32)); }
+        }
+        i = i + 1;
+    }
+    mask
+}
+
 fn mi_inst_phys_def_mask(inst: view<X64MI>) -> u32 {
     let opc = inst.opcode;
     if opc == X64_MI_MOV || opc == X64_MI_ADD || opc == X64_MI_SUB ||
@@ -1917,6 +2005,9 @@ fn mi_inst_phys_def_mask(inst: view<X64MI>) -> u32 {
     }
     if mi_is_i128_opcode(opc) {
         return mi_i128_def_mask(inst);
+    }
+    if mi_is_float_opcode(opc) {
+        return mi_float_def_mask(inst);
     }
     0u32
 }
@@ -2034,7 +2125,7 @@ fn mi_inst_phys_use_mask(inst: view<X64MI>) -> u32 {
         return 0u32;
     }
     if opc == X64_MI_RET {
-        return 1u32; // RAX
+        return 0x00010001u32; // RAX | XMM0 (scalar float return, T459)
     }
     if opc == X64_MI_CMOVCC {
         let mut mask: u32 = 0u32;
@@ -2065,6 +2156,9 @@ fn mi_inst_phys_use_mask(inst: view<X64MI>) -> u32 {
     }
     if mi_is_i128_opcode(opc) {
         return mi_i128_use_mask(inst, false);
+    }
+    if mi_is_float_opcode(opc) {
+        return mi_float_use_mask(inst);
     }
     0u32
 }
@@ -2565,7 +2659,8 @@ pub fn x64_regalloc_with_pgo_in_arena(
                 unsafe { *dp = prev_defs + 1u32; }
                 let iv = (iv_base + (dv_idx * iv_stride)) as *mut X64LiveInterval;
                 if prev_defs == 0u32 {
-                    if lkind == LIR_INST_CONST {
+                    if lkind == LIR_INST_CONST && (unsafe { (*iv).reg_class }) == REG_CLASS_GPR {
+                        // XMM-class constants are never rematerialised: there is no `mov xmm, imm` (T459).
                         unsafe {
                             (*iv).remat_kind = X64_REMAT_CONST;
                             (*iv).remat_imm = (*linst).const_val as i64;
@@ -2588,7 +2683,7 @@ pub fn x64_regalloc_with_pgo_in_arena(
                     } else if lkind == LIR_INST_ABI_ARG || lkind == LIR_INST_ABI_RESULT {
                         let lk = unsafe { (*linst).loc_kind };
                         let lro = unsafe { (*linst).loc_reg_or_offset };
-                        if lk == ABI_LOC_REG && lro < 16u32 {
+                        if lk == ABI_LOC_REG && lro < 32u32 {
                             unsafe { (*iv).fixed_reg_hint = lro as i32; }
                         } else if lk == ABI_LOC_INDIRECT {
                             unsafe { (*iv).must_stack = true; }
@@ -2613,7 +2708,7 @@ pub fn x64_regalloc_with_pgo_in_arena(
                     let lk = unsafe { (*linst).loc_kind };
                     let lro = unsafe { (*linst).loc_reg_or_offset };
                     let viv = (iv_base + ((val_v as usize) * iv_stride)) as *mut X64LiveInterval;
-                    if lk == ABI_LOC_REG && lro < 16u32 {
+                    if lk == ABI_LOC_REG && lro < 32u32 {
                         unsafe { (*viv).fixed_reg_hint = lro as i32; }
                     } else if lk == ABI_LOC_INDIRECT {
                         unsafe { (*viv).must_stack = true; }
@@ -2684,7 +2779,7 @@ pub fn x64_regalloc_with_pgo_in_arena(
                 mi_buf_cap = new_cap;
             }
 
-            let abi_arg_reg_mask: u32 = 0x00000306u32; // RCX | RDX | R8 | R9
+            let abi_arg_reg_mask: u32 = 0x000F0306u32; // RCX | RDX | R8 | R9 | XMM0..XMM3
             let mut pending_call_args: u32 = 0u32;
             let mut m: usize = 0;
             let mut cur = first_inst;
@@ -2732,7 +2827,7 @@ pub fn x64_regalloc_with_pgo_in_arena(
                     }
                 } else if opc == X64_MI_RET {
                     dm = 0u32;
-                    um = 1u32;
+                    um = 0x00010001u32; // RAX | XMM0
                 } else if opc == X64_MI_CMP || opc == X64_MI_TEST || opc == X64_MI_ADD || opc == X64_MI_SUB ||
                           opc == X64_MI_IMUL || opc == X64_MI_AND || opc == X64_MI_OR || opc == X64_MI_XOR ||
                           opc == X64_MI_SHL || opc == X64_MI_SAR || opc == X64_MI_SHR {
@@ -3776,8 +3871,13 @@ pub fn x64_mi_flags_effect(inst: view<X64MI>) -> u8 {
         FLAGS_PRESERVE
     } else if opc == X64_MI_SHLD || opc == X64_MI_SHRD || opc == X64_MI_NEG ||
               opc == X64_MI_IMUL1 || opc == X64_MI_BSR || opc == X64_MI_BSF ||
-              opc == X64_MI_LZCNT || opc == X64_MI_TZCNT || opc == X64_MI_POPCNT {
+              opc == X64_MI_LZCNT || opc == X64_MI_TZCNT || opc == X64_MI_POPCNT ||
+              opc == X64_MI_UCOMIS {
         FLAGS_DEF
+    } else if opc == X64_MI_FPREM || opc == X64_MI_U128TOF || opc == X64_MI_F2I128 {
+        FLAGS_KILL
+    } else if mi_is_float_opcode(opc) {
+        FLAGS_PRESERVE
     } else {
         FLAGS_NONE
     }
@@ -3814,6 +3914,9 @@ pub fn x64_flags_are_dead_after(inst: *mut X64MI) -> bool {
             continue;
         }
         if mi_is_i128_opcode(opc) {
+            return true;
+        }
+        if opc == X64_MI_UCOMIS || opc == X64_MI_FPREM || opc == X64_MI_U128TOF || opc == X64_MI_F2I128 {
             return true;
         }
         if opc == X64_MI_SHL || opc == X64_MI_SHR || opc == X64_MI_SAR {
@@ -3905,6 +4008,9 @@ fn peep_inst_phys_def_mask(inst: view<X64MI>) -> u32 {
     if mi_is_i128_opcode(opc) {
         return mi_i128_def_mask(inst);
     }
+    if mi_is_float_opcode(opc) {
+        return mi_float_def_mask(inst);
+    }
     0u32
 }
 
@@ -3951,7 +4057,7 @@ fn peep_inst_phys_use_mask(inst: view<X64MI>) -> u32 {
         return 0u32;
     }
     if opc == X64_MI_CALL {
-        let mut mask: u32 = 0x00000306u32; // RCX | RDX | R8 | R9
+        let mut mask: u32 = 0x000F0306u32; // RCX | RDX | R8 | R9 | XMM0..XMM3 (T459)
         if oc >= 1u8 {
             mask = mask | peep_op_phys_read_mask_v(view(inst.ops[0usize]));
         }
@@ -3964,7 +4070,7 @@ fn peep_inst_phys_use_mask(inst: view<X64MI>) -> u32 {
         return 0u32;
     }
     if opc == X64_MI_RET {
-        return 1u32;
+        return 0x00010001u32; // RAX | XMM0
     }
     if opc == X64_MI_CMOVCC {
         let mut mask: u32 = 0u32;
@@ -3995,6 +4101,9 @@ fn peep_inst_phys_use_mask(inst: view<X64MI>) -> u32 {
     }
     if mi_is_i128_opcode(opc) {
         return mi_i128_use_mask(inst, true);
+    }
+    if mi_is_float_opcode(opc) {
+        return mi_float_use_mask(inst);
     }
     0u32
 }
@@ -4042,7 +4151,7 @@ fn peep_reg_dead_after(inst: *mut X64MI, reg: i32) -> bool {
             return false;
         }
         if opc == X64_MI_RET {
-            return reg != REG_RAX;
+            return reg != REG_RAX && reg != REG_XMM0;
         }
         let u_mask: u32 = unsafe { peep_inst_phys_use_mask(view(*curr)) };
         if (u_mask & rbit) != 0u32 {
@@ -4156,6 +4265,9 @@ fn peep_cmp_zero_can_use_test(inst: *mut X64MI) -> bool {
             continue;
         }
         if mi_is_i128_opcode(opc) {
+            return true;
+        }
+        if opc == X64_MI_UCOMIS || opc == X64_MI_FPREM || opc == X64_MI_U128TOF || opc == X64_MI_F2I128 {
             return true;
         }
         if opc == X64_MI_SHL || opc == X64_MI_SHR || opc == X64_MI_SAR {
@@ -4306,6 +4418,8 @@ fn peep_opt_bb_stack(mbb: mut_view<X64MIBb>) -> u32 {
                             }
                         } else if mi_is_i128_opcode(sc_opc) {
                             d_mask = unsafe { mi_i128_def_mask(view(*scan)) };
+                        } else if mi_is_float_opcode(sc_opc) {
+                            d_mask = unsafe { mi_float_def_mask(view(*scan)) };
                         }
                         if (d_mask & stop_def_mask) != 0u32 {
                             break;
@@ -5081,6 +5195,7 @@ pub const X64_VERIFY_ERR_LEA_FORM: u32 = 7u32;
 pub const X64_VERIFY_ERR_SHIFT_REG_CLASS: u32 = 8u32;
 pub const X64_VERIFY_ERR_SHIFT_FORM: u32 = 9u32;
 pub const X64_VERIFY_ERR_IDIV_FORM: u32 = 10u32;
+pub const X64_VERIFY_ERR_XMM_FORM: u32 = 11u32;
 
 pub fn x64_verify_error_msg(code: u32) -> Str {
     if code == X64_VERIFY_OK {
@@ -5105,6 +5220,8 @@ pub fn x64_verify_error_msg(code: u32) -> Str {
         "Machine IR verifier: illegal operand form for shift"
     } else if code == X64_VERIFY_ERR_IDIV_FORM {
         "Machine IR verifier: illegal operand form for idiv"
+    } else if code == X64_VERIFY_ERR_XMM_FORM {
+        "Machine IR verifier: illegal XMM operand form"
     } else {
         "Machine IR verifier: unknown error"
     }
@@ -5141,6 +5258,24 @@ pub fn x64_verify_checked(body: view<X64MIBody>, layout: view<X64FrameLayout>) -
                     if !((k0 == X64_OP_REG || k0 == X64_OP_MEM) &&
                          (k1 == X64_OP_REG || k1 == X64_OP_MEM || k1 == X64_OP_IMM)) {
                         return X64_VERIFY_ERR_OPERAND_FORM;
+                    }
+                    // T459: an XMM register only moves to/from a register or memory, and only MOV
+                    // may name one (no `mov xmm, imm`, no integer ALU on XMM).
+                    let x0 = k0 == X64_OP_REG && x64_reg_is_xmm(unsafe { (*inst).ops[0usize].reg });
+                    let x1 = k1 == X64_OP_REG && x64_reg_is_xmm(unsafe { (*inst).ops[1usize].reg });
+                    if (x0 || x1) && (opc != X64_MI_MOV || k1 == X64_OP_IMM) {
+                        return X64_VERIFY_ERR_XMM_FORM;
+                    }
+                } else if opc >= X64_MI_FADD && opc <= X64_MI_FAND {
+                    if !(k0 == X64_OP_REG && k1 == X64_OP_REG) {
+                        return X64_VERIFY_ERR_XMM_FORM;
+                    }
+                    let r0 = unsafe { (*inst).ops[0usize].reg };
+                    let r1 = unsafe { (*inst).ops[1usize].reg };
+                    let want0_gpr = opc == X64_MI_CVTTF2SI;
+                    let want1_gpr = opc == X64_MI_CVTSI2F;
+                    if x64_reg_is_xmm(r0) == want0_gpr || x64_reg_is_xmm(r1) == want1_gpr {
+                        return X64_VERIFY_ERR_XMM_FORM;
                     }
                 } else if opc == X64_MI_LEA {
                     if !(k0 == X64_OP_REG && (k1 == X64_OP_MEM || k1 == X64_OP_SYM)) {
@@ -5227,20 +5362,34 @@ pub fn x64_encode_mi_inst(
             let r1 = inst.ops[1usize].reg;
             if x64_reg_is_xmm(r0) && x64_reg_is_xmm(r1) {
                 x64_movaps_rr(mut_view(*sec), r0, r1);
+            } else if x64_reg_is_xmm(r0) {
+                // GPR -> XMM bit move (T459): MOVD for 4-byte values, MOVQ otherwise.
+                x64_movdq_xr(mut_view(*sec), if sz == 4u8 { 4u8 } else { 8u8 }, r0, r1);
+            } else if x64_reg_is_xmm(r1) {
+                x64_movdq_rx(mut_view(*sec), if sz == 4u8 { 4u8 } else { 8u8 }, r0, r1);
             } else {
                 x64_mov_rr(mut_view(*sec), sz, r0, r1);
             }
         } else if k0 == X64_OP_REG && k1 == X64_OP_MEM {
             let r0 = inst.ops[0usize].reg;
             if x64_reg_is_xmm(r0) {
-                x64_movups_rm(mut_view(*sec), r0, inst.ops[1usize].mem);
+                // Scalar f32/f64 loads use MOVSS/MOVSD so a 4/8-byte slot is never over-read (T459).
+                if sz == 4u8 || sz == 8u8 {
+                    x64_movs_rm(mut_view(*sec), sz, r0, inst.ops[1usize].mem);
+                } else {
+                    x64_movups_rm(mut_view(*sec), r0, inst.ops[1usize].mem);
+                }
             } else {
                 x64_mov_rm(mut_view(*sec), sz, r0, inst.ops[1usize].mem);
             }
         } else if k0 == X64_OP_MEM && k1 == X64_OP_REG {
             let r1 = inst.ops[1usize].reg;
             if x64_reg_is_xmm(r1) {
-                x64_movups_mr(mut_view(*sec), inst.ops[0usize].mem, r1);
+                if sz == 4u8 || sz == 8u8 {
+                    x64_movs_mr(mut_view(*sec), sz, inst.ops[0usize].mem, r1);
+                } else {
+                    x64_movups_mr(mut_view(*sec), inst.ops[0usize].mem, r1);
+                }
             } else {
                 x64_mov_mr(mut_view(*sec), sz, inst.ops[0usize].mem, r1);
             }
@@ -5475,6 +5624,238 @@ pub fn x64_encode_mi_inst(
         x64_emit32(mut_view(*sec), 0u32);
     } else if opc >= X64_MI_ADC && opc <= X64_MI_UDIV128 {
         x64_encode_mi_i128_inst(mut_view(*sec), inst);
+    } else if opc >= X64_MI_FADD && opc <= X64_MI_F2I128 {
+        x64_encode_mi_float_inst(mut_view(*sec), inst);
+    }
+}
+
+// --- 128-bit integer <-> float pseudo-op expansions (SPEC-41 AXS-FLT-023, AXS-FLT-044, T459) ---
+
+fn frame_emit_jcc32_fwd(sec: mut_view<Section>, cc: u8) -> u32 {
+    x64_jcc(mut_view(*sec), cc, 0);
+    (sec.bytes_len - 4) as u32
+}
+
+fn frame_emit_jmp32_fwd(sec: mut_view<Section>) -> u32 {
+    x64_jmp(mut_view(*sec), 0);
+    (sec.bytes_len - 4) as u32
+}
+
+fn frame_patch_rel32_here(sec: mut_view<Section>, at: u32) {
+    let here = sec.bytes_len as u32;
+    x64_patch_rel32(mut_view(*sec), at, here);
+}
+
+// XMM <- 64-bit GPR (MOVQ) for f64 constants, MOVD for f32.
+fn frame_emit_movf_xr(sec: mut_view<Section>, fsz: u8, xmm: i32, gpr: i32) {
+    x64_movdq_xr(mut_view(*sec), if fsz == 4u8 { 4u8 } else { 8u8 }, xmm, gpr);
+}
+
+// xmm0 = (float) RDX:RAX, unsigned, one roundTiesToEven rounding. RAX/RDX are preserved.
+// A 128-bit value with s = bitlen(hi) > 0 is shifted right by s into R8 with a sticky bit (the
+// discarded bits sit far below the 24/53-bit rounding position), converted as a u64 and scaled by
+// 2^s exactly (an f32 product >= 2^128 overflows to +inf as required).
+pub fn x64_emit_u128_to_float(sec: mut_view<Section>, fsz: u8) {
+    x64_test_rr(mut_view(*sec), 8u8, REG_RDX, REG_RDX);
+    let j_small = frame_emit_jcc32_fwd(mut_view(*sec), CC_E);
+    x64_bsr_rr(mut_view(*sec), 8u8, REG_RCX, REG_RDX);
+    x64_add_ri(mut_view(*sec), 8u8, REG_RCX, 1);
+    x64_cmp_ri(mut_view(*sec), 8u8, REG_RCX, 64);
+    let j_s64 = frame_emit_jcc32_fwd(mut_view(*sec), CC_E);
+    // 1 <= s < 64: r8 = (lo >> s) | (hi << (64 - s)) | sticky(lo & (2^s - 1))
+    x64_mov_rr(mut_view(*sec), 8u8, REG_R8, REG_RAX);
+    x64_shrd_rrcl(mut_view(*sec), 8u8, REG_R8, REG_RDX);
+    x64_mov_rr(mut_view(*sec), 8u8, REG_R9, REG_RAX);
+    x64_shr_rcl(mut_view(*sec), 8u8, REG_R9);
+    x64_shl_rcl(mut_view(*sec), 8u8, REG_R9);
+    x64_cmp_rr(mut_view(*sec), 8u8, REG_R9, REG_RAX);
+    x64_setcc_r(mut_view(*sec), CC_NE, REG_R9);
+    x64_and_ri(mut_view(*sec), 8u8, REG_R9, 1);
+    x64_or_rr(mut_view(*sec), 8u8, REG_R8, REG_R9);
+    let j_conv1 = frame_emit_jmp32_fwd(mut_view(*sec));
+    // s == 64: r8 = hi | (lo != 0)
+    frame_patch_rel32_here(mut_view(*sec), j_s64);
+    x64_mov_rr(mut_view(*sec), 8u8, REG_R8, REG_RDX);
+    x64_test_rr(mut_view(*sec), 8u8, REG_RAX, REG_RAX);
+    x64_setcc_r(mut_view(*sec), CC_NE, REG_R9);
+    x64_and_ri(mut_view(*sec), 8u8, REG_R9, 1);
+    x64_or_rr(mut_view(*sec), 8u8, REG_R8, REG_R9);
+    let j_conv2 = frame_emit_jmp32_fwd(mut_view(*sec));
+    // hi == 0: r8 = lo, s = 0
+    frame_patch_rel32_here(mut_view(*sec), j_small);
+    x64_mov_rr(mut_view(*sec), 8u8, REG_R8, REG_RAX);
+    x64_mov_ri(mut_view(*sec), 8u8, REG_RCX, 0i64);
+    // u64 r8 -> xmm0 (two-path: halve with sticky when bit 63 is set, then double)
+    frame_patch_rel32_here(mut_view(*sec), j_conv1);
+    frame_patch_rel32_here(mut_view(*sec), j_conv2);
+    x64_test_rr(mut_view(*sec), 8u8, REG_R8, REG_R8);
+    let j_half = frame_emit_jcc32_fwd(mut_view(*sec), CC_S);
+    x64_cvtsi2f_rr(mut_view(*sec), fsz, 8u8, REG_XMM0, REG_R8);
+    let j_scale = frame_emit_jmp32_fwd(mut_view(*sec));
+    frame_patch_rel32_here(mut_view(*sec), j_half);
+    x64_mov_rr(mut_view(*sec), 8u8, REG_R9, REG_R8);
+    x64_shr_ri(mut_view(*sec), 8u8, REG_R9, 1u8);
+    x64_and_ri(mut_view(*sec), 8u8, REG_R8, 1);
+    x64_or_rr(mut_view(*sec), 8u8, REG_R9, REG_R8);
+    x64_cvtsi2f_rr(mut_view(*sec), fsz, 8u8, REG_XMM0, REG_R9);
+    x64_sse_arith_rr(mut_view(*sec), 0x58u8, fsz, REG_XMM0, REG_XMM0);
+    // xmm0 *= 2^s (exact power of two built from the exponent field)
+    frame_patch_rel32_here(mut_view(*sec), j_scale);
+    x64_mov_rr(mut_view(*sec), 8u8, REG_R9, REG_RCX);
+    if fsz == 4u8 {
+        x64_add_ri(mut_view(*sec), 8u8, REG_R9, 127);
+        x64_shl_ri(mut_view(*sec), 8u8, REG_R9, 23u8);
+    } else {
+        x64_add_ri(mut_view(*sec), 8u8, REG_R9, 1023);
+        x64_shl_ri(mut_view(*sec), 8u8, REG_R9, 52u8);
+    }
+    frame_emit_movf_xr(mut_view(*sec), fsz, REG_XMM1, REG_R9);
+    x64_sse_arith_rr(mut_view(*sec), 0x59u8, fsz, REG_XMM0, REG_XMM1);
+}
+
+// RDX:RAX = saturating truncation of xmm0 to i128 (`is_signed`) or u128 (AXS-FLT-022):
+// NaN -> 0, x >= MAX + 1 -> MAX, x <= MIN (or x < 1 for u128) -> MIN / 0, otherwise trunc(x).
+// |x| < 2^63 uses CVTT*2SI + CQO; larger magnitudes shift the significand by (exponent - bias).
+pub fn x64_emit_float_to_i128(sec: mut_view<Section>, fsz: u8, is_signed: bool) {
+    let upper: i64 = if is_signed {
+        if fsz == 4u8 { 0x7F000000i64 } else { 0x47E0000000000000i64 }
+    } else {
+        if fsz == 4u8 { 0x7F800000i64 } else { 0x47F0000000000000i64 }
+    };
+    let lower: i64 = if is_signed {
+        if fsz == 4u8 { 0xFF000000i64 } else { (0xC7E0000000000000u64) as i64 }
+    } else {
+        if fsz == 4u8 { 0x3F800000i64 } else { 0x3FF0000000000000i64 }
+    };
+    x64_ucomis_rr(mut_view(*sec), fsz, REG_XMM0, REG_XMM0);
+    let j_nan = frame_emit_jcc32_fwd(mut_view(*sec), CC_P);
+    x64_mov_ri(mut_view(*sec), 8u8, REG_RCX, upper);
+    frame_emit_movf_xr(mut_view(*sec), fsz, REG_XMM1, REG_RCX);
+    x64_ucomis_rr(mut_view(*sec), fsz, REG_XMM0, REG_XMM1);
+    let j_max = frame_emit_jcc32_fwd(mut_view(*sec), CC_AE);
+    x64_mov_ri(mut_view(*sec), 8u8, REG_RCX, lower);
+    frame_emit_movf_xr(mut_view(*sec), fsz, REG_XMM1, REG_RCX);
+    x64_ucomis_rr(mut_view(*sec), fsz, REG_XMM1, REG_XMM0);
+    // signed: lower >= x -> MIN; unsigned: 1.0 > x -> 0
+    let j_low = frame_emit_jcc32_fwd(mut_view(*sec), if is_signed { CC_AE } else { CC_A });
+    x64_cvttf2si_rr(mut_view(*sec), fsz, 8u8, REG_RAX, REG_XMM0);
+    x64_mov_ri(mut_view(*sec), 8u8, REG_RCX, (0x8000000000000000u64) as i64);
+    x64_cmp_rr(mut_view(*sec), 8u8, REG_RAX, REG_RCX);
+    let j_big = frame_emit_jcc32_fwd(mut_view(*sec), CC_E);
+    x64_cqo(mut_view(*sec));
+    let j_done1 = frame_emit_jmp32_fwd(mut_view(*sec));
+    // |x| >= 2^63: rdx:rax = significand << (exponent - bias - mantissa_bits), then apply the sign.
+    frame_patch_rel32_here(mut_view(*sec), j_big);
+    x64_movdq_rx(mut_view(*sec), if fsz == 4u8 { 4u8 } else { 8u8 }, REG_RCX, REG_XMM0);
+    x64_mov_rr(mut_view(*sec), 8u8, REG_R8, REG_RCX);
+    x64_mov_rr(mut_view(*sec), 8u8, REG_RAX, REG_RCX);
+    if fsz == 4u8 {
+        x64_shr_ri(mut_view(*sec), 8u8, REG_R8, 23u8);
+        x64_and_ri(mut_view(*sec), 8u8, REG_R8, 0xFF);
+        x64_sub_ri(mut_view(*sec), 8u8, REG_R8, 150);
+        x64_and_ri(mut_view(*sec), 8u8, REG_RAX, 0x7FFFFF);
+        x64_or_ri(mut_view(*sec), 8u8, REG_RAX, 0x800000);
+    } else {
+        x64_shr_ri(mut_view(*sec), 8u8, REG_R8, 52u8);
+        x64_and_ri(mut_view(*sec), 8u8, REG_R8, 0x7FF);
+        x64_sub_ri(mut_view(*sec), 8u8, REG_R8, 1075);
+        x64_mov_ri(mut_view(*sec), 8u8, REG_RDX, 0x000FFFFFFFFFFFFFi64);
+        x64_and_rr(mut_view(*sec), 8u8, REG_RAX, REG_RDX);
+        x64_mov_ri(mut_view(*sec), 8u8, REG_RDX, 0x0010000000000000i64);
+        x64_or_rr(mut_view(*sec), 8u8, REG_RAX, REG_RDX);
+    }
+    x64_mov_ri(mut_view(*sec), 8u8, REG_RDX, 0i64);
+    x64_mov_rr(mut_view(*sec), 8u8, REG_RCX, REG_R8);
+    x64_cmp_ri(mut_view(*sec), 8u8, REG_RCX, 64);
+    let j_lt64 = frame_emit_jcc32_fwd(mut_view(*sec), CC_B);
+    x64_sub_ri(mut_view(*sec), 8u8, REG_RCX, 64);
+    x64_shl_rcl(mut_view(*sec), 8u8, REG_RAX);
+    x64_mov_rr(mut_view(*sec), 8u8, REG_RDX, REG_RAX);
+    x64_mov_ri(mut_view(*sec), 8u8, REG_RAX, 0i64);
+    let j_sign = frame_emit_jmp32_fwd(mut_view(*sec));
+    frame_patch_rel32_here(mut_view(*sec), j_lt64);
+    x64_shld_rrcl(mut_view(*sec), 8u8, REG_RDX, REG_RAX);
+    x64_shl_rcl(mut_view(*sec), 8u8, REG_RAX);
+    frame_patch_rel32_here(mut_view(*sec), j_sign);
+    x64_movdq_rx(mut_view(*sec), if fsz == 4u8 { 4u8 } else { 8u8 }, REG_RCX, REG_XMM0);
+    if fsz == 4u8 {
+        x64_shl_ri(mut_view(*sec), 8u8, REG_RCX, 32u8);
+    }
+    x64_test_rr(mut_view(*sec), 8u8, REG_RCX, REG_RCX);
+    let j_pos = frame_emit_jcc32_fwd(mut_view(*sec), CC_NS);
+    x64_neg_r(mut_view(*sec), 8u8, REG_RAX);
+    x64_adc_ri(mut_view(*sec), 8u8, REG_RDX, 0);
+    x64_neg_r(mut_view(*sec), 8u8, REG_RDX);
+    frame_patch_rel32_here(mut_view(*sec), j_pos);
+    let j_done2 = frame_emit_jmp32_fwd(mut_view(*sec));
+    // MAX
+    frame_patch_rel32_here(mut_view(*sec), j_max);
+    x64_mov_ri(mut_view(*sec), 8u8, REG_RAX, -1i64);
+    x64_mov_ri(mut_view(*sec), 8u8, REG_RDX, if is_signed { 0x7FFFFFFFFFFFFFFFi64 } else { -1i64 });
+    let j_done3 = frame_emit_jmp32_fwd(mut_view(*sec));
+    // MIN (i128) or 0 (u128, x < 1)
+    frame_patch_rel32_here(mut_view(*sec), j_low);
+    x64_mov_ri(mut_view(*sec), 8u8, REG_RAX, 0i64);
+    x64_mov_ri(mut_view(*sec), 8u8, REG_RDX, if is_signed { (0x8000000000000000u64) as i64 } else { 0i64 });
+    let j_done4 = frame_emit_jmp32_fwd(mut_view(*sec));
+    // NaN -> 0
+    frame_patch_rel32_here(mut_view(*sec), j_nan);
+    x64_mov_ri(mut_view(*sec), 8u8, REG_RAX, 0i64);
+    x64_mov_ri(mut_view(*sec), 8u8, REG_RDX, 0i64);
+    frame_patch_rel32_here(mut_view(*sec), j_done1);
+    frame_patch_rel32_here(mut_view(*sec), j_done2);
+    frame_patch_rel32_here(mut_view(*sec), j_done3);
+    frame_patch_rel32_here(mut_view(*sec), j_done4);
+}
+
+// --- SSE2 scalar floating-point MI encoding (SPEC-41 AXS-FLT-042..044, T459) ---
+// Every float opcode is register-register: isel loads operands into scratch XMM registers with MOV
+// first, so a register-allocated (GPR) float vreg never appears as an SSE operand.
+fn x64_encode_mi_float_inst(sec: mut_view<Section>, inst: view<X64MI>) {
+    let opc = inst.opcode;
+    // `sz` is the width chosen by isel. `size` is not usable here: the build driver
+    // (`driver_emit_build_mi_body_obj`) normalises `size` to 8 for every opcode except MOV/CMP/atomics.
+    let fsz: u8 = if inst.sz == 4u8 { 4u8 } else { 8u8 };
+    if opc == X64_MI_FPREM {
+        x64_emit_fprem_seq(mut_view(*sec), fsz);
+        return;
+    }
+    if opc == X64_MI_U128TOF {
+        x64_emit_u128_to_float(mut_view(*sec), fsz);
+        return;
+    }
+    if opc == X64_MI_F2I128 {
+        let is_signed = inst.op_count >= 1u8 && inst.ops[0usize].kind == X64_OP_IMM && inst.ops[0usize].imm != 0i64;
+        x64_emit_float_to_i128(mut_view(*sec), fsz, is_signed);
+        return;
+    }
+    if inst.ops[0usize].kind != X64_OP_REG || inst.ops[1usize].kind != X64_OP_REG {
+        return;
+    }
+    let r0 = inst.ops[0usize].reg;
+    let r1 = inst.ops[1usize].reg;
+    if opc == X64_MI_FADD {
+        x64_sse_arith_rr(mut_view(*sec), 0x58u8, fsz, r0, r1);
+    } else if opc == X64_MI_FSUB {
+        x64_sse_arith_rr(mut_view(*sec), 0x5Cu8, fsz, r0, r1);
+    } else if opc == X64_MI_FMUL {
+        x64_sse_arith_rr(mut_view(*sec), 0x59u8, fsz, r0, r1);
+    } else if opc == X64_MI_FDIV {
+        x64_sse_arith_rr(mut_view(*sec), 0x5Eu8, fsz, r0, r1);
+    } else if opc == X64_MI_FSQRT {
+        x64_sse_arith_rr(mut_view(*sec), 0x51u8, fsz, r0, r1);
+    } else if opc == X64_MI_UCOMIS {
+        x64_ucomis_rr(mut_view(*sec), fsz, r0, r1);
+    } else if opc == X64_MI_CVTSI2F {
+        x64_cvtsi2f_rr(mut_view(*sec), fsz, 8u8, r0, r1);
+    } else if opc == X64_MI_CVTTF2SI {
+        x64_cvttf2si_rr(mut_view(*sec), fsz, 8u8, r0, r1);
+    } else if opc == X64_MI_CVTF2F {
+        x64_cvtf2f_rr(mut_view(*sec), fsz, r0, r1);
+    } else if opc == X64_MI_FXOR {
+        x64_fxor_rr(mut_view(*sec), fsz, r0, r1);
+    } else if opc == X64_MI_FAND {
+        x64_fand_rr(mut_view(*sec), fsz, r0, r1);
     }
 }
 

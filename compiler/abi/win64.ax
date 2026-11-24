@@ -18,6 +18,10 @@ use compiler.types.types.TY_STR
 use compiler.types.types.TY_I64
 use compiler.types.types.TY_I128
 use compiler.types.types.TY_U128
+use compiler.types.types.TY_F32
+use compiler.types.types.TY_F64
+use compiler.types.types.TYPEID_F32
+use compiler.types.types.TYPEID_F64
 use compiler.types.types.type_get
 use compiler.types.types.typeid_at
 use compiler.types.types.intern_singleton
@@ -42,6 +46,10 @@ use compiler.lir.lir.lir_vreg_at
 pub const ABI_LOC_REG: u32 = 0u32;
 pub const ABI_LOC_STACK: u32 = 1u32;
 pub const ABI_LOC_INDIRECT: u32 = 2u32;
+// Variadic `extern "C"` float argument in positions 0..3 (SPEC-41 AXS-FLT-041 rule 3): the value is
+// passed in XMMn (`reg`) and its 64-bit pattern is mirrored into the GPR of the same position
+// (`win64_mirror_gpr(reg)`). Produced only by `win64_classify_ex(.., variadic = true)`.
+pub const ABI_LOC_REG_MIRROR: u32 = 3u32;
 
 pub const AX_ABI_LOC_REG: u32 = 0u32;
 pub const AX_ABI_LOC_STACK: u32 = 1u32;
@@ -70,6 +78,28 @@ pub const WIN64_REG_R13: u32 = 13u32;
 pub const WIN64_REG_R14: u32 = 14u32;
 pub const WIN64_REG_R15: u32 = 15u32;
 pub const WIN64_REG_NONE: u32 = 0xFFFFFFFFu32;
+
+// --- Windows x64 XMM Register Identifiers (matching ax_x64_reg_t: XMM0 = 16 .. XMM15 = 31) ---
+
+pub const WIN64_REG_XMM0: u32 = 16u32;
+pub const WIN64_REG_XMM5: u32 = 21u32;
+pub const WIN64_REG_XMM6: u32 = 22u32;
+pub const WIN64_REG_XMM15: u32 = 31u32;
+pub const WIN64_FLOAT_RET_REG: u32 = 16u32;
+
+// Positional floating-point argument registers (SPEC-41 AXS-FLT-041 rule 1): position k < 4 uses
+// XMMk; the integer register of the same position is skipped (and vice versa).
+pub const WIN64_ARG_XMM_REGS: [4]u32 = [
+    16u32,
+    17u32,
+    18u32,
+    19u32,
+];
+
+// Volatile XMM0..XMM5 and non-volatile XMM6..XMM15 as physical-register bitmasks (bit = reg number).
+pub const WIN64_XMM_CALLER_SAVED_MASK: u32 = 0x003F0000u32;
+pub const WIN64_XMM_CALLEE_SAVED_MASK: u32 = 0xFFC00000u32;
+pub const WIN64_XMM_SAVE_SLOT_SIZE: u32 = 16u32;
 
 // --- Windows x64 Calling Convention Invariants ---
 
@@ -231,6 +261,47 @@ pub fn win64_arg_reg(index: u32) -> u32 {
     }
 }
 
+pub fn win64_arg_xmm_reg(index: u32) -> u32 {
+    if index < WIN64_MAX_REG_ARGS {
+        WIN64_ARG_XMM_REGS[index as usize]
+    } else {
+        WIN64_REG_NONE
+    }
+}
+
+// GPR of the same argument position as XMM argument register `xmm` (XMM0 -> RCX .. XMM3 -> R9).
+pub fn win64_mirror_gpr(xmm: u32) -> u32 {
+    if xmm >= WIN64_REG_XMM0 && xmm < WIN64_REG_XMM0 + WIN64_MAX_REG_ARGS {
+        WIN64_ARG_REGS[(xmm - WIN64_REG_XMM0) as usize]
+    } else {
+        WIN64_REG_NONE
+    }
+}
+
+pub fn win64_is_xmm_callee_saved(reg: u32) -> bool {
+    reg >= WIN64_REG_XMM6 && reg <= WIN64_REG_XMM15
+}
+
+pub fn win64_is_xmm_caller_saved(reg: u32) -> bool {
+    reg >= WIN64_REG_XMM0 && reg <= WIN64_REG_XMM5
+}
+
+// `f32` / `f64` scalars are classified to the XMM register file (SPEC-41 AXS-FLT-041).
+pub fn win64_is_float_type(ty: TypeId, interner: view<TypeInterner>) -> bool {
+    if ty.v == 0u32 {
+        return false;
+    }
+    if ty.v == TYPEID_F32 || ty.v == TYPEID_F64 {
+        return true;
+    }
+    let t = type_get(interner, ty);
+    if (t as usize) == 0 {
+        return false;
+    }
+    let k = unsafe { (*t).kind };
+    k == TY_F32 || k == TY_F64
+}
+
 pub fn win64_is_caller_saved(reg: u32) -> bool {
     reg == WIN64_REG_RAX ||
     reg == WIN64_REG_RCX ||
@@ -304,6 +375,18 @@ pub fn win64_classify(
     interner: *mut TypeInterner,
     arena: mut_view<Arena>
 ) -> AbiSig {
+    win64_classify_ex(fn_ty, interner, arena, false)
+}
+
+// `variadic`: the callee is a variadic `extern "C"` function; float arguments in positions 0..3 are
+// then `ABI_LOC_REG_MIRROR` (XMMn + GPR copy). Promotion of `f32` variadic arguments to `f64` is the
+// caller's (MIR) responsibility.
+pub fn win64_classify_ex(
+    fn_ty: *const AxType,
+    interner: *mut TypeInterner,
+    arena: mut_view<Arena>,
+    variadic: bool
+) -> AbiSig {
     let mut sig = abi_sig_empty();
     if (fn_ty as usize) == 0 || (interner as usize) == 0 {
         return sig;
@@ -373,7 +456,8 @@ pub fn win64_classify(
         sig.ret.loc = abi_loc_indirect_reg(sret_reg);
     } else {
         sig.ret.ty = TypeId { v: ret_ty_v };
-        sig.ret.loc = abi_loc_reg(WIN64_RET_REG);
+        let ret_is_float = unsafe { win64_is_float_type(TypeId { v: ret_ty_v }, view(*interner)) };
+        sig.ret.loc = abi_loc_reg(if ret_is_float { WIN64_FLOAT_RET_REG } else { WIN64_RET_REG });
     }
 
     sig.arg_count = param_count;
@@ -429,11 +513,15 @@ pub fn win64_classify(
                 arg_idx = arg_idx + 1u32;
             }
         } else {
+            let p_is_float = k == TY_FN && unsafe { win64_is_float_type(TypeId { v: pty_v }, view(*interner)) };
             if arg_idx < WIN64_MAX_REG_ARGS {
-                let reg = WIN64_ARG_REGS[arg_idx as usize];
+                let reg = if p_is_float { WIN64_ARG_XMM_REGS[arg_idx as usize] } else { WIN64_ARG_REGS[arg_idx as usize] };
                 arg_idx = arg_idx + 1u32;
                 unsafe {
                     (*arg_ptr).loc = abi_loc_reg(reg);
+                    if p_is_float && variadic {
+                        (*arg_ptr).loc.kind = ABI_LOC_REG_MIRROR;
+                    }
                 }
             } else {
                 unsafe {
