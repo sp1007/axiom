@@ -111,6 +111,8 @@ use compiler.lex.token.SUFFIX_I64
 use compiler.lex.token.SUFFIX_I8
 use compiler.lex.token.SUFFIX_ISIZE
 use compiler.lex.token.SUFFIX_NONE
+use compiler.lex.token.SUFFIX_F32
+use compiler.lex.token.SUFFIX_F64
 use compiler.lex.token.SUFFIX_U128
 use compiler.lex.token.SUFFIX_U16
 use compiler.lex.token.SUFFIX_U32
@@ -300,6 +302,15 @@ use compiler.types.types.TY_ENUM
 use compiler.types.types.TY_ERROR
 use compiler.types.types.TY_FN
 use compiler.types.types.TY_I128
+use compiler.types.types.TY_F32
+use compiler.types.types.TY_F64
+use compiler.types.types.TY_FLOAT_VAR
+use compiler.types.types.TYPEID_F32
+use compiler.types.types.TYPEID_F64
+use compiler.types.types.type_vars_new_float_var
+use compiler.lex.token.float_bits_from_u128
+use compiler.lex.token.FLOAT_LIT_F64_OVERFLOW
+use compiler.lex.token.FLOAT_LIT_F32_OVERFLOW
 use compiler.types.types.TY_I16
 use compiler.types.types.TY_I32
 use compiler.types.types.TY_I64
@@ -461,7 +472,11 @@ pub struct LitCheck {
     pub ty: TypeId,
     pub negated: bool,
     pub unary: *mut HirExpr,
+    // T457: 0 for an integer literal; TC_LIT_FLOAT_TOKEN | overflow flags for a float literal token.
+    pub float_flags: u8,
 }
+
+const TC_LIT_FLOAT_TOKEN: u8 = 0x80u8;
 
 pub struct NegCheck {
     pub span: Span,
@@ -1471,6 +1486,7 @@ fn tc_index_word(k: u8) -> usize {
     if k == TY_ARRAY { return 9; }
     if k == TY_SLICE { return 10; }
     if k == TY_UNIT { return 11; }
+    if k == TY_F32 || k == TY_F64 || k == TY_FLOAT_VAR { return 12; }
     13
 }
 
@@ -1585,6 +1601,18 @@ fn new_int_var(cx: mut_view<TypeckCtx>) -> TypeId {
     }
 }
 
+fn new_float_var(cx: mut_view<TypeckCtx>) -> TypeId {
+    unsafe {
+        type_vars_new_float_var(mut_view(cx.type_vars), mut_view((*cx.thir).interner))
+    }
+}
+
+// T457: f32, f64 or an unsuffixed float literal variable.
+fn is_floatlike(cx: mut_view<TypeckCtx>, id: TypeId) -> bool {
+    let k = kind_of(mut_view(*cx), (TypeId { v: id.v }));
+    k == TY_F32 || k == TY_F64 || k == TY_FLOAT_VAR
+}
+
 fn new_ty_var(cx: mut_view<TypeckCtx>, sp: view<Span>) -> TypeId {
     unsafe {
         type_vars_new_ty_var(mut_view(cx.type_vars), mut_view((*cx.thir).interner), sp)
@@ -1620,6 +1648,7 @@ fn push_lit_check(cx: mut_view<TypeckCtx>, sp: view<Span>, value: u64, value_hi:
         (*e).ty.v = ty.v;
         (*e).negated = false;
         (*e).unary = 0 as *mut HirExpr;
+        (*e).float_flags = 0u8;
     }
     cx.lits_len = cx.lits_len + 1;
 }
@@ -1834,6 +1863,9 @@ fn default_int_vars(cx: mut_view<TypeckCtx>) {
                 let en = unsafe { (*e).span.end };
                 type_error_sp(mut_view(*cx), fv, st, en, AX_TYPE_UNKNOWN);
                 unsafe { (*e).resolved_to.v = err_v; }
+            } else if unsafe { (*e).is_float } {
+                // T457 (SPEC-41 AXS-FLT-003): an unconstrained float literal defaults to f64.
+                unsafe { (*e).resolved_to.v = TYPEID_F64; }
             } else {
                 unsafe { (*e).resolved_to.v = i32_v; }
             }
@@ -1918,7 +1950,33 @@ fn check_literal_ranges(cx: mut_view<TypeckCtx>) {
         let l_ty_v = unsafe { (*lc).ty.v };
         let ty = resolve_ty(mut_view(*cx), (TypeId { v: l_ty_v }));
         let k = kind_of(mut_view(*cx), (TypeId { v: ty.v }));
-        if k != TY_ERROR {
+        let ffl = unsafe { (*lc).float_flags };
+        if k == TY_F32 || k == TY_F64 {
+            // T457 (SPEC-41 AXS-FLT-003): a literal whose value rounds to infinity is out of range.
+            let mut ovf = false;
+            if (ffl & TC_LIT_FLOAT_TOKEN) != 0u8 {
+                if k == TY_F32 {
+                    ovf = (ffl & (FLOAT_LIT_F32_OVERFLOW as u8)) != 0u8;
+                } else {
+                    ovf = (ffl & (FLOAT_LIT_F64_OVERFLOW as u8)) != 0u8;
+                }
+            } else {
+                let mut o = false;
+                let lv = unsafe { (*lc).value };
+                let lvh = unsafe { (*lc).value_hi };
+                let _ = float_bits_from_u128(lv, lvh, false, k == TY_F32, mut_view(o));
+                ovf = o;
+            }
+            if ovf {
+                let neg = unsafe { (*lc).negated };
+                let fv = if neg { unsafe { (*lc).neg_span.file.v } } else { unsafe { (*lc).span.file.v } };
+                let st = if neg { unsafe { (*lc).neg_span.start } } else { unsafe { (*lc).span.start } };
+                let en = if neg { unsafe { (*lc).neg_span.end } } else { unsafe { (*lc).span.end } };
+                type_error_sp(mut_view(*cx), fv, st, en, AX_TYPE_LITERAL_OUT_OF_RANGE);
+            }
+        } else if (ffl & TC_LIT_FLOAT_TOKEN) != 0u8 {
+            // A float literal unified with a non-float type was already reported as a mismatch.
+        } else if k != TY_ERROR {
             let neg = unsafe { (*lc).negated };
             let val = unsafe { (*lc).value };
             let val_hi = unsafe { (*lc).value_hi };
@@ -2003,6 +2061,155 @@ fn int_literal_type(cx: mut_view<TypeckCtx>, tok: view<Token>, sp: view<Span>) -
         unsafe { (*lc).negated = true; }
     }
     ty
+}
+
+// T457 (SPEC-41 AXS-FLT-003): `2.5f32` / `2.5f64` are concrete; an unsuffixed float literal gets a fresh
+// float variable (default f64). The range check (rounding to infinity) runs once the type is final.
+fn float_literal_type(cx: mut_view<TypeckCtx>, tok: view<Token>, sp: view<Span>) -> TypeId {
+    if (tok.flags & TOK_FLAG_ERROR) != 0u16 {
+        let err_v = unsafe { (*cx.thir).interner.t_error.v };
+        return (TypeId { v: err_v });
+    }
+    let mut ty = (TypeId { v: 0u32 });
+    if tok.suffix == SUFFIX_F32 {
+        ty.v = TYPEID_F32;
+    } else if tok.suffix == SUFFIX_F64 {
+        ty.v = TYPEID_F64;
+    } else {
+        let fv = new_float_var(mut_view(*cx));
+        ty.v = fv.v;
+    }
+    push_lit_check(mut_view(*cx), sp, 0u64, 0u64, (TypeId { v: ty.v }));
+    let lc = unsafe { litcheck_at(cx.lits, cx.lits_len - 1) };
+    let ovf_bits: u8 = (tok.str_len & 3) as u8;
+    unsafe { (*lc).float_flags = TC_LIT_FLOAT_TOKEN | ovf_bits; }
+    ty
+}
+
+// T457: an integer literal operand as written in source (`3` or `-3`); returns the literal node.
+fn tc_int_lit_operand(e: *const HirExpr) -> *mut HirExpr {
+    if (e as usize) == 0 { return 0 as *mut HirExpr; }
+    let ek = unsafe { (*e).kind };
+    if ek == HIR_EXPR_LITERAL && (unsafe { (*e).literal.kind }) == TOK_INT {
+        return e as *mut HirExpr;
+    }
+    if ek == HIR_EXPR_UNARY && (unsafe { (*e).op }) == UNOP_NEG {
+        let inner: *mut HirExpr = unsafe { (*e).inner };
+        if (inner as usize) != 0 && (unsafe { (*inner).kind }) == HIR_EXPR_LITERAL && (unsafe { (*inner).literal.kind }) == TOK_INT {
+            return inner;
+        }
+    }
+    0 as *mut HirExpr
+}
+
+// T457 (SPEC-04 AXS-EXT-035, SPEC-41 AXS-FLT-032 rule 2): an unsuffixed integer literal operand of a numeric
+// operator whose peer is floating-point is typed directly as that float type (no cast needed).
+fn tc_fix_int_lit_to_float(cx: mut_view<TypeckCtx>, e: *const HirExpr, fty: TypeId) -> bool {
+    let lit = tc_int_lit_operand(e);
+    if (lit as usize) == 0 { return false; }
+    if (unsafe { (*lit).literal.suffix }) != SUFFIX_NONE { return false; }
+    unsafe {
+        thir_set_expr_type(mut_view(*cx.thir), lit as *const HirExpr, (TypeId { v: fty.v }));
+        thir_set_expr_type(mut_view(*cx.thir), e, (TypeId { v: fty.v }));
+    }
+    let fv = unsafe { (*lit).span.file.v };
+    let st = unsafe { (*lit).span.start };
+    let en = unsafe { (*lit).span.end };
+    let mut i = cx.lits_len;
+    while i > 0 {
+        let lc = unsafe { litcheck_at(cx.lits, i - 1) };
+        if unsafe { (*lc).span.file.v } == fv && unsafe { (*lc).span.start } == st && unsafe { (*lc).span.end } == en {
+            unsafe { (*lc).ty.v = fty.v; }
+            break;
+        }
+        i = i - 1;
+    }
+    true
+}
+
+// T457 (REQ-OWNER-007, SPEC-41 AXS-FLT-031..033): typing of a binary arithmetic / comparison node where at
+// least one operand is floating-point. Returns the operator type (bool for comparisons). Integer operands
+// that are not literals keep their own type and are promoted by an explicit IntToFloat cast in the MIR
+// builder; an f32 operand of an f64 operation is promoted with FloatConvert.
+fn check_binary_float(
+    cx: mut_view<TypeckCtx>,
+    expr: *const HirExpr,
+    lptr: *const HirExpr,
+    left_ty: TypeId,
+    rptr: *const HirExpr,
+    right_ty: TypeId,
+    expected: TypeId
+) -> TypeId {
+    let op = unsafe { (*expr).op };
+    let bool_v = unsafe { (*cx.thir).interner.t_bool.v };
+    let err_v = unsafe { (*cx.thir).interner.t_error.v };
+    let is_cmp = op >= BINOP_EQ && op <= BINOP_GE;
+    let rl = resolve_ty(mut_view(*cx), (TypeId { v: left_ty.v }));
+    let rr = resolve_ty(mut_view(*cx), (TypeId { v: right_ty.v }));
+    if is_error(mut_view(*cx), (TypeId { v: rl.v })) || is_error(mut_view(*cx), (TypeId { v: rr.v })) {
+        return if is_cmp { (TypeId { v: bool_v }) } else { (TypeId { v: err_v }) };
+    }
+    if op == BINOP_BITAND || op == BINOP_BITOR || op == BINOP_BITXOR {
+        return unsafe { type_error(mut_view(*cx), view((*expr).span), AX_TYPE_OPERATOR) };
+    }
+    let lnev = is_never(mut_view(*cx), (TypeId { v: rl.v }));
+    let rnev = is_never(mut_view(*cx), (TypeId { v: rr.v }));
+    if lnev || rnev {
+        let o = if lnev { (TypeId { v: rr.v }) } else { (TypeId { v: rl.v }) };
+        return if is_cmp { (TypeId { v: bool_v }) } else { o };
+    }
+    let lf = is_floatlike(mut_view(*cx), (TypeId { v: rl.v }));
+    let rf = is_floatlike(mut_view(*cx), (TypeId { v: rr.v }));
+    let li = is_intlike(mut_view(*cx), (TypeId { v: rl.v }));
+    let ri = is_intlike(mut_view(*cx), (TypeId { v: rr.v }));
+    if (!lf && !li) || (!rf && !ri) {
+        return unsafe { type_error(mut_view(*cx), view((*expr).span), AX_TYPE_MISMATCH) };
+    }
+    let lk = kind_of(mut_view(*cx), (TypeId { v: rl.v }));
+    let rk = kind_of(mut_view(*cx), (TypeId { v: rr.v }));
+    let mut f = (TypeId { v: 0u32 });
+    if lf && rf {
+        if lk == TY_FLOAT_VAR && rk == TY_FLOAT_VAR {
+            let _ = unify_ty(mut_view(*cx), (TypeId { v: rl.v }), (TypeId { v: rr.v }));
+            f.v = rl.v;
+        } else if lk == TY_FLOAT_VAR {
+            let _ = unify_ty(mut_view(*cx), (TypeId { v: rl.v }), (TypeId { v: rr.v }));
+            f.v = rr.v;
+        } else if rk == TY_FLOAT_VAR {
+            let _ = unify_ty(mut_view(*cx), (TypeId { v: rr.v }), (TypeId { v: rl.v }));
+            f.v = rl.v;
+        } else if lk == TY_F64 || rk == TY_F64 {
+            f.v = TYPEID_F64;
+        } else {
+            f.v = TYPEID_F32;
+        }
+    } else if lf {
+        f.v = rl.v;
+    } else {
+        f.v = rr.v;
+    }
+    if !is_cmp && expected.v != 0u32 {
+        let re = resolve_ty(mut_view(*cx), (TypeId { v: expected.v }));
+        let ek = kind_of(mut_view(*cx), (TypeId { v: re.v }));
+        let fk = kind_of(mut_view(*cx), (TypeId { v: f.v }));
+        if ek == TY_F32 || ek == TY_F64 {
+            if fk == TY_FLOAT_VAR {
+                let _ = unify_ty(mut_view(*cx), (TypeId { v: f.v }), (TypeId { v: re.v }));
+                f.v = re.v;
+            } else if fk == TY_F32 && ek == TY_F64 {
+                // An enclosing f64 context evaluates the operation in f64 (SPEC-41 AXS-FLT-031 rule 2).
+                f.v = re.v;
+            }
+        }
+    }
+    if li {
+        let _ = tc_fix_int_lit_to_float(mut_view(*cx), lptr, (TypeId { v: f.v }));
+    }
+    if ri {
+        let _ = tc_fix_int_lit_to_float(mut_view(*cx), rptr, (TypeId { v: f.v }));
+    }
+    if is_cmp { return (TypeId { v: bool_v }); }
+    f
 }
 
 fn tc_path_name_sv(cx: view<TypeckCtx>, path: view<HirPath>) -> StrView {
@@ -3597,9 +3804,8 @@ pub fn hir_type_to_typeid(cx: mut_view<TypeckCtx>, ht: *const HirType) -> TypeId
             if tc_sv_is_4(view(name), 99u8, 104u8, 97u8, 114u8) { return (TypeId { v: (*cx.thir).interner.t_char.v }); } // char
             if tc_sv_is_3(view(name), 83u8, 116u8, 114u8) { return (TypeId { v: (*cx.thir).interner.t_str.v }); } // Str
             if tc_sv_is_5(view(name), 110u8, 101u8, 118u8, 101u8, 114u8) { return (TypeId { v: (*cx.thir).interner.t_never.v }); } // never
-            if tc_sv_is_3(view(name), 102u8, 51u8, 50u8) || tc_sv_is_3(view(name), 102u8, 54u8, 52u8) {
-                return type_error(mut_view(*cx), view((*ht).span), AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP);
-            }
+            if tc_sv_is_3(view(name), 102u8, 51u8, 50u8) { return (TypeId { v: TYPEID_F32 }); } // f32
+            if tc_sv_is_3(view(name), 102u8, 54u8, 52u8) { return (TypeId { v: TYPEID_F64 }); } // f64
         }
         let mut dummy_gargs = (GenericArgsSlice { args: 0 as *mut TypeId, count: 0 });
         let res_ty = unsafe { lookup_path_type(mut_view(*cx), view((*ht).path), mut_view(dummy_gargs)) };
@@ -5990,6 +6196,20 @@ pub fn check_pat(cx: mut_view<TypeckCtx>, pat: *const HirPat, expected: TypeId, 
                 }
             }
             lit_ty.v = it.v;
+        } else if tk == TOK_FLOAT {
+            // T457 (SPEC-41 AXS-FLT-006): float literal pattern, compared with IEEE `==`.
+            let before = cx.lits_len;
+            let ft = unsafe { float_literal_type(mut_view(*cx), view((*pat).tok), view((*pat).span)) };
+            if unsafe { (*pat).is_negated } && cx.lits_len == before + 1 {
+                let lc = unsafe { litcheck_at(cx.lits, before) };
+                unsafe {
+                    (*lc).negated = true;
+                    (*lc).neg_span.file.v = (*pat).span.file.v;
+                    (*lc).neg_span.start = (*pat).span.start;
+                    (*lc).neg_span.end = (*pat).span.end;
+                }
+            }
+            lit_ty.v = ft.v;
         } else {
             return unsafe { type_error(mut_view(*cx), view((*pat).span), AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP) };
         }
@@ -6324,7 +6544,7 @@ fn check_literal(cx: mut_view<TypeckCtx>, expr: *const HirExpr) -> TypeId {
             return int_literal_type(mut_view(*cx), view((*expr).literal), view((*expr).span));
         }
         if tk == TOK_FLOAT {
-            return type_error(mut_view(*cx), view((*expr).span), AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP);
+            return float_literal_type(mut_view(*cx), view((*expr).literal), view((*expr).span));
         }
         if tk == TOK_STR || tk == TOK_BYTE_STR {
             return (TypeId { v: (*cx.thir).interner.t_str.v });
@@ -6927,6 +7147,7 @@ fn check_unary_in_arith(cx: mut_view<TypeckCtx>, expr: *const HirExpr, ctx_ty: T
         let r = resolve_ty(mut_view(*cx), (TypeId { v: ty.v }));
         let k = kind_of(mut_view(*cx), (TypeId { v: r.v }));
         if k == TY_ERROR || k == TY_NEVER { return (TypeId { v: r.v }); }
+        if k == TY_F32 || k == TY_F64 || k == TY_FLOAT_VAR { return (TypeId { v: r.v }); }
         if k == TY_INT_VAR {
             unsafe { push_neg_check(mut_view(*cx), view((*expr).span), (TypeId { v: r.v })); }
             if rc.v != 0u32 && unsafe { type_is_signed((TypeId { v: rc.v }), view((*cx.thir).interner)) } {
@@ -7047,6 +7268,15 @@ fn check_binary(cx: mut_view<TypeckCtx>, expr: *const HirExpr, expected: TypeId)
         return unsafe { type_error(mut_view(*cx), view((*rptr).span), AX_TYPE_OPERATOR) };
     }
 
+    if is_floatlike(mut_view(*cx), (TypeId { v: left_ty.v })) {
+        let right_f = if is_arith_tree_subexpr(rptr) {
+            check_arith_subexpr(mut_view(*cx), rptr, (TypeId { v: 0u32 }))
+        } else {
+            check_expr(mut_view(*cx), rptr, (TypeId { v: 0u32 }))
+        };
+        return check_binary_float(mut_view(*cx), expr, lptr, (TypeId { v: left_ty.v }), rptr, (TypeId { v: right_f.v }), (TypeId { v: expected.v }));
+    }
+
     let rl_pre = resolve_ty(mut_view(*cx), (TypeId { v: left_ty.v }));
     if unsafe { type_is_int((TypeId { v: rl_pre.v }), view((*cx.thir).interner)) } {
         let mut r_acc = (TypeId { v: ctx_ty.v });
@@ -7070,6 +7300,10 @@ fn check_binary(cx: mut_view<TypeckCtx>, expr: *const HirExpr, expected: TypeId)
     } else {
         check_expr(mut_view(*cx), rptr, (TypeId { v: 0u32 }))
     };
+
+    if is_intlike(mut_view(*cx), (TypeId { v: left_ty.v })) && is_floatlike(mut_view(*cx), (TypeId { v: right_ty.v })) {
+        return check_binary_float(mut_view(*cx), expr, lptr, (TypeId { v: left_ty.v }), rptr, (TypeId { v: right_ty.v }), (TypeId { v: expected.v }));
+    }
 
     if is_intlike(mut_view(*cx), (TypeId { v: left_ty.v })) && is_intlike(mut_view(*cx), (TypeId { v: right_ty.v })) {
         let rl = resolve_ty(mut_view(*cx), (TypeId { v: left_ty.v }));
@@ -7125,7 +7359,8 @@ fn check_binary(cx: mut_view<TypeckCtx>, expr: *const HirExpr, expected: TypeId)
     let k = kind_of(mut_view(*cx), (TypeId { v: opnd.v }));
     let mut ok = false;
     if is_cmp {
-        ok = is_intlike(mut_view(*cx), (TypeId { v: opnd.v })) || k == TY_BOOL || k == TY_CHAR || k == TY_PTR;
+        ok = is_intlike(mut_view(*cx), (TypeId { v: opnd.v })) || k == TY_BOOL || k == TY_CHAR || k == TY_PTR ||
+             k == TY_F32 || k == TY_F64 || k == TY_FLOAT_VAR;
     } else if op == BINOP_BITAND || op == BINOP_BITOR || op == BINOP_BITXOR {
         ok = is_intlike(mut_view(*cx), (TypeId { v: opnd.v })) || k == TY_BOOL;
     } else {
@@ -7188,6 +7423,7 @@ fn check_unary(cx: mut_view<TypeckCtx>, expr: *const HirExpr) -> TypeId {
         let r = resolve_ty(mut_view(*cx), (TypeId { v: ty.v }));
         let k = kind_of(mut_view(*cx), (TypeId { v: r.v }));
         if k == TY_ERROR || k == TY_NEVER { return (TypeId { v: r.v }); }
+        if k == TY_F32 || k == TY_F64 || k == TY_FLOAT_VAR { return (TypeId { v: r.v }); }
         if k == TY_INT_VAR {
             unsafe { push_neg_check(mut_view(*cx), view((*expr).span), (TypeId { v: r.v })); }
             return (TypeId { v: r.v });
@@ -8679,7 +8915,18 @@ fn check_expr_flow_or_cast(cx: mut_view<TypeckCtx>, expr: *const HirExpr, expect
         let dest_is_int = unsafe { type_is_int((TypeId { v: dest_ty.v }), view((*cx.thir).interner)) };
         let src_is_int = unsafe { type_is_int((TypeId { v: src_ty.v }), view((*cx.thir).interner)) };
 
+        let src_is_fl = sk == TY_F32 || sk == TY_F64 || sk == TY_FLOAT_VAR;
+        let dest_is_fl = dk == TY_F32 || dk == TY_F64;
         if is_intlike(mut_view(*cx), (TypeId { v: src_ty.v })) && dest_is_int {
+            is_valid = true;
+        } else if (src_is_fl || is_intlike(mut_view(*cx), (TypeId { v: src_ty.v }))) && dest_is_fl {
+            // T457 (SPEC-41 AXS-FLT-023/024): IntToFloat, FloatConvert (f32 <-> f64).
+            if sk == TY_FLOAT_VAR {
+                let _ = unify_ty(mut_view(*cx), (TypeId { v: src_ty.v }), (TypeId { v: dest_ty.v }));
+            }
+            is_valid = true;
+        } else if src_is_fl && dest_is_int {
+            // T457 (SPEC-41 AXS-FLT-022): saturating FloatToInt.
             is_valid = true;
         } else if sk == TY_ENUM && dest_is_int {
             let t = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: src_ty.v })) };
@@ -14741,6 +14988,22 @@ fn td_typeid(st: mut_view<ThirDumpState>, id: TypeId) {
         td_str(mut_view(*st), 110);
         let rt_v = unsafe { (*t).ret_type.v };
         td_typeid(mut_view(*st), (TypeId { v: rt_v }));
+    } else if k == TY_F32 || k == TY_F64 {
+        unsafe {
+            diag_buf_push_byte(mut_view(*st.buf), 102u8);
+            diag_buf_push_byte(mut_view(*st.buf), if k == TY_F32 { 51u8 } else { 54u8 });
+            diag_buf_push_byte(mut_view(*st.buf), if k == TY_F32 { 50u8 } else { 52u8 });
+        }
+    } else if k == TY_FLOAT_VAR {
+        unsafe {
+            diag_buf_push_byte(mut_view(*st.buf), 123u8);
+            diag_buf_push_byte(mut_view(*st.buf), 102u8);
+            diag_buf_push_byte(mut_view(*st.buf), 108u8);
+            diag_buf_push_byte(mut_view(*st.buf), 111u8);
+            diag_buf_push_byte(mut_view(*st.buf), 97u8);
+            diag_buf_push_byte(mut_view(*st.buf), 116u8);
+            diag_buf_push_byte(mut_view(*st.buf), 125u8);
+        }
     } else if k == TY_INT_VAR {
         td_str(mut_view(*st), 111);
         let vid = unsafe { (*t).var_id };

@@ -8,13 +8,15 @@ model: opus
 gate_model: opus
 depends: [T537, T423h]
 priority: 145
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 600
-paths: [compiler/link/import.ax, std/sys/windows/fiber.ax, std/sys/windows/thread.ax, tests/std/fiber/native_panic, tests/std/thread/native_panic_hook, tests/run/panic_hook_slot]
-locks: [compiler/link/linker.ax, tests/std/fiber/gen_tests.py]
+paths: [compiler/link/import.ax, std/sys/windows/fiber.ax, std/sys/windows/thread.ax, tests/std/thread/native_panic_hook, tests/run/panic_hook_slot, compiler/link/linker.ax, tests/std/fiber, tests/conformance/p11/e11_3_threads_sync, tests/conformance/p11/e11_5_executors, tests/perf/p11_executor, tests/std/async/executor, tests/std/async/structured, tests/std/async/waker, tests/std/async/waker_qa, tests/std/channel, tests/std/sync]
+locks: []
 spec: [spec/SPEC-34-executors-fibers.md, spec/SPEC-32-threads-sync.md, spec/SPEC-26-windows-artifact-kinds.md, spec/decisions/ADR-0046-t423-fiber-followups-and-tracked-xfail.md]
 covers: [REQ-TST-072]
+started: 2026-11-24 11:17:20
+agent: T538-impl
 ---
 # T538 — Explicit panic path for native containment
 
@@ -60,3 +62,4 @@ return). `ExitProcess` is no longer hooked, so every other exit code — includi
 
 ## Log
 - 2026-11-22 created by axiom-architect (triage-1122; T423b-qa follow-ups 1 and 2, T423b-report follow-up)
+- 2026-11-24 11:17:20 started (attempt 1) T538-impl

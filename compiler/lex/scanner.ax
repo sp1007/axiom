@@ -50,6 +50,10 @@ use compiler.diag.format.diag_buf_push_byte
 use compiler.lex.token.TOK_IDENT
 use compiler.lex.token.TOK_INT
 use compiler.lex.token.TOK_FLOAT
+use compiler.lex.token.FloatLitBits
+use compiler.lex.token.float_lit_parse
+use compiler.lex.token.FLOAT_LIT_F64_OVERFLOW
+use compiler.lex.token.FLOAT_LIT_F32_OVERFLOW
 use compiler.lex.token.TOK_STR
 use compiler.lex.token.TOK_BYTE_STR
 use compiler.lex.token.TOK_CHAR
@@ -792,6 +796,15 @@ fn u128_mul_add(lo: mut_view<u64>, hi: mut_view<u64>, base: u64, d: u64) -> bool
     false
 }
 
+// AXS-LEX-056: `p[at]` is `e`/`E`. Returns the position of the first exponent digit (after an optional sign), or
+// 0 when no digit follows (a digit position is never 0: the letter precedes it).
+fn exponent_digits_pos(p: *const u8, byte_len: usize, at: usize) -> usize {
+    let mut look = at + 1;
+    if look < byte_len && ((unsafe { *(p + look) }) == 43u8 || (unsafe { *(p + look) }) == 45u8) { look = look + 1; }
+    if look < byte_len && is_dec_digit(unsafe { *(p + look) }) { return look; }
+    0
+}
+
 fn scan_number(cur: mut_view<LexCursor>, start: u32, last_kind: u8, flags: u16, sink: mut_view<DiagSink>, res: mut_view<LexResult>) {
     let p = cur.p;
     let byte_len = cur.byte_len;
@@ -848,18 +861,16 @@ fn scan_number(cur: mut_view<LexCursor>, start: u32, last_kind: u8, flags: u16, 
                 is_float = true;
             } else {
                 if last_kind == TOK_DOT { break; }
-                let mut look = cur.pos + 1;
-                if look < byte_len && ((unsafe { *(p + look) }) == 43u8 || (unsafe { *(p + look) }) == 45u8) { look = look + 1; }
-                if look < byte_len && is_dec_digit(unsafe { *(p + look) }) {
-                    is_float = true;
-                } else {
-                    break;
-                }
+                if exponent_digits_pos(p, byte_len, cur.pos) == 0 { break; }
+                is_float = true;
             }
         }
 
         if is_float {
-            cur.pos = cur.pos + 1;
+            // `.` is consumed here; an `e`/`E` right after the integer digits (`1e-5`) is left to the exponent
+            // branch below, so both forms accept an optional sign (T457 F1).
+            if c == 46u8 { cur.pos = cur.pos + 1; }
+            let mut exp_seen = false;
             while (cur.pos) < byte_len {
                 let fc = unsafe { *(p + cur.pos) };
                 if fc == 95u8 {
@@ -873,10 +884,12 @@ fn scan_number(cur: mut_view<LexCursor>, start: u32, last_kind: u8, flags: u16, 
                     continue;
                 }
                 if fc == 101u8 || fc == 69u8 {
-                    cur.pos = cur.pos + 1;
-                    if (cur.pos) < byte_len && ((unsafe { *(p + cur.pos) }) == 43u8 || (unsafe { *(p + cur.pos) }) == 45u8) {
-                        cur.pos = cur.pos + 1;
-                    }
+                    // AXS-LEX-056: at most one exponent, and only with digits; otherwise the letters are an
+                    // (invalid) suffix.
+                    let exp_pos = exponent_digits_pos(p, byte_len, cur.pos);
+                    if exp_seen || exp_pos == 0 { break; }
+                    exp_seen = true;
+                    cur.pos = exp_pos;
                     continue;
                 }
                 if !is_dec_digit(fc) { break; }
@@ -932,6 +945,7 @@ fn scan_number(cur: mut_view<LexCursor>, start: u32, last_kind: u8, flags: u16, 
         val_hi = 0u64;
     }
 
+    let num_end: usize = cur.pos;
     cur.had_err = false;
     let mut suf: u8 = SUFFIX_NONE;
     if last_kind != TOK_DOT {
@@ -954,6 +968,18 @@ fn scan_number(cur: mut_view<LexCursor>, start: u32, last_kind: u8, flags: u16, 
     let mut tok = Token { kind: if is_float { TOK_FLOAT } else { TOK_INT }, suffix: suf, flags: flags | err_flags, char_val: 0u32, span: span_new(FileId { v: cur.file_v }, start, cur.pos as u32), int_val: if is_float { 0u64 } else { val }, str_ptr: 0 as *const u8, str_len: 0, ident_val: StrId { v: 0u32 } };
     if !is_float && val_hi != 0u64 {
         token_set_int_hi(mut_view(tok), val_hi);
+    }
+    if is_float && err_flags == 0u16 {
+        // T457 (SPEC-41 AXS-FLT-003): exact binary64 bits in `int_val`, binary32 bits in `char_val`,
+        // overflow flags (FLOAT_LIT_F64_OVERFLOW | FLOAT_LIT_F32_OVERFLOW) in `str_len`.
+        let mut fb = FloatLitBits { f64_bits: 0u64, f32_bits: 0u32, f64_overflow: false, f32_overflow: false };
+        float_lit_parse(unsafe { p + (start as usize) }, num_end - (start as usize), mut_view(fb));
+        tok.int_val = fb.f64_bits;
+        tok.char_val = fb.f32_bits;
+        let mut ovf: usize = 0;
+        if fb.f64_overflow { ovf = ovf | FLOAT_LIT_F64_OVERFLOW; }
+        if fb.f32_overflow { ovf = ovf | FLOAT_LIT_F32_OVERFLOW; }
+        tok.str_len = ovf;
     }
     push_token(res, view(tok));
 }

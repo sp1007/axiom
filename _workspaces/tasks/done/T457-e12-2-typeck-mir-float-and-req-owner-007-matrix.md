@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T456, T451]
 priority: 147
-status: todo
-attempts: 0
-paths: [compiler/lex, compiler/syntax, compiler/hir, compiler/types, compiler/mir, tests/typeck/float, tests/mir/float_mixed]
-locks: [compiler/verify/verifier.ax, compiler/diag/code.ax]
+status: done
+attempts: 1
+paths: [compiler/lex, compiler/syntax, compiler/hir, compiler/types, compiler/mir, tests/typeck/float, tests/mir/float_mixed, compiler/verify/verifier.ax, compiler/diag/code.ax, tests/ui/numeric/float_bootstrap.ax, tests/ui/typeck/bug_float_unsupported.ax, tests/conformance/vs0/float_unsupported.ax]
+locks: []
 spec: [spec/SPEC-41-floating-point.md, spec/SPEC-04-core-extensibility.md, spec/requirements/OWNER.md, tasks/0331, tasks/0338, tasks/0345]
 covers: [REQ-OWNER-007, REQ-SIMD-174, REQ-SIMD-175, REQ-SIMD-270]
+started: 2026-11-24 11:17:21
+finished: 2026-11-24 16:17:18
 ---
 # T457 — E12.2 — Frontend, typeck & MIR lowering for f32/f64 and REQ-OWNER-007 mixed-type promotion matrix
 
@@ -43,3 +45,5 @@ Enable `f32`/`f64` types and literals in `axiomc`, and implement the full `REQ-O
 
 ## Log
 - 2026-11-03 00:30:00 created by T212 (P12 phase planning)
+- 2026-11-24 11:17:21 started (attempt 1) T457-impl
+- 2026-11-24 16:17:18 accepted by QA -> done

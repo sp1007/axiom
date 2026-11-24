@@ -4007,6 +4007,8 @@ use compiler.source.span.Span
 use compiler.diag.format.DiagBuffer
 use compiler.diag.format.diag_buf_push_byte
 use compiler.diag.format.diag_buf_push_u32
+use host_intrinsics.heap_alloc
+use host_intrinsics.heap_free
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 
@@ -4366,6 +4368,531 @@ pub fn ax_lex_render_tokens(res: view<LexResult>, interner: view<StrInterner>, o
         diag_buf_push_byte(mut_view(*out), 10u8);
         j = j + 1;
     }
+}
+
+// Exact IEEE-754 conversions for floating-point literals (SPEC-41 AXS-FLT-003, AXS-FLT-023, T457).
+//
+// `float_lit_parse` converts the spelling of a decimal float literal (`1.5`, `6.02e23`, `3.141_592`)
+// directly to both binary64 and binary32 with roundTiesToEven: each result is rounded once from the exact
+// decimal value (never binary64 first and then binary32), so there is no double rounding.
+// `float_bits_from_u128` rounds an exact integer (an unsuffixed integer literal fixed to a float type,
+// SPEC-04 AXS-EXT-035) the same way.
+//
+// The compiler is itself built by axiom0, which has no floating point, so everything here is integer
+// arithmetic on little-endian base-2^32 big integers (FlBig). Sizes: at most FL_MAX_DIGITS significant
+// decimal digits are kept (more than the 768 a binary64 midpoint can need; a dropped non-zero digit becomes
+// a sticky `1` digit), and magnitudes outside 10^-330 .. 10^311 are decided without big arithmetic, so no
+// operand exceeds FL_CAP limbs.
+const FL_CAP: usize = 192;
+const FL_MAX_DIGITS: usize = 800;
+
+pub const FLOAT_LIT_F64_OVERFLOW: usize = 1;
+pub const FLOAT_LIT_F32_OVERFLOW: usize = 2;
+
+pub struct FloatLitBits {
+    pub f64_bits: u64,
+    pub f32_bits: u32,
+    pub f64_overflow: bool,
+    pub f32_overflow: bool,
+}
+
+struct FlBig {
+    d: *mut u32,
+    n: usize,
+}
+
+fn fl_new() -> FlBig {
+    let raw = unsafe { heap_alloc(FL_CAP * 4, 4) };
+    let mut i: usize = 0;
+    while (i < FL_CAP * 4) {
+        unsafe { *(raw + i) = 0u8; }
+        i = i + 1;
+    }
+    FlBig { d: raw as *mut u32, n: 0 }
+}
+
+fn fl_free(b: mut_view<FlBig>) {
+    unsafe { heap_free(b.d as *mut u8, FL_CAP * 4, 4); }
+    b.n = 0;
+}
+
+fn fl_get(b: view<FlBig>, i: usize) -> u32 {
+    if i >= b.n {
+        return 0u32;
+    }
+    unsafe { *(((b.d as usize) + i * 4) as *const u32) }
+}
+
+fn fl_put(b: mut_view<FlBig>, i: usize, v: u32) {
+    if i >= FL_CAP {
+        return;
+    }
+    unsafe { *(((b.d as usize) + i * 4) as *mut u32) = v; }
+}
+
+fn fl_clear(b: mut_view<FlBig>) {
+    let mut i: usize = 0;
+    while (i < FL_CAP) {
+        fl_put(mut_view(*b), i, 0u32);
+        i = i + 1;
+    }
+    b.n = 0;
+}
+
+fn fl_trim(b: mut_view<FlBig>) {
+    while b.n > 0 && fl_get(view(*b), b.n - 1) == 0u32 {
+        b.n = b.n - 1;
+    }
+}
+
+fn fl_is_zero(b: view<FlBig>) -> bool {
+    let mut i: usize = 0;
+    while i < b.n {
+        if fl_get(b, i) != 0u32 {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+// b = b * m + a
+fn fl_mul_small_add(b: mut_view<FlBig>, m: u32, a: u32) {
+    let mut carry: u64 = a as u64;
+    let mut i: usize = 0;
+    while i < b.n {
+        let t: u64 = (fl_get(view(*b), i) as u64) * (m as u64) + carry;
+        fl_put(mut_view(*b), i, (t & 0xFFFFFFFFu64) as u32);
+        carry = t >> 32u64;
+        i = i + 1;
+    }
+    if carry != 0u64 && FL_CAP > b.n {
+        fl_put(mut_view(*b), b.n, carry as u32);
+        b.n = b.n + 1;
+    }
+}
+
+// b = b * 10^k
+fn fl_mul_pow10(b: mut_view<FlBig>, k: u64) {
+    let mut left: u64 = k;
+    while left >= 9u64 {
+        fl_mul_small_add(mut_view(*b), 1000000000u32, 0u32);
+        left = left - 9u64;
+    }
+    let mut m: u32 = 1u32;
+    while left > 0u64 {
+        m = m * 10u32;
+        left = left - 1u64;
+    }
+    if m != 1u32 {
+        fl_mul_small_add(mut_view(*b), m, 0u32);
+    }
+}
+
+fn fl_bitlen(b: view<FlBig>) -> u64 {
+    let mut n = b.n;
+    while n > 0 && fl_get(b, n - 1) == 0u32 {
+        n = n - 1;
+    }
+    if n == 0 {
+        return 0u64;
+    }
+    let top = fl_get(b, n - 1) as u64;
+    let mut bits: u64 = 0u64;
+    while bits < 32u64 && (top >> bits) != 0u64 {
+        bits = bits + 1u64;
+    }
+    ((n - 1) as u64) * 32u64 + bits
+}
+
+fn fl_bit(b: view<FlBig>, i: u64) -> bool {
+    let limb = (i / 32u64) as usize;
+    let sh = i % 32u64;
+    let w: u64 = fl_get(b, limb) as u64;
+    ((w >> sh) & 1u64) == 1u64
+}
+
+fn fl_set_bit(b: mut_view<FlBig>, i: u64) {
+    let limb = (i / 32u64) as usize;
+    if limb >= FL_CAP {
+        return;
+    }
+    while b.n <= limb {
+        fl_put(mut_view(*b), b.n, 0u32);
+        b.n = b.n + 1;
+    }
+    let sh = i % 32u64;
+    let cur = fl_get(view(*b), limb) as u64;
+    fl_put(mut_view(*b), limb, ((cur | (1u64 << sh)) & 0xFFFFFFFFu64) as u32);
+}
+
+// True when any bit below position `i` is set.
+fn fl_any_below(b: view<FlBig>, i: u64) -> bool {
+    let full = (i / 32u64) as usize;
+    let mut k: usize = 0;
+    while k < full && k < b.n {
+        if fl_get(b, k) != 0u32 {
+            return true;
+        }
+        k = k + 1;
+    }
+    let rem = i % 32u64;
+    if rem != 0u64 {
+        let mask: u64 = (1u64 << rem) - 1u64;
+        if ((fl_get(b, full) as u64) & mask) != 0u64 {
+            return true;
+        }
+    }
+    false
+}
+
+// b = b << s
+fn fl_shl(b: mut_view<FlBig>, s: u64) {
+    if b.n == 0 || s == 0u64 {
+        return;
+    }
+    let limbs = (s / 32u64) as usize;
+    let bits = s % 32u64;
+    let mut new_n = b.n + limbs + 1;
+    if new_n > FL_CAP {
+        new_n = FL_CAP;
+    }
+    let mut i = new_n;
+    while i > 0 {
+        let dst = i - 1;
+        let mut v: u64 = 0u64;
+        if dst >= limbs {
+            let src = dst - limbs;
+            let cur = fl_get(view(*b), src) as u64;
+            v = (cur << bits) & 0xFFFFFFFFu64;
+            if bits != 0u64 && src > 0 {
+                let low = fl_get(view(*b), src - 1) as u64;
+                v = v | (low >> (32u64 - bits));
+            }
+        }
+        fl_put(mut_view(*b), dst, v as u32);
+        i = i - 1;
+    }
+    b.n = new_n;
+    fl_trim(mut_view(*b));
+}
+
+// r = (r << 1) | bit
+fn fl_shl1_or(r: mut_view<FlBig>, bit: bool) {
+    let mut carry: u64 = if bit { 1u64 } else { 0u64 };
+    let mut i: usize = 0;
+    while i < r.n {
+        let cur = fl_get(view(*r), i) as u64;
+        let nv = ((cur << 1u64) & 0xFFFFFFFFu64) | carry;
+        fl_put(mut_view(*r), i, nv as u32);
+        carry = cur >> 31u64;
+        i = i + 1;
+    }
+    if carry != 0u64 && FL_CAP > r.n {
+        fl_put(mut_view(*r), r.n, carry as u32);
+        r.n = r.n + 1;
+    }
+}
+
+// -1, 0, 1 for a < b, a == b, a > b
+fn fl_cmp(a: view<FlBig>, b: view<FlBig>) -> i32 {
+    let mut n = if a.n > b.n { a.n } else { b.n };
+    while n > 0 {
+        let x = fl_get(a, n - 1);
+        let y = fl_get(b, n - 1);
+        if x != y {
+            return if x > y { 1i32 } else { -1i32 };
+        }
+        n = n - 1;
+    }
+    0i32
+}
+
+// a = a - b, requires a >= b
+fn fl_sub(a: mut_view<FlBig>, b: view<FlBig>) {
+    let mut borrow: u64 = 0u64;
+    let mut i: usize = 0;
+    while i < a.n {
+        let t: u64 = (fl_get(view(*a), i) as u64) + 0x100000000u64 - (fl_get(b, i) as u64) - borrow;
+        if t >= 0x100000000u64 {
+            fl_put(mut_view(*a), i, (t - 0x100000000u64) as u32);
+            borrow = 0u64;
+        } else {
+            fl_put(mut_view(*a), i, t as u32);
+            borrow = 1u64;
+        }
+        i = i + 1;
+    }
+    fl_trim(mut_view(*a));
+}
+
+// q = num / den, r = num % den (den != 0)
+fn fl_divmod(num: view<FlBig>, den: view<FlBig>, q: mut_view<FlBig>, r: mut_view<FlBig>) {
+    fl_clear(mut_view(*q));
+    fl_clear(mut_view(*r));
+    let nb = fl_bitlen(num);
+    let mut i = nb;
+    while i > 0u64 {
+        let pos = i - 1u64;
+        fl_shl1_or(mut_view(*r), fl_bit(num, pos));
+        if fl_cmp(view(*r), den) >= 0i32 {
+            fl_sub(mut_view(*r), den);
+            fl_set_bit(mut_view(*q), pos);
+        }
+        i = i - 1u64;
+    }
+    fl_trim(mut_view(*q));
+    fl_trim(mut_view(*r));
+}
+
+// Bits [lo, lo + cnt) of b, cnt <= 64.
+fn fl_extract(b: view<FlBig>, lo: u64, cnt: u64) -> u64 {
+    let mut v: u64 = 0u64;
+    let mut k = cnt;
+    while k > 0u64 {
+        let pos = lo + k - 1u64;
+        v = (v << 1u64) | (if fl_bit(b, pos) { 1u64 } else { 0u64 });
+        k = k - 1u64;
+    }
+    v
+}
+
+// Rounds m * 2^e2 (plus a sticky fraction below the last bit of m when `sticky`) to the binary format with
+// `prec` significand bits and exponent range [emin, emax], roundTiesToEven. Writes the unsigned bit
+// pattern to `out` and returns true on overflow (the result is then +inf).
+fn fl_round(m: view<FlBig>, e2: i64, sticky: bool, prec: i64, emin: i64, emax: i64, out: mut_view<u64>) -> bool {
+    let tbits: u64 = (prec - 1i64) as u64;
+    let inf_bits: u64 = (((emax * 2i64) + 1i64) as u64) << tbits;
+    let len = fl_bitlen(m);
+    if len == 0u64 {
+        *out = 0u64;
+        return false;
+    }
+    let mut e: i64 = (len as i64) - 1i64 + e2;
+    if e > emax {
+        *out = inf_bits;
+        return true;
+    }
+    let keep: i64 = if e >= emin { prec } else { prec - (emin - e) };
+    if keep < 0i64 {
+        *out = 0u64;
+        return false;
+    }
+    let shift: i64 = (len as i64) - keep;
+    let mut mant: u64 = 0u64;
+    let mut round_bit = false;
+    let mut rest = sticky;
+    if shift <= 0i64 {
+        mant = fl_extract(m, 0u64, len) << ((0i64 - shift) as u64);
+    } else {
+        let sh = shift as u64;
+        if keep > 0i64 {
+            mant = fl_extract(m, sh, keep as u64);
+        }
+        round_bit = fl_bit(m, sh - 1u64);
+        if !rest {
+            rest = fl_any_below(m, sh - 1u64);
+        }
+    }
+    if round_bit && (rest || (mant & 1u64) == 1u64) {
+        mant = mant + 1u64;
+    }
+    if e >= emin {
+        let hidden: u64 = 1u64 << tbits;
+        if mant == (hidden << 1u64) {
+            mant = hidden;
+            e = e + 1i64;
+            if e > emax {
+                *out = inf_bits;
+                return true;
+            }
+        }
+        *out = (((e + emax) as u64) << tbits) | (mant - hidden);
+        return false;
+    }
+    // Subnormal (a carry into 2^(prec-1) encodes the smallest normal exactly).
+    *out = mant;
+    false
+}
+
+fn fl_round_both(m: view<FlBig>, e2: i64, sticky: bool, out: mut_view<FloatLitBits>) {
+    let mut b64: u64 = 0u64;
+    let mut b32: u64 = 0u64;
+    out.f64_overflow = fl_round(m, e2, sticky, 53i64, -1022i64, 1023i64, mut_view(b64));
+    out.f32_overflow = fl_round(m, e2, sticky, 24i64, -126i64, 127i64, mut_view(b32));
+    out.f64_bits = b64;
+    out.f32_bits = (b32 & 0xFFFFFFFFu64) as u32;
+}
+
+fn fl_is_digit(c: u8) -> bool {
+    c >= 48u8 && c <= 57u8
+}
+
+// Converts the spelling `p[0..len)` of a decimal float literal (digits, optional `.` fraction, optional
+// `e`/`E` exponent with sign, `_` separators; no suffix) to binary64 and binary32 bit patterns.
+pub fn float_lit_parse(p: *const u8, len: usize, out: mut_view<FloatLitBits>) {
+    out.f64_bits = 0u64;
+    out.f32_bits = 0u32;
+    out.f64_overflow = false;
+    out.f32_overflow = false;
+    let digits = unsafe { heap_alloc(FL_MAX_DIGITS + 2, 1) };
+    let mut ndig: usize = 0;
+    let mut dec_exp: i64 = 0i64;
+    let mut sticky = false;
+    let mut seen_nonzero = false;
+    let mut in_frac = false;
+    let mut i: usize = 0;
+    while i < len {
+        let c = unsafe { *(p + i) };
+        if c == 95u8 {
+            i = i + 1;
+            continue;
+        }
+        if c == 46u8 {
+            in_frac = true;
+            i = i + 1;
+            continue;
+        }
+        if !fl_is_digit(c) {
+            break;
+        }
+        let d = c - 48u8;
+        if d == 0u8 && !seen_nonzero {
+            if in_frac {
+                dec_exp = dec_exp - 1i64;
+            }
+        } else {
+            seen_nonzero = true;
+            if (ndig < FL_MAX_DIGITS) {
+                unsafe { *(digits + ndig) = d; }
+                ndig = ndig + 1;
+                if in_frac {
+                    dec_exp = dec_exp - 1i64;
+                }
+            } else {
+                if !in_frac {
+                    dec_exp = dec_exp + 1i64;
+                }
+                if d != 0u8 {
+                    sticky = true;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    let mut exp_val: i64 = 0i64;
+    if i < len && ((unsafe { *(p + i) }) == 101u8 || (unsafe { *(p + i) }) == 69u8) {
+        i = i + 1;
+        let mut neg = false;
+        if i < len && ((unsafe { *(p + i) }) == 43u8 || (unsafe { *(p + i) }) == 45u8) {
+            neg = (unsafe { *(p + i) }) == 45u8;
+            i = i + 1;
+        }
+        while i < len {
+            let c = unsafe { *(p + i) };
+            if c == 95u8 {
+                i = i + 1;
+                continue;
+            }
+            if !fl_is_digit(c) {
+                break;
+            }
+            if exp_val < 1000000i64 {
+                exp_val = exp_val * 10i64 + ((c - 48u8) as i64);
+            }
+            i = i + 1;
+        }
+        if neg {
+            exp_val = 0i64 - exp_val;
+        }
+    }
+    if sticky {
+        unsafe { *(digits + ndig) = 1u8; }
+        ndig = ndig + 1;
+        dec_exp = dec_exp - 1i64;
+    }
+    if ndig == 0 {
+        unsafe { heap_free(digits, FL_MAX_DIGITS + 2, 1); }
+        return;
+    }
+    let e10: i64 = dec_exp + exp_val;
+    let mag: i64 = (ndig as i64) + e10;
+    if mag - 1i64 > 310i64 {
+        out.f64_bits = 0x7FF0000000000000u64;
+        out.f32_bits = 0x7F800000u32;
+        out.f64_overflow = true;
+        out.f32_overflow = true;
+        unsafe { heap_free(digits, FL_MAX_DIGITS + 2, 1); }
+        return;
+    }
+    if mag < -330i64 {
+        unsafe { heap_free(digits, FL_MAX_DIGITS + 2, 1); }
+        return;
+    }
+    let mut m = fl_new();
+    let mut k: usize = 0;
+    while k < ndig {
+        let dg = unsafe { *(digits + k) };
+        fl_mul_small_add(mut_view(m), 10u32, dg as u32);
+        k = k + 1;
+    }
+    unsafe { heap_free(digits, FL_MAX_DIGITS + 2, 1); }
+    if e10 >= 0i64 {
+        fl_mul_pow10(mut_view(m), e10 as u64);
+        fl_round_both(view(m), 0i64, false, mut_view(*out));
+        fl_free(mut_view(m));
+        return;
+    }
+    let mut den = fl_new();
+    fl_put(mut_view(den), 0, 1u32);
+    den.n = 1;
+    fl_mul_pow10(mut_view(den), (0i64 - e10) as u64);
+    let bl_den = fl_bitlen(view(den));
+    let bl_num = fl_bitlen(view(m));
+    let mut s: u64 = 0u64;
+    if bl_den + 66u64 > bl_num {
+        s = bl_den + 66u64 - bl_num;
+    }
+    fl_shl(mut_view(m), s);
+    let mut q = fl_new();
+    let mut r = fl_new();
+    fl_divmod(view(m), view(den), mut_view(q), mut_view(r));
+    let rem_nz = !fl_is_zero(view(r));
+    fl_round_both(view(q), 0i64 - (s as i64), rem_nz, mut_view(*out));
+    fl_free(mut_view(r));
+    fl_free(mut_view(q));
+    fl_free(mut_view(den));
+    fl_free(mut_view(m));
+}
+
+// Rounds the exact integer (hi:lo), negated when `negative`, to binary32 (`is_f32`, bits in the low 32 bits)
+// or binary64. Sets `*overflow` when the magnitude rounds to infinity (only u128 values near 2^128 in f32).
+pub fn float_bits_from_u128(lo: u64, hi: u64, negative: bool, is_f32: bool, overflow: mut_view<bool>) -> u64 {
+    *overflow = false;
+    if lo == 0u64 && hi == 0u64 {
+        return 0u64;
+    }
+    let mut m = fl_new();
+    fl_put(mut_view(m), 0, (lo & 0xFFFFFFFFu64) as u32);
+    fl_put(mut_view(m), 1, (lo >> 32u64) as u32);
+    fl_put(mut_view(m), 2, (hi & 0xFFFFFFFFu64) as u32);
+    fl_put(mut_view(m), 3, (hi >> 32u64) as u32);
+    m.n = 4;
+    fl_trim(mut_view(m));
+    let mut bits: u64 = 0u64;
+    if is_f32 {
+        *overflow = fl_round(view(m), 0i64, false, 24i64, -126i64, 127i64, mut_view(bits));
+        if negative {
+            bits = bits | 0x80000000u64;
+        }
+    } else {
+        *overflow = fl_round(view(m), 0i64, false, 53i64, -1022i64, 1023i64, mut_view(bits));
+        if negative {
+            bits = bits | 0x8000000000000000u64;
+        }
+    }
+    fl_free(mut_view(m));
+    bits
 }
 
 module compiler.syntax.ast
@@ -7261,6 +7788,14 @@ pub const TY_BUILTIN_PTR_WRITE_BYTES: u8 = 47u8;
 pub const TY_BUILTIN_NULL: u8 = 48u8;
 pub const TY_BUILTIN_NULL_MUT: u8 = 49u8;
 pub const TY_COROUTINE: u8 = 50u8;
+// T457 (SPEC-41 AXS-FLT-001): IEEE-754 binary32/binary64 and the unsuffixed float literal variable.
+// Like i128/u128 (T451) the two float types use sentinel TypeIds outside the interned range so the
+// numbering of every interned type (and the `type#N` MIR goldens) is unchanged.
+pub const TY_F32: u8 = 51u8;
+pub const TY_F64: u8 = 52u8;
+pub const TY_FLOAT_VAR: u8 = 53u8;
+pub const TYPEID_F32: u32 = 0x3FFF0F32u32;
+pub const TYPEID_F64: u32 = 0x3FFF0F64u32;
 
 pub const CAP_COPY: u8 = 0u8;
 pub const CAP_VIEW: u8 = 1u8;
@@ -7273,6 +7808,7 @@ pub const CONST_AGGREGATE: u8 = 2u8;
 pub const CONST_UNIT: u8 = 3u8;
 pub const CONST_ERROR: u8 = 4u8;
 pub const CONST_INT128: u8 = 5u8;
+pub const CONST_FLOAT: u8 = 6u8;
 
 const MAP_INIT_CAP: usize = 16;
 const MAP_LOAD_NUM: usize = 7;
@@ -7643,7 +8179,7 @@ pub fn key_hash_type(k: view<AxType>) -> u64 {
             h = hash_combine(h, hash_u32(pv));
             i = i + 1;
         }
-    } else if k.kind == TY_INT_VAR || k.kind == TY_VAR {
+    } else if k.kind == TY_INT_VAR || k.kind == TY_VAR || k.kind == TY_FLOAT_VAR {
         h = hash_combine(h, hash_u32(k.var_id));
     } else if k.kind == TY_PARAM {
         h = hash_combine(h, hash_u32(k.param_index));
@@ -7711,7 +8247,7 @@ pub fn key_eq_type(a: view<AxType>, b: view<AxType>) -> bool {
         }
         return true;
     }
-    if a.kind == TY_INT_VAR || a.kind == TY_VAR {
+    if a.kind == TY_INT_VAR || a.kind == TY_VAR || a.kind == TY_FLOAT_VAR {
         return a.var_id == b.var_id;
     }
     if a.kind == TY_PARAM {
@@ -8063,6 +8599,12 @@ pub fn intern_singleton(ti: mut_view<TypeInterner>, kind: u8) -> TypeId {
         }
         return TypeId { v: 0x3FFF0129u32 };
     }
+    if kind == TY_F32 {
+        return TypeId { v: TYPEID_F32 };
+    }
+    if kind == TY_F64 {
+        return TypeId { v: TYPEID_F64 };
+    }
     let sp = ti.scratch;
     unsafe {
         ax_type_reset(mut_view(*sp), kind);
@@ -8183,7 +8725,7 @@ pub fn type_interner_init(ti: mut_view<TypeInterner>) {
     ti.len = 0;
     ti.cap = 0;
     ti.next_int_var = 1u32;
-    let scratch_ptr = arena_alloc_raw(mut_view(ti.arena), mul_usize(3, size_of<AxType>()), align_of<AxType>()) as *mut AxType;
+    let scratch_ptr = arena_alloc_raw(mut_view(ti.arena), mul_usize(5, size_of<AxType>()), align_of<AxType>()) as *mut AxType;
 
     ti.scratch = scratch_ptr;
 
@@ -8238,9 +8780,13 @@ pub fn type_interner_init(ti: mut_view<TypeInterner>) {
     ti.t_str.v = id_t_str.v;
     let t_i128_ptr = unsafe { axtype_at(scratch_ptr, 1) };
     let t_u128_ptr = unsafe { axtype_at(scratch_ptr, 2) };
+    let t_f32_ptr = unsafe { axtype_at(scratch_ptr, 3) };
+    let t_f64_ptr = unsafe { axtype_at(scratch_ptr, 4) };
     unsafe {
         ax_type_reset(mut_view(*t_i128_ptr), TY_I128);
         ax_type_reset(mut_view(*t_u128_ptr), TY_U128);
+        ax_type_reset(mut_view(*t_f32_ptr), TY_F32);
+        ax_type_reset(mut_view(*t_f64_ptr), TY_F64);
     }
     ti.t_i128.v = 0x3FFF0128u32;
     ti.t_u128.v = 0x3FFF0129u32;
@@ -8285,6 +8831,16 @@ pub fn type_get(ti: view<TypeInterner>, id: TypeId) -> *mut AxType {
         }
         return ti.scratch;
     }
+    if (id.v == TYPEID_F32 || id.v == TYPEID_F64) && (ti.scratch as usize) != 0 {
+        // Interners whose i128 sentinel is set (type_interner_init, verifier minimal THIR) own 5 scratch slots.
+        if ti.t_i128.v == 0x3FFF0128u32 {
+            return unsafe { axtype_at(ti.scratch, if id.v == TYPEID_F32 { 3 } else { 4 }) };
+        }
+        unsafe {
+            ax_type_reset(mut_view(*ti.scratch), if id.v == TYPEID_F32 { TY_F32 } else { TY_F64 });
+        }
+        return ti.scratch;
+    }
     let idx = (id.v - 1) as usize;
     if idx >= ti.len {
         return unsafe { *axtype_ptr_at(ti.types, 0) };
@@ -8309,6 +8865,16 @@ pub fn type_is_int(id: TypeId, ti: view<TypeInterner>) -> bool {
     let t = type_get(ti, id);
     let k = unsafe { (*t).kind };
     (k >= TY_I8 && k <= TY_USIZE) || k == TY_I128 || k == TY_U128
+}
+
+// T457: concrete f32/f64 (not the unsuffixed literal variable).
+pub fn type_is_float(id: TypeId, ti: view<TypeInterner>) -> bool {
+    let t = type_get(ti, id);
+    if (t as usize) == 0 {
+        return false;
+    }
+    let k = unsafe { (*t).kind };
+    k == TY_F32 || k == TY_F64
 }
 
 pub fn type_is_signed(id: TypeId, ti: view<TypeInterner>) -> bool {
@@ -8355,7 +8921,8 @@ pub fn type_is_copy(id: TypeId, thir: view<Thir>, str_in: view<StrInterner>) -> 
     if k == TY_ERROR || k == TY_STR {
         return false;
     }
-    if (k >= TY_UNIT && k <= TY_FN) || k == TY_I128 || k == TY_U128 || k == TY_PTR || k == TY_INT_VAR || k == TY_VIEW {
+    if (k >= TY_UNIT && k <= TY_FN) || k == TY_I128 || k == TY_U128 || k == TY_PTR || k == TY_INT_VAR || k == TY_VIEW ||
+       k == TY_F32 || k == TY_F64 || k == TY_FLOAT_VAR {
         return true;
     }
     if k == TY_ARRAY {
@@ -9390,6 +9957,7 @@ pub struct TypeVarEntry {
     pub resolved_to: TypeId,
     pub is_generic: bool,
     pub span: Span,
+    pub is_float: bool,
 }
 
 pub struct TypeVarTable {
@@ -9459,9 +10027,30 @@ pub fn type_vars_new_int_var(tv: mut_view<TypeVarTable>, ti: mut_view<TypeIntern
         (*entry).span.file.v = 0u32;
         (*entry).span.start = 0u32;
         (*entry).span.end = 0u32;
+        (*entry).is_float = false;
     }
     tv.len = tv.len + 1;
     intern_var_ty(mut_view(*ti), TY_INT_VAR, var_id)
+}
+
+// T457 (SPEC-41 AXS-FLT-003): variable of an unsuffixed float literal; unifies only with f32/f64 or another
+// float variable and defaults to f64.
+pub fn type_vars_new_float_var(tv: mut_view<TypeVarTable>, ti: mut_view<TypeInterner>) -> TypeId {
+    if tv.len == tv.cap {
+        type_vars_grow(mut_view(*tv));
+    }
+    let var_id = tv.len as u32;
+    let entry = unsafe { typevar_at(tv.items, tv.len) };
+    unsafe {
+        (*entry).resolved_to.v = 0u32;
+        (*entry).is_generic = false;
+        (*entry).span.file.v = 0u32;
+        (*entry).span.start = 0u32;
+        (*entry).span.end = 0u32;
+        (*entry).is_float = true;
+    }
+    tv.len = tv.len + 1;
+    intern_var_ty(mut_view(*ti), TY_FLOAT_VAR, var_id)
 }
 
 pub fn type_vars_new_ty_var(
@@ -9480,6 +10069,7 @@ pub fn type_vars_new_ty_var(
         (*entry).span.file.v = span.file.v;
         (*entry).span.start = span.start;
         (*entry).span.end = span.end;
+        (*entry).is_float = false;
     }
     tv.len = tv.len + 1;
     intern_var_ty(mut_view(*ti), TY_VAR, var_id)
@@ -9495,7 +10085,7 @@ pub fn type_vars_resolve(tv: mut_view<TypeVarTable>, ti: view<TypeInterner>, id:
         return TypeId { v: id_v };
     }
     let k = unsafe { (*t).kind };
-    if k == TY_INT_VAR || k == TY_VAR {
+    if k == TY_INT_VAR || k == TY_VAR || k == TY_FLOAT_VAR {
         let vid = unsafe { (*t).var_id as usize };
         if vid < tv.len {
             let entry = unsafe { typevar_at(tv.items, vid) };
@@ -9581,6 +10171,34 @@ pub fn type_vars_unify(
     if kb == TY_INT_VAR {
         let ra_ty = TypeId { v: ra_v };
         if type_is_int(ra_ty, ti) {
+            let vb = unsafe { (*tb).var_id as usize };
+            if vb < tv.len {
+                let eb = unsafe { typevar_at(tv.items, vb) };
+                unsafe {
+                    (*eb).resolved_to.v = ra_v;
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+    if ka == TY_FLOAT_VAR {
+        let rb_ty = TypeId { v: rb_v };
+        if kb == TY_FLOAT_VAR || type_is_float(rb_ty, ti) {
+            let va = unsafe { (*ta).var_id as usize };
+            if va < tv.len {
+                let ea = unsafe { typevar_at(tv.items, va) };
+                unsafe {
+                    (*ea).resolved_to.v = rb_v;
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+    if kb == TY_FLOAT_VAR {
+        let ra_ty = TypeId { v: ra_v };
+        if type_is_float(ra_ty, ti) {
             let vb = unsafe { (*tb).var_id as usize };
             if vb < tv.len {
                 let eb = unsafe { typevar_at(tv.items, vb) };
@@ -10741,6 +11359,8 @@ use compiler.diag.format.diag_buf_push_u32
 use compiler.types.types.AxType
 use compiler.types.types.TypeInterner
 use compiler.types.types.TY_ERROR
+use compiler.types.types.TYPEID_F32
+use compiler.types.types.TYPEID_F64
 use compiler.types.types.TY_UNIT
 use compiler.types.types.TY_NEVER
 use compiler.types.types.TY_BOOL
@@ -10868,6 +11488,9 @@ pub const MIR_CONST_UNIT: u8 = 3u8;
 pub const MIR_CONST_FN: u8 = 4u8;
 pub const MIR_CONST_CLOSURE_SHIM: u8 = 5u8;
 pub const MIR_CONST_INT128: u8 = MIR_CONST_INT;
+// T457 (SPEC-41 AXS-FLT-003 rule 4): IEEE-754 bit pattern in `val` (f32 in the low 32 bits), `ty` f32/f64.
+// Text form: `const f64#3ff8000000000000` / `const f32#3fc00000`.
+pub const MIR_CONST_FLOAT: u8 = 6u8;
 
 pub struct MirConst {
     pub ty: TypeId,
@@ -10935,6 +11558,42 @@ pub const MIR_CAST_INT_TO_INT: u8 = 0u8;
 pub const MIR_CAST_PTR_TO_PTR: u8 = 1u8;
 pub const MIR_CAST_INT_TO_PTR: u8 = 2u8;
 pub const MIR_CAST_PTR_TO_INT: u8 = 3u8;
+// T457 (SPEC-41 AXS-FLT-034, SPEC-04 AXS-EXT-042): numeric float casts. Printed as `as type#N (IntToFloat)` etc.
+pub const MIR_CAST_FLOAT_TO_INT: u8 = 4u8;
+pub const MIR_CAST_INT_TO_FLOAT: u8 = 5u8;
+pub const MIR_CAST_FLOAT_CONVERT: u8 = 6u8;
+
+// "IntToFloat" 0..10, "FloatToInt" 10..20, "FloatConvert" 20..32, "f32#" 32..36, "f64#" 36..40
+const MIR_FLT_KW: [40]u8 = [
+    73u8, 110u8, 116u8, 84u8, 111u8, 70u8, 108u8, 111u8, 97u8, 116u8,
+    70u8, 108u8, 111u8, 97u8, 116u8, 84u8, 111u8, 73u8, 110u8, 116u8,
+    70u8, 108u8, 111u8, 97u8, 116u8, 67u8, 111u8, 110u8, 118u8, 101u8, 114u8, 116u8,
+    102u8, 51u8, 50u8, 35u8, 102u8, 54u8, 52u8, 35u8,
+];
+
+pub fn mir_flt_kw_byte(i: usize) -> u8 {
+    MIR_FLT_KW[i]
+}
+
+fn mir_push_flt_kw(out: mut_view<DiagBuffer>, off: usize, len: usize) {
+    let mut i: usize = 0;
+    while i < len {
+        diag_buf_push_byte(mut_view(*out), MIR_FLT_KW[off + i]);
+        i = i + 1;
+    }
+}
+
+fn mir_push_float_const(out: mut_view<DiagBuffer>, c: view<MirConst>) {
+    let is32 = c.ty.v == TYPEID_F32;
+    mir_push_flt_kw(mut_view(*out), if is32 { 32 } else { 36 }, 4);
+    let mut nd: u64 = if is32 { 8u64 } else { 16u64 };
+    while nd > 0u64 {
+        let sh = (nd - 1u64) * 4u64;
+        let dg = ((c.val >> sh) & 15u64) as u8;
+        diag_buf_push_byte(mut_view(*out), mir_hex_digit(dg));
+        nd = nd - 1u64;
+    }
+}
 
 pub const MIR_RVALUE_USE: u8 = 0u8;
 pub const MIR_RVALUE_REPEAT: u8 = 1u8;
@@ -12262,6 +12921,9 @@ pub fn mir_print_operand(out: mut_view<DiagBuffer>, op: view<MirOperand>) {
                 i = i + 1;
             }
             diag_buf_push_byte(mut_view(*out), 34u8);
+        } else if op.constant.kind == MIR_CONST_FLOAT {
+            mir_push_str(mut_view(*out), 41, 6);
+            mir_push_float_const(mut_view(*out), view(op.constant));
         } else {
             mir_push_str(mut_view(*out), 41, 6);
             let hi = mir_const_int_hi(view(op.constant));
@@ -12384,6 +13046,18 @@ pub fn mir_print_rvalue(out: mut_view<DiagBuffer>, rv: view<MirRvalue>) {
         mir_print_operand(mut_view(*out), view(rv.use_op));
         mir_push_str(mut_view(*out), 76, 9);
         diag_buf_push_u32(mut_view(*out), rv.target_ty.v);
+        if rv.cast_kind == MIR_CAST_INT_TO_FLOAT || rv.cast_kind == MIR_CAST_FLOAT_TO_INT || rv.cast_kind == MIR_CAST_FLOAT_CONVERT {
+            diag_buf_push_byte(mut_view(*out), 32u8);
+            diag_buf_push_byte(mut_view(*out), 40u8);
+            if rv.cast_kind == MIR_CAST_INT_TO_FLOAT {
+                mir_push_flt_kw(mut_view(*out), 0, 10);
+            } else if rv.cast_kind == MIR_CAST_FLOAT_TO_INT {
+                mir_push_flt_kw(mut_view(*out), 10, 10);
+            } else {
+                mir_push_flt_kw(mut_view(*out), 20, 12);
+            }
+            diag_buf_push_byte(mut_view(*out), 41u8);
+        }
     } else if rv.kind == MIR_RVALUE_BINARY_OP {
         if rv.bin_op == MIR_BINOP_OFFSET || rv.bin_op >= MIR_BINOP_WRAPPING_ADD {
             mir_print_binop(mut_view(*out), rv.bin_op);
@@ -12912,6 +13586,23 @@ fn mp_skip_ws(p: mut_view<MirParser>) {
     }
 }
 
+// T457: matches MIR_FLT_KW[off..off+len) after whitespace.
+fn mp_match_flt(p: mut_view<MirParser>, off: usize, len: usize) -> bool {
+    mp_skip_ws(mut_view(*p));
+    if p.pos + len > p.len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < len {
+        if (unsafe { *(p.src + p.pos + i) }) != MIR_FLT_KW[off + i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    p.pos = p.pos + len;
+    true
+}
+
 fn mp_match_bytes(p: mut_view<MirParser>, kw_off: usize, kw_len: usize) -> bool {
     mp_skip_ws(mut_view(*p));
     if p.pos + kw_len > p.len {
@@ -13403,6 +14094,10 @@ fn mp_parse_place(p: mut_view<MirParser>, arena: mut_view<Arena>, out: mut_view<
     }
 }
 
+fn mp_is_hex_ch(c: u8) -> bool {
+    (c >= 48u8 && c <= 57u8) || (c >= 97u8 && c <= 102u8) || (c >= 65u8 && c <= 70u8)
+}
+
 fn mp_hex_val(c: u8) -> u8 {
     if c >= 48u8 && c <= 57u8 {
         return c - 48u8;
@@ -13524,6 +14219,21 @@ fn mp_parse_operand(
             out.constant.str_bytes = buf as *const u8;
             out.constant.str_len = actual_len;
             out.constant.ty.v = interner.t_str.v;
+        } else if mp_match_flt(mut_view(*p), 32, 4) || mp_match_flt(mut_view(*p), 36, 4) {
+            let is32 = (unsafe { *(p.src + p.pos - 3) }) == 51u8;
+            let mut v: u64 = 0u64;
+            let mut nd: u32 = 0u32;
+            while (p.pos) < p.len && mp_is_hex_ch(unsafe { *(p.src + p.pos) }) && nd < 16u32 {
+                v = (v << 4u64) | (mp_hex_val(unsafe { *(p.src + p.pos) }) as u64);
+                p.pos = p.pos + 1;
+                nd = nd + 1u32;
+            }
+            if nd == 0u32 || (is32 && nd > 8u32) {
+                p.failed = true;
+            }
+            out.constant.val = v;
+            out.constant.kind = MIR_CONST_FLOAT;
+            out.constant.ty.v = if is32 { TYPEID_F32 } else { TYPEID_F64 };
         } else if mp_match_kw_4(mut_view(*p), 116u8, 114u8, 117u8, 101u8) {
             out.constant.val = 1u64;
             out.constant.kind = MIR_CONST_BOOL;
@@ -13910,6 +14620,12 @@ fn mp_parse_rvalue(
                 out.cast_kind = MIR_CAST_INT_TO_PTR;
             } else if mp_match_bytes(mut_view(*p), 592, 8) {
                 out.cast_kind = MIR_CAST_PTR_TO_INT;
+            } else if mp_match_flt(mut_view(*p), 0, 10) {
+                out.cast_kind = MIR_CAST_INT_TO_FLOAT;
+            } else if mp_match_flt(mut_view(*p), 10, 10) {
+                out.cast_kind = MIR_CAST_FLOAT_TO_INT;
+            } else if mp_match_flt(mut_view(*p), 20, 12) {
+                out.cast_kind = MIR_CAST_FLOAT_CONVERT;
             }
             mp_match_bytes(mut_view(*p), 503, 1);
         }
