@@ -229,7 +229,8 @@ are `BinaryOp` + an `Assert` terminator, SPEC-03 AXS-SEM-030), `UnaryOp`, `Wrapp
 `AddressOf(mutability)` (T061a), `NullaryOp(SizeOf | AlignOf | NeedsDrop)`. Reserved:
 - `BinaryOp` operators `SatAdd`, `SatSub`, `SatMul` (E12.1); float operands of the existing operators
   (E12.2);
-- `Cast` kinds `IntToFloat`, `FloatToInt`, `FloatConvert` (E12.2), `Unsize` (E14.4),
+- `Cast` kinds `IntToFloat`, `FloatToInt`, `FloatConvert`, `FloatBits` (same-width float <-> unsigned integer, ADR-0049) and
+  float-only `UnaryOp` `Sqrt`, `Fabs` (E12.2), `Unsize` (E14.4),
   `PtrAddrSpace` (E13.2/E22.2);
 - `VectorOp { op, lanes }`, `Splat`, `Extract`, `Insert`, `Shuffle`, `Reduce` (E12.3).
 
@@ -433,6 +434,10 @@ SPEC-03.)
 | `print` | `fn(s: Str)` (bootstrap output; std.io replaces it for programs, ADR-0006 §9) | T041 / T042 |
 | `print_int` | `fn(n: i64)` | T041 / T042 |
 | `drop` | `fn<T>(x: T)` (moves and drops) | T049 / T051 |
+| `to_bits_f32`, `to_bits_f64` | `fn(x: f32) -> u32`, `fn(x: f64) -> u64` (ADR-0049) | T458a / T458a |
+| `from_bits_f32`, `from_bits_f64` | `fn(v: u32) -> f32`, `fn(v: u64) -> f64` | T458a / T458a |
+| `sqrt_f32`, `abs_f32`, `sqrt_f64`, `abs_f64` | `fn(x: F) -> F` | T458a / T458a |
+| `copysign_f32`, `copysign_f64` | `fn(x: F, y: F) -> F` | T458a / T458a |
 
 `checked_*` and `overflowing_*` are library code in T069 over these intrinsics and comparisons;
 saturating operations are E12.1. No float intrinsic exists in axiom0.

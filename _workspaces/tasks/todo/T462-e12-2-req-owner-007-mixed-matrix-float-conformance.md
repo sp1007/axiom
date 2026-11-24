@@ -6,7 +6,7 @@ owner: axiom-qa
 reviewer: axiom-architect
 model: opus
 gate_model: sonnet
-depends: [T456, T457, T458, T459, T460, T461, T480]
+depends: [T456, T457, T458, T458a, T458b, T459, T460, T461, T480]
 priority: 152
 status: todo
 attempts: 0
@@ -43,3 +43,4 @@ Certify `REQ-OWNER-007` (Complex Mixed-Type Expression Matrix Patterns A, B, C, 
 
 ## Log
 - 2026-11-03 00:30:00 created by T212 (P12 phase planning)
+- 2026-11-24 depends += T458a, T458b (architect, unblock-T458, ADR-0049)

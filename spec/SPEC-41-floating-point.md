@@ -4,7 +4,7 @@ Status: draft (T456, 2026-11-03)
 Owner: axiom-architect
 Consolidates: `tasks/0327 §84.2, §84.4–84.9`; `tasks/0331 §17–30, §59–70, §100 (ANUM-41..57, 81..100)`; `tasks/0334 §91.1–12`; `tasks/0338 §15–36, §93–100 (ANUM-37..65, 80..100)`; `tasks/0345 §17–36, §98–100 (ANUM-22, 35..62, 78..100)`; `tasks/0427 §15–26`; `tasks/0431 §172.1–14`; `tasks/0469 §210.1–210.80 (AMATH-20..70)`; `specs/0157`; `specs/0162`; `specs/0175`; `specs/0179`; `specs/0181`; `specs/0245`; `spec/SPEC-01-lexical.md`; `spec/SPEC-03-core-semantics.md`; `spec/SPEC-04-core-extensibility.md`; `spec/SPEC-40-integers.md`; `spec/requirements/OWNER.md` (`REQ-OWNER-007`).
 Covers: `REQ-OWNER-007`, `REQ-SIMD-108`, `REQ-SIMD-109`, `REQ-SIMD-110`, `REQ-SIMD-163`, `REQ-SIMD-186`, `REQ-SIMD-187`, `REQ-SIMD-188`, `REQ-SIMD-189`.
-Consumers: `compiler/lex/`, `compiler/syntax/`, `compiler/hir/`, `compiler/types/types.ax`, `compiler/types/layout.ax`, `compiler/types/typeck.ax`, `compiler/mir/mir.ax`, `compiler/mir/builder.ax`, `compiler/verify/verifier.ax`, `compiler/interp/`, `compiler/opt/`, `compiler/lir/`, `compiler/abi/win64.ax`, `compiler/target/x64/`, `std/core/float.ax`, `std/text/fmt/float.ax`, `std/math/mod.ax`, `T457`–`T462`.
+Consumers: `compiler/lex/`, `compiler/syntax/`, `compiler/hir/`, `compiler/types/types.ax`, `compiler/types/layout.ax`, `compiler/types/typeck.ax`, `compiler/mir/mir.ax`, `compiler/mir/builder.ax`, `compiler/verify/verifier.ax`, `compiler/interp/`, `compiler/opt/`, `compiler/lir/`, `compiler/abi/win64.ax`, `compiler/target/x64/`, `std/core/float.ax`, `std/text/fmt/float.ax`, `std/math/mod.ax`, `T457`–`T462`, `T458a`, `T458b`.
 
 ## Tóm tắt
 
@@ -324,6 +324,13 @@ Per `SPEC-40 AXS-INT-040, AXS-INT-044`, bit reinterpretation (`BITCAST`) is stri
 2. **`f64` bitcasts and byte conversions**:
    - `f64.to_bits(self: f64) -> u64` and `f64.from_bits(v: u64) -> f64` (`MOVQ rax, xmm0` / `MOVQ xmm0, rax`): exact 64-bit bit-pattern reinterpretation.
    - `f64.to_le_bytes(self: f64) -> [8]u8`, `f64.from_le_bytes(b: [8]u8) -> f64`, `f64.to_be_bytes(self: f64) -> [8]u8`, `f64.from_be_bytes(b: [8]u8) -> f64`, `f64.to_ne_bytes(self: f64) -> [8]u8`, `f64.from_ne_bytes(b: [8]u8) -> f64`: exact delegation to `u64` endian byte conversions.
+
+### AXS-FLT-026 — Compiler-Known Float Intrinsics and Derived Operations (ADR-0049, `T458a`, `T460`)
+
+1. The compiler knows exactly these float intrinsics, for `f32` and `f64` (names carry the suffix `_f32` / `_f64`): `to_bits`, `from_bits`, `sqrt`, `abs`, `copysign`. `to_bits`, `from_bits`, `abs` and `copysign` are pure bit operations (payload, quiet bit and, where not written, sign are preserved, also for signaling `NaN`s); `sqrt` is correctly rounded. They never panic and are never folded except by an IEEE-exact folder.
+2. **`INV-FLT-INTR`**: an intrinsic is in the table only when the oracle and the native backend both implement it in the same commit; an oracle-only intrinsic is forbidden. Any other `@intrinsic` name is `AX_TYPE_UNKNOWN_INTRINSIC`.
+3. `floor`, `ceil`, `trunc`, `round`, `round_ties_even`, `fract`, `mul_add`/`fma`, `min`, `max`, `next_up`, `next_down` and every other operation of `AXS-FLT-015`, `AXS-FLT-016`, `AXS-FLT-062` is an ordinary pure-Axiom function of `std.core.float` / `std.math` over these intrinsics, bit-identical in the oracle and natively for every input. Hardware forms (SSE4.1 `ROUND*`, FMA3) may be selected later (`T473`) only if the results are bit-identical.
+4. `MIR`: `to_bits`/`from_bits` are `Cast(FloatBits)`; `sqrt`/`abs` are `UnaryOp(Sqrt)`/`UnaryOp(Fabs)`; `copysign` is expanded to these and integer masks.
 
 ---
 
@@ -738,7 +745,7 @@ The following operations MUST be exact ($\le 0.5\text{ ULP}$, correctly rounded 
 
 1. **Square Root & Fused Multiply-Add**:
    - `sqrt(x)` — exact IEEE-754 square root (`SQRTSS` / `SQRTSD`); returns `-0.0` for `-0.0`, `+0.0` for `+0.0`, `+inf` for `+inf`, and `NaN` for `x < -0.0` or `NaN`.
-   - `fma(a, b, c)` / `mul_add(a, b, c)` — computes $(a \times b) + c$ with a **single** final `roundTiesToEven` rounding step (implemented via hardware `VFMADD213SS`/`SD` when enabled by target profile or Dekker/TwoProduct + TwoSum exact software emulation on baseline SSE2).
+   - `fma(a, b, c)` / `mul_add(a, b, c)` — computes $(a \times b) + c$ with a **single** final `roundTiesToEven` rounding step (implemented via hardware `VFMADD213SS`/`SD` when enabled by target profile or exact integer soft-float in `std.core.float` on baseline SSE2; the Dekker/TwoProduct form is not sufficient because it fails near overflow and underflow, ADR-0049).
 2. **Sign, Rounding & Decomposition**:
    - `abs(x)`, `copysign(x, y)`, `signum(x)`
    - `floor(x)`, `ceil(x)`, `trunc(x)`, `round(x)`, `round_ties_even(x)`, `fract(x)`

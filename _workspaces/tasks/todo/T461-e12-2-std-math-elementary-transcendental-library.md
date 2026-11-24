@@ -12,7 +12,7 @@ status: todo
 attempts: 0
 paths: [std/math, tests/std/math]
 locks: [std/core/prelude.ax]
-spec: [spec/SPEC-41-floating-point.md, tasks/0334, tasks/0338, tasks/0345, tasks/0469]
+spec: [spec/SPEC-41-floating-point.md, spec/decisions/ADR-0049-float-intrinsics-minimal-set.md, tasks/0334, tasks/0338, tasks/0345, tasks/0469]
 covers: [REQ-SIMD-142, REQ-SIMD-143, REQ-SIMD-304, REQ-SIMD-305]
 ---
 # T461 — E12.2 — std.math deterministic elementary & transcendental library
@@ -22,7 +22,7 @@ Implement `std/math/` in pure Axiom (zero CRT/libm dependency), delivering deter
 
 ## Scope
 - Create `std/math/mod.ax` with mathematical constants (`PI`, `TAU`, `E`, `LN_2`, `LN_10`, `LOG2_E`, `LOG10_E`, `SQRT_2`, `FRAC_1_SQRT_2`, `FRAC_PI_2`, `FRAC_PI_3`, `FRAC_PI_4`, `FRAC_PI_6`, `FRAC_PI_8`, `FRAC_1_PI`, `FRAC_2_PI`, `FRAC_2_SQRT_PI`) for `f32` and `f64`.
-- Implement deterministic IEEE-754 elementary and rounding operations: `abs`, `copysign`, `signum`, `floor`, `ceil`, `trunc`, `round`, `round_ties_even`, `fract`, `modf`, `frexp`, `ldexp`, `scalbn`, `fma`, `sqrt`, `cbrt`, `hypot`, `min`, `max`, `clamp`, `div_euclid`, `rem_euclid`.
+- Provide deterministic IEEE-754 elementary and rounding operations (those that exist in `std.core.float` from T460 — `abs`, `copysign`, `floor`, `ceil`, `trunc`, `round`, `round_ties_even`, `fract`, `fma`/`mul_add`, `sqrt`, `min`, `max`, `clamp` — are thin re-exports, never a second implementation; no new `@intrinsic`): `abs`, `copysign`, `signum`, `floor`, `ceil`, `trunc`, `round`, `round_ties_even`, `fract`, `modf`, `frexp`, `ldexp`, `scalbn`, `fma`, `sqrt`, `cbrt`, `hypot`, `min`, `max`, `clamp`, `div_euclid`, `rem_euclid`.
 - Implement deterministic polynomial/rational minimax approximations with Cody-Waite / Payne-Hanek range reduction for `exp`, `exp2`, `expm1`, `ln`, `log2`, `log10`, `ln_1p`, `powf`, `powi`, `sin`, `cos`, `tan`, `sincos`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `erf`, and `erfc` within the `SPEC-41` ULP budget.
 
 ## Acceptance
@@ -41,3 +41,4 @@ Implement `std/math/` in pure Axiom (zero CRT/libm dependency), delivering deter
 
 ## Log
 - 2026-11-03 00:30:00 created by T212 (P12 phase planning)
+- 2026-11-24 elementary operations re-export std.core.float (T460); float intrinsics and const tables come through T460's closure (T458a, T458b) (architect, unblock-T458, ADR-0049)

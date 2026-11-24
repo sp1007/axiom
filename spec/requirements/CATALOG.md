@@ -3844,7 +3844,7 @@
 | REQ-SIMD-103 | simd | v1-full | ANUM-38 â€” Wrapping arithmetic is explicit. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T450 |
 | REQ-SIMD-104 | simd | v1-full | ANUM-39 â€” Checked arithmetic is explicit. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T450 |
 | REQ-SIMD-105 | simd | v1-full | ANUM-40 â€” SIMD bitwise operations preserve bit-level semantics. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T450 |
-| REQ-SIMD-106 | simd | v1-full | ANUM-41 â€” Numeric conversion is distinct from bitcast. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T450 |
+| REQ-SIMD-106 | simd | v1-full | ANUM-41 â€” Numeric conversion is distinct from bitcast. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T450, T458a |
 | REQ-SIMD-107 | simd | v1-full | ANUM-42 â€” SIMD bitcast requires valid representation constraints. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T464 |
 | REQ-SIMD-108 | simd | v1-full | ANUM-43 â€” Floating-point reassociation is not implicitly permitted. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T456 |
 | REQ-SIMD-109 | simd | v1-full | ANUM-44 â€” Fast-math behavior requires an explicit semantic or compilation contract. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T456 |
@@ -4688,7 +4688,7 @@
 | REQ-SIMD-269 | simd | v1-full | ANUM-42 — SIMD bitcast requires valid representation constraints. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T465 |
 | REQ-SIMD-270 | simd | v1-full | ANUM-43 — Floating-point reassociation is not implicitly permitted. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T457 |
 | REQ-SIMD-271 | simd | v1-full | ANUM-44 — Fast-math behavior requires an explicit semantic or compilation contract. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T458 |
-| REQ-SIMD-272 | simd | v1-full | ANUM-45 — FMA contraction must respect floating-point semantics. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T458 |
+| REQ-SIMD-272 | simd | v1-full | ANUM-45 — FMA contraction must respect floating-point semantics. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T458, T460 |
 | REQ-SIMD-273 | simd | v1-full | ANUM-46 — SIMD memory operations obey the ordinary Axiom memory model unless explicitly atomic/volatile. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T465 |
 | REQ-SIMD-274 | simd | v1-full | ANUM-47 — SIMD operations do not imply synchronization. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T465 |
 | REQ-SIMD-275 | simd | v1-full | ANUM-48 — SIMD operations do not imply atomicity. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T465 |
