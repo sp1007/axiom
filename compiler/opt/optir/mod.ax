@@ -40,6 +40,9 @@ use compiler.types.types.Thir
 use compiler.types.types.type_get
 use compiler.types.types.typeid_at
 use compiler.mir.mir.MIR_LOCAL_ARG
+use compiler.mir.mir.MIR_LOCAL_CONST
+use compiler.mir.mir.MIR_LOCAL_STATIC
+use compiler.mir.mir.MIR_LOCAL_TLS
 use compiler.mir.mir.MIR_PROJ_DEREF
 use compiler.mir.mir.MIR_PROJ_FIELD
 use compiler.mir.mir.MIR_PROJ_INDEX
@@ -1064,10 +1067,12 @@ fn optir_classify_locals(
     while i < lc {
         let decl = unsafe { mir_local_at(mir.locals, i) };
         let ty = unsafe { (*decl).ty };
+        let lk = unsafe { (*decl).kind };
+        let is_global_mem = lk == MIR_LOCAL_CONST || lk == MIR_LOCAL_TLS || lk == MIR_LOCAL_STATIC;
         unsafe {
             *opt_typeid_at(body.local_tys, i) = ty;
             *opt_u8_at(body.local_modes, i) = OPT_LOCAL_SCALAR;
-            *opt_bool_at(body.local_addr_taken, i) = false;
+            *opt_bool_at(body.local_addr_taken, i) = is_global_mem;
             *opt_bool_at(body.local_dropped, i) = false;
             *opt_u32_at(body.local_sroa_base, i) = OPT_PROJ_NONE;
             *opt_u32_at(body.local_sroa_count, i) = 0u32;
@@ -3112,9 +3117,30 @@ pub fn optir_simplify_trivial_phis(body: mut_view<OptBody>) {
 
 // --- MemoryRegion, Alias Analysis, Effect Summary & MemorySSA Construction (AXS-OPT-020..024) ---
 
+fn opt_local_is_global(body: view<OptBody>, loc_v: u32, out_const_sym_v: mut_view<u32>) -> bool {
+    *out_const_sym_v = 0u32;
+    if (body.orig_mir as usize) == 0 {
+        return false;
+    }
+    let orig = unsafe { view(*body.orig_mir) };
+    let idx = loc_v as usize;
+    if idx >= orig.local_count || (orig.locals as usize) == 0 {
+        return false;
+    }
+    let decl = unsafe { mir_local_at(orig.locals, idx) };
+    let dk = unsafe { (*decl).kind };
+    if dk == MIR_LOCAL_STATIC || dk == MIR_LOCAL_TLS || dk == MIR_LOCAL_CONST {
+        *out_const_sym_v = unsafe { (*decl).const_sym.v };
+        return true;
+    }
+    false
+}
+
 pub fn optir_extract_memory_region(body: view<OptBody>, place: view<MirPlace>) -> MemoryRegion {
     let lv = place.local.v as usize;
-    let mut domain = STORAGE_STACK_LOCAL;
+    let mut dummy_sym: u32 = 0u32;
+    let is_glob = opt_local_is_global(body, place.local.v, mut_view(dummy_sym));
+    let mut domain: u8 = if is_glob { STORAGE_GLOBAL } else { STORAGE_STACK_LOCAL };
     let mut const_off: i64 = 0i64;
     let byte_sz: u64 = 1u64;
     let mut known_bounds = true;
@@ -3144,7 +3170,10 @@ pub fn optir_extract_memory_region(body: view<OptBody>, place: view<MirPlace>) -
         while pi < place.proj_count {
             let pr = unsafe { mir_proj_at(place.projs, pi) };
             let pk = unsafe { (*pr).kind };
-            if pk == MIR_PROJ_FIELD {
+            if pk == MIR_PROJ_DEREF && pi > 0 {
+                domain = STORAGE_UNKNOWN;
+                known_bounds = false;
+            } else if pk == MIR_PROJ_FIELD {
                 const_off = const_off + ((unsafe { (*pr).field_idx }) as i64);
             } else if pk == MIR_PROJ_INDEX || pk == MIR_PROJ_SUB_SLICE {
                 known_bounds = false;
@@ -3187,6 +3216,41 @@ pub fn optir_alias_query(body: view<OptBody>, reg_a: view<MemoryRegion>, reg_b: 
             return ALIAS_PARTIAL_ALIAS;
         }
         return ALIAS_MAY_ALIAS;
+    }
+
+    // 1b. Stack local vs direct global static/const/TLS: disjoint storage segments
+    if (reg_a.domain == STORAGE_STACK_LOCAL && reg_b.domain == STORAGE_GLOBAL) ||
+       (reg_a.domain == STORAGE_GLOBAL && reg_b.domain == STORAGE_STACK_LOCAL) {
+        return ALIAS_NO_ALIAS;
+    }
+
+    // 1c. Both direct global static/const/TLS places: relate by `(const_sym, projections)`
+    if reg_a.domain == STORAGE_GLOBAL && reg_b.domain == STORAGE_GLOBAL {
+        let mut sym_a: u32 = 0u32;
+        let mut sym_b: u32 = 0u32;
+        let _ = opt_local_is_global(body, reg_a.base_local.v, mut_view(sym_a));
+        let _ = opt_local_is_global(body, reg_b.base_local.v, mut_view(sym_b));
+        if reg_a.base_local.v == reg_b.base_local.v ||
+           (sym_a != 0u32 && sym_a == sym_b) {
+            let mut norm_b = mir_local_place(reg_a.base_local.v);
+            mir_copy_place(mut_view(norm_b), view(reg_b.place));
+            norm_b.local.v = reg_a.base_local.v;
+            let rel_g = mir_region_relate(view(reg_a.place), view(norm_b));
+            if rel_g == MIR_REGION_DISJOINT {
+                return ALIAS_NO_ALIAS;
+            }
+            if rel_g == MIR_REGION_SAME {
+                return ALIAS_MUST_ALIAS;
+            }
+            if rel_g == MIR_REGION_CONTAINS || rel_g == MIR_REGION_OVERLAPS {
+                return ALIAS_PARTIAL_ALIAS;
+            }
+            return ALIAS_MAY_ALIAS;
+        }
+        if sym_a != 0u32 && sym_b != 0u32 && sym_a != sym_b {
+            return ALIAS_NO_ALIAS;
+        }
+        return ALIAS_UNKNOWN;
     }
 
     // 2. Non-address-taken stack local vs non-stack domain (view, raw ptr, heap, global)

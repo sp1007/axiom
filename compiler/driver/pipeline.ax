@@ -164,6 +164,9 @@ use compiler.traits.mono.mono_engine_init
 use compiler.typeck_traits.session.session_typeck_and_seed_mono
 use compiler.mir.mir.MirBody
 use compiler.mir.mir.MirOperand
+use compiler.mir.mir.MIR_LOCAL_CONST
+use compiler.mir.mir.MIR_LOCAL_STATIC
+use compiler.mir.mir.MIR_LOCAL_TLS
 use compiler.mir.mir.MIR_OP_CONST
 use compiler.mir.mir.MIR_STMT_ASSIGN
 use compiler.mir.mir.MIR_RVALUE_USE
@@ -172,6 +175,7 @@ use compiler.mir.mir.MIR_RVALUE_BINARY_OP
 use compiler.mir.mir.MIR_RVALUE_UNARY_OP
 use compiler.mir.mir.MIR_RVALUE_AGGREGATE
 use compiler.mir.mir.MIR_TERM_CALL
+use compiler.mir.mir.mir_local_at
 use compiler.mir.mir.mir_bb_at
 use compiler.mir.mir.mir_stmt_at
 use compiler.mir.mir.mir_op_at
@@ -223,6 +227,8 @@ use compiler.backend.session.backend_lower_fn_to_mc_checked_opt
 use compiler.backend.session.backend_lower_fn_to_mc_checked_timed
 use compiler.backend.session.backend_emit_fn_strings_rdata
 use compiler.backend.session.backend_format_const_sym_name
+use compiler.backend.session.backend_format_static_sym_name
+use compiler.backend.session.backend_emit_one_static_item
 use compiler.backend.session.session_emit_lir_mir_text_opt
 use compiler.backend.session.session_emit_mi_mir_text_opt
 use compiler.backend.session.session_emit_mc_mir_text_opt
@@ -3011,12 +3017,13 @@ fn pipe_static_has_freestanding_attr(interner: view<StrInterner>, it: *const Hir
 }
 
 fn pipeline_mask_allowed_statics(interner: view<StrInterner>, items: *mut HirItem, eff_profile: u32) -> bool {
+    let _ = interner;
+    let _ = eff_profile;
     let mut masked = false;
     let mut it = items;
     while (it as usize) != 0 {
         unsafe {
-            if (*it).kind == HIR_ITEM_STATIC &&
-               (eff_profile != PROFILE_HOSTED || pipe_static_has_freestanding_attr(interner, it as *const HirItem)) {
+            if (*it).kind == HIR_ITEM_STATIC && ((*it).is_tls || ((*it).expr as usize) == 0) {
                 (*it).kind = 255u8;
                 masked = true;
             }
@@ -5522,6 +5529,121 @@ fn pipe_emit_tls_statics(
     }
 }
 
+fn pipe_emit_statics(
+    ctx: mut_view<PipelineCtx>,
+    bodies_buf: *mut *mut MirBody,
+    fn_count: usize,
+    is_build_mode: bool,
+    for_lib: bool,
+    for_obj: bool,
+    filter_fid_v: u32,
+    include_std_weak: bool,
+    rdata_sec_id_v: u32,
+    cstr_counter: mut_view<u32>,
+    obj: mut_view<ObjModel>,
+    drectve_buf: mut_view<CoffBuf>
+) {
+    let restrict_private: bool = for_lib || (for_obj && filter_fid_v != 0u32);
+    let mut data_sec_id_v: u32 = 0u32;
+    let mut bss_sec_id_v: u32 = 0u32;
+    let mut bss_offset: u64 = 0u64;
+    let hir_ptr = unsafe { address_of(ctx.hir.items) as *const HirFile };
+    let str_in_ptr = unsafe { address_of(ctx.sess.interner.bytes.head) as *const StrInterner };
+
+    let mut sit: *mut HirItem = ctx.hir.items;
+    while (sit as usize) != 0 {
+        if (unsafe { (*sit).kind }) == HIR_ITEM_STATIC &&
+           !(unsafe { (*sit).is_tls }) &&
+           (unsafe { (*sit).abi.v }) == 0u32 {
+            let sit_fid_v = unsafe { (*sit).span.file.v };
+            let is_std_sit = pipe_fid_is_std(ctx.proj.files as *const ProjectFile, ctx.proj.file_count, sit_fid_v);
+            let should_emit: bool = if !is_std_sit {
+                filter_fid_v == 0u32 || sit_fid_v == filter_fid_v
+            } else {
+                !for_lib &&
+                (filter_fid_v == 0u32 || include_std_weak) &&
+                pipe_bodies_ref_sym(bodies_buf, fn_count, unsafe { (*sit).symbol.v })
+            };
+            if should_emit {
+                let mut has_export: bool = false;
+                let export_sv = pipe_item_get_export_info(
+                    sit as *const HirItem,
+                    view(ctx.sess.interner),
+                    mut_view(has_export)
+                );
+                let sym_bind: u32 = if !restrict_private ||
+                                       (unsafe { (*sit).vis.kind }) != 0u8 ||
+                                       has_export ||
+                                       (unsafe { (*sit).is_used }) ||
+                                       (unsafe { (*sit).is_no_mangle }) {
+                    SYM_GLOBAL
+                } else {
+                    SYM_LOCAL
+                };
+                let mut out_sec_v: u32 = 0u32;
+                let mut out_off: u64 = 0u64;
+                let mut out_sz: u64 = 0u64;
+                let _ = backend_emit_one_static_item(
+                    mut_view(ctx.backend_arena),
+                    sit as *const HirItem,
+                    view(ctx.hir),
+                    view(ctx.thir),
+                    view(ctx.sess.interner),
+                    mut_view(*obj),
+                    rdata_sec_id_v,
+                    mut_view(data_sec_id_v),
+                    mut_view(bss_sec_id_v),
+                    mut_view(bss_offset),
+                    mut_view(*cstr_counter),
+                    sym_bind,
+                    mut_view(out_sec_v),
+                    mut_view(out_off),
+                    mut_view(out_sz)
+                );
+                if is_build_mode && has_export {
+                    let sname_sv = interner_get(view(ctx.sess.interner), unsafe { (*sit).name });
+                    let exp_ptr: *const u8 = if export_sv.len > 0 { export_sv.ptr } else { sname_sv.ptr };
+                    let exp_len: usize = if export_sv.len > 0 { export_sv.len } else { sname_sv.len };
+                    let exp_name_sv = StrView { ptr: exp_ptr, len: exp_len };
+                    let internal_sv = backend_format_static_sym_name(
+                        mut_view(ctx.backend_arena),
+                        hir_ptr,
+                        str_in_ptr,
+                        unsafe { (*sit).symbol.v }
+                    );
+                    let mut alias_ptr: *const u8 = internal_sv.ptr;
+                    let mut alias_len: usize = internal_sv.len;
+                    if exp_len > 0 && !sv_eq(view(exp_name_sv), view(internal_sv)) {
+                        if objmodel_find_symbol_bytes(view(*obj), exp_ptr, exp_len).v == 0u32 &&
+                           !pipe_any_hir_fn_uses_name(ctx.hir.items, view(ctx.sess.interner), view(exp_name_sv)) {
+                            let _ = objmodel_add_symbol_bytes(
+                                mut_view(*obj),
+                                exp_ptr,
+                                exp_len,
+                                SectionId { v: out_sec_v },
+                                out_off,
+                                out_sz,
+                                SYM_GLOBAL
+                            );
+                            alias_ptr = exp_ptr;
+                            alias_len = exp_len;
+                        }
+                    }
+                    if !for_lib && exp_len > 0 {
+                        let drectve_int_sv = if for_obj {
+                            StrView { ptr: alias_ptr, len: alias_len }
+                        } else {
+                            StrView { ptr: internal_sv.ptr, len: internal_sv.len }
+                        };
+                        pipe_append_drectve_export(mut_view(*drectve_buf), view(exp_name_sv), view(drectve_int_sv), true);
+                    }
+                }
+            }
+        }
+        sit = unsafe { (*sit).next };
+    }
+}
+
 fn pipe_emit_exported_consts(
     ctx: mut_view<PipelineCtx>,
     for_lib: bool,
@@ -6702,10 +6824,11 @@ fn pipe_emit_axmeta_section(
         fi = fi + 1;
     }
 
-    // 2. Emit `AXMETA_ENTRY_DEF` for exported `const` items (`SYM_ABI_KIND_DATA`).
+    // 2. Emit `AXMETA_ENTRY_DEF` for exported `const` / `static` items (`SYM_ABI_KIND_DATA`).
     let mut cit: *mut HirItem = ctx.hir.items;
     while (cit as usize) != 0 {
-        if (unsafe { (*cit).kind }) == HIR_ITEM_CONST &&
+        if ((unsafe { (*cit).kind }) == HIR_ITEM_CONST ||
+            ((unsafe { (*cit).kind }) == HIR_ITEM_STATIC && !(unsafe { (*cit).is_tls }))) &&
            (filter_fid_v == 0u32 || (unsafe { (*cit).span.file.v }) == filter_fid_v) {
             let mut has_export: bool = false;
             let export_sv = pipe_item_get_export_info(
@@ -7000,6 +7123,18 @@ fn pipe_bodies_ref_sym(bodies_buf: *mut *mut MirBody, fn_count: usize, sym_v: u3
     while i < fn_count {
         let body = unsafe { *pipe_mir_body_ptr_at(bodies_buf, i) };
         if (body as usize) != 0 {
+            let lcnt = unsafe { (*body).local_count };
+            let locs = unsafe { (*body).locals };
+            let mut li: usize = 0;
+            while li < lcnt && (locs as usize) != 0 {
+                let ldecl = unsafe { mir_local_at(locs, li) };
+                let lk = unsafe { (*ldecl).kind };
+                if (lk == MIR_LOCAL_STATIC || lk == MIR_LOCAL_TLS || lk == MIR_LOCAL_CONST) &&
+                   (unsafe { (*ldecl).const_sym.v }) == sym_v {
+                    return true;
+                }
+                li = li + 1;
+            }
             let bbs = unsafe { (*body).bbs };
             let bb_cnt = unsafe { (*body).bb_count };
             let mut b: usize = 0;
@@ -7134,11 +7269,7 @@ fn pipe_std_sym_insert(cap: usize, keys: *mut u32, sym_v: u32) {
     }
 }
 
-fn pipe_std_sym_mark_op(cap: usize, keys: *mut u32, hit: *mut u8, op: view<MirOperand>) {
-    if op.kind != MIR_OP_CONST {
-        return;
-    }
-    let sym_v = op.constant.sym.v;
+fn pipe_std_sym_mark_val(cap: usize, keys: *mut u32, hit: *mut u8, sym_v: u32) {
     if cap == 0 || sym_v == 0u32 || (keys as usize) == 0 {
         return;
     }
@@ -7155,6 +7286,13 @@ fn pipe_std_sym_mark_op(cap: usize, keys: *mut u32, hit: *mut u8, op: view<MirOp
         }
         slot = (slot + 1) & mask;
     }
+}
+
+fn pipe_std_sym_mark_op(cap: usize, keys: *mut u32, hit: *mut u8, op: view<MirOperand>) {
+    if op.kind != MIR_OP_CONST {
+        return;
+    }
+    pipe_std_sym_mark_val(cap, keys, hit, op.constant.sym.v);
 }
 
 fn pipe_std_sym_is_hit(cap: usize, keys: *mut u32, hit: *mut u8, sym_v: u32) -> bool {
@@ -7179,6 +7317,17 @@ fn pipe_std_sym_is_hit(cap: usize, keys: *mut u32, hit: *mut u8, sym_v: u32) -> 
 fn pipe_mark_body_std_refs(cap: usize, keys: *mut u32, hit: *mut u8, body: *const MirBody) {
     if (body as usize) == 0 || cap == 0 {
         return;
+    }
+    let lcnt = unsafe { (*body).local_count };
+    let locs = unsafe { (*body).locals };
+    let mut li: usize = 0;
+    while li < lcnt && (locs as usize) != 0 {
+        let ldecl = unsafe { mir_local_at(locs, li) };
+        let lk = unsafe { (*ldecl).kind };
+        if lk == MIR_LOCAL_STATIC || lk == MIR_LOCAL_TLS || lk == MIR_LOCAL_CONST {
+            pipe_std_sym_mark_val(cap, keys, hit, unsafe { (*ldecl).const_sym.v });
+        }
+        li = li + 1;
     }
     let bbs = unsafe { (*body).bbs };
     let bb_cnt = unsafe { (*body).bb_count };
@@ -7801,6 +7950,21 @@ fn driver_emit_objmodel_filtered_ex(
         ctx.build_ns[BT_LIR + lk] = ctx.build_ns[BT_LIR + lk] + lower_acc[lk];
         lk = lk + 1;
     }
+
+    pipe_emit_statics(
+        mut_view(*ctx),
+        bodies_buf,
+        fn_count,
+        is_build_mode,
+        for_lib,
+        for_obj,
+        filter_fid_v,
+        include_std_weak,
+        rdata_id_v,
+        mut_view(cstr_counter),
+        mut_view(*obj),
+        mut_view(drectve_buf)
+    );
 
     if is_build_mode {
         pipe_strip_unlinked_extern_c_prefixes(view(*ctx), mut_view(*obj));

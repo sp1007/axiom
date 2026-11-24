@@ -1,0 +1,222 @@
+// test: run
+// modes: interp native
+// timeout: 60
+// stdout: sync_data=62 1 sync_bss=45 9 drops=2 rec=108 clos=90 store=88 33 cfn=52 140\n
+
+module main
+
+use std.sync.atomic.Atomic
+use std.sync.atomic.AtomicU32
+use std.sync.atomic.Ordering
+use std.thread.spawn
+
+struct InnerSync {
+    pub lock: AtomicU32,
+    pub hits: Atomic<u64>,
+}
+
+struct OuterSync {
+    pub label: str,
+    pub slots: [2]InnerSync,
+    pub pair: (u64, InnerSync),
+}
+
+struct PureZeroSync {
+    pub slots: [2]InnerSync,
+}
+
+// Immutable `static` with nested `Atomic` inside struct/array/tuple + `str` reloc -> must land in writable `.data`!
+static OUTER_SYNC: OuterSync = OuterSync {
+    label: "nested-sync",
+    slots: [
+        InnerSync { lock: Atomic { v: 1u32 }, hits: Atomic { v: 10u64 } },
+        InnerSync { lock: Atomic { v: 2u32 }, hits: Atomic { v: 20u64 } },
+    ],
+    pair: (7u64, InnerSync { lock: Atomic { v: 0u32 }, hits: Atomic { v: 5u64 } }),
+};
+
+// Immutable `static` with pure-zero nested `Atomic`s and 0 relocs -> must land in writable `.bss`!
+static ZERO_SYNC: PureZeroSync = PureZeroSync {
+    slots: [
+        InnerSync { lock: Atomic { v: 0u32 }, hits: Atomic { v: 0u64 } },
+        InnerSync { lock: Atomic { v: 0u32 }, hits: Atomic { v: 0u64 } },
+    ],
+};
+
+static mut DROP_EVENTS: i64 = 0i64;
+
+struct DropProbe {
+    pub code: i64,
+}
+
+impl Drop for DropProbe {
+    fn drop(self: mut_view<DropProbe>) {
+        let _ = self;
+        unsafe {
+            DROP_EVENTS = DROP_EVENTS + 1i64;
+        }
+    }
+}
+
+struct DropHolder {
+    pub inner: DropProbe,
+    pub tag: i64,
+}
+
+impl DropHolder {
+    pub fn peek_sum(self: view<DropHolder>) -> i64 {
+        self.inner.code + self.tag
+    }
+}
+
+static IMM_HOLDER: DropHolder = DropHolder {
+    inner: DropProbe { code: 30i64 },
+    tag: 12i64,
+};
+
+static mut MUT_HOLDER: DropHolder = DropHolder {
+    inner: DropProbe { code: 40i64 },
+    tag: 8i64,
+};
+
+@derive(Copy)
+struct MutState {
+    pub a: i64,
+    pub b: i64,
+}
+
+const BASE_SEED: i64 = 25i64;
+const DERIVED_SEED: i64 = (BASE_SEED << 1i64) + 2i64;
+
+static CFN_SCALAR: i64 = DERIVED_SEED;
+static mut CFN_STATE: MutState = MutState { a: BASE_SEED + 15i64, b: BASE_SEED * 5i64 };
+
+static mut REC_ACC: i64 = 3i64;
+static mut VOID_ARR: [4]i64 = [0i64; 4];
+
+fn inspect_imm_holder_once() -> i64 {
+    let direct_code: i64 = IMM_HOLDER.inner.code;
+    let via_view: i64 = view(IMM_HOLDER.inner).code;
+    let via_method: i64 = IMM_HOLDER.peek_sum();
+    direct_code + via_view + via_method
+}
+
+fn spawn_local_drop_probe() {
+    let local_p = DropProbe { code: 1i64 };
+    let _ = local_p.code;
+}
+
+// Void helper whose ONLY observable side effects are stores into `static mut` places right before return
+fn store_only_globals(idx: usize, val: i64) {
+    unsafe {
+        MUT_HOLDER.tag = val;
+        VOID_ARR[idx] = val - 55i64;
+    }
+}
+
+fn rec_ping(n: i64) -> i64 {
+    if n <= 0i64 {
+        return unsafe { REC_ACC };
+    }
+    unsafe {
+        REC_ACC = REC_ACC * 2i64 + n;
+    }
+    let sub = rec_pong(n - 1i64);
+    unsafe {
+        REC_ACC = REC_ACC + 5i64;
+    }
+    sub + (unsafe { REC_ACC })
+}
+
+fn rec_pong(n: i64) -> i64 {
+    if n <= 0i64 {
+        return unsafe { REC_ACC };
+    }
+    unsafe {
+        REC_ACC = REC_ACC + n * 3i64;
+    }
+    rec_ping(n - 1i64)
+}
+
+pub fn main() -> i32 {
+    // 1. Nested Atomic operations across threads on immutable statics in `.data` and `.bss`
+    let t1 = spawn(|| -> i64 {
+        let _ = OUTER_SYNC.slots[0].hits.fetch_add(7u64, Ordering.SeqCst);
+        let _ = OUTER_SYNC.slots[1].hits.fetch_add(20u64, Ordering.SeqCst);
+        let cas = OUTER_SYNC.pair.1.lock.compare_exchange(0u32, 1u32, Ordering.SeqCst, Ordering.SeqCst);
+        let _ = ZERO_SYNC.slots[0].hits.fetch_add(15u64, Ordering.SeqCst);
+        let _ = ZERO_SYNC.slots[1].hits.fetch_add(30u64, Ordering.SeqCst);
+        ZERO_SYNC.slots[1].lock.store(9u32, Ordering.SeqCst);
+        if cas.ok { 1i64 } else { 0i64 }
+    });
+    let mut cas_ok: i64 = 0i64;
+    match t1.join() {
+        Result.Ok(v) => { cas_ok = v; },
+        Result.Err(_) => {},
+    }
+    let sync_data_sum: i64 = (OUTER_SYNC.slots[0].hits.load(Ordering.SeqCst) +
+                              OUTER_SYNC.slots[1].hits.load(Ordering.SeqCst) +
+                              OUTER_SYNC.pair.1.hits.load(Ordering.SeqCst)) as i64;
+    let sync_bss_sum: i64 = (ZERO_SYNC.slots[0].hits.load(Ordering.SeqCst) +
+                             ZERO_SYNC.slots[1].hits.load(Ordering.SeqCst)) as i64;
+    let sync_bss_lock: i64 = ZERO_SYNC.slots[1].lock.load(Ordering.SeqCst) as i64;
+
+    // 2. `!Copy` `Drop` static accessed across multiple calls + overwrite of `static mut` `Drop` holder
+    let mut holder_check: i64 = 0i64;
+    let mut k: i64 = 0i64;
+    while k < 4i64 {
+        holder_check = holder_check + inspect_imm_holder_once();
+        k = k + 1i64;
+    }
+    spawn_local_drop_probe();
+    spawn_local_drop_probe();
+    unsafe {
+        MUT_HOLDER = DropHolder { inner: DropProbe { code: 50i64 }, tag: 9i64 };
+    }
+    let drops_now: i64 = unsafe { DROP_EVENTS };
+
+    // 3. Mutual recursion + capturing closure + void store-only helper on `static mut`
+    let rec_val: i64 = rec_ping(3i64);
+    let bias: i64 = 10i64;
+    let bump_clos = |step: i64| -> i64 {
+        unsafe {
+            REC_ACC = REC_ACC + bias + step + IMM_HOLDER.tag;
+            REC_ACC
+        }
+    };
+    let _ = bump_clos(2i64);
+    let clos_val: i64 = bump_clos(3i64);
+
+    store_only_globals(2usize, 88i64);
+    let st_tag: i64 = unsafe { MUT_HOLDER.tag };
+    let st_arr: i64 = unsafe { VOID_ARR[2] };
+
+    // 4. `const`-derived scalar and aggregate static initializers
+    let cfn_s: i64 = CFN_SCALAR;
+    let cfn_agg: i64 = unsafe { CFN_STATE.a + CFN_STATE.b - 25i64 } + (if holder_check == 408i64 && len(OUTER_SYNC.label) == 11usize { 0i64 } else { 999i64 });
+
+    print("sync_data=");
+    print_int(sync_data_sum);
+    print(" ");
+    print_int(cas_ok);
+    print(" sync_bss=");
+    print_int(sync_bss_sum);
+    print(" ");
+    print_int(sync_bss_lock);
+    print(" drops=");
+    print_int(drops_now);
+    print(" rec=");
+    print_int(rec_val);
+    print(" clos=");
+    print_int(clos_val);
+    print(" store=");
+    print_int(st_tag);
+    print(" ");
+    print_int(st_arr);
+    print(" cfn=");
+    print_int(cfn_s);
+    print(" ");
+    print_int(cfn_agg);
+    print("\n");
+    0
+}

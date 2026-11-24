@@ -17,6 +17,11 @@ use compiler.diag.format.DiagBuffer
 use compiler.diag.format.diag_buf_push_byte
 use compiler.diag.format.diag_buf_push_bytes
 use compiler.diag.format.diag_buf_push_u32
+use compiler.hir.hir.HIR_EXPR_LITERAL
+use compiler.hir.hir.HirAttr
+use compiler.hir.hir.HirAttrArg
+use compiler.hir.hir.HirExpr
+use compiler.hir.hir.HirItem
 use compiler.types.types.AxType
 use compiler.types.types.TY_ARRAY
 use compiler.types.types.TY_BOOL
@@ -58,6 +63,8 @@ use compiler.mir.mir.MIR_CONST_BOOL
 use compiler.mir.mir.MIR_CONST_INT
 use compiler.mir.mir.MIR_LOCAL_ARG
 use compiler.mir.mir.MIR_LOCAL_CONST
+use compiler.mir.mir.MIR_LOCAL_STATIC
+use compiler.mir.mir.MIR_LOCAL_TLS
 use compiler.mir.mir.MIR_OP_CONST
 use compiler.mir.mir.MIR_OP_COPY
 use compiler.mir.mir.MIR_OP_MOVE
@@ -1567,6 +1574,95 @@ fn al_callee_builtin_kind(body: view<OptBody>, func_op: view<MirOperand>) -> u8 
     0u8
 }
 
+fn al_is_global_alloc_root(root: u32) -> bool {
+    root >= ALLOC_ROOT_GLOBAL_BASE && root < ALLOC_ROOT_MMIO_BASE
+}
+
+fn al_global_alloc_root_for_sym(csym_v: u32) -> u32 {
+    if csym_v == 0u32 {
+        return ALLOC_ROOT_UNKNOWN;
+    }
+    ALLOC_ROOT_GLOBAL_BASE + (csym_v & 0x0FFFFFFFu32)
+}
+
+fn al_type_contains_atomic(thir: *const Thir, ty_id: TypeId, depth: usize) -> bool {
+    if (thir as usize) == 0 || ty_id.v == 0u32 || depth > 8 {
+        return false;
+    }
+    let tp = type_get(unsafe { view((*thir).interner) }, ty_id);
+    if (tp as usize) == 0 {
+        return false;
+    }
+    let tk = unsafe { (*tp).kind };
+    if tk == TY_STRUCT {
+        let def = unsafe { (*tp).def };
+        if (def as usize) != 0 {
+            let mut attr: *mut HirAttr = unsafe { (*def).attrs };
+            while (attr as usize) != 0 {
+                let args: *mut HirAttrArg = unsafe { (*attr).args };
+                if (args as usize) != 0 {
+                    let expr: *mut HirExpr = unsafe { (*args).expr };
+                    if (expr as usize) != 0 && (unsafe { (*expr).kind }) == HIR_EXPR_LITERAL {
+                        let lptr = unsafe { (*expr).literal.str_ptr };
+                        let llen = unsafe { (*expr).literal.str_len };
+                        if llen == 6 && (lptr as usize) != 0 && (unsafe {
+                            *(lptr + 0) == 97u8 && *(lptr + 1) == 116u8 && *(lptr + 2) == 111u8 &&
+                            *(lptr + 3) == 109u8 && *(lptr + 4) == 105u8 && *(lptr + 5) == 99u8
+                        }) {
+                            return true;
+                        }
+                    }
+                }
+                attr = unsafe { (*attr).next };
+            }
+        }
+        let acnt = unsafe { (*tp).arg_count };
+        let targs = unsafe { (*tp).args };
+        let mut ai: usize = 0;
+        while ai < acnt && (targs as usize) != 0 {
+            let aty_v = unsafe { (*opt_typeid_at(targs, ai)).v };
+            if al_type_contains_atomic(thir, (TypeId { v: aty_v }), depth + 1) {
+                return true;
+            }
+            ai = ai + 1;
+        }
+    }
+    if tk == TY_STRUCT || tk == TY_TUPLE || tk == TY_CLOSURE {
+        let fcnt = unsafe { (*tp).field_count };
+        let flds = unsafe { (*tp).fields };
+        let mut i: usize = 0;
+        while i < fcnt && (flds as usize) != 0 {
+            let f_ty_v = unsafe { (*opt_typeid_at(flds, i)).v };
+            if al_type_contains_atomic(thir, (TypeId { v: f_ty_v }), depth + 1) {
+                return true;
+            }
+            i = i + 1;
+        }
+    } else if tk == TY_ARRAY {
+        let elem_ty_v = unsafe { (*tp).elem.v };
+        return al_type_contains_atomic(thir, (TypeId { v: elem_ty_v }), depth + 1);
+    } else if tk == TY_ENUM {
+        let vcnt = unsafe { (*tp).variant_count };
+        let vfcnts = unsafe { (*tp).variant_field_counts };
+        let vfptrs = unsafe { (*tp).variant_fields };
+        let mut vi: usize = 0;
+        while vi < vcnt && (vfcnts as usize) != 0 && (vfptrs as usize) != 0 {
+            let fc = unsafe { *al_usize_at(vfcnts, vi) };
+            let vfields = unsafe { *al_typeid_ptr_at(vfptrs, vi) };
+            let mut fi: usize = 0;
+            while fi < fc && (vfields as usize) != 0 {
+                let f_ty_v = unsafe { (*opt_typeid_at(vfields, fi)).v };
+                if al_type_contains_atomic(thir, (TypeId { v: f_ty_v }), depth + 1) {
+                    return true;
+                }
+                fi = fi + 1;
+            }
+            vi = vi + 1;
+        }
+    }
+    false
+}
+
 fn al_mark_root_exposed(info: mut_view<AliasInfo>, loc_v: u32, external: bool) {
     if (loc_v as usize) >= info.local_count {
         return;
@@ -1586,6 +1682,20 @@ fn al_mark_root_exposed(info: mut_view<AliasInfo>, loc_v: u32, external: bool) {
             if external {
                 (*rp).escaped_external = true;
             }
+        }
+    } else if al_is_global_alloc_root(root) && (info.locals as usize) != 0 {
+        let mut gi: usize = 0;
+        while gi < info.local_count {
+            let gp = unsafe { alias_local_prov_at(info.locals, gi) };
+            if (unsafe { (*gp).alloc_root }) == root {
+                unsafe {
+                    (*gp).raw_addr_exposed = true;
+                    if external {
+                        (*gp).escaped_external = true;
+                    }
+                }
+            }
+            gi = gi + 1;
         }
     }
 }
@@ -1627,8 +1737,8 @@ pub fn alias_init_info(
     // 1. Initialize per-local baseline domain, capability mode, and allocation identity
     let mut l: usize = 0;
     while l < lcnt {
-        let lty = TypeId { v: unsafe { (*opt_typeid_at(body.local_tys, l)).v } };
-        let cmode = al_local_cap_mode_from_ty(body.thir, lty, 0u8);
+        let lty_v = unsafe { (*opt_typeid_at(body.local_tys, l)).v };
+        let cmode = al_local_cap_mode_from_ty(body.thir, TypeId { v: lty_v }, 0u8);
         let is_arg = l >= 1 && l <= body.arg_count;
         let dcnt = alias_count_local_defs(body, l as u32);
         let mut dom = DOMAIN_STACK_LOCAL;
@@ -1643,13 +1753,32 @@ pub fn alias_init_info(
             dom = DOMAIN_RAW_PTR;
             root = ALLOC_ROOT_UNKNOWN;
         }
+        let mut is_mut_global = false;
         if (body.orig_mir as usize) != 0 {
             let orig = unsafe { view(*body.orig_mir) };
             if l < orig.local_count && (orig.locals as usize) != 0 {
                 let decl = unsafe { mir_local_at(orig.locals, l) };
-                if (unsafe { (*decl).kind }) == MIR_LOCAL_CONST {
+                let dk = unsafe { (*decl).kind };
+                let dm = unsafe { (*decl).mut_flag };
+                let csym_v = unsafe { (*decl).const_sym.v };
+                let decl_ty = TypeId {
+                    v: if lty_v != 0u32 { lty_v } else { unsafe { (*decl).ty.v } }
+                };
+                if dk == MIR_LOCAL_CONST && !dm {
                     dom = DOMAIN_CONST_RDATA;
-                    root = ALLOC_ROOT_GLOBAL_BASE + (unsafe { (*decl).const_sym.v });
+                    root = al_global_alloc_root_for_sym(csym_v);
+                } else if dk == MIR_LOCAL_STATIC {
+                    if dm || al_type_contains_atomic(body.thir, decl_ty, 0) {
+                        dom = DOMAIN_GLOBAL_STATIC;
+                        is_mut_global = true;
+                    } else {
+                        dom = DOMAIN_CONST_RDATA;
+                    }
+                    root = al_global_alloc_root_for_sym(csym_v);
+                } else if dk == MIR_LOCAL_TLS || (dk == MIR_LOCAL_CONST && dm) {
+                    dom = DOMAIN_GLOBAL_STATIC;
+                    is_mut_global = true;
+                    root = al_global_alloc_root_for_sym(csym_v);
                 }
             }
         }
@@ -1691,10 +1820,10 @@ pub fn alias_init_info(
             (*lp).origin_place = mir_local_place(l as u32);
             (*lp).has_const_ptr_off = cmode != CAP_MODE_RAW_PTR;
             (*lp).const_ptr_elem_off = 0i64;
-            (*lp).borrow_taken = addr_flag;
-            (*lp).mut_borrow_taken = false;
-            (*lp).raw_addr_exposed = false;
-            (*lp).escaped_external = false;
+            (*lp).borrow_taken = addr_flag || is_mut_global;
+            (*lp).mut_borrow_taken = is_mut_global;
+            (*lp).raw_addr_exposed = is_mut_global;
+            (*lp).escaped_external = is_mut_global;
             (*lp).is_fixed_mmio = false;
             (*lp).is_zero_copy_pinned = false;
             (*lp).cap_root_local = init_cap_root;
@@ -1818,17 +1947,26 @@ pub fn alias_init_info(
                                             }
                                             unsafe { (*dlp).valid_start = alias_make_prog_pt(b as u32, i as u32); }
                                             if last_d == ref_pl.proj_count {
-                                                if (unsafe { (*blp).domain }) == DOMAIN_STACK_LOCAL ||
-                                                   (unsafe { (*blp).domain }) == DOMAIN_CONST_RDATA {
+                                                let bdom = unsafe { (*blp).domain };
+                                                if bdom == DOMAIN_STACK_LOCAL ||
+                                                   bdom == DOMAIN_CONST_RDATA ||
+                                                   bdom == DOMAIN_GLOBAL_STATIC {
+                                                    let broot = unsafe { (*blp).alloc_root };
                                                     unsafe {
-                                                        (*dlp).alloc_root = if (*blp).domain == DOMAIN_CONST_RDATA {
-                                                            (*blp).alloc_root
-                                                        } else {
+                                                        (*dlp).alloc_root = if bdom == DOMAIN_STACK_LOCAL {
                                                             base_l
+                                                        } else {
+                                                            broot
                                                         };
                                                         (*dlp).has_origin_place = true;
                                                         mir_copy_place(mut_view((*dlp).origin_place), ref_pl);
-                                                        (*dlp).cap_root_local = base_l;
+                                                        (*dlp).cap_root_local = if bdom == DOMAIN_STACK_LOCAL {
+                                                            base_l
+                                                        } else if broot != ALLOC_ROOT_UNKNOWN {
+                                                            broot
+                                                        } else {
+                                                            CAP_ROOT_AMBIGUOUS
+                                                        };
                                                         (*dlp).has_cap_subplace = false;
                                                     }
                                                 } else {
@@ -2025,13 +2163,26 @@ pub fn alias_init_info(
                                             unsafe {
                                                 (*dlp).domain = DOMAIN_RAW_PTR;
                                                 (*dlp).cap_mode = CAP_MODE_RAW_PTR;
-                                                if alast_d == apl.proj_count && (*slp).domain == DOMAIN_STACK_LOCAL {
+                                                if alast_d == apl.proj_count &&
+                                                   ((*slp).domain == DOMAIN_STACK_LOCAL ||
+                                                    (*slp).domain == DOMAIN_CONST_RDATA ||
+                                                    (*slp).domain == DOMAIN_GLOBAL_STATIC) {
                                                     (*dlp).has_const_ptr_off = true;
                                                     (*dlp).const_ptr_elem_off = 0i64;
-                                                    (*dlp).alloc_root = apl.local.v;
+                                                    (*dlp).alloc_root = if (*slp).domain == DOMAIN_STACK_LOCAL {
+                                                        apl.local.v
+                                                    } else {
+                                                        (*slp).alloc_root
+                                                    };
                                                     (*dlp).has_origin_place = true;
                                                     mir_copy_place(mut_view((*dlp).origin_place), apl);
-                                                    (*dlp).cap_root_local = apl.local.v;
+                                                    (*dlp).cap_root_local = if (*slp).domain == DOMAIN_STACK_LOCAL {
+                                                        apl.local.v
+                                                    } else if (*slp).alloc_root != ALLOC_ROOT_UNKNOWN {
+                                                        (*slp).alloc_root
+                                                    } else {
+                                                        CAP_ROOT_AMBIGUOUS
+                                                    };
                                                 } else if alast_d == 0 && (*slp).def_count == 1u32 {
                                                     (*dlp).has_const_ptr_off = (*slp).has_const_ptr_off;
                                                     (*dlp).const_ptr_elem_off = (*slp).const_ptr_elem_off;
@@ -2170,9 +2321,9 @@ pub fn alias_extract_region(
         let lroot = unsafe { (*lp).alloc_root };
         if last_d == place.proj_count {
             // No `MIR_PROJ_DEREF` anywhere in `place`: genuine direct access to `local` or its sub-fields/elements
-            dom = if ldom == DOMAIN_CONST_RDATA { DOMAIN_CONST_RDATA } else { DOMAIN_STACK_LOCAL };
+            dom = if ldom == DOMAIN_CONST_RDATA || ldom == DOMAIN_GLOBAL_STATIC { ldom } else { DOMAIN_STACK_LOCAL };
             cmode = CAP_MODE_OWNER;
-            root = if ldom == DOMAIN_CONST_RDATA { lroot } else { lv as u32 };
+            root = if ldom == DOMAIN_CONST_RDATA || ldom == DOMAIN_GLOBAL_STATIC { lroot } else { lv as u32 };
             has_res = true;
             mir_copy_place(mut_view(res_pl), place);
         } else if last_d == 0 {
@@ -2633,6 +2784,34 @@ fn al_fact_from_spatial_rel(
     alias_fact_make(ALIAS_MAY_ALIAS, REGION_UNKNOWN, CERTAINTY_POSSIBLE, reason, valid_start, valid_end)
 }
 
+fn al_resolved_local_is_global(info: view<AliasInfo>, body: view<OptBody>, loc_v: u32) -> bool {
+    let idx = loc_v as usize;
+    if idx < info.local_count && (info.locals as usize) != 0 {
+        let dom = unsafe { (*alias_local_prov_at(info.locals, idx)).domain };
+        if dom == DOMAIN_GLOBAL_STATIC || dom == DOMAIN_CONST_RDATA {
+            return true;
+        }
+    }
+    if (body.orig_mir as usize) != 0 {
+        let orig = unsafe { view(*body.orig_mir) };
+        if idx < orig.local_count && (orig.locals as usize) != 0 {
+            let dk = unsafe { (*mir_local_at(orig.locals, idx)).kind };
+            if dk == MIR_LOCAL_STATIC || dk == MIR_LOCAL_TLS || dk == MIR_LOCAL_CONST {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn al_resolved_local_alloc_root(info: view<AliasInfo>, loc_v: u32, fallback_root: u32) -> u32 {
+    let idx = loc_v as usize;
+    if idx < info.local_count && (info.locals as usize) != 0 {
+        return unsafe { (*alias_local_prov_at(info.locals, idx)).alloc_root };
+    }
+    fallback_root
+}
+
 pub fn alias_query_regions(
     info: view<AliasInfo>,
     body: view<OptBody>,
@@ -2723,49 +2902,68 @@ pub fn alias_query_regions(
         );
     }
 
-    // 2. Both regions resolve to concrete root places (`DOMAIN_STACK_LOCAL` or traced borrow/raw-ptr)
+    // 2. Both regions resolve to concrete root places (`DOMAIN_STACK_LOCAL`, `DOMAIN_GLOBAL_STATIC`, `DOMAIN_CONST_RDATA`, or traced borrow/raw-ptr)
     if reg_a.has_resolved_place && reg_b.has_resolved_place {
         let ra = view(reg_a.resolved_place);
         let rb = view(reg_b.resolved_place);
-        if ra.local.v != rb.local.v {
-            let reason_root: u8 = if (reg_a.cap_mode == CAP_MODE_MUT_VIEW_WRITE && reg_b.cap_mode == CAP_MODE_VIEW_READ) ||
-                                     (reg_a.cap_mode == CAP_MODE_VIEW_READ && reg_b.cap_mode == CAP_MODE_MUT_VIEW_WRITE) {
-                ALIAS_REASON_CAP_VIEW_READONLY
-            } else if reg_a.cap_mode == CAP_MODE_MUT_VIEW_WRITE ||
-                      reg_b.cap_mode == CAP_MODE_MUT_VIEW_WRITE {
-                ALIAS_REASON_CAP_MUT_DISJOINT
-            } else {
-                ALIAS_REASON_DISTINCT_ALLOC
-            };
-            return alias_fact_make(
-                ALIAS_NO_ALIAS,
-                REGION_DISJOINT,
-                CERTAINTY_PROVEN,
-                reason_root,
-                ALIAS_PT_WHOLE_START,
-                ALIAS_PT_WHOLE_END
-            );
+        let mut same_root_entity = ra.local.v == rb.local.v;
+        let mut unknown_global_pair = false;
+        if !same_root_entity {
+            let ga = al_resolved_local_is_global(info, body, ra.local.v);
+            let gb = al_resolved_local_is_global(info, body, rb.local.v);
+            if ga && gb {
+                let root_a = al_resolved_local_alloc_root(info, ra.local.v, reg_a.alloc_root);
+                let root_b = al_resolved_local_alloc_root(info, rb.local.v, reg_b.alloc_root);
+                if al_is_global_alloc_root(root_a) && al_is_global_alloc_root(root_b) {
+                    if root_a == root_b {
+                        same_root_entity = true;
+                    }
+                } else {
+                    unknown_global_pair = true;
+                }
+            }
         }
-        let mut preason = ALIAS_REASON_IDENTICAL_PLACE;
-        let prel = alias_relate_projection_paths(body, ra, rb, 0, mut_view(preason));
-        if prel == REGION_DISJOINT {
-            return alias_fact_make(
-                ALIAS_NO_ALIAS,
-                REGION_DISJOINT,
-                CERTAINTY_PROVEN,
+        if !unknown_global_pair {
+            if !same_root_entity {
+                let reason_root: u8 = if (reg_a.cap_mode == CAP_MODE_MUT_VIEW_WRITE && reg_b.cap_mode == CAP_MODE_VIEW_READ) ||
+                                         (reg_a.cap_mode == CAP_MODE_VIEW_READ && reg_b.cap_mode == CAP_MODE_MUT_VIEW_WRITE) {
+                    ALIAS_REASON_CAP_VIEW_READONLY
+                } else if reg_a.cap_mode == CAP_MODE_MUT_VIEW_WRITE ||
+                          reg_b.cap_mode == CAP_MODE_MUT_VIEW_WRITE {
+                    ALIAS_REASON_CAP_MUT_DISJOINT
+                } else {
+                    ALIAS_REASON_DISTINCT_ALLOC
+                };
+                return alias_fact_make(
+                    ALIAS_NO_ALIAS,
+                    REGION_DISJOINT,
+                    CERTAINTY_PROVEN,
+                    reason_root,
+                    ALIAS_PT_WHOLE_START,
+                    ALIAS_PT_WHOLE_END
+                );
+            }
+            let mut preason = ALIAS_REASON_IDENTICAL_PLACE;
+            let prel = alias_relate_projection_paths(body, ra, rb, 0, mut_view(preason));
+            if prel == REGION_DISJOINT {
+                return alias_fact_make(
+                    ALIAS_NO_ALIAS,
+                    REGION_DISJOINT,
+                    CERTAINTY_PROVEN,
+                    preason,
+                    ALIAS_PT_WHOLE_START,
+                    ALIAS_PT_WHOLE_END
+                );
+            }
+            return al_fact_from_spatial_rel(
+                prel,
                 preason,
+                reg_a.access_ty,
+                reg_b.access_ty,
                 ALIAS_PT_WHOLE_START,
                 ALIAS_PT_WHOLE_END
             );
         }
-        return al_fact_from_spatial_rel(
-            prel,
-            preason,
-            reg_a.access_ty,
-            reg_b.access_ty,
-            ALIAS_PT_WHOLE_START,
-            ALIAS_PT_WHOLE_END
-        );
     }
 
     // 3. Tier 1 — Non-address-taken NoEscape stack local vs external/pointer/view region,

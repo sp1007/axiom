@@ -8,15 +8,16 @@ model: opus
 gate_model: opus
 depends: [T423b, T448]
 priority: 140
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 600
 paths: [compiler/types/typeck.ax, compiler/mir, compiler/interp, compiler/lir/builder.ax, compiler/obj, compiler/link/linker.ax, compiler/link/pe.ax, tests/run/static_items, tests/ui/static_items]
-locks: [compiler/diag/code.ax, compiler/driver/pipeline.ax, compiler/interp_opt/session.ax, compiler/backend/session.ax, compiler/verify/verifier.ax, compiler/own/init.ax, compiler/opt]
+locks: [compiler/diag/code.ax, compiler/driver/pipeline.ax, compiler/interp_opt/session.ax, compiler/backend/session.ax, compiler/verify/verifier.ax, compiler/own/init.ax, compiler/opt, tests/ui/comptime/static_err.ax, tests/selfhost/interp_opt/gen_interp_opt_tests.py]
 spec: [spec/SPEC-02-grammar.md, spec/SPEC-30-concurrency.md, spec/SPEC-50-unsafe-ub-ffi.md, spec/decisions/ADR-0004-self-host-subset-additions.md]
 covers: [REQ-CORE-2226, REQ-CORE-2227]
-started: 2026-11-23 16:58:49
+started: 2026-11-23 17:39:34
 unblocks: 1
+finished: 2026-11-24 11:16:34
 ---
 # T537 — Process-wide statics
 
@@ -78,3 +79,5 @@ any linker change.
 - 2026-11-23 17:20:15 block: Needs widened paths/locks (compiler/mir, driver/pipeline.ax, interp_opt/session.ax, backend/session.ax, verify/verifier.ax, own/init.ax, opt/const_fold.ax, opt/dce.ax) and architect clarification on AX_CONC_UNSYNC_STATIC vs AX_UNSAFE_REQUIRED
 - 2026-11-23 17:35:00 architect (T537-unblock): widened paths (compiler/mir) and locks (driver/pipeline.ax, interp_opt/session.ax, backend/session.ax, verify/verifier.ax, own/init.ax, compiler/opt for -O1/-O2), clarified AX_CONC_UNSYNC_STATIC per SPEC-30 AXS-CONC-034, and ordered T513 after T537
 - 2026-11-23 17:39:27 unblocked (cycle 1) 
+- 2026-11-23 17:39:34 started (attempt 1) axiom-semantics
+- 2026-11-24 11:16:34 accepted by QA -> done
