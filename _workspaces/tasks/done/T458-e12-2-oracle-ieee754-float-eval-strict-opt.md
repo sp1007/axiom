@@ -8,14 +8,15 @@ model: sonnet
 gate_model: sonnet
 depends: [T457, T452]
 priority: 148
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/interp, compiler/opt, tests/mir/float_interp, tests/opt/float_strict]
 locks: [compiler/interp_opt/session.ax, tests/selfhost/interp]
 spec: [spec/SPEC-41-floating-point.md, spec/decisions/ADR-0049-float-intrinsics-minimal-set.md, tasks/0331, tasks/0338, tasks/0345]
 covers: [REQ-SIMD-026, REQ-SIMD-271, REQ-SIMD-272]
-started: 2026-11-24 17:48:05
+started: 2026-11-24 19:11:30
 unblocks: 1
+finished: 2026-11-24 21:40:26
 ---
 # T458 — E12.2 — Oracle IEEE-754 floating-point evaluator & strict FP optimizer preservation
 
@@ -53,3 +54,5 @@ Implement bit-deterministic IEEE-754 `f32`/`f64` execution, casts, and float int
 - 2026-11-24 19:03:05 block: acceptance item 'float intrinsics pass under --interp' unmet: typeck intrinsic table (compiler/types/types.ax, typeck.ax check_intrinsic_item) has no float entries (AX_TYPE_UNKNOWN_INTRINSIC); outside T458 paths, held by running T501; tests/mir/float_interp/intrinsics.ax demoted to helper; no backlog task owns the registration
 - 2026-11-24 rescope (architect, unblock-T458, ADR-0049): intrinsic acceptance narrowed to a committed kernel unit test (lock tests/selfhost/interp); registration + native moved to T458a, float const items to T458b. Remaining work: the unit test, the native-after retarget, report round; implementation in the main tree stays as is.
 - 2026-11-24 19:09:48 unblocked (cycle 1) 
+- 2026-11-24 19:11:30 started (attempt 1) T458-impl
+- 2026-11-24 21:40:26 accepted by QA -> done

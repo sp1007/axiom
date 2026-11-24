@@ -8,14 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T457, T453]
 priority: 149
-status: doing
-attempts: 1
+status: todo
+attempts: 0
 paths: [compiler/lir, compiler/abi, compiler/target/x64, tests/lir/float, tests/encode/sse2_scalar, tests/abi/win64_float, tests/encode/axiom/gnu_as_vectors.ax, tests/encode/encode_tests.inc]
 locks: [compiler/backend/session.ax]
 spec: [spec/SPEC-41-floating-point.md, spec/SPEC-04-core-extensibility.md, 0162, 0179, 0181, tasks/0331, tasks/0338]
 covers: [REQ-SIMD-325, REQ-SIMD-332]
 started: 2026-11-24 17:48:06
-agent: T459-impl
 ---
 # T459 — E12.2 — LIR Xmm register class, Windows x64 XMM ABI & SSE2 scalar floating-point codegen
 
@@ -47,3 +46,4 @@ Implement the LIR `f32`/`f64` scalar types and `Xmm` register class (`AXS-EXT-05
 - 2026-11-24 16:19:08 started (attempt 1) axiom-backend
 - 2026-11-24 17:47:57 requeue:  (not charged: attempt refunded)
 - 2026-11-24 17:48:06 started (attempt 1) T459-impl
+- 2026-11-24 21:32:20 requeue: paused for max_parallel=1 quota conservation (edits kept on disk) (not charged: attempt refunded)

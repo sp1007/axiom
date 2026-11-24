@@ -45,6 +45,7 @@ use compiler.hir.hir.HirParam
 use compiler.types.types.AxType
 use compiler.types.types.CONST_AGGREGATE
 use compiler.types.types.CONST_INT
+use compiler.types.types.CONST_FLOAT
 use compiler.types.types.CONST_STR
 use compiler.types.types.CONST_UNIT
 use compiler.types.types.sym_constmap_get
@@ -75,6 +76,8 @@ use compiler.types.types.TY_CHAR
 use compiler.types.types.TY_CLOSURE
 use compiler.types.types.TY_ENUM
 use compiler.types.types.TY_FN
+use compiler.types.types.TY_F32
+use compiler.types.types.TY_F64
 use compiler.types.types.TY_I8
 use compiler.types.types.TY_I16
 use compiler.types.types.TY_I32
@@ -159,6 +162,9 @@ use compiler.mir.mir.MIR_PROJ_DEREF
 use compiler.mir.mir.MIR_RVALUE_AGGREGATE
 use compiler.mir.mir.MIR_RVALUE_BINARY_OP
 use compiler.mir.mir.MIR_RVALUE_CAST
+use compiler.mir.mir.MIR_CAST_FLOAT_TO_INT
+use compiler.mir.mir.MIR_CAST_INT_TO_FLOAT
+use compiler.mir.mir.MIR_CAST_FLOAT_CONVERT
 use compiler.mir.mir.MIR_RVALUE_DISCRIMINANT
 use compiler.mir.mir.MIR_RVALUE_LEN
 use compiler.mir.mir.MIR_RVALUE_OVERFLOWS_BINARY_OP
@@ -249,6 +255,15 @@ use compiler.interp.value.interp_validate_ptr_arith
 use compiler.interp.value.interp_validate_raw_ptr
 use compiler.interp.value.interp_zero_bytes
 use compiler.interp.value.interp_zero_val
+use compiler.interp.value.sf_binop
+use compiler.interp.value.sf_neg
+use compiler.interp.value.sf_int_to_float
+use compiler.interp.value.sf_float_to_int
+use compiler.interp.value.sf_float_convert
+use compiler.interp.value.sf_intrinsic
+use compiler.interp.value.sf_intrinsic_kind
+use compiler.interp.value.SF_I_NONE
+use compiler.interp.value.SF_I_FROM_BITS
 use compiler.interp.oracle.HOST_INTR_FIBER_CREATE
 use compiler.interp.oracle.HOST_INTR_FIBER_DESTROY
 use compiler.interp.oracle.HOST_INTR_FIBER_RESUME
@@ -487,7 +502,8 @@ pub fn interp_init_frame_tls(ctx: mut_view<InterpCtx>, frm: mut_view<CallFrame>,
                                     *((host_buf as *mut u64) + 1) = slen as u64;
                                 }
                             }
-                        } else if ckind == CONST_INT {
+                        } else if ckind == CONST_INT || ckind == CONST_FLOAT {
+                            // T458: a float constant stores its IEEE-754 bit pattern in int_val (f32 in the low 32 bits).
                             if sz == 16 {
                                 let mut int128_v: [2]u64 = [unsafe { (*cval).int_val }, const_val_int_hi(unsafe { view(*cval) })];
                                 let int128_ptr = unsafe { address_of(int128_v[0]) as *const u8 };
@@ -1709,6 +1725,43 @@ fn func_has_intrinsic_attr(ctx: view<InterpCtx>, func: *const HirItem) -> bool {
     false
 }
 
+// Float width of the first parameter (or of the return type when `use_ret`) of an intrinsic function:
+// 32 for f32, 64 for f64, 0 for anything else (T458).
+fn float_intrinsic_width(ctx: view<InterpCtx>, func: *mut HirItem, use_ret: bool) -> u8 {
+    if (ctx.thir as usize) == 0 {
+        return 0u8;
+    }
+    let fn_ty_ptr = unsafe { thir_get_item_type(view(*ctx.thir), func as *const HirItem) };
+    if (fn_ty_ptr as usize) == 0 {
+        return 0u8;
+    }
+    let fn_ty = unsafe { type_get(view((*ctx.thir).interner), TypeId { v: (*fn_ty_ptr).v }) };
+    if (fn_ty as usize) == 0 || (unsafe { (*fn_ty).kind }) != TY_FN {
+        return 0u8;
+    }
+    let mut tid: u32 = 0u32;
+    if use_ret {
+        tid = unsafe { (*fn_ty).ret_type.v };
+    } else if (unsafe { (*fn_ty).param_count }) > 0 {
+        tid = unsafe { (*typeid_at((*fn_ty).param_types, 0)).v };
+    }
+    if tid == 0u32 {
+        return 0u8;
+    }
+    let t = unsafe { type_get(view((*ctx.thir).interner), TypeId { v: tid }) };
+    if (t as usize) == 0 {
+        return 0u8;
+    }
+    let k = unsafe { (*t).kind };
+    if k == TY_F32 {
+        return 32u8;
+    }
+    if k == TY_F64 {
+        return 64u8;
+    }
+    0u8
+}
+
 fn eval_core_intrinsic(
     ctx: mut_view<InterpCtx>,
     func: *mut HirItem,
@@ -1737,6 +1790,20 @@ fn eval_core_intrinsic(
     if core_name_eq(view(name), 17, 5) {
         interp_panic(mut_view(*ctx), INTERP_MSG_PANIC_PANIC);
         return true;
+    }
+
+    // T458 (SPEC-41 AXS-FLT-012..016, 025): float intrinsics evaluated on IEEE-754 bit patterns. The kind comes
+    // from the name; the float width comes from the first parameter type (the return type for `from_bits`).
+    // An integer-typed function that shares a name (`abs_diff`, `min_u8`, ...) falls through to the integer table.
+    let fkind = sf_intrinsic_kind(view(name));
+    if fkind != SF_I_NONE && arg_count >= 1 {
+        let fw = float_intrinsic_width(view(*ctx), func, fkind == SF_I_FROM_BITS);
+        if fw != 0u8 {
+            let a2_lo: u64 = if arg_count > 2 && (args as usize) != 0 { unsafe { *(args + 2) } } else { 0u64 };
+            out_ret.vals[0] = sf_intrinsic(fkind, fw == 32u8, a0_lo, a1_lo, a2_lo);
+            out_ret.vals[1] = 0u64;
+            return true;
+        }
     }
 
     let mut bits: i32 = 64;
@@ -2762,6 +2829,13 @@ fn exec_assign_binop(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, stmt: *mu
     let tk = classify_int_ty(view(*ctx), TypeId { v: ty_v }, mut_view(is_signed), mut_view(bits));
     let t = if ty_v != 0u32 { unsafe { type_get(view((*ctx.thir).interner), TypeId { v: ty_v }) } } else { 0 as *mut AxType };
 
+    // T458 (SPEC-41 AXS-FLT-010/011/020): f32/f64 operands are IEEE-754 bit patterns. Float arithmetic never
+    // panics and a comparison with a NaN operand is false (only `!=` is true).
+    if tk == TY_F32 || tk == TY_F64 {
+        ctx.val_hi = 0u64;
+        return sf_binop(op, tk == TY_F32, lhs, rhs);
+    }
+
     let mut res: u64 = 0u64;
     let mut res_hi: u64 = 0u64;
     let mut overflow = false;
@@ -3322,10 +3396,14 @@ fn exec_assign_unop(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, stmt: *mut
 
     let mut is_signed = true;
     let mut bits: i32 = 32;
-    let _ = classify_int_ty(view(*ctx), ty, mut_view(is_signed), mut_view(bits));
+    let utk = classify_int_ty(view(*ctx), ty, mut_view(is_signed), mut_view(bits));
     let uop = unsafe { (*stmt).rvalue.un_op };
 
     ctx.val_hi = 0u64;
+    // T458 (AXS-FLT-010): float negation flips the sign bit (keeps NaN payloads, -0.0 <-> +0.0), no overflow panic.
+    if (utk == TY_F32 || utk == TY_F64) && uop == MIR_UNOP_NEG {
+        return sf_neg(utk == TY_F32, op_val);
+    }
     if bits == 128 {
         if uop == MIR_UNOP_BITNOT {
             ctx.val_hi = op_hi ^ 0xFFFFFFFFFFFFFFFFu64;
@@ -3390,8 +3468,9 @@ fn exec_assign_cast(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, stmt: *mut
 
     let mut src_signed = false;
     let mut src_bits: i32 = 64;
+    let mut s_kind: u8 = 0u8;
     if src_ty.v != 0u32 {
-        let _ = classify_int_ty(view(*ctx), src_ty, mut_view(src_signed), mut_view(src_bits));
+        s_kind = classify_int_ty(view(*ctx), src_ty, mut_view(src_signed), mut_view(src_bits));
     }
 
     let mut dest_signed = false;
@@ -3402,6 +3481,40 @@ fn exec_assign_cast(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, stmt: *mut
         if dest_bits == 1 {
             dest_bits = 64;
         }
+    }
+
+    // T458 (SPEC-41 AXS-FLT-022..024): the three float cast kinds. Every conversion rounds to nearest-even
+    // (IntToFloat, narrowing FloatConvert) or saturates with NaN -> 0 (FloatToInt); none can panic.
+    let fcast = unsafe { (*stmt).rvalue.cast_kind };
+    if fcast == MIR_CAST_INT_TO_FLOAT {
+        let mut ilo = op_val;
+        let mut ihi = op_hi;
+        if src_bits < 128 {
+            // The pair is the value extended from its own width (sign-extended for signed sources).
+            if src_signed {
+                if src_bits < 64 {
+                    ilo = sign_extend_u64(ilo, src_bits);
+                }
+                ihi = if (ilo >> 63u64) != 0u64 { 0xFFFFFFFFFFFFFFFFu64 } else { 0u64 };
+            } else {
+                if src_bits < 64 {
+                    ilo = ilo & bit_mask_u64(src_bits);
+                }
+                ihi = 0u64;
+            }
+        }
+        ctx.val_hi = 0u64;
+        return sf_int_to_float(ilo, ihi, src_signed, d_kind == TY_F32);
+    }
+    if fcast == MIR_CAST_FLOAT_TO_INT {
+        let mut fhi: u64 = 0u64;
+        let flo = sf_float_to_int(op_val, s_kind == TY_F32, dest_signed, dest_bits, mut_view(fhi));
+        ctx.val_hi = fhi;
+        return flo;
+    }
+    if fcast == MIR_CAST_FLOAT_CONVERT {
+        ctx.val_hi = 0u64;
+        return sf_float_convert(op_val, s_kind == TY_F32);
     }
 
     let mut res_lo = op_val;
@@ -6799,6 +6912,10 @@ pub fn interp_eval_const_expr_into(
             }
         } else {
             out_res.val.kind = CONST_INT;
+            if (exp_t as usize) != 0 && ((unsafe { (*exp_t).kind }) == TY_F32 || (unsafe { (*exp_t).kind }) == TY_F64) {
+                // T458: a float result keeps its IEEE-754 bit pattern (ConstValue.Float, SPEC-41 AXS-FLT-003 rule 4).
+                out_res.val.kind = CONST_FLOAT;
+            }
             if ret_size == 1 {
                 out_res.val.int_val = unsafe { *ret_buf as u64 };
             } else if ret_size == 2 {

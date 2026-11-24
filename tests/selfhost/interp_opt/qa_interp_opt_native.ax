@@ -92688,6 +92688,9 @@ use compiler.mir.mir.mir_const_int_hi
 use compiler.mir.mir.mir_const_set_int_hi
 use compiler.mir.mir.MIR_CONST_INT
 use compiler.mir.mir.MIR_CONST_BOOL
+use compiler.mir.mir.MIR_CONST_FLOAT
+use compiler.types.types.TYPEID_F32
+use compiler.types.types.TYPEID_F64
 use compiler.mir.mir.MIR_OP_COPY
 use compiler.mir.mir.MIR_OP_MOVE
 use compiler.mir.mir.MIR_OP_CONST
@@ -93421,8 +93424,19 @@ pub fn opt_u128_div_rem_raw(
     *out_r_hi = rem_hi;
 }
 
+// T458 (SPEC-41 AXS-FLT-014): a floating-point constant (an IEEE-754 bit pattern, `MIR_CONST_FLOAT`, or any
+// constant typed f32/f64) is never an integer scalar. Folding its bits as an integer would be wrong
+// (`-0.0` is not `0`, a NaN is not equal to itself, `0.0 * x` is not `0.0`), so every folding entry point
+// refuses it. The strict-FP default has no relaxed mode, so there is no flag that re-enables folding.
+pub fn opt_const_is_float(c: view<MirConst>) -> bool {
+    c.kind == MIR_CONST_FLOAT || c.ty.v == TYPEID_F32 || c.ty.v == TYPEID_F64
+}
+
 pub fn opt_is_scalar_const_op(op: view<MirOperand>) -> bool {
     if op.kind != MIR_OP_CONST {
+        return false;
+    }
+    if opt_const_is_float(view(op.constant)) {
         return false;
     }
     op.constant.kind == MIR_CONST_INT || op.constant.kind == MIR_CONST_BOOL
@@ -94025,10 +94039,15 @@ pub fn do_const_fold_cast(
     target_ty: TypeId,
     out_const: mut_view<MirConst>
 ) -> bool {
+    // IntToFloat / FloatToInt / FloatConvert are never folded (T458): their results depend on the IEEE-754
+    // rounding and saturation rules that only the oracle and the native code implement.
     if cast_kind != MIR_CAST_INT_TO_INT {
         return false;
     }
     if !opt_is_scalar_const_op(operand) {
+        return false;
+    }
+    if target_ty.v == TYPEID_F32 || target_ty.v == TYPEID_F64 {
         return false;
     }
     let src_ty_v = operand.constant.ty.v;
@@ -95104,6 +95123,10 @@ pub fn opt_count_rvalue_uses(rv: view<MirRvalue>, uses: *mut u32, max_locals: us
     }
 }
 
+// T458 (SPEC-41 AXS-FLT-014): `BINARY_OP` and `UNARY_OP` are deliberately not pure, so float arithmetic and
+// comparisons are never deleted, merged, hoisted or reordered here: DCE only drops unused USE, REF, LEN,
+// CAST, DISCRIMINANT and AGGREGATE statements. In particular it never value-numbers `x - x`, `x == x` or
+// `x + 0.0`, and it keeps the source evaluation order of every float operation.
 pub fn opt_rvalue_is_pure(rv: view<MirRvalue>) -> bool {
     let k = rv.kind;
     k == MIR_RVALUE_USE ||
@@ -96222,6 +96245,17 @@ use compiler.types.types.ConstValue
 use compiler.types.types.Thir
 use compiler.traits.mono.MonoEngine
 use compiler.mir.mir.MirBody
+use compiler.mir.mir.MIR_BINOP_ADD
+use compiler.mir.mir.MIR_BINOP_SUB
+use compiler.mir.mir.MIR_BINOP_MUL
+use compiler.mir.mir.MIR_BINOP_DIV
+use compiler.mir.mir.MIR_BINOP_REM
+use compiler.mir.mir.MIR_BINOP_EQ
+use compiler.mir.mir.MIR_BINOP_NE
+use compiler.mir.mir.MIR_BINOP_LT
+use compiler.mir.mir.MIR_BINOP_LE
+use compiler.mir.mir.MIR_BINOP_GT
+use compiler.mir.mir.MIR_BINOP_GE
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 @intrinsic fn align_of<T>() -> usize { 0 }
@@ -97655,6 +97689,1145 @@ pub fn interp_ctx_free_allocs(ctx: mut_view<InterpCtx>) {
         ctx.alloc_count = 0;
         ctx.alloc_cap = 0;
     }
+}
+
+// =================================================================================================
+// T458: bit-exact IEEE-754 binary32/binary64 soft-float (SPEC-41 AXS-FLT-010..025)
+//
+// The oracle evaluates every f32/f64 operation on raw bit patterns with integer arithmetic only (axiom0
+// has no floating point and the result must not depend on the host FPU). Values are raw bit patterns in
+// a u64 (an f32 occupies the low 32 bits). Rounding is roundTiesToEven; subnormals are exact (no FTZ/DAZ).
+// A fresh NaN is the canonical positive quiet NaN (AXS-FLT-002); sign flips (neg, abs, copysign) and
+// bitcasts keep every payload bit.
+// =================================================================================================
+
+const SF_K_ZERO: u8 = 0u8;
+const SF_K_FINITE: u8 = 1u8;
+const SF_K_INF: u8 = 2u8;
+const SF_K_NAN: u8 = 3u8;
+const SF_ALL: u64 = 0xFFFFFFFFFFFFFFFFu64;
+
+// Intrinsic kinds returned by `sf_intrinsic_kind` (names match `op` or `op_<suffix>`).
+pub const SF_I_NONE: u32 = 0u32;
+pub const SF_I_ROUND_TIES_EVEN: u32 = 1u32;
+pub const SF_I_NEXT_DOWN: u32 = 2u32;
+pub const SF_I_FROM_BITS: u32 = 3u32;
+pub const SF_I_COPYSIGN: u32 = 4u32;
+pub const SF_I_NEXT_UP: u32 = 5u32;
+pub const SF_I_TO_BITS: u32 = 6u32;
+pub const SF_I_FLOOR: u32 = 7u32;
+pub const SF_I_ROUND: u32 = 8u32;
+pub const SF_I_TRUNC: u32 = 9u32;
+pub const SF_I_SQRT: u32 = 10u32;
+pub const SF_I_CEIL: u32 = 11u32;
+pub const SF_I_ABS: u32 = 12u32;
+pub const SF_I_FMA: u32 = 13u32;
+pub const SF_I_MIN: u32 = 14u32;
+pub const SF_I_MAX: u32 = 15u32;
+
+const SF_NAME_BYTES: [90]u8 = [
+    // "round_ties_even" (0..15)
+    114u8, 111u8, 117u8, 110u8, 100u8, 95u8, 116u8, 105u8, 101u8, 115u8, 95u8, 101u8, 118u8, 101u8, 110u8,
+    // "next_down" (15..24)
+    110u8, 101u8, 120u8, 116u8, 95u8, 100u8, 111u8, 119u8, 110u8,
+    // "from_bits" (24..33)
+    102u8, 114u8, 111u8, 109u8, 95u8, 98u8, 105u8, 116u8, 115u8,
+    // "copysign" (33..41)
+    99u8, 111u8, 112u8, 121u8, 115u8, 105u8, 103u8, 110u8,
+    // "next_up" (41..48)
+    110u8, 101u8, 120u8, 116u8, 95u8, 117u8, 112u8,
+    // "to_bits" (48..55)
+    116u8, 111u8, 95u8, 98u8, 105u8, 116u8, 115u8,
+    // "floor" (55..60)
+    102u8, 108u8, 111u8, 111u8, 114u8,
+    // "round" (60..65)
+    114u8, 111u8, 117u8, 110u8, 100u8,
+    // "trunc" (65..70)
+    116u8, 114u8, 117u8, 110u8, 99u8,
+    // "sqrt" (70..74)
+    115u8, 113u8, 114u8, 116u8,
+    // "ceil" (74..78)
+    99u8, 101u8, 105u8, 108u8,
+    // "abs" (78..81)
+    97u8, 98u8, 115u8,
+    // "fma" (81..84)
+    102u8, 109u8, 97u8,
+    // "min" (84..87)
+    109u8, 105u8, 110u8,
+    // "max" (87..90)
+    109u8, 97u8, 120u8,
+];
+const SF_NAME_OFF: [15]u8 = [0u8, 15u8, 24u8, 33u8, 41u8, 48u8, 55u8, 60u8, 65u8, 70u8, 74u8, 78u8, 81u8, 84u8, 87u8];
+const SF_NAME_LEN: [15]u8 = [15u8, 9u8, 9u8, 8u8, 7u8, 7u8, 5u8, 5u8, 5u8, 4u8, 4u8, 3u8, 3u8, 3u8, 3u8];
+
+// Maps an intrinsic function name (`sqrt`, `sqrt_f64`, ...) to its SF_I_* kind; 0 when it is not a float intrinsic.
+pub fn sf_intrinsic_kind(name: view<StrView>) -> u32 {
+    if (name.ptr as usize) == 0 {
+        return SF_I_NONE;
+    }
+    let mut k: usize = 0;
+    while k < 15 {
+        let off = SF_NAME_OFF[k] as usize;
+        let n = SF_NAME_LEN[k] as usize;
+        if name.len >= n && (name.len == n || unsafe { *(name.ptr + n) } == 95u8) {
+            let mut i: usize = 0;
+            let mut same = true;
+            while i < n {
+                if (unsafe { *(name.ptr + i) }) != SF_NAME_BYTES[off + i] {
+                    same = false;
+                    break;
+                }
+                i = i + 1;
+            }
+            if same {
+                return (k as u32) + 1u32;
+            }
+        }
+        k = k + 1;
+    }
+    SF_I_NONE
+}
+
+fn sf_sign_mask(is32: bool) -> u64 {
+    if is32 { 0x80000000u64 } else { 0x8000000000000000u64 }
+}
+
+fn sf_inf_bits(is32: bool) -> u64 {
+    if is32 { 0x7F800000u64 } else { 0x7FF0000000000000u64 }
+}
+
+fn sf_qnan(is32: bool) -> u64 {
+    if is32 { 0x7FC00000u64 } else { 0x7FF8000000000000u64 }
+}
+
+fn sf_word_mask(is32: bool) -> u64 {
+    if is32 { 0xFFFFFFFFu64 } else { SF_ALL }
+}
+
+fn sf_with_sign(is32: bool, sign: u64, mag: u64) -> u64 {
+    if sign != 0u64 { mag | sf_sign_mask(is32) } else { mag }
+}
+
+fn sf_wadd(a: u64, b: u64) -> u64 {
+    let a_lo = a & 0xFFFFFFFFu64;
+    let a_hi = (a >> 32u64) & 0xFFFFFFFFu64;
+    let b_lo = b & 0xFFFFFFFFu64;
+    let b_hi = (b >> 32u64) & 0xFFFFFFFFu64;
+    let sum_lo = a_lo + b_lo;
+    let carry = sum_lo >> 32u64;
+    let sum_hi = (a_hi + b_hi + carry) & 0xFFFFFFFFu64;
+    (sum_hi << 32u64) | (sum_lo & 0xFFFFFFFFu64)
+}
+
+fn sf_wsub(a: u64, b: u64) -> u64 {
+    sf_wadd(a, sf_wadd(b ^ SF_ALL, 1u64))
+}
+
+fn sf_clz64(val: u64) -> i32 {
+    if val == 0u64 {
+        return 64;
+    }
+    let mut n: i32 = 0;
+    let mut v = val;
+    if (v >> 32u64) == 0u64 {
+        n = n + 32;
+        v = v << 32u64;
+    }
+    if (v >> 48u64) == 0u64 {
+        n = n + 16;
+        v = v << 16u64;
+    }
+    if (v >> 56u64) == 0u64 {
+        n = n + 8;
+        v = v << 8u64;
+    }
+    if (v >> 60u64) == 0u64 {
+        n = n + 4;
+        v = v << 4u64;
+    }
+    if (v >> 62u64) == 0u64 {
+        n = n + 2;
+        v = v << 2u64;
+    }
+    if (v >> 63u64) == 0u64 {
+        n = n + 1;
+    }
+    n
+}
+
+// Right shift that ORs every bit shifted out into the lsb ("jamming"), so a later rounding sees the sticky bit.
+fn sf_shr_jam64(v: u64, n: i32) -> u64 {
+    if n <= 0 {
+        return v;
+    }
+    if n >= 64 {
+        if v != 0u64 {
+            return 1u64;
+        }
+        return 0u64;
+    }
+    let sh = n as u64;
+    let lost = v & ((1u64 << sh) - 1u64);
+    let mut r = v >> sh;
+    if lost != 0u64 {
+        r = r | 1u64;
+    }
+    r
+}
+
+fn sf_shr_jam128(hi: u64, lo: u64, n: i32, out_hi: mut_view<u64>, out_lo: mut_view<u64>) {
+    if n <= 0 {
+        *out_hi = hi;
+        *out_lo = lo;
+        return;
+    }
+    if n >= 128 {
+        *out_hi = 0u64;
+        *out_lo = if (hi | lo) != 0u64 { 1u64 } else { 0u64 };
+        return;
+    }
+    if n >= 64 {
+        let k = n - 64;
+        let mut nlo: u64 = hi;
+        let mut lost: u64 = lo;
+        if k > 0 {
+            let ku = k as u64;
+            lost = lost | (hi & ((1u64 << ku) - 1u64));
+            nlo = hi >> ku;
+        }
+        if lost != 0u64 {
+            nlo = nlo | 1u64;
+        }
+        *out_hi = 0u64;
+        *out_lo = nlo;
+        return;
+    }
+    let s = n as u64;
+    let lost = lo & ((1u64 << s) - 1u64);
+    let mut nlo = (lo >> s) | (hi << (64u64 - s));
+    if lost != 0u64 {
+        nlo = nlo | 1u64;
+    }
+    *out_hi = hi >> s;
+    *out_lo = nlo;
+}
+
+fn sf_mul_wide(a: u64, b: u64, out_hi: mut_view<u64>) -> u64 {
+    let a_lo = a & 0xFFFFFFFFu64;
+    let a_hi = (a >> 32u64) & 0xFFFFFFFFu64;
+    let b_lo = b & 0xFFFFFFFFu64;
+    let b_hi = (b >> 32u64) & 0xFFFFFFFFu64;
+    let p0 = a_lo * b_lo;
+    let p1 = a_lo * b_hi;
+    let p2 = a_hi * b_lo;
+    let p3 = a_hi * b_hi;
+    let mid1 = p1 + ((p0 >> 32u64) & 0xFFFFFFFFu64);
+    let mid2 = p2 + (mid1 & 0xFFFFFFFFu64);
+    *out_hi = p3 + ((mid1 >> 32u64) & 0xFFFFFFFFu64) + ((mid2 >> 32u64) & 0xFFFFFFFFu64);
+    (p0 & 0xFFFFFFFFu64) | ((mid2 & 0xFFFFFFFFu64) << 32u64)
+}
+
+// Shifts the 128-bit value left until its msb is bit 127; returns the new high word, sets the low word and the shift.
+fn sf_norm128(hi_in: u64, lo_in: u64, out_lo: mut_view<u64>, out_sh: mut_view<i32>) -> u64 {
+    let mut hi = hi_in;
+    let mut lo = lo_in;
+    let mut sh: i32 = 0;
+    if hi != 0u64 {
+        let k = sf_clz64(hi);
+        if k > 0 {
+            let ku = k as u64;
+            hi = (hi << ku) | (lo >> (64u64 - ku));
+            lo = lo << ku;
+        }
+        sh = k;
+    } else if lo != 0u64 {
+        let k = sf_clz64(lo);
+        hi = lo << (k as u64);
+        lo = 0u64;
+        sh = 64 + k;
+    }
+    *out_lo = lo;
+    *out_sh = sh;
+    hi
+}
+
+// kind: ZERO / FINITE / INF / NAN. A finite non-zero value is m * 2^e (m an integer, subnormals included).
+fn sf_unpack(is32: bool, bits_in: u64, out_sign: mut_view<u64>, out_e: mut_view<i32>, out_m: mut_view<u64>) -> u8 {
+    let bits = bits_in & sf_word_mask(is32);
+    let mut sign: u64 = bits >> 63u64;
+    let mut ef: u64 = (bits >> 52u64) & 0x7FFu64;
+    let mut fr: u64 = bits & 0xFFFFFFFFFFFFFu64;
+    let mut ef_max: u64 = 2047u64;
+    let mut hidden: u64 = 0x10000000000000u64;
+    let mut bias_p: i32 = 1075;
+    if is32 {
+        sign = (bits >> 31u64) & 1u64;
+        ef = (bits >> 23u64) & 0xFFu64;
+        fr = bits & 0x7FFFFFu64;
+        ef_max = 255u64;
+        hidden = 0x800000u64;
+        bias_p = 150;
+    }
+    *out_sign = sign;
+    *out_e = 0;
+    *out_m = 0u64;
+    if ef == ef_max {
+        if fr == 0u64 {
+            return SF_K_INF;
+        }
+        return SF_K_NAN;
+    }
+    if ef == 0u64 {
+        if fr == 0u64 {
+            return SF_K_ZERO;
+        }
+        *out_m = fr;
+        *out_e = 1 - bias_p;
+        return SF_K_FINITE;
+    }
+    *out_m = fr | hidden;
+    *out_e = (ef as i32) - bias_p;
+    SF_K_FINITE
+}
+
+// Rounds (-1)^sign * (m + epsilon) * 2^e to the target format (roundTiesToEven) and packs it. `m` is any
+// non-zero 64-bit significand; `sticky` says the exact value exceeds m*2^e by less than one lsb of m.
+fn sf_round_pack(is32: bool, sign: u64, e_in: i32, m_in: u64, sticky_in: bool) -> u64 {
+    let sbits = if sign != 0u64 { sf_sign_mask(is32) } else { 0u64 };
+    if m_in == 0u64 {
+        return sbits;
+    }
+    let mut p: i32 = 53;
+    let mut emin: i32 = -1022;
+    let mut emax: i32 = 1023;
+    if is32 {
+        p = 24;
+        emin = -126;
+        emax = 127;
+    }
+    let inf_bits = sf_inf_bits(is32);
+    let lz = sf_clz64(m_in);
+    let m = m_in << (lz as u64);
+    let big_e = e_in - lz + 63;
+    if big_e > emax {
+        return sbits | inf_bits;
+    }
+    let mut keep: i32 = p;
+    if big_e < emin {
+        keep = p - (emin - big_e);
+    }
+    let mut q: u64 = 0u64;
+    let mut up = false;
+    if keep >= 1 {
+        let drop = (64 - keep) as u64;
+        q = m >> drop;
+        let rem = m & ((1u64 << drop) - 1u64);
+        let half = 1u64 << (drop - 1u64);
+        if rem > half {
+            up = true;
+        } else if rem == half {
+            if sticky_in || (q & 1u64) != 0u64 {
+                up = true;
+            }
+        }
+    } else if keep == 0 {
+        if (m & 0x7FFFFFFFFFFFFFFFu64) != 0u64 || sticky_in {
+            up = true;
+        }
+    } else {
+        return sbits;
+    }
+    if up {
+        q = q + 1u64;
+    }
+    let mut res: u64 = q;
+    if big_e >= emin {
+        res = (((big_e - emin) as u64) << ((p - 1) as u64)) + q;
+    }
+    if res >= inf_bits {
+        res = inf_bits;
+    }
+    sbits | res
+}
+
+fn sf_add(is32: bool, a_in: u64, b_in: u64) -> u64 {
+    let a = a_in & sf_word_mask(is32);
+    let b = b_in & sf_word_mask(is32);
+    let mut sa: u64 = 0u64;
+    let mut ea: i32 = 0;
+    let mut ma: u64 = 0u64;
+    let mut sb: u64 = 0u64;
+    let mut eb: i32 = 0;
+    let mut mb: u64 = 0u64;
+    let ka = sf_unpack(is32, a, mut_view(sa), mut_view(ea), mut_view(ma));
+    let kb = sf_unpack(is32, b, mut_view(sb), mut_view(eb), mut_view(mb));
+    if ka == SF_K_NAN || kb == SF_K_NAN {
+        return sf_qnan(is32);
+    }
+    if ka == SF_K_INF {
+        if kb == SF_K_INF && sa != sb {
+            return sf_qnan(is32);
+        }
+        return a;
+    }
+    if kb == SF_K_INF {
+        return b;
+    }
+    if ka == SF_K_ZERO && kb == SF_K_ZERO {
+        if sa == sb {
+            return a;
+        }
+        return 0u64;
+    }
+    if ka == SF_K_ZERO {
+        return b;
+    }
+    if kb == SF_K_ZERO {
+        return a;
+    }
+    // Both finite and non-zero: normalise the significands to msb = bit 62 and align by exponent.
+    let lza = sf_clz64(ma) - 1;
+    let lzb = sf_clz64(mb) - 1;
+    let na = ma << (lza as u64);
+    let nb = mb << (lzb as u64);
+    let nea = ea - lza;
+    let neb = eb - lzb;
+    let mut xs = sa;
+    let mut xe = nea;
+    let mut xm = na;
+    let mut ys = sb;
+    let mut ye = neb;
+    let mut ym = nb;
+    if neb > nea || (neb == nea && nb > na) {
+        xs = sb;
+        xe = neb;
+        xm = nb;
+        ys = sa;
+        ye = nea;
+        ym = na;
+    }
+    let ysh = sf_shr_jam64(ym, xe - ye);
+    if xs == ys {
+        return sf_round_pack(is32, xs, xe, xm + ysh, false);
+    }
+    let rm = xm - ysh;
+    if rm == 0u64 {
+        return 0u64;
+    }
+    sf_round_pack(is32, xs, xe, rm, false)
+}
+
+fn sf_mul(is32: bool, a_in: u64, b_in: u64) -> u64 {
+    let a = a_in & sf_word_mask(is32);
+    let b = b_in & sf_word_mask(is32);
+    let mut sa: u64 = 0u64;
+    let mut ea: i32 = 0;
+    let mut ma: u64 = 0u64;
+    let mut sb: u64 = 0u64;
+    let mut eb: i32 = 0;
+    let mut mb: u64 = 0u64;
+    let ka = sf_unpack(is32, a, mut_view(sa), mut_view(ea), mut_view(ma));
+    let kb = sf_unpack(is32, b, mut_view(sb), mut_view(eb), mut_view(mb));
+    if ka == SF_K_NAN || kb == SF_K_NAN {
+        return sf_qnan(is32);
+    }
+    let sign = sa ^ sb;
+    if (ka == SF_K_INF && kb == SF_K_ZERO) || (ka == SF_K_ZERO && kb == SF_K_INF) {
+        return sf_qnan(is32);
+    }
+    if ka == SF_K_INF || kb == SF_K_INF {
+        return sf_with_sign(is32, sign, sf_inf_bits(is32));
+    }
+    if ka == SF_K_ZERO || kb == SF_K_ZERO {
+        return sf_with_sign(is32, sign, 0u64);
+    }
+    let mut phi: u64 = 0u64;
+    let plo = sf_mul_wide(ma, mb, mut_view(phi));
+    let mut nlo: u64 = 0u64;
+    let mut sh: i32 = 0;
+    let nhi = sf_norm128(phi, plo, mut_view(nlo), mut_view(sh));
+    sf_round_pack(is32, sign, ea + eb + 64 - sh, nhi, nlo != 0u64)
+}
+
+fn sf_div(is32: bool, a_in: u64, b_in: u64) -> u64 {
+    let a = a_in & sf_word_mask(is32);
+    let b = b_in & sf_word_mask(is32);
+    let mut sa: u64 = 0u64;
+    let mut ea: i32 = 0;
+    let mut ma: u64 = 0u64;
+    let mut sb: u64 = 0u64;
+    let mut eb: i32 = 0;
+    let mut mb: u64 = 0u64;
+    let ka = sf_unpack(is32, a, mut_view(sa), mut_view(ea), mut_view(ma));
+    let kb = sf_unpack(is32, b, mut_view(sb), mut_view(eb), mut_view(mb));
+    if ka == SF_K_NAN || kb == SF_K_NAN {
+        return sf_qnan(is32);
+    }
+    let sign = sa ^ sb;
+    if (ka == SF_K_INF && kb == SF_K_INF) || (ka == SF_K_ZERO && kb == SF_K_ZERO) {
+        return sf_qnan(is32);
+    }
+    if ka == SF_K_INF || kb == SF_K_ZERO {
+        return sf_with_sign(is32, sign, sf_inf_bits(is32));
+    }
+    if ka == SF_K_ZERO || kb == SF_K_INF {
+        return sf_with_sign(is32, sign, 0u64);
+    }
+    let lza = sf_clz64(ma);
+    let lzb = sf_clz64(mb);
+    let na = ma << (lza as u64);
+    let nb = mb << (lzb as u64);
+    let mut rem: u64 = na;
+    let mut q: u64 = 0u64;
+    if na >= nb {
+        rem = na - nb;
+        q = 1u64;
+    }
+    let mut i: i32 = 0;
+    while i < 63 {
+        let carry = rem >> 63u64;
+        let rem2 = rem << 1u64;
+        if carry != 0u64 || rem2 >= nb {
+            rem = sf_wsub(rem2, nb);
+            q = (q << 1u64) | 1u64;
+        } else {
+            rem = rem2;
+            q = q << 1u64;
+        }
+        i = i + 1;
+    }
+    sf_round_pack(is32, sign, (ea - lza) - (eb - lzb) - 63, q, rem != 0u64)
+}
+
+// Truncating remainder (fmod), exact: the sign of a non-zero result is the sign of the dividend.
+fn sf_rem(is32: bool, a_in: u64, b_in: u64) -> u64 {
+    let a = a_in & sf_word_mask(is32);
+    let b = b_in & sf_word_mask(is32);
+    let mut sa: u64 = 0u64;
+    let mut ea: i32 = 0;
+    let mut ma: u64 = 0u64;
+    let mut sb: u64 = 0u64;
+    let mut eb: i32 = 0;
+    let mut mb: u64 = 0u64;
+    let ka = sf_unpack(is32, a, mut_view(sa), mut_view(ea), mut_view(ma));
+    let kb = sf_unpack(is32, b, mut_view(sb), mut_view(eb), mut_view(mb));
+    if ka == SF_K_NAN || kb == SF_K_NAN || ka == SF_K_INF || kb == SF_K_ZERO {
+        return sf_qnan(is32);
+    }
+    if kb == SF_K_INF || ka == SF_K_ZERO {
+        return a;
+    }
+    if ea >= eb {
+        let mut x = ma % mb;
+        let mut k = ea - eb;
+        while k > 0 && x != 0u64 {
+            x = x * 2u64;
+            if x >= mb {
+                x = x - mb;
+            }
+            k = k - 1;
+        }
+        if x == 0u64 {
+            return sf_with_sign(is32, sa, 0u64);
+        }
+        return sf_round_pack(is32, sa, eb, x, false);
+    }
+    let d = eb - ea;
+    if d >= 64 || (mb >> ((64 - d) as u64)) != 0u64 {
+        return a;
+    }
+    let bb = mb << (d as u64);
+    if ma < bb {
+        return a;
+    }
+    let r = ma % bb;
+    if r == 0u64 {
+        return sf_with_sign(is32, sa, 0u64);
+    }
+    sf_round_pack(is32, sa, ea, r, false)
+}
+
+// -1 less, 0 equal, 1 greater, 2 unordered (a NaN operand).
+fn sf_cmp(is32: bool, a_in: u64, b_in: u64) -> i32 {
+    let sm = sf_sign_mask(is32);
+    let a = a_in & sf_word_mask(is32);
+    let b = b_in & sf_word_mask(is32);
+    let ma = a & (sm ^ SF_ALL);
+    let mb = b & (sm ^ SF_ALL);
+    let inf_bits = sf_inf_bits(is32);
+    if ma > inf_bits || mb > inf_bits {
+        return 2;
+    }
+    if ma == 0u64 && mb == 0u64 {
+        return 0;
+    }
+    let na = (a & sm) != 0u64;
+    let nb = (b & sm) != 0u64;
+    if na != nb {
+        if na {
+            return -1;
+        }
+        return 1;
+    }
+    if ma == mb {
+        return 0;
+    }
+    if ma < mb {
+        if na {
+            return 1;
+        }
+        return -1;
+    }
+    if na {
+        return -1;
+    }
+    1
+}
+
+pub fn sf_neg(is32: bool, a: u64) -> u64 {
+    (a & sf_word_mask(is32)) ^ sf_sign_mask(is32)
+}
+
+// MIR binary operator on two floats of the same type. Comparisons return 1 / 0 (unordered: only != is true).
+pub fn sf_binop(op: u8, is32: bool, a: u64, b: u64) -> u64 {
+    if op == MIR_BINOP_ADD {
+        return sf_add(is32, a, b);
+    }
+    if op == MIR_BINOP_SUB {
+        return sf_add(is32, a, sf_neg(is32, b));
+    }
+    if op == MIR_BINOP_MUL {
+        return sf_mul(is32, a, b);
+    }
+    if op == MIR_BINOP_DIV {
+        return sf_div(is32, a, b);
+    }
+    if op == MIR_BINOP_REM {
+        return sf_rem(is32, a, b);
+    }
+    let c = sf_cmp(is32, a, b);
+    if op == MIR_BINOP_EQ {
+        return if c == 0 { 1u64 } else { 0u64 };
+    }
+    if op == MIR_BINOP_NE {
+        return if c != 0 { 1u64 } else { 0u64 };
+    }
+    if op == MIR_BINOP_LT {
+        return if c == -1 { 1u64 } else { 0u64 };
+    }
+    if op == MIR_BINOP_LE {
+        return if c == -1 || c == 0 { 1u64 } else { 0u64 };
+    }
+    if op == MIR_BINOP_GT {
+        return if c == 1 { 1u64 } else { 0u64 };
+    }
+    if op == MIR_BINOP_GE {
+        return if c == 1 || c == 0 { 1u64 } else { 0u64 };
+    }
+    0u64
+}
+
+// IntToFloat: the integer is given as a 128-bit two's-complement pair already extended from its own width.
+pub fn sf_int_to_float(lo: u64, hi: u64, is_signed: bool, is32: bool) -> u64 {
+    let mut sign: u64 = 0u64;
+    let mut mlo = lo;
+    let mut mhi = hi;
+    if is_signed && (hi >> 63u64) != 0u64 {
+        sign = 1u64;
+        mlo = sf_wadd(lo ^ SF_ALL, 1u64);
+        mhi = hi ^ SF_ALL;
+        if mlo == 0u64 {
+            mhi = mhi + 1u64;
+        }
+    }
+    if mlo == 0u64 && mhi == 0u64 {
+        return 0u64;
+    }
+    let mut nlo: u64 = 0u64;
+    let mut sh: i32 = 0;
+    let nhi = sf_norm128(mhi, mlo, mut_view(nlo), mut_view(sh));
+    sf_round_pack(is32, sign, 64 - sh, nhi, nlo != 0u64)
+}
+
+fn sf_u128_gt(alo: u64, ahi: u64, blo: u64, bhi: u64) -> bool {
+    ahi > bhi || (ahi == bhi && alo > blo)
+}
+
+// FloatToInt (saturating, NaN -> 0). Returns the low word; the high word (128-bit destinations) goes to out_hi.
+// For destinations narrower than 64 bits the low word is the two's-complement value masked to dest_bits.
+pub fn sf_float_to_int(bits: u64, is32: bool, dest_signed: bool, dest_bits: i32, out_hi: mut_view<u64>) -> u64 {
+    *out_hi = 0u64;
+    let mut sign: u64 = 0u64;
+    let mut e: i32 = 0;
+    let mut m: u64 = 0u64;
+    let k = sf_unpack(is32, bits, mut_view(sign), mut_view(e), mut_view(m));
+    if k == SF_K_NAN || k == SF_K_ZERO {
+        return 0u64;
+    }
+    let neg = sign != 0u64;
+    // Magnitude of trunc(x) as a 128-bit pair; `big` when it does not fit in 128 bits (or x is infinite).
+    let mut big = k == SF_K_INF;
+    let mut mag_lo: u64 = 0u64;
+    let mut mag_hi: u64 = 0u64;
+    if k == SF_K_FINITE {
+        if e >= 0 {
+            let msb = 63 - sf_clz64(m);
+            if msb + e >= 128 {
+                big = true;
+            } else if e >= 64 {
+                mag_hi = m << ((e - 64) as u64);
+            } else if e == 0 {
+                mag_lo = m;
+            } else {
+                mag_lo = m << (e as u64);
+                mag_hi = m >> ((64 - e) as u64);
+            }
+        } else {
+            let n = 0 - e;
+            if n < 64 {
+                mag_lo = m >> (n as u64);
+            }
+        }
+    }
+    // Limits of the destination as 128-bit pairs.
+    let mut max_lo: u64 = SF_ALL;
+    let mut max_hi: u64 = SF_ALL;
+    let mut min_lo: u64 = 0u64;
+    let mut min_hi: u64 = 0u64;
+    if dest_signed {
+        let kb = dest_bits - 1;
+        let mut p2_lo: u64 = 0u64;
+        let mut p2_hi: u64 = 0u64;
+        if kb >= 64 {
+            p2_hi = 1u64 << ((kb - 64) as u64);
+        } else {
+            p2_lo = 1u64 << (kb as u64);
+        }
+        // |MIN| = 2^(bits-1); MAX = 2^(bits-1) - 1
+        min_lo = p2_lo;
+        min_hi = p2_hi;
+        if kb >= 64 {
+            max_lo = SF_ALL;
+            max_hi = p2_hi - 1u64;
+        } else {
+            max_lo = p2_lo - 1u64;
+            max_hi = 0u64;
+        }
+    } else {
+        if dest_bits < 64 {
+            max_lo = (1u64 << (dest_bits as u64)) - 1u64;
+            max_hi = 0u64;
+        } else if dest_bits == 64 {
+            max_hi = 0u64;
+        }
+    }
+    let mask: u64 = if dest_bits >= 64 { SF_ALL } else { (1u64 << (dest_bits as u64)) - 1u64 };
+    if !dest_signed {
+        if neg {
+            return 0u64;
+        }
+        if big || sf_u128_gt(mag_lo, mag_hi, max_lo, max_hi) {
+            mag_lo = max_lo;
+            mag_hi = max_hi;
+        }
+        *out_hi = mag_hi;
+        return mag_lo & mask;
+    }
+    if !neg {
+        if big || sf_u128_gt(mag_lo, mag_hi, max_lo, max_hi) {
+            mag_lo = max_lo;
+            mag_hi = max_hi;
+        }
+        *out_hi = mag_hi;
+        return mag_lo & mask;
+    }
+    // Negative: saturate at -2^(bits-1), otherwise two's complement of the magnitude.
+    if big || sf_u128_gt(mag_lo, mag_hi, min_lo, min_hi) {
+        mag_lo = min_lo;
+        mag_hi = min_hi;
+    }
+    if mag_lo == 0u64 && mag_hi == 0u64 {
+        return 0u64;
+    }
+    let mut rlo = sf_wadd(mag_lo ^ SF_ALL, 1u64);
+    let mut rhi = mag_hi ^ SF_ALL;
+    if rlo == 0u64 {
+        rhi = rhi + 1u64;
+    }
+    if dest_bits == 128 {
+        *out_hi = rhi;
+        return rlo;
+    }
+    rlo & mask
+}
+
+// FloatConvert: `from_f32` true widens f32 -> f64 (exact), false narrows f64 -> f32 (roundTiesToEven).
+pub fn sf_float_convert(bits_in: u64, from_f32: bool) -> u64 {
+    let mut sign: u64 = 0u64;
+    let mut e: i32 = 0;
+    let mut m: u64 = 0u64;
+    let k = sf_unpack(from_f32, bits_in, mut_view(sign), mut_view(e), mut_view(m));
+    let bits = bits_in & sf_word_mask(from_f32);
+    if from_f32 {
+        let sbit = sign << 63u64;
+        if k == SF_K_NAN {
+            return sbit | 0x7FF8000000000000u64 | ((bits & 0x3FFFFFu64) << 29u64);
+        }
+        if k == SF_K_INF {
+            return sbit | 0x7FF0000000000000u64;
+        }
+        if k == SF_K_ZERO {
+            return sbit;
+        }
+        return sf_round_pack(false, sign, e, m, false);
+    }
+    let sbit32 = sign << 31u64;
+    if k == SF_K_NAN {
+        return sbit32 | 0x7FC00000u64 | ((bits >> 29u64) & 0x3FFFFFu64);
+    }
+    if k == SF_K_INF {
+        return sbit32 | 0x7F800000u64;
+    }
+    if k == SF_K_ZERO {
+        return sbit32;
+    }
+    sf_round_pack(true, sign, e, m, false)
+}
+
+fn sf_sqrt(is32: bool, a_in: u64) -> u64 {
+    let a = a_in & sf_word_mask(is32);
+    let mut sa: u64 = 0u64;
+    let mut ea: i32 = 0;
+    let mut ma: u64 = 0u64;
+    let ka = sf_unpack(is32, a, mut_view(sa), mut_view(ea), mut_view(ma));
+    if ka == SF_K_NAN {
+        return sf_qnan(is32);
+    }
+    if ka == SF_K_ZERO {
+        return a;
+    }
+    if sa != 0u64 {
+        return sf_qnan(is32);
+    }
+    if ka == SF_K_INF {
+        return a;
+    }
+    let lz = sf_clz64(ma);
+    let m1 = ma << (lz as u64);
+    let e1 = ea - lz;
+    // R = m1 * 2^t with (e1 - t) even, so sqrt(value) = sqrt(R) * 2^((e1 - t) / 2).
+    let mut t: i32 = 64;
+    if (e1 & 1) != 0 {
+        t = 63;
+    }
+    let mut rhi: u64 = m1;
+    let mut rlo: u64 = 0u64;
+    if t == 63 {
+        rhi = m1 >> 1u64;
+        rlo = m1 << 63u64;
+    }
+    let mut root: u64 = 0u64;
+    let mut bit: i32 = 63;
+    let mut sq_hi: u64 = 0u64;
+    let mut sq_lo: u64 = 0u64;
+    while bit >= 0 {
+        let cand = root | (1u64 << (bit as u64));
+        let mut ch: u64 = 0u64;
+        let cl = sf_mul_wide(cand, cand, mut_view(ch));
+        if !sf_u128_gt(cl, ch, rlo, rhi) {
+            root = cand;
+            sq_hi = ch;
+            sq_lo = cl;
+        }
+        bit = bit - 1;
+    }
+    let exact = sq_hi == rhi && sq_lo == rlo;
+    sf_round_pack(is32, 0u64, (e1 - t) / 2, root, !exact)
+}
+
+// mode: 0 trunc, 1 floor, 2 ceil, 3 round (ties away), 4 round_ties_even.
+fn sf_round_int(is32: bool, a_in: u64, mode: u32) -> u64 {
+    let sm = sf_sign_mask(is32);
+    let a = a_in & sf_word_mask(is32);
+    let mag = a & (sm ^ SF_ALL);
+    let neg = (a & sm) != 0u64;
+    let inf_bits = sf_inf_bits(is32);
+    if mag > inf_bits {
+        return sf_qnan(is32);
+    }
+    if mag == inf_bits || mag == 0u64 {
+        return a;
+    }
+    let mut p1: u64 = 52u64;
+    let mut bias: u64 = 1023u64;
+    if is32 {
+        p1 = 23u64;
+        bias = 127u64;
+    }
+    let ef = mag >> p1;
+    if ef >= bias + p1 {
+        return a;
+    }
+    let sbits = if neg { sm } else { 0u64 };
+    if ef < bias {
+        // |x| < 1: the result is +-0 or +-1.
+        let mut one = false;
+        if mode == 1u32 {
+            one = neg;
+        } else if mode == 2u32 {
+            one = !neg;
+        } else if mode == 3u32 {
+            one = ef == bias - 1u64;
+        } else if mode == 4u32 {
+            one = ef == bias - 1u64 && (mag & ((1u64 << p1) - 1u64)) != 0u64;
+        }
+        if one {
+            return sbits | (bias << p1);
+        }
+        return sbits;
+    }
+    let fb = p1 - (ef - bias);
+    let low_mask = (1u64 << fb) - 1u64;
+    let rem = mag & low_mask;
+    if rem == 0u64 {
+        return a;
+    }
+    let tr = mag & (low_mask ^ SF_ALL);
+    let unit = 1u64 << fb;
+    let half = 1u64 << (fb - 1u64);
+    let mut add = false;
+    if mode == 1u32 {
+        add = neg;
+    } else if mode == 2u32 {
+        add = !neg;
+    } else if mode == 3u32 {
+        add = rem >= half;
+    } else if mode == 4u32 {
+        add = rem > half || (rem == half && (tr & unit) != 0u64);
+    }
+    if add {
+        return sbits | (tr + unit);
+    }
+    sbits | tr
+}
+
+// IEEE-754 nextUp; nextDown(x) = -nextUp(-x).
+fn sf_next_up(is32: bool, a_in: u64) -> u64 {
+    let sm = sf_sign_mask(is32);
+    let a = a_in & sf_word_mask(is32);
+    let mag = a & (sm ^ SF_ALL);
+    let inf_bits = sf_inf_bits(is32);
+    if mag > inf_bits {
+        return sf_qnan(is32);
+    }
+    if mag == 0u64 {
+        return 1u64;
+    }
+    if (a & sm) == 0u64 {
+        if mag == inf_bits {
+            return a;
+        }
+        return a + 1u64;
+    }
+    a - 1u64
+}
+
+fn sf_min_max(is32: bool, a_in: u64, b_in: u64, want_max: bool) -> u64 {
+    let sm = sf_sign_mask(is32);
+    let a = a_in & sf_word_mask(is32);
+    let b = b_in & sf_word_mask(is32);
+    let inf_bits = sf_inf_bits(is32);
+    let a_nan = (a & (sm ^ SF_ALL)) > inf_bits;
+    let b_nan = (b & (sm ^ SF_ALL)) > inf_bits;
+    if a_nan && b_nan {
+        return sf_qnan(is32);
+    }
+    if a_nan {
+        return b;
+    }
+    if b_nan {
+        return a;
+    }
+    let c = sf_cmp(is32, a, b);
+    if c == 0 {
+        // Equal values: only +0 / -0 can differ; min prefers -0, max prefers +0.
+        if (a & sm) == (b & sm) {
+            return a;
+        }
+        if want_max {
+            if (a & sm) == 0u64 {
+                return a;
+            }
+            return b;
+        }
+        if (a & sm) != 0u64 {
+            return a;
+        }
+        return b;
+    }
+    if want_max {
+        if c == 1 {
+            return a;
+        }
+        return b;
+    }
+    if c == -1 {
+        return a;
+    }
+    b
+}
+
+fn sf_fma(is32: bool, a_in: u64, b_in: u64, c_in: u64) -> u64 {
+    let mut sa: u64 = 0u64;
+    let mut ea: i32 = 0;
+    let mut ma: u64 = 0u64;
+    let mut sb: u64 = 0u64;
+    let mut eb: i32 = 0;
+    let mut mb: u64 = 0u64;
+    let mut sc: u64 = 0u64;
+    let mut ec: i32 = 0;
+    let mut mc: u64 = 0u64;
+    let ka = sf_unpack(is32, a_in, mut_view(sa), mut_view(ea), mut_view(ma));
+    let kb = sf_unpack(is32, b_in, mut_view(sb), mut_view(eb), mut_view(mb));
+    let kc = sf_unpack(is32, c_in, mut_view(sc), mut_view(ec), mut_view(mc));
+    if ka == SF_K_NAN || kb == SF_K_NAN || kc == SF_K_NAN {
+        return sf_qnan(is32);
+    }
+    let ps = sa ^ sb;
+    if (ka == SF_K_INF && kb == SF_K_ZERO) || (ka == SF_K_ZERO && kb == SF_K_INF) {
+        return sf_qnan(is32);
+    }
+    if ka == SF_K_INF || kb == SF_K_INF {
+        if kc == SF_K_INF && sc != ps {
+            return sf_qnan(is32);
+        }
+        return sf_with_sign(is32, ps, sf_inf_bits(is32));
+    }
+    if kc == SF_K_INF {
+        return sf_with_sign(is32, sc, sf_inf_bits(is32));
+    }
+    if ka == SF_K_ZERO || kb == SF_K_ZERO {
+        if kc == SF_K_ZERO {
+            if ps == sc {
+                return sf_with_sign(is32, sc, 0u64);
+            }
+            return 0u64;
+        }
+        return c_in & sf_word_mask(is32);
+    }
+    // Exact product (at most 106 bits) normalised to msb = bit 127.
+    let mut phi: u64 = 0u64;
+    let plo = sf_mul_wide(ma, mb, mut_view(phi));
+    let pe = ea + eb;
+    let mut nlo: u64 = 0u64;
+    let mut sh: i32 = 0;
+    let nhi = sf_norm128(phi, plo, mut_view(nlo), mut_view(sh));
+    if kc == SF_K_ZERO {
+        return sf_round_pack(is32, ps, pe + 64 - sh, nhi, nlo != 0u64);
+    }
+    // Put both terms at msb = bit 126 (the product's low bits are zero, so the shift is exact).
+    let xh0 = nhi >> 1u64;
+    let xl0 = (nlo >> 1u64) | (nhi << 63u64);
+    let pe2 = pe + 1 - sh;
+    let lzc = sf_clz64(mc);
+    let ch0 = mc << ((lzc - 1) as u64);
+    let ce2 = ec - (lzc + 63);
+    let mut xs = ps;
+    let mut xe = pe2;
+    let mut xh = xh0;
+    let mut xl = xl0;
+    let mut ys = sc;
+    let mut ye = ce2;
+    let mut yh = ch0;
+    let mut yl = 0u64;
+    if ce2 > pe2 || (ce2 == pe2 && ch0 > xh0) {
+        xs = sc;
+        xe = ce2;
+        xh = ch0;
+        xl = 0u64;
+        ys = ps;
+        ye = pe2;
+        yh = xh0;
+        yl = xl0;
+    }
+    let mut sh_hi: u64 = 0u64;
+    let mut sh_lo: u64 = 0u64;
+    sf_shr_jam128(yh, yl, xe - ye, mut_view(sh_hi), mut_view(sh_lo));
+    let mut rh: u64 = 0u64;
+    let mut rl: u64 = 0u64;
+    if xs == ys {
+        rl = sf_wadd(xl, sh_lo);
+        rh = xh + sh_hi;
+        if rl < xl {
+            rh = rh + 1u64;
+        }
+    } else {
+        rl = sf_wsub(xl, sh_lo);
+        rh = xh - sh_hi;
+        if xl < sh_lo {
+            rh = rh - 1u64;
+        }
+    }
+    if rh == 0u64 && rl == 0u64 {
+        return 0u64;
+    }
+    let mut ol: u64 = 0u64;
+    let mut osh: i32 = 0;
+    let oh = sf_norm128(rh, rl, mut_view(ol), mut_view(osh));
+    sf_round_pack(is32, xs, xe + 64 - osh, oh, ol != 0u64)
+}
+
+// Float intrinsic by SF_I_* kind. `is32` is the float width of the operand (of the result for from_bits).
+pub fn sf_intrinsic(kind: u32, is32: bool, a: u64, b: u64, c: u64) -> u64 {
+    let wm = sf_word_mask(is32);
+    if kind == SF_I_SQRT {
+        return sf_sqrt(is32, a);
+    }
+    if kind == SF_I_ABS {
+        return (a & wm) & (sf_sign_mask(is32) ^ SF_ALL);
+    }
+    if kind == SF_I_COPYSIGN {
+        let sm = sf_sign_mask(is32);
+        return ((a & wm) & (sm ^ SF_ALL)) | (b & sm);
+    }
+    if kind == SF_I_TRUNC {
+        return sf_round_int(is32, a, 0u32);
+    }
+    if kind == SF_I_FLOOR {
+        return sf_round_int(is32, a, 1u32);
+    }
+    if kind == SF_I_CEIL {
+        return sf_round_int(is32, a, 2u32);
+    }
+    if kind == SF_I_ROUND {
+        return sf_round_int(is32, a, 3u32);
+    }
+    if kind == SF_I_ROUND_TIES_EVEN {
+        return sf_round_int(is32, a, 4u32);
+    }
+    if kind == SF_I_FMA {
+        return sf_fma(is32, a, b, c);
+    }
+    if kind == SF_I_MIN {
+        return sf_min_max(is32, a, b, false);
+    }
+    if kind == SF_I_MAX {
+        return sf_min_max(is32, a, b, true);
+    }
+    if kind == SF_I_TO_BITS || kind == SF_I_FROM_BITS {
+        return a & wm;
+    }
+    if kind == SF_I_NEXT_UP {
+        return sf_next_up(is32, a);
+    }
+    if kind == SF_I_NEXT_DOWN {
+        let up = sf_next_up(is32, sf_neg(is32, a));
+        if (up & (sf_sign_mask(is32) ^ SF_ALL)) > sf_inf_bits(is32) {
+            return sf_qnan(is32);
+        }
+        return sf_neg(is32, up);
+    }
+    0u64
 }
 
 // Axiom Compiler — MIR Interpreter Host Oracle (compiler/interp/oracle.ax)
@@ -100639,6 +101812,7 @@ use compiler.hir.hir.HirParam
 use compiler.types.types.AxType
 use compiler.types.types.CONST_AGGREGATE
 use compiler.types.types.CONST_INT
+use compiler.types.types.CONST_FLOAT
 use compiler.types.types.CONST_STR
 use compiler.types.types.CONST_UNIT
 use compiler.types.types.sym_constmap_get
@@ -100669,6 +101843,8 @@ use compiler.types.types.TY_CHAR
 use compiler.types.types.TY_CLOSURE
 use compiler.types.types.TY_ENUM
 use compiler.types.types.TY_FN
+use compiler.types.types.TY_F32
+use compiler.types.types.TY_F64
 use compiler.types.types.TY_I8
 use compiler.types.types.TY_I16
 use compiler.types.types.TY_I32
@@ -100753,6 +101929,9 @@ use compiler.mir.mir.MIR_PROJ_DEREF
 use compiler.mir.mir.MIR_RVALUE_AGGREGATE
 use compiler.mir.mir.MIR_RVALUE_BINARY_OP
 use compiler.mir.mir.MIR_RVALUE_CAST
+use compiler.mir.mir.MIR_CAST_FLOAT_TO_INT
+use compiler.mir.mir.MIR_CAST_INT_TO_FLOAT
+use compiler.mir.mir.MIR_CAST_FLOAT_CONVERT
 use compiler.mir.mir.MIR_RVALUE_DISCRIMINANT
 use compiler.mir.mir.MIR_RVALUE_LEN
 use compiler.mir.mir.MIR_RVALUE_OVERFLOWS_BINARY_OP
@@ -100843,6 +102022,15 @@ use compiler.interp.value.interp_validate_ptr_arith
 use compiler.interp.value.interp_validate_raw_ptr
 use compiler.interp.value.interp_zero_bytes
 use compiler.interp.value.interp_zero_val
+use compiler.interp.value.sf_binop
+use compiler.interp.value.sf_neg
+use compiler.interp.value.sf_int_to_float
+use compiler.interp.value.sf_float_to_int
+use compiler.interp.value.sf_float_convert
+use compiler.interp.value.sf_intrinsic
+use compiler.interp.value.sf_intrinsic_kind
+use compiler.interp.value.SF_I_NONE
+use compiler.interp.value.SF_I_FROM_BITS
 use compiler.interp.oracle.HOST_INTR_FIBER_CREATE
 use compiler.interp.oracle.HOST_INTR_FIBER_DESTROY
 use compiler.interp.oracle.HOST_INTR_FIBER_RESUME
@@ -101081,7 +102269,8 @@ pub fn interp_init_frame_tls(ctx: mut_view<InterpCtx>, frm: mut_view<CallFrame>,
                                     *((host_buf as *mut u64) + 1) = slen as u64;
                                 }
                             }
-                        } else if ckind == CONST_INT {
+                        } else if ckind == CONST_INT || ckind == CONST_FLOAT {
+                            // T458: a float constant stores its IEEE-754 bit pattern in int_val (f32 in the low 32 bits).
                             if sz == 16 {
                                 let mut int128_v: [2]u64 = [unsafe { (*cval).int_val }, const_val_int_hi(unsafe { view(*cval) })];
                                 let int128_ptr = unsafe { address_of(int128_v[0]) as *const u8 };
@@ -102303,6 +103492,43 @@ fn func_has_intrinsic_attr(ctx: view<InterpCtx>, func: *const HirItem) -> bool {
     false
 }
 
+// Float width of the first parameter (or of the return type when `use_ret`) of an intrinsic function:
+// 32 for f32, 64 for f64, 0 for anything else (T458).
+fn float_intrinsic_width(ctx: view<InterpCtx>, func: *mut HirItem, use_ret: bool) -> u8 {
+    if (ctx.thir as usize) == 0 {
+        return 0u8;
+    }
+    let fn_ty_ptr = unsafe { thir_get_item_type(view(*ctx.thir), func as *const HirItem) };
+    if (fn_ty_ptr as usize) == 0 {
+        return 0u8;
+    }
+    let fn_ty = unsafe { type_get(view((*ctx.thir).interner), TypeId { v: (*fn_ty_ptr).v }) };
+    if (fn_ty as usize) == 0 || (unsafe { (*fn_ty).kind }) != TY_FN {
+        return 0u8;
+    }
+    let mut tid: u32 = 0u32;
+    if use_ret {
+        tid = unsafe { (*fn_ty).ret_type.v };
+    } else if (unsafe { (*fn_ty).param_count }) > 0 {
+        tid = unsafe { (*typeid_at((*fn_ty).param_types, 0)).v };
+    }
+    if tid == 0u32 {
+        return 0u8;
+    }
+    let t = unsafe { type_get(view((*ctx.thir).interner), TypeId { v: tid }) };
+    if (t as usize) == 0 {
+        return 0u8;
+    }
+    let k = unsafe { (*t).kind };
+    if k == TY_F32 {
+        return 32u8;
+    }
+    if k == TY_F64 {
+        return 64u8;
+    }
+    0u8
+}
+
 fn eval_core_intrinsic(
     ctx: mut_view<InterpCtx>,
     func: *mut HirItem,
@@ -102331,6 +103557,20 @@ fn eval_core_intrinsic(
     if core_name_eq(view(name), 17, 5) {
         interp_panic(mut_view(*ctx), INTERP_MSG_PANIC_PANIC);
         return true;
+    }
+
+    // T458 (SPEC-41 AXS-FLT-012..016, 025): float intrinsics evaluated on IEEE-754 bit patterns. The kind comes
+    // from the name; the float width comes from the first parameter type (the return type for `from_bits`).
+    // An integer-typed function that shares a name (`abs_diff`, `min_u8`, ...) falls through to the integer table.
+    let fkind = sf_intrinsic_kind(view(name));
+    if fkind != SF_I_NONE && arg_count >= 1 {
+        let fw = float_intrinsic_width(view(*ctx), func, fkind == SF_I_FROM_BITS);
+        if fw != 0u8 {
+            let a2_lo: u64 = if arg_count > 2 && (args as usize) != 0 { unsafe { *(args + 2) } } else { 0u64 };
+            out_ret.vals[0] = sf_intrinsic(fkind, fw == 32u8, a0_lo, a1_lo, a2_lo);
+            out_ret.vals[1] = 0u64;
+            return true;
+        }
     }
 
     let mut bits: i32 = 64;
@@ -103356,6 +104596,13 @@ fn exec_assign_binop(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, stmt: *mu
     let tk = classify_int_ty(view(*ctx), TypeId { v: ty_v }, mut_view(is_signed), mut_view(bits));
     let t = if ty_v != 0u32 { unsafe { type_get(view((*ctx.thir).interner), TypeId { v: ty_v }) } } else { 0 as *mut AxType };
 
+    // T458 (SPEC-41 AXS-FLT-010/011/020): f32/f64 operands are IEEE-754 bit patterns. Float arithmetic never
+    // panics and a comparison with a NaN operand is false (only `!=` is true).
+    if tk == TY_F32 || tk == TY_F64 {
+        ctx.val_hi = 0u64;
+        return sf_binop(op, tk == TY_F32, lhs, rhs);
+    }
+
     let mut res: u64 = 0u64;
     let mut res_hi: u64 = 0u64;
     let mut overflow = false;
@@ -103916,10 +105163,14 @@ fn exec_assign_unop(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, stmt: *mut
 
     let mut is_signed = true;
     let mut bits: i32 = 32;
-    let _ = classify_int_ty(view(*ctx), ty, mut_view(is_signed), mut_view(bits));
+    let utk = classify_int_ty(view(*ctx), ty, mut_view(is_signed), mut_view(bits));
     let uop = unsafe { (*stmt).rvalue.un_op };
 
     ctx.val_hi = 0u64;
+    // T458 (AXS-FLT-010): float negation flips the sign bit (keeps NaN payloads, -0.0 <-> +0.0), no overflow panic.
+    if (utk == TY_F32 || utk == TY_F64) && uop == MIR_UNOP_NEG {
+        return sf_neg(utk == TY_F32, op_val);
+    }
     if bits == 128 {
         if uop == MIR_UNOP_BITNOT {
             ctx.val_hi = op_hi ^ 0xFFFFFFFFFFFFFFFFu64;
@@ -103984,8 +105235,9 @@ fn exec_assign_cast(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, stmt: *mut
 
     let mut src_signed = false;
     let mut src_bits: i32 = 64;
+    let mut s_kind: u8 = 0u8;
     if src_ty.v != 0u32 {
-        let _ = classify_int_ty(view(*ctx), src_ty, mut_view(src_signed), mut_view(src_bits));
+        s_kind = classify_int_ty(view(*ctx), src_ty, mut_view(src_signed), mut_view(src_bits));
     }
 
     let mut dest_signed = false;
@@ -103996,6 +105248,40 @@ fn exec_assign_cast(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, stmt: *mut
         if dest_bits == 1 {
             dest_bits = 64;
         }
+    }
+
+    // T458 (SPEC-41 AXS-FLT-022..024): the three float cast kinds. Every conversion rounds to nearest-even
+    // (IntToFloat, narrowing FloatConvert) or saturates with NaN -> 0 (FloatToInt); none can panic.
+    let fcast = unsafe { (*stmt).rvalue.cast_kind };
+    if fcast == MIR_CAST_INT_TO_FLOAT {
+        let mut ilo = op_val;
+        let mut ihi = op_hi;
+        if src_bits < 128 {
+            // The pair is the value extended from its own width (sign-extended for signed sources).
+            if src_signed {
+                if src_bits < 64 {
+                    ilo = sign_extend_u64(ilo, src_bits);
+                }
+                ihi = if (ilo >> 63u64) != 0u64 { 0xFFFFFFFFFFFFFFFFu64 } else { 0u64 };
+            } else {
+                if src_bits < 64 {
+                    ilo = ilo & bit_mask_u64(src_bits);
+                }
+                ihi = 0u64;
+            }
+        }
+        ctx.val_hi = 0u64;
+        return sf_int_to_float(ilo, ihi, src_signed, d_kind == TY_F32);
+    }
+    if fcast == MIR_CAST_FLOAT_TO_INT {
+        let mut fhi: u64 = 0u64;
+        let flo = sf_float_to_int(op_val, s_kind == TY_F32, dest_signed, dest_bits, mut_view(fhi));
+        ctx.val_hi = fhi;
+        return flo;
+    }
+    if fcast == MIR_CAST_FLOAT_CONVERT {
+        ctx.val_hi = 0u64;
+        return sf_float_convert(op_val, s_kind == TY_F32);
     }
 
     let mut res_lo = op_val;
@@ -107393,6 +108679,10 @@ pub fn interp_eval_const_expr_into(
             }
         } else {
             out_res.val.kind = CONST_INT;
+            if (exp_t as usize) != 0 && ((unsafe { (*exp_t).kind }) == TY_F32 || (unsafe { (*exp_t).kind }) == TY_F64) {
+                // T458: a float result keeps its IEEE-754 bit pattern (ConstValue.Float, SPEC-41 AXS-FLT-003 rule 4).
+                out_res.val.kind = CONST_FLOAT;
+            }
             if ret_size == 1 {
                 out_res.val.int_val = unsafe { *ret_buf as u64 };
             } else if ret_size == 2 {
@@ -107518,6 +108808,9 @@ pub use compiler.interp.interp.w_sub_u64_ovf
 pub use compiler.interp.interp.w_mul_u64_ovf
 pub use compiler.interp.interp.w_mul_u64
 pub use compiler.interp.interp.bit_mask_u64
+pub use compiler.interp.value.sf_binop
+pub use compiler.interp.value.sf_intrinsic
+pub use compiler.interp.value.sf_intrinsic_kind
 pub use compiler.interp.interp.sign_extend_u64
 pub use compiler.interp.interp.signed_lt_u64
 pub use compiler.interp.interp.signed_le_u64
@@ -107639,6 +108932,9 @@ use compiler.types.types.TY_STRUCT
 use compiler.types.types.TY_ENUM
 use compiler.types.types.TY_INT_VAR
 use compiler.types.types.CONST_INT
+use compiler.types.types.CONST_FLOAT
+use compiler.types.types.TY_F32
+use compiler.types.types.TY_F64
 use compiler.types.types.CONST_STR
 use compiler.types.types.CONST_UNIT
 use compiler.types.types.CONST_AGGREGATE
@@ -108214,6 +109510,10 @@ fn session_eval_const_expr_into(
             out_res.val.kind = CONST_UNIT;
         } else {
             out_res.val.kind = CONST_INT;
+            if (exp_t as usize) != 0 && (exp_tk == TY_F32 || exp_tk == TY_F64) {
+                // T458: a float result keeps its IEEE-754 bit pattern (ConstValue.Float, SPEC-41 AXS-FLT-003 rule 4).
+                out_res.val.kind = CONST_FLOAT;
+            }
             let mut raw_v: u64 = 0u64;
             if ret_size == 1 {
                 raw_v = unsafe { *ret_buf as u64 };
