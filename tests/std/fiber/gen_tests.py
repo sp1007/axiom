@@ -76,6 +76,8 @@ TESTS = {
     "native_panic/qa_np_drop_not_run": ("OK qa_np_drop_not_run 0 1\\n", FIBER_SOURCES, 60),
     "native_panic/qa_np_exit_passthrough": ("panicked\\nin fiber\\n", FIBER_SOURCES, 60),
     "native_panic/qa_np_plain_after": ("contained\\n", FIBER_SOURCES, 60),
+    # T538: a user ExitProcess(101) inside a fiber is no longer mistaken for a panic.
+    "native_panic/exit101_passthrough": ("panicked\\nin fiber\\n", FIBER_SOURCES, 60),
 }
 
 # Tests whose expected outcome is a panic (exit 101, stdout up to the panic point).
@@ -85,10 +87,11 @@ EXPECT_EXIT = {
     "native_panic/np_resume_after_panic": 101,
     "native_panic/qa_np_exit_passthrough": 3,
     "native_panic/qa_np_plain_after": 101,
+    "native_panic/exit101_passthrough": 101,
 }
 
 # Native-only tests (direct FFI is native-only, ADR-0002).
-NATIVE_ONLY = {"native_panic/qa_np_exit_passthrough"}
+NATIVE_ONLY = {"native_panic/qa_np_exit_passthrough", "native_panic/exit101_passthrough"}
 
 # Tests whose native mode is skipped until a catch-up task lands (`// native-after: <task>`). Empty since
 # T423b made native fibers contain panics (fiber_panic_contained runs in both modes).

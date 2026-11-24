@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T457, T453]
 priority: 149
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/lir, compiler/abi, compiler/target/x64, tests/lir/float, tests/encode/sse2_scalar, tests/abi/win64_float]
 locks: [compiler/backend/session.ax]
 spec: [spec/SPEC-41-floating-point.md, spec/SPEC-04-core-extensibility.md, 0162, 0179, 0181, tasks/0331, tasks/0338]
 covers: [REQ-SIMD-325, REQ-SIMD-332]
+started: 2026-11-24 16:19:08
+agent: axiom-backend
 ---
 # T459 — E12.2 — LIR Xmm register class, Windows x64 XMM ABI & SSE2 scalar floating-point codegen
 
@@ -42,3 +44,4 @@ Implement the LIR `f32`/`f64` scalar types and `Xmm` register class (`AXS-EXT-05
 
 ## Log
 - 2026-11-03 00:30:00 created by T212 (P12 phase planning)
+- 2026-11-24 16:19:08 started (attempt 1) axiom-backend

@@ -189,6 +189,18 @@ pub fn __ax_host_monotonic_ns() -> u64 {
 
 module std.sys.windows.thread
 
+// Native backing of host.thread_* / futex_* on x86_64-windows.
+//
+// Panic containment (T538, SPEC-32, SPEC-34 AXS-EXEC-055.5): a native panic runs the linker stub
+// `axiom_panic`, which writes the message and then calls the process-wide panic hook registered
+// through `__ax_panic_hook_set` (a linker-provided setter of the data slot `__ax_panic_hook`) before
+// it ends the process with exit code 101. The thread runtime registers win_thread_panic_hook when it is
+// created: a panic on a spawned thread marks the slot panicked (join returns Err) and ends only that
+// thread; on any other thread the hook returns and the process exits with 101. std/sys/windows/fiber.ax
+// replaces the hook with one that first handles a panic on a running user fiber and otherwise calls
+// win_thread_panic_contain. The process exit import is never patched, so a user exit code (including 101) always
+// ends the process unchanged.
+
 @link("kernel32")
 extern "system" {
     fn GetProcessHeap() -> *mut u8;
@@ -208,10 +220,6 @@ extern "system" {
     fn SwitchToThread() -> i32;
     fn Sleep(dwMilliseconds: u32);
     fn ExitThread(dwExitCode: u32);
-    fn ExitProcess(uExitCode: u32);
-    fn GetModuleHandleA(lpModuleName: *const u8) -> *mut u8;
-    fn GetProcAddress(hModule: *mut u8, lpProcName: *const u8) -> *mut u8;
-    fn VirtualProtect(lpAddress: *mut u8, dwSize: usize, flNewProtect: u32, lpflOldProtect: *mut u32) -> i32;
     fn InitializeCriticalSection(lpCriticalSection: *mut u8);
     fn EnterCriticalSection(lpCriticalSection: *mut u8);
     fn LeaveCriticalSection(lpCriticalSection: *mut u8);
@@ -223,6 +231,13 @@ extern "system" {
     fn WaitOnAddress(address: *const u8, compareAddress: *const u8, addressSize: usize, dwMilliseconds: u32) -> i32;
     fn WakeByAddressSingle(address: *const u8);
     fn WakeByAddressAll(address: *const u8);
+}
+
+// Linker-provided runtime stub (compiler/link/import.ax AXIOM_PANIC_HOOK_SET_CODE): atomically stores
+// `hook` (the address of a `fn(*const u8, usize) -> u32`, or 0) into `__ax_panic_hook` and returns the
+// previous value. Axiom has no extern data declarations, so the slot is reached through this setter.
+extern "C" {
+    fn __ax_panic_hook_set(hook: usize) -> usize;
 }
 
 @intrinsic fn size_of<T>() -> usize { 0 }
@@ -252,159 +267,99 @@ struct WinThreadRt {
     cs: [6]u64,
     main_win_tid: u32,
     pad0: u32,
-    orig_exit_process: usize,
     next_logical_id: u64,
     slots: *mut *mut WinThreadSlot,
     slot_cap: usize,
 }
+
+// Process-wide thread runtime (T537 process-wide statics); null until the first thread call.
+static mut WIN_THREAD_RT: *mut WinThreadRt = 0 as *mut WinThreadRt;
 
 unsafe fn fn_entry_to_addr(f: fn(*mut u8) -> i64) -> usize {
     let tmp: [1]fn(*mut u8) -> i64 = [f];
     *(address_of(tmp[0]) as *const usize)
 }
 
-unsafe fn fn_exit_to_addr(f: fn(u32) -> u32) -> usize {
-    let tmp: [1]fn(u32) -> u32 = [f];
+pub unsafe fn win_panic_hook_to_addr(f: fn(*const u8, usize) -> u32) -> usize {
+    let tmp: [1]fn(*const u8, usize) -> u32 = [f];
     *(address_of(tmp[0]) as *const usize)
 }
 
-unsafe fn addr_to_fn_exit(addr: usize) -> fn(u32) -> u32 {
-    let tmp: [1]usize = [addr];
-    *(address_of(tmp[0]) as *const fn(u32) -> u32)
+// Registers `hook` (address of a `fn(*const u8, usize) -> u32`, 0 to clear; the result is ignored) as the process-wide panic hook
+// called by `axiom_panic`; returns the previously registered hook.
+pub unsafe fn win_panic_hook_set(hook: usize) -> usize {
+    __ax_panic_hook_set(hook)
 }
 
 unsafe fn slot_ptr_at(arr: *mut *mut WinThreadSlot, idx: usize) -> *mut *mut WinThreadSlot {
     ((arr as usize) + idx * size_of<*mut WinThreadSlot>()) as *mut *mut WinThreadSlot
 }
 
-unsafe fn pe_first_import_desc() -> *mut u8 {
-    let base = GetModuleHandleA(0 as *const u8);
-    if (base as usize) == 0 {
-        return 0 as *mut u8;
-    }
-    if *((base as *const u16)) != 0x5A4Du16 {
-        return 0 as *mut u8;
-    }
-    let lfanew = *((base + 0x3C) as *const u32) as usize;
-    let nt = base + lfanew;
-    if *((nt as *const u32)) != 0x00004550u32 {
-        return 0 as *mut u8;
-    }
-    let opt = nt + 24;
-    if *((opt as *const u16)) != 0x020Bu16 {
-        return 0 as *mut u8;
-    }
-    let imp_rva = *((opt + 120) as *const u32) as usize;
-    if imp_rva == 0 {
-        return 0 as *mut u8;
-    }
-    base + imp_rva
-}
-
 unsafe fn win_rt_peek() -> *mut WinThreadRt {
-    let desc0 = pe_first_import_desc();
-    if (desc0 as usize) == 0 {
-        return 0 as *mut WinThreadRt;
-    }
-    let lo = *((desc0 + 4) as *const u32) as usize;
-    let hi = *((desc0 + 8) as *const u32) as usize;
-    (lo | (hi << 32)) as *mut WinThreadRt
+    WIN_THREAD_RT
 }
 
-fn win_exit_process_hook(code: u32) -> u32 {
-    unsafe {
-        let rt = win_rt_peek();
-        if (rt as usize) != 0 {
-            let cur_tid = GetCurrentThreadId();
-            if cur_tid != (*rt).main_win_tid && code == 101u32 {
-                let cs_ptr = address_of_mut((*rt).cs[0]) as *mut u8;
-                EnterCriticalSection(cs_ptr);
-                let mut idx: usize = 1;
-                while idx < (*rt).slot_cap {
-                    let s = *slot_ptr_at((*rt).slots, idx);
-                    if (s as usize) != 0 && (*s).in_use != 0u32 && (*s).finished == 0u32 && (*s).win_tid == cur_tid {
-                        (*s).panicked = 1u32;
-                        (*s).ret_val = -101i64;
-                        (*s).finished = 1u32;
-                        (*s).win_tid = 0u32;
-                        if (*s).detached != 0u32 {
-                            let h = (*s).os_handle;
-                            (*s).os_handle = 0 as *mut u8;
-                            (*s).in_use = 0u32;
-                            LeaveCriticalSection(cs_ptr);
-                            if (h as usize) != 0 {
-                                CloseHandle(h);
-                            }
-                        } else {
-                            let p_ctx = (*s).ctx;
-                            if (p_ctx as usize) != 0 && *(p_ctx as *const u64) == 0x4158544852504B54u64 {
-                                let lw = (p_ctx + 8) as *mut u32;
-                                *lw = (*lw) | 1u32;
-                            }
-                            LeaveCriticalSection(cs_ptr);
-                        }
-                        ExitThread(101u32);
-                    }
-                    idx = idx + 1;
+// Panic containment for spawned threads. Called on the panicking thread by the panic hook: when it is
+// a live spawned thread of this runtime, the slot is marked panicked (join returns Err) and the
+// thread ends with ExitThread(101). Returns on the main thread or on threads the runtime does not own;
+// the caller then lets `axiom_panic` exit the process with 101.
+pub unsafe fn win_thread_panic_contain() {
+    let rt = WIN_THREAD_RT;
+    if (rt as usize) == 0 {
+        return;
+    }
+    let cur_tid = GetCurrentThreadId();
+    if cur_tid == (*rt).main_win_tid {
+        return;
+    }
+    let cs_ptr = address_of_mut((*rt).cs[0]) as *mut u8;
+    EnterCriticalSection(cs_ptr);
+    let mut idx: usize = 1;
+    while idx < (*rt).slot_cap {
+        let s = *slot_ptr_at((*rt).slots, idx);
+        if (s as usize) != 0 && (*s).in_use != 0u32 && (*s).finished == 0u32 && (*s).win_tid == cur_tid {
+            (*s).panicked = 1u32;
+            (*s).ret_val = -101i64;
+            (*s).finished = 1u32;
+            (*s).win_tid = 0u32;
+            if (*s).detached != 0u32 {
+                let h = (*s).os_handle;
+                (*s).os_handle = 0 as *mut u8;
+                (*s).in_use = 0u32;
+                LeaveCriticalSection(cs_ptr);
+                if (h as usize) != 0 {
+                    CloseHandle(h);
+                }
+            } else {
+                let p_ctx = (*s).ctx;
+                if (p_ctx as usize) != 0 && *(p_ctx as *const u64) == 0x4158544852504B54u64 {
+                    let lw = (p_ctx + 8) as *mut u32;
+                    *lw = (*lw) | 1u32;
                 }
                 LeaveCriticalSection(cs_ptr);
             }
-            if (*rt).orig_exit_process != 0usize {
-                let orig = addr_to_fn_exit((*rt).orig_exit_process);
-                orig(code);
-            }
+            ExitThread(101u32);
         }
-        ExitProcess(code);
-        0u32
+        idx = idx + 1;
     }
+    LeaveCriticalSection(cs_ptr);
 }
 
-unsafe fn win_install_exit_hook(rt: *mut WinThreadRt) {
-    let base = GetModuleHandleA(0 as *const u8);
-    let desc0 = pe_first_import_desc();
-    if (base as usize) == 0 || (desc0 as usize) == 0 {
-        return;
+// Panic hook registered by the thread runtime (see the module comment).
+fn win_thread_panic_hook(_msg: *const u8, _msg_len: usize) -> u32 {
+    unsafe {
+        win_thread_panic_contain();
     }
-    let k32_name: [13]u8 = [107u8, 101u8, 114u8, 110u8, 101u8, 108u8, 51u8, 50u8, 46u8, 100u8, 108u8, 108u8, 0u8];
-    let ep_name: [12]u8 = [69u8, 120u8, 105u8, 116u8, 80u8, 114u8, 111u8, 99u8, 101u8, 115u8, 115u8, 0u8];
-    let hk32 = GetModuleHandleA(address_of(k32_name[0]));
-    if (hk32 as usize) == 0 {
-        return;
-    }
-    let real_ep = GetProcAddress(hk32, address_of(ep_name[0])) as usize;
-    if real_ep == 0usize {
-        return;
-    }
-    (*rt).orig_exit_process = real_ep;
-    let hook_addr = fn_exit_to_addr(win_exit_process_hook);
-    let mut d = desc0;
-    while *((d + 16) as *const u32) != 0u32 {
-        let ft_rva = *((d + 16) as *const u32) as usize;
-        let mut iat = (base + ft_rva) as *mut usize;
-        while *iat != 0usize {
-            if *iat == real_ep {
-                let mut old_prot: [1]u32 = [0u32];
-                let ok = VirtualProtect(iat as *mut u8, 8usize, 0x04u32, address_of_mut(old_prot[0]));
-                if ok != 0 {
-                    *iat = hook_addr;
-                    let mut tmp_prot: [1]u32 = [0u32];
-                    VirtualProtect(iat as *mut u8, 8usize, old_prot[0], address_of_mut(tmp_prot[0]));
-                }
-            }
-            iat = ((iat as usize) + 8usize) as *mut usize;
-        }
-        d = d + 20;
-    }
+    0u32
 }
 
 unsafe fn win_rt_get() -> *mut WinThreadRt {
-    let existing = win_rt_peek();
+    let existing = WIN_THREAD_RT;
     if (existing as usize) != 0 {
         return existing;
     }
-    let desc0 = pe_first_import_desc();
     let heap = GetProcessHeap();
-    if (desc0 as usize) == 0 || (heap as usize) == 0 {
+    if (heap as usize) == 0 {
         return 0 as *mut WinThreadRt;
     }
     let rt = HeapAlloc(heap, 8u32, size_of<WinThreadRt>()) as *mut WinThreadRt;
@@ -422,13 +377,11 @@ unsafe fn win_rt_get() -> *mut WinThreadRt {
     (*rt).next_logical_id = 2u64;
     (*rt).slots = slots;
     (*rt).slot_cap = init_cap;
-    win_install_exit_hook(rt);
-
-    let mut old_prot: [1]u32 = [0u32];
-    if VirtualProtect(desc0, 16usize, 0x04u32, address_of_mut(old_prot[0])) != 0 {
-        let addr = rt as usize;
-        *((desc0 + 4) as *mut u32) = (addr & 0xFFFFFFFFusize) as u32;
-        *((desc0 + 8) as *mut u32) = ((addr >> 32) & 0xFFFFFFFFusize) as u32;
+    WIN_THREAD_RT = rt;
+    // Register the thread hook unless a hook is already set (the fiber hook also covers threads).
+    let prev = __ax_panic_hook_set(win_panic_hook_to_addr(win_thread_panic_hook));
+    if prev != 0usize {
+        let _ = __ax_panic_hook_set(prev);
     }
     rt
 }

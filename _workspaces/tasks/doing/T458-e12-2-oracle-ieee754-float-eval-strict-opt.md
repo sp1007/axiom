@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T457, T452]
 priority: 148
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/interp, compiler/opt, tests/mir/float_interp, tests/opt/float_strict]
 locks: [compiler/interp_opt/session.ax]
 spec: [spec/SPEC-41-floating-point.md, tasks/0331, tasks/0338, tasks/0345]
 covers: [REQ-SIMD-026, REQ-SIMD-271, REQ-SIMD-272]
+started: 2026-11-24 16:19:08
+agent: axiom-semantics
 ---
 # T458 — E12.2 — Oracle IEEE-754 floating-point evaluator & strict FP optimizer preservation
 
@@ -42,3 +44,4 @@ Implement bit-deterministic IEEE-754 `f32`/`f64` execution, casts, and float int
 
 ## Log
 - 2026-11-03 00:30:00 created by T212 (P12 phase planning)
+- 2026-11-24 16:19:08 started (attempt 1) axiom-semantics
