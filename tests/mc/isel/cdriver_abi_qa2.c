@@ -1,8 +1,13 @@
 #include <stdio.h>
-// This test's only checks are assert()s: keep them live in Release (-DNDEBUG) builds,
-// where they would otherwise vanish and leave `sig` unused (-Werror).
-#undef NDEBUG
-#include <assert.h>
+/* T503 (ADR-0034 §8): explicit checks that stay live in release (-DNDEBUG) builds, where a
+   compiled-out check would leave this driver verifying nothing. */
+#define CHECK(cond)                                                                  \
+    do {                                                                             \
+        if (!(cond)) {                                                               \
+            fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #cond); \
+            return 1;                                                                \
+        }                                                                            \
+    } while (0)
 #include "abi/abi.h"
 
 int main(void) {
@@ -20,21 +25,21 @@ int main(void) {
     AxType fn = { .kind = AX_TY_FN, .fn = { .ret_type = arr16_ty, .param_count = 5, .param_types = params } };
     
     AxAbiSig sig = ax_abi_win64.classify(&fn, &interner, &arena);
-    assert(sig.arg_count == 5);
+    CHECK(sig.arg_count == 5);
     
     // Hidden return pointer in RCX
-    assert(sig.ret.loc.kind == AX_ABI_LOC_INDIRECT && sig.ret.loc.reg == 1); // RCX
+    CHECK(sig.ret.loc.kind == AX_ABI_LOC_INDIRECT && sig.ret.loc.reg == 1); // RCX
 
     // Arg 1 is passed in RDX
-    assert(sig.args[0].loc.kind == AX_ABI_LOC_REG && sig.args[0].loc.reg == 2); // RDX
+    CHECK(sig.args[0].loc.kind == AX_ABI_LOC_REG && sig.args[0].loc.reg == 2); // RDX
     // Arg 2 is passed in R8
-    assert(sig.args[1].loc.kind == AX_ABI_LOC_REG && sig.args[1].loc.reg == 8); // R8
+    CHECK(sig.args[1].loc.kind == AX_ABI_LOC_REG && sig.args[1].loc.reg == 8); // R8
     // Arg 3 is passed in R9
-    assert(sig.args[2].loc.kind == AX_ABI_LOC_REG && sig.args[2].loc.reg == 9); // R9
+    CHECK(sig.args[2].loc.kind == AX_ABI_LOC_REG && sig.args[2].loc.reg == 9); // R9
     // Arg 4 is passed on stack at offset 32
-    assert(sig.args[3].loc.kind == AX_ABI_LOC_STACK && sig.args[3].loc.offset == 32);
+    CHECK(sig.args[3].loc.kind == AX_ABI_LOC_STACK && sig.args[3].loc.offset == 32);
     // Arg 5 is passed on stack at offset 40
-    assert(sig.args[4].loc.kind == AX_ABI_LOC_STACK && sig.args[4].loc.offset == 40);
+    CHECK(sig.args[4].loc.kind == AX_ABI_LOC_STACK && sig.args[4].loc.offset == 40);
 
     printf("cdriver_abi_qa2 pass\n");
     ax_arena_destroy(&arena);

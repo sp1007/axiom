@@ -1,6 +1,13 @@
 #include <stdio.h>
-#undef NDEBUG
-#include <assert.h>
+/* T503 (ADR-0034 §8): explicit checks that stay live in release (-DNDEBUG) builds, where a
+   compiled-out check would leave this driver verifying nothing. */
+#define CHECK(cond)                                                                  \
+    do {                                                                             \
+        if (!(cond)) {                                                               \
+            fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #cond); \
+            return 1;                                                                \
+        }                                                                            \
+    } while (0)
 #include "abi/abi.h"
 
 int main(void) {
@@ -18,11 +25,11 @@ int main(void) {
     AxType fn = { .kind = AX_TY_FN, .fn = { .ret_type = interner.t_unit, .param_count = 2, .param_types = params } };
     
     AxAbiSig sig = ax_abi_win64.classify(&fn, &interner, &arena);
-    assert(sig.arg_count == 2);
+    CHECK(sig.arg_count == 2);
     // Size 8 is passed by value in RCX
-    assert(sig.args[0].loc.kind == AX_ABI_LOC_REG && sig.args[0].loc.reg == 1); // RCX
+    CHECK(sig.args[0].loc.kind == AX_ABI_LOC_REG && sig.args[0].loc.reg == 1); // RCX
     // Size 9 is passed by reference, pointer in RDX
-    assert(sig.args[1].loc.kind == AX_ABI_LOC_INDIRECT && sig.args[1].loc.reg == 2); // RDX
+    CHECK(sig.args[1].loc.kind == AX_ABI_LOC_INDIRECT && sig.args[1].loc.reg == 2); // RDX
 
     printf("cdriver_abi_qa pass\n");
     ax_arena_destroy(&arena);
