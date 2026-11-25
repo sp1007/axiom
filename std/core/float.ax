@@ -1,0 +1,917 @@
+module std.core.float
+
+// std.core.float (T460, SPEC-41 AXS-FLT-004, 015, 016, 021, 025, 026, 062, ADR-0049).
+//
+// The compiler knows exactly five float intrinsics per type: to_bits, from_bits, sqrt, abs and copysign.
+// Everything else in this file is ordinary Axiom over them, so the MIR interpreter and the native backend
+// run the same code and give the same bits for every input, subnormals and NaN included:
+//
+//   * associated constants of f32 / f64 (`f64.MAX`, `f32.EPSILON`, ...),
+//   * FpCategory and the classification predicates,
+//   * total_cmp (IEEE-754 totalOrder), clamp, min, max,
+//   * floor, ceil, trunc, round, round_ties_even, fract (exact bit manipulation),
+//   * next_up, next_down,
+//   * mul_add (fused multiply-add) as exact integer soft-float with one final rounding,
+//   * to_degrees, to_radians.
+//
+// The module must be part of the program for these methods to exist (`use std.core.float.FpCategory` does it).
+// f16 members are added by T480.
+
+use std.core.cmp.Ordering
+use std.core.cmp.Clone
+use std.core.cmp.PartialEq
+use std.core.cmp.Eq
+
+// ================================================================================================
+// The five compiler intrinsics (ADR-0049 section 1)
+// ================================================================================================
+
+@intrinsic fn panic(msg: str) {}
+
+@intrinsic pub fn to_bits_f32(x: f32) -> u32 { 0u32 }
+@intrinsic pub fn from_bits_f32(v: u32) -> f32 { 0.0 }
+@intrinsic pub fn sqrt_f32(x: f32) -> f32 { 0.0 }
+@intrinsic pub fn abs_f32(x: f32) -> f32 { 0.0 }
+@intrinsic pub fn copysign_f32(x: f32, y: f32) -> f32 { 0.0 }
+
+@intrinsic pub fn to_bits_f64(x: f64) -> u64 { 0u64 }
+@intrinsic pub fn from_bits_f64(v: u64) -> f64 { 0.0 }
+@intrinsic pub fn sqrt_f64(x: f64) -> f64 { 0.0 }
+@intrinsic pub fn abs_f64(x: f64) -> f64 { 0.0 }
+@intrinsic pub fn copysign_f64(x: f64, y: f64) -> f64 { 0.0 }
+
+// ================================================================================================
+// FpCategory
+// ================================================================================================
+
+@derive(Copy)
+pub enum FpCategory {
+    Nan,
+    Infinite,
+    Zero,
+    Subnormal,
+    Normal,
+}
+
+fn category_code(c: FpCategory) -> i32 {
+    match c {
+        FpCategory.Nan => 0,
+        FpCategory.Infinite => 1,
+        FpCategory.Zero => 2,
+        FpCategory.Subnormal => 3,
+        FpCategory.Normal => 4,
+    }
+}
+
+impl Clone for FpCategory {
+    fn clone(self: view<FpCategory>) -> FpCategory {
+        *self
+    }
+}
+
+impl PartialEq for FpCategory {
+    fn eq(self: view<FpCategory>, other: view<FpCategory>) -> bool {
+        category_code(*self) == category_code(*other)
+    }
+}
+
+impl Eq for FpCategory {}
+
+// ================================================================================================
+// Bit-level constants
+// ================================================================================================
+
+const F64_SIGN: u64 = 0x8000_0000_0000_0000u64;
+const F64_EXP: u64 = 0x7FF0_0000_0000_0000u64;
+const F64_MANT: u64 = 0x000F_FFFF_FFFF_FFFFu64;
+const F64_ABS: u64 = 0x7FFF_FFFF_FFFF_FFFFu64;
+
+const F32_SIGN: u32 = 0x8000_0000u32;
+const F32_EXP: u32 = 0x7F80_0000u32;
+const F32_MANT: u32 = 0x007F_FFFFu32;
+const F32_ABS: u32 = 0x7FFF_FFFFu32;
+
+// ================================================================================================
+// Rounding to an integral value (mode 0 trunc, 1 floor, 2 ceil, 3 round half away, 4 round half even)
+// ================================================================================================
+
+fn round_integral_f64(x: f64, mode: u32) -> f64 {
+    let bits = to_bits_f64(x);
+    let negative = (bits >> 63u32) != 0u64;
+    let exp_field = ((bits >> 52u32) & 0x7FFu64) as i32;
+    if exp_field == 0x7FF {
+        // inf is unchanged; a NaN stays a NaN (and becomes quiet).
+        return x + x;
+    }
+    if (bits & F64_ABS) == 0u64 {
+        return x;
+    }
+    let e = exp_field - 1023;
+    if e >= 52 {
+        return x;
+    }
+    if e < 0 {
+        // 0 < |x| < 1: the result is +-0 or +-1.
+        let mut up = false;
+        if mode == 1u32 {
+            up = negative;
+        } else if mode == 2u32 {
+            up = !negative;
+        } else if mode == 3u32 {
+            up = e == -1;
+        } else if mode == 4u32 {
+            up = e == -1 && (bits & F64_MANT) != 0u64;
+        }
+        if up {
+            return if negative { from_bits_f64(0xBFF0_0000_0000_0000u64) } else { 1.0 };
+        }
+        return if negative { from_bits_f64(F64_SIGN) } else { 0.0 };
+    }
+    let frac_mask = F64_MANT >> (e as u32);
+    let frac = bits & frac_mask;
+    if frac == 0u64 {
+        return x;
+    }
+    let unit = 1u64 << ((52 - e) as u32);
+    let half = 1u64 << ((51 - e) as u32);
+    let truncated = bits - frac;
+    let mut up = false;
+    if mode == 1u32 {
+        up = negative;
+    } else if mode == 2u32 {
+        up = !negative;
+    } else if mode == 3u32 {
+        up = frac >= half;
+    } else if mode == 4u32 {
+        up = frac > half || (frac == half && (truncated & unit) != 0u64);
+    }
+    if up {
+        from_bits_f64(truncated + unit)
+    } else {
+        from_bits_f64(truncated)
+    }
+}
+
+// ================================================================================================
+// Fused multiply-add: exact integer arithmetic, one rounding (ADR-0049 section 4)
+// ================================================================================================
+
+// A rounded result before packing: value = m * 2^q (m == 0 is a zero of the given sign).
+@derive(Copy)
+struct Rounded {
+    neg: bool,
+    m: u64,
+    q: i32,
+}
+
+// Position of the highest set bit of a nonzero u128.
+fn top_bit_u128(v: u128) -> i32 {
+    127 - (v.leading_zeros() as i32)
+}
+
+// Rounds (-1)^neg * r * 2^e0 to `prec` bits, never below the quantum 2^qmin, ties to even.
+// The result mantissa may equal 2^prec (carry); the packers renormalise.
+fn round_wide(neg: bool, r: u128, e0: i32, prec: i32, qmin: i32) -> Rounded {
+    if r == 0u128 {
+        return Rounded { neg: neg, m: 0u64, q: qmin };
+    }
+    let t = top_bit_u128(r);
+    let ev = t + e0;
+    let mut q = ev - (prec - 1);
+    if q < qmin {
+        q = qmin;
+    }
+    let s = q - e0;
+    let mut m: u64 = 0u64;
+    if s <= 0 {
+        m = (r << ((-s) as u32)) as u64;
+    } else if s < 124 {
+        let sh = s as u32;
+        m = (r >> sh) as u64;
+        let rem = r & ((1u128 << sh) - 1u128);
+        let half = 1u128 << (sh - 1u32);
+        if rem > half || (rem == half && (m & 1u64) != 0u64) {
+            m = m + 1u64;
+        }
+    }
+    Rounded { neg: neg, m: m, q: q }
+}
+
+// Exact (-1)^neg_p * p * 2^ep + (-1)^neg_c * c * 2^ec, rounded once. p is nonzero, c may be zero.
+fn fused_sum(neg_p: bool, p: u128, ep: i32, neg_c: bool, c: u64, ec: i32, prec: i32, qmin: i32) -> Rounded {
+    if c == 0u64 {
+        return round_wide(neg_p, p, ep, prec, qmin);
+    }
+    // Both operands normalised to bit 120: the product has at most 106 bits, so its low 15 bits are zero and
+    // jamming the shifted-out bits of the smaller operand into bit 0 keeps every rounding decision exact.
+    let sp = 120 - top_bit_u128(p);
+    let pn = p << (sp as u32);
+    let epn = ep - sp;
+    let cw = c as u128;
+    let sc = 120 - top_bit_u128(cw);
+    let cn = cw << (sc as u32);
+    let ecn = ec - sc;
+    let mut big = pn;
+    let mut big_neg = neg_p;
+    let mut small = cn;
+    let mut small_neg = neg_c;
+    let mut e0 = epn;
+    let mut d = epn - ecn;
+    if ecn > epn {
+        big = cn;
+        big_neg = neg_c;
+        small = pn;
+        small_neg = neg_p;
+        e0 = ecn;
+        d = ecn - epn;
+    }
+    // Align the smaller operand.
+    let mut aligned = small;
+    if d >= 128 {
+        aligned = 1u128;
+    } else if d > 0 {
+        let sh = d as u32;
+        let lost = small & ((1u128 << sh) - 1u128);
+        aligned = small >> sh;
+        if lost != 0u128 {
+            aligned = aligned | 1u128;
+        }
+    }
+    if big_neg == small_neg {
+        return round_wide(big_neg, big + aligned, e0, prec, qmin);
+    }
+    if big > aligned {
+        return round_wide(big_neg, big - aligned, e0, prec, qmin);
+    }
+    if aligned > big {
+        return round_wide(small_neg, aligned - big, e0, prec, qmin);
+    }
+    // Exact cancellation: +0 in round-to-nearest.
+    Rounded { neg: false, m: 0u64, q: qmin }
+}
+
+fn pack_f64(r: Rounded) -> f64 {
+    let sign = if r.neg { F64_SIGN } else { 0u64 };
+    let mut m = r.m;
+    let mut q = r.q;
+    if m == 0u64 {
+        return from_bits_f64(sign);
+    }
+    if m == (1u64 << 53u32) {
+        m = 1u64 << 52u32;
+        q = q + 1;
+    }
+    if m < (1u64 << 52u32) {
+        return from_bits_f64(sign | m);
+    }
+    let field = q + 1075;
+    if field >= 2047 {
+        return from_bits_f64(sign | F64_EXP);
+    }
+    from_bits_f64(sign | ((field as u64) << 52u32) | (m & F64_MANT))
+}
+
+fn pack_f32(r: Rounded) -> f32 {
+    let sign = if r.neg { F32_SIGN } else { 0u32 };
+    let mut m = r.m;
+    let mut q = r.q;
+    if m == 0u64 {
+        return from_bits_f32(sign);
+    }
+    if m == (1u64 << 24u32) {
+        m = 1u64 << 23u32;
+        q = q + 1;
+    }
+    if m < (1u64 << 23u32) {
+        return from_bits_f32(sign | (m as u32));
+    }
+    let field = q + 150;
+    if field >= 255 {
+        return from_bits_f32(sign | F32_EXP);
+    }
+    from_bits_f32(sign | ((field as u32) << 23u32) | ((m as u32) & F32_MANT))
+}
+
+fn mantissa_f64(bits: u64) -> u64 {
+    let field = (bits >> 52u32) & 0x7FFu64;
+    let frac = bits & F64_MANT;
+    if field == 0u64 { frac } else { frac | (1u64 << 52u32) }
+}
+
+fn exponent_f64(bits: u64) -> i32 {
+    let field = ((bits >> 52u32) & 0x7FFu64) as i32;
+    if field == 0 { -1074 } else { field - 1075 }
+}
+
+fn mantissa_f32(bits: u32) -> u64 {
+    let field = (bits >> 23u32) & 0xFFu32;
+    let frac = (bits & F32_MANT) as u64;
+    if field == 0u32 { frac } else { frac | (1u64 << 23u32) }
+}
+
+fn exponent_f32(bits: u32) -> i32 {
+    let field = ((bits >> 23u32) & 0xFFu32) as i32;
+    if field == 0 { -149 } else { field - 150 }
+}
+
+fn fma_f64(a: f64, b: f64, c: f64) -> f64 {
+    if !a.is_finite() || !b.is_finite() {
+        // NaN and infinities: the hardware product and sum are already exact for them.
+        return (a * b) + c;
+    }
+    if !c.is_finite() {
+        return c + c;
+    }
+    if a == 0.0 || b == 0.0 {
+        return (a * b) + c;
+    }
+    let ab = to_bits_f64(a);
+    let bb = to_bits_f64(b);
+    let cb = to_bits_f64(c);
+    let neg_p = ((ab ^ bb) >> 63u32) != 0u64;
+    let neg_c = (cb >> 63u32) != 0u64;
+    let p = (mantissa_f64(ab) as u128) * (mantissa_f64(bb) as u128);
+    let ep = exponent_f64(ab) + exponent_f64(bb);
+    let r = fused_sum(neg_p, p, ep, neg_c, mantissa_f64(cb), exponent_f64(cb), 53, -1074);
+    pack_f64(r)
+}
+
+fn fma_f32(a: f32, b: f32, c: f32) -> f32 {
+    if !a.is_finite() || !b.is_finite() {
+        return (a * b) + c;
+    }
+    if !c.is_finite() {
+        return c + c;
+    }
+    if a == 0.0 || b == 0.0 {
+        return (a * b) + c;
+    }
+    let ab = to_bits_f32(a);
+    let bb = to_bits_f32(b);
+    let cb = to_bits_f32(c);
+    let neg_p = ((ab ^ bb) >> 31u32) != 0u32;
+    let neg_c = (cb >> 31u32) != 0u32;
+    let p = (mantissa_f32(ab) as u128) * (mantissa_f32(bb) as u128);
+    let ep = exponent_f32(ab) + exponent_f32(bb);
+    let r = fused_sum(neg_p, p, ep, neg_c, mantissa_f32(cb), exponent_f32(cb), 24, -149);
+    pack_f32(r)
+}
+
+// ================================================================================================
+// f64
+// ================================================================================================
+
+impl f64 {
+    // ---- associated constants (SPEC-41 AXS-FLT-004) --------------------------------------------
+    pub const RADIX: u32 = 2u32;
+    pub const MANTISSA_DIGITS: u32 = 53u32;
+    pub const DIGITS: u32 = 15u32;
+    pub const EPSILON: f64 = 2.220446049250313e-16;
+    pub const MIN: f64 = -1.7976931348623157e308;
+    pub const MAX: f64 = 1.7976931348623157e308;
+    pub const MIN_POSITIVE: f64 = 2.2250738585072014e-308;
+    pub const MIN_POSITIVE_SUBNORMAL: f64 = 4.9406564584124654e-324;
+    pub const MIN_EXP: i32 = -1021;
+    pub const MAX_EXP: i32 = 1024;
+    pub const MIN_10_EXP: i32 = -307;
+    pub const MAX_10_EXP: i32 = 308;
+    pub const INFINITY: f64 = 1.0 / 0.0;
+    pub const NEG_INFINITY: f64 = -1.0 / 0.0;
+    pub const NAN: f64 = 0.0 / 0.0;
+
+    // ---- bit conversions ------------------------------------------------------------------------
+    pub fn to_bits(self: f64) -> u64 {
+        to_bits_f64(self)
+    }
+
+    pub fn from_bits(v: u64) -> f64 {
+        from_bits_f64(v)
+    }
+
+    // ---- byte conversions (AXS-FLT-025): exactly the integer conversions of the bit pattern ------
+    pub fn to_le_bytes(self: f64) -> [8]u8 {
+        let bits = to_bits_f64(self);
+        let mut out: [8]u8 = [0u8; 8];
+        let mut i: usize = 0;
+        while i < 8 {
+            out[i] = ((bits >> ((i * 8) as u32)) & 0xFFu64) as u8;
+            i = i + 1;
+        }
+        out
+    }
+
+    pub fn to_be_bytes(self: f64) -> [8]u8 {
+        let bits = to_bits_f64(self);
+        let mut out: [8]u8 = [0u8; 8];
+        let mut i: usize = 0;
+        while i < 8 {
+            out[8 - 1 - i] = ((bits >> ((i * 8) as u32)) & 0xFFu64) as u8;
+            i = i + 1;
+        }
+        out
+    }
+
+    pub fn to_ne_bytes(self: f64) -> [8]u8 {
+        self.to_le_bytes()
+    }
+
+    pub fn from_le_bytes(bytes: [8]u8) -> f64 {
+        let mut bits: u64 = 0u64;
+        let mut i: usize = 8;
+        while i > 0 {
+            i = i - 1;
+            bits = (bits << 8u32) | (bytes[i] as u64);
+        }
+        from_bits_f64(bits)
+    }
+
+    pub fn from_be_bytes(bytes: [8]u8) -> f64 {
+        let mut bits: u64 = 0u64;
+        let mut i: usize = 0;
+        while i < 8 {
+            bits = (bits << 8u32) | (bytes[i] as u64);
+            i = i + 1;
+        }
+        from_bits_f64(bits)
+    }
+
+    pub fn from_ne_bytes(bytes: [8]u8) -> f64 {
+        f64.from_le_bytes(bytes)
+    }
+
+    // ---- classification -------------------------------------------------------------------------
+    pub fn is_nan(self: f64) -> bool {
+        (to_bits_f64(self) & F64_ABS) > F64_EXP
+    }
+
+    pub fn is_infinite(self: f64) -> bool {
+        (to_bits_f64(self) & F64_ABS) == F64_EXP
+    }
+
+    pub fn is_finite(self: f64) -> bool {
+        (to_bits_f64(self) & F64_EXP) != F64_EXP
+    }
+
+    pub fn is_normal(self: f64) -> bool {
+        let e = to_bits_f64(self) & F64_EXP;
+        e != 0u64 && e != F64_EXP
+    }
+
+    pub fn is_subnormal(self: f64) -> bool {
+        let bits = to_bits_f64(self);
+        (bits & F64_EXP) == 0u64 && (bits & F64_MANT) != 0u64
+    }
+
+    pub fn is_sign_positive(self: f64) -> bool {
+        (to_bits_f64(self) >> 63u32) == 0u64
+    }
+
+    pub fn is_sign_negative(self: f64) -> bool {
+        (to_bits_f64(self) >> 63u32) != 0u64
+    }
+
+    pub fn classify(self: f64) -> FpCategory {
+        let bits = to_bits_f64(self);
+        let e = bits & F64_EXP;
+        let m = bits & F64_MANT;
+        if e == F64_EXP {
+            if m != 0u64 { FpCategory.Nan } else { FpCategory.Infinite }
+        } else if e == 0u64 {
+            if m != 0u64 { FpCategory.Subnormal } else { FpCategory.Zero }
+        } else {
+            FpCategory.Normal
+        }
+    }
+
+    // ---- ordering -------------------------------------------------------------------------------
+    pub fn total_cmp(self: f64, other: f64) -> Ordering {
+        let mut left = to_bits_f64(self) as i64;
+        let mut right = to_bits_f64(other) as i64;
+        left = left ^ ((((left >> 63u32) as u64) >> 1u32) as i64);
+        right = right ^ ((((right >> 63u32) as u64) >> 1u32) as i64);
+        if left < right {
+            Ordering.Less
+        } else if left > right {
+            Ordering.Greater
+        } else {
+            Ordering.Equal
+        }
+    }
+
+    pub fn min(self: f64, other: f64) -> f64 {
+        if self.is_nan() {
+            return if other.is_nan() { self + self } else { other };
+        }
+        if other.is_nan() {
+            return self;
+        }
+        if self < other {
+            return self;
+        }
+        if other < self {
+            return other;
+        }
+        // Equal: the only distinguishable case is -0.0 against +0.0, where min is -0.0.
+        if self.is_sign_negative() { self } else { other }
+    }
+
+    pub fn max(self: f64, other: f64) -> f64 {
+        if self.is_nan() {
+            return if other.is_nan() { self + self } else { other };
+        }
+        if other.is_nan() {
+            return self;
+        }
+        if self > other {
+            return self;
+        }
+        if other > self {
+            return other;
+        }
+        if self.is_sign_positive() { self } else { other }
+    }
+
+    pub fn clamp(self: f64, min_val: f64, max_val: f64) -> f64 {
+        if min_val.is_nan() || max_val.is_nan() || min_val > max_val {
+            panic("min > max in clamp");
+        }
+        if self.is_nan() {
+            return self + self;
+        }
+        if self < min_val {
+            min_val
+        } else if self > max_val {
+            max_val
+        } else {
+            self
+        }
+    }
+
+    // ---- sign, root -----------------------------------------------------------------------------
+    pub fn abs(self: f64) -> f64 {
+        abs_f64(self)
+    }
+
+    pub fn copysign(self: f64, sign: f64) -> f64 {
+        copysign_f64(self, sign)
+    }
+
+    pub fn sqrt(self: f64) -> f64 {
+        sqrt_f64(self)
+    }
+
+    // ---- rounding to integral values ------------------------------------------------------------
+    pub fn trunc(self: f64) -> f64 {
+        round_integral_f64(self, 0u32)
+    }
+
+    pub fn floor(self: f64) -> f64 {
+        round_integral_f64(self, 1u32)
+    }
+
+    pub fn ceil(self: f64) -> f64 {
+        round_integral_f64(self, 2u32)
+    }
+
+    pub fn round(self: f64) -> f64 {
+        round_integral_f64(self, 3u32)
+    }
+
+    pub fn round_ties_even(self: f64) -> f64 {
+        round_integral_f64(self, 4u32)
+    }
+
+    pub fn fract(self: f64) -> f64 {
+        self - round_integral_f64(self, 0u32)
+    }
+
+    // ---- neighbours -----------------------------------------------------------------------------
+    pub fn next_up(self: f64) -> f64 {
+        let bits = to_bits_f64(self);
+        if (bits & F64_ABS) > F64_EXP {
+            return self + self;
+        }
+        if bits == F64_EXP {
+            return self;
+        }
+        if (bits & F64_ABS) == 0u64 {
+            return from_bits_f64(1u64);
+        }
+        if (bits >> 63u32) == 0u64 {
+            from_bits_f64(bits + 1u64)
+        } else {
+            from_bits_f64(bits - 1u64)
+        }
+    }
+
+    pub fn next_down(self: f64) -> f64 {
+        let bits = to_bits_f64(self);
+        if (bits & F64_ABS) > F64_EXP {
+            return self + self;
+        }
+        if bits == (F64_SIGN | F64_EXP) {
+            return self;
+        }
+        if (bits & F64_ABS) == 0u64 {
+            return from_bits_f64(F64_SIGN | 1u64);
+        }
+        if (bits >> 63u32) == 0u64 {
+            from_bits_f64(bits - 1u64)
+        } else {
+            from_bits_f64(bits + 1u64)
+        }
+    }
+
+    // ---- fused multiply-add ---------------------------------------------------------------------
+    pub fn mul_add(self: f64, a: f64, b: f64) -> f64 {
+        fma_f64(self, a, b)
+    }
+
+    // ---- angle conversion -----------------------------------------------------------------------
+    pub fn to_degrees(self: f64) -> f64 {
+        self * (180.0 / 3.14159265358979323846264338327950288)
+    }
+
+    pub fn to_radians(self: f64) -> f64 {
+        self * (3.14159265358979323846264338327950288 / 180.0)
+    }
+}
+
+// ================================================================================================
+// f32
+// ================================================================================================
+
+impl f32 {
+    // ---- associated constants (SPEC-41 AXS-FLT-004) --------------------------------------------
+    pub const RADIX: u32 = 2u32;
+    pub const MANTISSA_DIGITS: u32 = 24u32;
+    pub const DIGITS: u32 = 6u32;
+    pub const EPSILON: f32 = 1.1920929e-7;
+    pub const MIN: f32 = -3.4028235e38;
+    pub const MAX: f32 = 3.4028235e38;
+    pub const MIN_POSITIVE: f32 = 1.17549435e-38;
+    pub const MIN_POSITIVE_SUBNORMAL: f32 = 1.4012985e-45;
+    pub const MIN_EXP: i32 = -125;
+    pub const MAX_EXP: i32 = 128;
+    pub const MIN_10_EXP: i32 = -37;
+    pub const MAX_10_EXP: i32 = 38;
+    pub const INFINITY: f32 = 1.0 / 0.0;
+    pub const NEG_INFINITY: f32 = -1.0 / 0.0;
+    pub const NAN: f32 = 0.0 / 0.0;
+
+    // ---- bit conversions ------------------------------------------------------------------------
+    pub fn to_bits(self: f32) -> u32 {
+        to_bits_f32(self)
+    }
+
+    pub fn from_bits(v: u32) -> f32 {
+        from_bits_f32(v)
+    }
+
+    // ---- byte conversions (AXS-FLT-025): exactly the integer conversions of the bit pattern ------
+    pub fn to_le_bytes(self: f32) -> [4]u8 {
+        let bits = to_bits_f32(self);
+        let mut out: [4]u8 = [0u8; 4];
+        let mut i: usize = 0;
+        while i < 4 {
+            out[i] = ((bits >> ((i * 8) as u32)) & 0xFFu32) as u8;
+            i = i + 1;
+        }
+        out
+    }
+
+    pub fn to_be_bytes(self: f32) -> [4]u8 {
+        let bits = to_bits_f32(self);
+        let mut out: [4]u8 = [0u8; 4];
+        let mut i: usize = 0;
+        while i < 4 {
+            out[4 - 1 - i] = ((bits >> ((i * 8) as u32)) & 0xFFu32) as u8;
+            i = i + 1;
+        }
+        out
+    }
+
+    pub fn to_ne_bytes(self: f32) -> [4]u8 {
+        self.to_le_bytes()
+    }
+
+    pub fn from_le_bytes(bytes: [4]u8) -> f32 {
+        let mut bits: u32 = 0u32;
+        let mut i: usize = 4;
+        while i > 0 {
+            i = i - 1;
+            bits = (bits << 8u32) | (bytes[i] as u32);
+        }
+        from_bits_f32(bits)
+    }
+
+    pub fn from_be_bytes(bytes: [4]u8) -> f32 {
+        let mut bits: u32 = 0u32;
+        let mut i: usize = 0;
+        while i < 4 {
+            bits = (bits << 8u32) | (bytes[i] as u32);
+            i = i + 1;
+        }
+        from_bits_f32(bits)
+    }
+
+    pub fn from_ne_bytes(bytes: [4]u8) -> f32 {
+        f32.from_le_bytes(bytes)
+    }
+
+    // ---- classification -------------------------------------------------------------------------
+    pub fn is_nan(self: f32) -> bool {
+        (to_bits_f32(self) & F32_ABS) > F32_EXP
+    }
+
+    pub fn is_infinite(self: f32) -> bool {
+        (to_bits_f32(self) & F32_ABS) == F32_EXP
+    }
+
+    pub fn is_finite(self: f32) -> bool {
+        (to_bits_f32(self) & F32_EXP) != F32_EXP
+    }
+
+    pub fn is_normal(self: f32) -> bool {
+        let e = to_bits_f32(self) & F32_EXP;
+        e != 0u32 && e != F32_EXP
+    }
+
+    pub fn is_subnormal(self: f32) -> bool {
+        let bits = to_bits_f32(self);
+        (bits & F32_EXP) == 0u32 && (bits & F32_MANT) != 0u32
+    }
+
+    pub fn is_sign_positive(self: f32) -> bool {
+        (to_bits_f32(self) >> 31u32) == 0u32
+    }
+
+    pub fn is_sign_negative(self: f32) -> bool {
+        (to_bits_f32(self) >> 31u32) != 0u32
+    }
+
+    pub fn classify(self: f32) -> FpCategory {
+        let bits = to_bits_f32(self);
+        let e = bits & F32_EXP;
+        let m = bits & F32_MANT;
+        if e == F32_EXP {
+            if m != 0u32 { FpCategory.Nan } else { FpCategory.Infinite }
+        } else if e == 0u32 {
+            if m != 0u32 { FpCategory.Subnormal } else { FpCategory.Zero }
+        } else {
+            FpCategory.Normal
+        }
+    }
+
+    // ---- ordering -------------------------------------------------------------------------------
+    pub fn total_cmp(self: f32, other: f32) -> Ordering {
+        let mut left = to_bits_f32(self) as i32;
+        let mut right = to_bits_f32(other) as i32;
+        left = left ^ ((((left >> 31u32) as u32) >> 1u32) as i32);
+        right = right ^ ((((right >> 31u32) as u32) >> 1u32) as i32);
+        if left < right {
+            Ordering.Less
+        } else if left > right {
+            Ordering.Greater
+        } else {
+            Ordering.Equal
+        }
+    }
+
+    pub fn min(self: f32, other: f32) -> f32 {
+        if self.is_nan() {
+            return if other.is_nan() { self + self } else { other };
+        }
+        if other.is_nan() {
+            return self;
+        }
+        if self < other {
+            return self;
+        }
+        if other < self {
+            return other;
+        }
+        if self.is_sign_negative() { self } else { other }
+    }
+
+    pub fn max(self: f32, other: f32) -> f32 {
+        if self.is_nan() {
+            return if other.is_nan() { self + self } else { other };
+        }
+        if other.is_nan() {
+            return self;
+        }
+        if self > other {
+            return self;
+        }
+        if other > self {
+            return other;
+        }
+        if self.is_sign_positive() { self } else { other }
+    }
+
+    pub fn clamp(self: f32, min_val: f32, max_val: f32) -> f32 {
+        if min_val.is_nan() || max_val.is_nan() || min_val > max_val {
+            panic("min > max in clamp");
+        }
+        if self.is_nan() {
+            return self + self;
+        }
+        if self < min_val {
+            min_val
+        } else if self > max_val {
+            max_val
+        } else {
+            self
+        }
+    }
+
+    // ---- sign, root -----------------------------------------------------------------------------
+    pub fn abs(self: f32) -> f32 {
+        abs_f32(self)
+    }
+
+    pub fn copysign(self: f32, sign: f32) -> f32 {
+        copysign_f32(self, sign)
+    }
+
+    pub fn sqrt(self: f32) -> f32 {
+        sqrt_f32(self)
+    }
+
+    // ---- rounding to integral values (f32 -> f64 is exact, and so is the way back) --------------
+    pub fn trunc(self: f32) -> f32 {
+        round_integral_f64(self as f64, 0u32) as f32
+    }
+
+    pub fn floor(self: f32) -> f32 {
+        round_integral_f64(self as f64, 1u32) as f32
+    }
+
+    pub fn ceil(self: f32) -> f32 {
+        round_integral_f64(self as f64, 2u32) as f32
+    }
+
+    pub fn round(self: f32) -> f32 {
+        round_integral_f64(self as f64, 3u32) as f32
+    }
+
+    pub fn round_ties_even(self: f32) -> f32 {
+        round_integral_f64(self as f64, 4u32) as f32
+    }
+
+    pub fn fract(self: f32) -> f32 {
+        self - (round_integral_f64(self as f64, 0u32) as f32)
+    }
+
+    // ---- neighbours -----------------------------------------------------------------------------
+    pub fn next_up(self: f32) -> f32 {
+        let bits = to_bits_f32(self);
+        if (bits & F32_ABS) > F32_EXP {
+            return self + self;
+        }
+        if bits == F32_EXP {
+            return self;
+        }
+        if (bits & F32_ABS) == 0u32 {
+            return from_bits_f32(1u32);
+        }
+        if (bits >> 31u32) == 0u32 {
+            from_bits_f32(bits + 1u32)
+        } else {
+            from_bits_f32(bits - 1u32)
+        }
+    }
+
+    pub fn next_down(self: f32) -> f32 {
+        let bits = to_bits_f32(self);
+        if (bits & F32_ABS) > F32_EXP {
+            return self + self;
+        }
+        if bits == (F32_SIGN | F32_EXP) {
+            return self;
+        }
+        if (bits & F32_ABS) == 0u32 {
+            return from_bits_f32(F32_SIGN | 1u32);
+        }
+        if (bits >> 31u32) == 0u32 {
+            from_bits_f32(bits - 1u32)
+        } else {
+            from_bits_f32(bits + 1u32)
+        }
+    }
+
+    // ---- fused multiply-add ---------------------------------------------------------------------
+    pub fn mul_add(self: f32, a: f32, b: f32) -> f32 {
+        fma_f32(self, a, b)
+    }
+
+    // ---- angle conversion -----------------------------------------------------------------------
+    pub fn to_degrees(self: f32) -> f32 {
+        self * 57.2957795130823208767981548141051703
+    }
+
+    pub fn to_radians(self: f32) -> f32 {
+        self * (3.14159265358979323846264338327950288 / 180.0)
+    }
+}

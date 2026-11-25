@@ -1,0 +1,1140 @@
+module std.text.fmt.float
+
+// std.text.fmt.float (T460, SPEC-41 AXS-FLT-050..052): deterministic float formatting and exact parsing in pure Axiom.
+//
+//   format_f64 / format_f32                shortest decimal text that parses back to the same bits (Burger-Dybvig)
+//   format_f64_fixed / format_f32_fixed    fixed number of fractional digits, exact value, ties to even
+//   format_f64_exp / format_f32_exp        [-]d.ddde+XX with `precision` fractional digits, ties to even
+//   parse_f64 / parse_f32                  decimal text -> nearest value, ties to even (0.5 ULP everywhere)
+//
+// All arithmetic is exact: a small fixed-size big integer (160 limbs of 32 bits, 5120 bits) holds every intermediate
+// value (the largest are about 1100 bits when formatting and 3800 bits when parsing).
+// Special values print as "NaN", "inf", "-inf" (any NaN, whatever its sign or payload) and "0.0" / "-0.0".
+//
+// Design choices (recorded in the T460 report):
+//   * format_f64 / format_f32 use decimal notation for 1e-4 <= |x| < 1e16 and `d[.ddd]e[-]N` otherwise;
+//     decimal text of a whole number always ends in ".0".
+//   * parse_* take the bytes of the text (`view<[u8]>`, like std.text.fmt.int).
+
+use std.core.result.Result
+use std.core.float.FpCategory
+use std.text.string.String
+use std.text.string.string_new
+use std.text.string.string_push_char
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+pub enum ParseFloatError {
+    Empty,
+    InvalidSyntax,
+}
+
+// ================================================================================================
+// Big unsigned integers
+// ================================================================================================
+
+@derive(Copy)
+struct Big {
+    n: usize,
+    d: [160]u32,
+}
+
+fn big_new() -> Big {
+    Big { n: 0, d: [0u32; 160] }
+}
+
+fn big_trim(b: mut_view<Big>) {
+    while b.n > 0 && b.d[b.n - 1] == 0u32 {
+        b.n = b.n - 1;
+    }
+}
+
+fn big_from_u64(v: u64) -> Big {
+    let mut b = big_new();
+    let lo = (v & 0xFFFF_FFFFu64) as u32;
+    let hi = (v >> 32u32) as u32;
+    b.d[0] = lo;
+    b.d[1] = hi;
+    b.n = 2;
+    big_trim(mut_view(b));
+    b
+}
+
+fn big_is_zero(b: view<Big>) -> bool {
+    b.n == 0
+}
+
+fn big_bit_len(b: view<Big>) -> u32 {
+    if b.n == 0 {
+        return 0u32;
+    }
+    let top = b.d[b.n - 1];
+    ((b.n - 1) as u32) * 32u32 + (32u32 - top.leading_zeros())
+}
+
+fn big_mul_small(b: mut_view<Big>, m: u32) {
+    let mm = m as u64;
+    let mut carry: u64 = 0u64;
+    let mut i: usize = 0;
+    while i < b.n {
+        let t = (b.d[i] as u64) * mm + carry;
+        b.d[i] = (t & 0xFFFF_FFFFu64) as u32;
+        carry = t >> 32u32;
+        i = i + 1;
+    }
+    if carry != 0u64 {
+        b.d[b.n] = carry as u32;
+        b.n = b.n + 1;
+    }
+}
+
+fn big_add_small(b: mut_view<Big>, a: u32) {
+    let mut carry: u64 = a as u64;
+    let mut i: usize = 0;
+    while carry != 0u64 {
+        if i >= b.n {
+            b.d[i] = 0u32;
+            b.n = i + 1;
+        }
+        let t = (b.d[i] as u64) + carry;
+        b.d[i] = (t & 0xFFFF_FFFFu64) as u32;
+        carry = t >> 32u32;
+        i = i + 1;
+    }
+}
+
+// a = a + b
+fn big_add(a: mut_view<Big>, b: view<Big>) {
+    let mut carry: u64 = 0u64;
+    let mut i: usize = 0;
+    let top = if a.n > b.n { a.n } else { b.n };
+    while i < top || carry != 0u64 {
+        let x = a.d[i] as u64;
+        let y = b.d[i] as u64;
+        let t = x + y + carry;
+        a.d[i] = (t & 0xFFFF_FFFFu64) as u32;
+        carry = t >> 32u32;
+        i = i + 1;
+    }
+    if i > a.n {
+        a.n = i;
+    }
+    big_trim(mut_view(*a));
+}
+
+// a = a - b, requires a >= b
+fn big_sub(a: mut_view<Big>, b: view<Big>) {
+    let mut borrow: u64 = 0u64;
+    let mut i: usize = 0;
+    while i < a.n {
+        let x = (a.d[i] as u64) + 0x1_0000_0000u64;
+        let y = (b.d[i] as u64) + borrow;
+        let t = x - y;
+        a.d[i] = (t & 0xFFFF_FFFFu64) as u32;
+        borrow = if t < 0x1_0000_0000u64 { 1u64 } else { 0u64 };
+        i = i + 1;
+    }
+    big_trim(mut_view(*a));
+}
+
+// -1, 0 or 1
+fn big_cmp(a: view<Big>, b: view<Big>) -> i32 {
+    if a.n != b.n {
+        return if a.n < b.n { -1 } else { 1 };
+    }
+    let mut i = a.n;
+    while i > 0 {
+        i = i - 1;
+        let x = a.d[i];
+        let y = b.d[i];
+        if x != y {
+            return if x < y { -1 } else { 1 };
+        }
+    }
+    0
+}
+
+fn big_shl(b: mut_view<Big>, bits: u32) {
+    if b.n == 0 || bits == 0u32 {
+        return;
+    }
+    let ls = (bits / 32u32) as usize;
+    let bs = bits % 32u32;
+    let old_n = b.n;
+    if bs == 0u32 {
+        let mut i = old_n;
+        while i > 0 {
+            i = i - 1;
+            b.d[i + ls] = b.d[i];
+        }
+        b.n = old_n + ls;
+    } else {
+        let back = 32u32 - bs;
+        b.d[old_n + ls] = b.d[old_n - 1] >> back;
+        let mut i = old_n - 1;
+        while i > 0 {
+            let hi = ((b.d[i] as u64) << bs) & 0xFFFF_FFFFu64;
+            let lo = (b.d[i - 1] >> back) as u64;
+            b.d[i + ls] = (hi | lo) as u32;
+            i = i - 1;
+        }
+        b.d[ls] = (((b.d[0] as u64) << bs) & 0xFFFF_FFFFu64) as u32;
+        b.n = old_n + ls + 1;
+    }
+    let mut j: usize = 0;
+    while j < ls {
+        b.d[j] = 0u32;
+        j = j + 1;
+    }
+    big_trim(mut_view(*b));
+}
+
+fn big_shr1(b: mut_view<Big>) {
+    let mut i: usize = 0;
+    while i < b.n {
+        let lo = b.d[i] >> 1u32;
+        let hi = if i + 1 < b.n { ((b.d[i + 1] & 1u32) << 31u32) } else { 0u32 };
+        b.d[i] = lo | hi;
+        i = i + 1;
+    }
+    big_trim(mut_view(*b));
+}
+
+// b = b / d, returns the remainder (d != 0)
+fn big_divmod_small(b: mut_view<Big>, d: u32) -> u32 {
+    let dd = d as u64;
+    let mut rem: u64 = 0u64;
+    let mut i = b.n;
+    while i > 0 {
+        i = i - 1;
+        let cur = (rem << 32u32) | (b.d[i] as u64);
+        b.d[i] = (cur / dd) as u32;
+        rem = cur % dd;
+    }
+    big_trim(mut_view(*b));
+    rem as u32
+}
+
+// b = b * 10^n
+fn big_mul_pow10(b: mut_view<Big>, n: u32) {
+    let mut left = n;
+    while left >= 9u32 {
+        big_mul_small(mut_view(*b), 1_000_000_000u32);
+        left = left - 9u32;
+    }
+    let mut p: u32 = 1u32;
+    while left > 0u32 {
+        p = p * 10u32;
+        left = left - 1u32;
+    }
+    if p > 1u32 {
+        big_mul_small(mut_view(*b), p);
+    }
+}
+
+// ================================================================================================
+// Decomposition of the binary formats: value = f * 2^e
+// ================================================================================================
+
+const F64_MANT: u64 = 0x000F_FFFF_FFFF_FFFFu64;
+const F64_EXP: u64 = 0x7FF0_0000_0000_0000u64;
+const F32_MANT: u32 = 0x007F_FFFFu32;
+const F32_EXP: u32 = 0x7F80_0000u32;
+
+@derive(Copy)
+struct Parts {
+    neg: bool,
+    f: u64,
+    e: i32,
+}
+
+fn parts_f64(x: f64) -> Parts {
+    let bits = x.to_bits();
+    let neg = (bits >> 63u32) != 0u64;
+    let field = ((bits >> 52u32) & 0x7FFu64) as i32;
+    let frac = bits & F64_MANT;
+    if field == 0 {
+        Parts { neg: neg, f: frac, e: -1074 }
+    } else {
+        Parts { neg: neg, f: frac | (1u64 << 52u32), e: field - 1075 }
+    }
+}
+
+fn parts_f32(x: f32) -> Parts {
+    let bits = x.to_bits();
+    let neg = (bits >> 31u32) != 0u32;
+    let field = ((bits >> 23u32) & 0xFFu32) as i32;
+    let frac = (bits & F32_MANT) as u64;
+    if field == 0 {
+        Parts { neg: neg, f: frac, e: -149 }
+    } else {
+        Parts { neg: neg, f: frac | (1u64 << 23u32), e: field - 150 }
+    }
+}
+
+fn push_str_bytes3(out: mut_view<String>, a: u8, b: u8, c: u8) {
+    string_push_char(mut_view(*out), a as char);
+    string_push_char(mut_view(*out), b as char);
+    string_push_char(mut_view(*out), c as char);
+}
+
+// "NaN", "inf", "-inf" for the three non-finite cases; false when the value is finite.
+fn push_non_finite(out: mut_view<String>, cat: FpCategory, neg: bool) -> bool {
+    match cat {
+        FpCategory.Nan => {
+            push_str_bytes3(mut_view(*out), b'N', b'a', b'N');
+            true
+        },
+        FpCategory.Infinite => {
+            if neg {
+                string_push_char(mut_view(*out), '-');
+            }
+            push_str_bytes3(mut_view(*out), b'i', b'n', b'f');
+            true
+        },
+        _ => false,
+    }
+}
+
+fn push_digit(out: mut_view<String>, d: u8) {
+    string_push_char(mut_view(*out), (b'0' + d) as char);
+}
+
+fn push_zeros(out: mut_view<String>, count: usize) {
+    let mut i: usize = 0;
+    while i < count {
+        string_push_char(mut_view(*out), '0');
+        i = i + 1;
+    }
+}
+
+fn push_exponent_plain(out: mut_view<String>, value: i32) {
+    // [-]N, no padding, no plus sign
+    let mut v = value;
+    if v < 0 {
+        string_push_char(mut_view(*out), '-');
+        v = -v;
+    }
+    let mut buf: [12]u8 = [0u8; 12];
+    let mut count: usize = 0;
+    if v == 0 {
+        buf[0] = 0u8;
+        count = 1;
+    }
+    while v > 0 {
+        buf[count] = (v % 10) as u8;
+        v = v / 10;
+        count = count + 1;
+    }
+    while count > 0 {
+        count = count - 1;
+        push_digit(mut_view(*out), buf[count]);
+    }
+}
+
+fn push_exponent_padded(out: mut_view<String>, value: i32) {
+    // (+|-)NN with at least two digits
+    let mut v = value;
+    if v < 0 {
+        string_push_char(mut_view(*out), '-');
+        v = -v;
+    } else {
+        string_push_char(mut_view(*out), '+');
+    }
+    if v < 10 {
+        string_push_char(mut_view(*out), '0');
+    }
+    push_exponent_plain(mut_view(*out), v);
+}
+
+// ================================================================================================
+// Shortest round-trip digits (Burger & Dybvig free-format algorithm, exact big-integer arithmetic)
+// ================================================================================================
+
+@derive(Copy)
+struct Shortest {
+    count: usize,
+    k: i32,
+    digits: [24]u8,
+}
+
+// f > 0, value = f * 2^e, `prec` bits of precision, `qmin` the exponent of the smallest quantum.
+// Result: value ~ 0.d1 d2 ... dn * 10^k with the fewest digits that stay inside the rounding interval.
+fn shortest_digits(f: u64, e: i32, prec: i32, qmin: i32) -> Shortest {
+    let mut out = Shortest { count: 0, k: 0, digits: [0u8; 24] };
+    let even = (f & 1u64) == 0u64;
+    let boundary = f == (1u64 << ((prec - 1) as u32)) && e > qmin;
+    let mut r = big_from_u64(f);
+    let mut s = big_from_u64(1u64);
+    let mut mp = big_from_u64(1u64);
+    let mut mm = big_from_u64(1u64);
+    if e >= 0 {
+        if boundary {
+            big_shl(mut_view(r), (e + 2) as u32);
+            s = big_from_u64(4u64);
+            mp = big_from_u64(1u64);
+            big_shl(mut_view(mp), (e + 1) as u32);
+            mm = big_from_u64(1u64);
+            big_shl(mut_view(mm), e as u32);
+        } else {
+            big_shl(mut_view(r), (e + 1) as u32);
+            s = big_from_u64(2u64);
+            mp = big_from_u64(1u64);
+            big_shl(mut_view(mp), e as u32);
+            mm = big_from_u64(1u64);
+            big_shl(mut_view(mm), e as u32);
+        }
+    } else {
+        if boundary {
+            big_shl(mut_view(r), 2u32);
+            big_shl(mut_view(s), ((-e) + 2) as u32);
+            mp = big_from_u64(2u64);
+            mm = big_from_u64(1u64);
+        } else {
+            big_shl(mut_view(r), 1u32);
+            big_shl(mut_view(s), ((-e) + 1) as u32);
+            mp = big_from_u64(1u64);
+            mm = big_from_u64(1u64);
+        }
+    }
+    // Estimate k = ceil(log10(v)) from below, then fix it upwards.
+    let log2 = e + (64 - (f.leading_zeros() as i32)) - 1;
+    let mut k = ((log2 * 1233) >> 12u32) - 1;
+    if k >= 0 {
+        big_mul_pow10(mut_view(s), k as u32);
+    } else {
+        big_mul_pow10(mut_view(r), (-k) as u32);
+        big_mul_pow10(mut_view(mp), (-k) as u32);
+        big_mul_pow10(mut_view(mm), (-k) as u32);
+    }
+    loop {
+        let mut high = r;
+        big_add(mut_view(high), view(mp));
+        let c = big_cmp(view(high), view(s));
+        let too_low = if even { c >= 0 } else { c > 0 };
+        if !too_low {
+            break;
+        }
+        big_mul_small(mut_view(s), 10u32);
+        k = k + 1;
+    }
+    out.k = k;
+    loop {
+        big_mul_small(mut_view(r), 10u32);
+        big_mul_small(mut_view(mp), 10u32);
+        big_mul_small(mut_view(mm), 10u32);
+        let mut d: u8 = 0u8;
+        while big_cmp(view(r), view(s)) >= 0 {
+            big_sub(mut_view(r), view(s));
+            d = d + 1u8;
+        }
+        let c1 = big_cmp(view(r), view(mm));
+        let tc1 = if even { c1 <= 0 } else { c1 < 0 };
+        let mut high = r;
+        big_add(mut_view(high), view(mp));
+        let c2 = big_cmp(view(high), view(s));
+        let tc2 = if even { c2 >= 0 } else { c2 > 0 };
+        if !tc1 && !tc2 {
+            out.digits[out.count] = d;
+            out.count = out.count + 1;
+            continue;
+        }
+        let mut last = d;
+        if tc2 {
+            if !tc1 {
+                last = d + 1u8;
+            } else {
+                let mut twice = r;
+                big_shl(mut_view(twice), 1u32);
+                let c3 = big_cmp(view(twice), view(s));
+                if c3 > 0 {
+                    last = d + 1u8;
+                } else if c3 == 0 && (d % 2u8) == 1u8 {
+                    last = d + 1u8;
+                }
+            }
+        }
+        out.digits[out.count] = last;
+        out.count = out.count + 1;
+        break;
+    }
+    out
+}
+
+fn format_shortest_into(out: mut_view<String>, p: Parts, cat: FpCategory, prec: i32, qmin: i32) {
+    if push_non_finite(mut_view(*out), cat, p.neg) {
+        return;
+    }
+    if p.neg {
+        string_push_char(mut_view(*out), '-');
+    }
+    if p.f == 0u64 {
+        string_push_char(mut_view(*out), '0');
+        string_push_char(mut_view(*out), '.');
+        string_push_char(mut_view(*out), '0');
+        return;
+    }
+    let sd = shortest_digits(p.f, p.e, prec, qmin);
+    let n = sd.count;
+    let x10 = sd.k - 1;
+    if x10 >= -4 && x10 < 16 {
+        if sd.k <= 0 {
+            string_push_char(mut_view(*out), '0');
+            string_push_char(mut_view(*out), '.');
+            push_zeros(mut_view(*out), (-sd.k) as usize);
+            let mut i: usize = 0;
+            while i < n {
+                push_digit(mut_view(*out), sd.digits[i]);
+                i = i + 1;
+            }
+        } else {
+            let int_len = sd.k as usize;
+            let mut i: usize = 0;
+            while i < int_len {
+                if i < n {
+                    push_digit(mut_view(*out), sd.digits[i]);
+                } else {
+                    string_push_char(mut_view(*out), '0');
+                }
+                i = i + 1;
+            }
+            string_push_char(mut_view(*out), '.');
+            if n > int_len {
+                let mut j = int_len;
+                while j < n {
+                    push_digit(mut_view(*out), sd.digits[j]);
+                    j = j + 1;
+                }
+            } else {
+                string_push_char(mut_view(*out), '0');
+            }
+        }
+        return;
+    }
+    push_digit(mut_view(*out), sd.digits[0]);
+    if n > 1 {
+        string_push_char(mut_view(*out), '.');
+        let mut i: usize = 1;
+        while i < n {
+            push_digit(mut_view(*out), sd.digits[i]);
+            i = i + 1;
+        }
+    }
+    string_push_char(mut_view(*out), 'e');
+    push_exponent_plain(mut_view(*out), x10);
+}
+
+// ================================================================================================
+// Exact decimal expansion (for fixed and exponent formats)
+// ================================================================================================
+
+@derive(Copy)
+struct Exact {
+    n: usize,
+    dp: i32,
+    digits: [1400]u8,
+}
+
+// f > 0, value = f * 2^e = 0.d0 d1 ... d(n-1) * 10^dp exactly, no leading and no trailing zero digit.
+fn exact_digits(f: u64, e: i32) -> Exact {
+    let mut x = Exact { n: 0, dp: 0, digits: [0u8; 1400] };
+    if e >= 0 {
+        let mut b = big_from_u64(f);
+        big_shl(mut_view(b), e as u32);
+        let mut chunks: [40]u32 = [0u32; 40];
+        let mut count: usize = 0;
+        while !big_is_zero(view(b)) {
+            chunks[count] = big_divmod_small(mut_view(b), 1_000_000_000u32);
+            count = count + 1;
+        }
+        // most significant chunk without padding, the rest with 9 digits
+        let mut started = false;
+        let mut ci = count;
+        while ci > 0 {
+            ci = ci - 1;
+            let mut div: u32 = 100_000_000u32;
+            let mut rest = chunks[ci];
+            let mut pos: u32 = 0u32;
+            while pos < 9u32 {
+                let digit = (rest / div) as u8;
+                rest = rest % div;
+                if started || digit != 0u8 {
+                    started = true;
+                    x.digits[x.n] = digit;
+                    x.n = x.n + 1;
+                }
+                if div > 1u32 {
+                    div = div / 10u32;
+                }
+                pos = pos + 1u32;
+            }
+        }
+        x.dp = x.n as i32;
+    } else {
+        let shift = (-e) as u32;
+        // integer part (fits in u64: f < 2^53 here) and the fraction as a big integer below 2^shift
+        let mut int_part: u64 = 0u64;
+        let mut frac = big_new();
+        if shift < 64u32 {
+            int_part = f >> shift;
+            let rest = f - (int_part << shift);
+            frac = big_from_u64(rest);
+        } else {
+            frac = big_from_u64(f);
+        }
+        let mut int_digits: [24]u8 = [0u8; 24];
+        let mut int_count: usize = 0;
+        let mut ip = int_part;
+        while ip > 0u64 {
+            int_digits[int_count] = (ip % 10u64) as u8;
+            ip = ip / 10u64;
+            int_count = int_count + 1;
+        }
+        let mut ic = int_count;
+        while ic > 0 {
+            ic = ic - 1;
+            x.digits[x.n] = int_digits[ic];
+            x.n = x.n + 1;
+        }
+        x.dp = int_count as i32;
+        let limb = (shift / 32u32) as usize;
+        let sh = shift % 32u32;
+        let mut leading_zero_run = int_count == 0;
+        while !big_is_zero(view(frac)) {
+            big_mul_small(mut_view(frac), 10u32);
+            // the digit is the part of frac above bit `shift`
+            let lo = frac.d[limb] as u64;
+            let hi = frac.d[limb + 1] as u64;
+            let digit = (((lo | (hi << 32u32)) >> sh) & 0xFu64) as u8;
+            // clear bits >= shift
+            let mask: u32 = if sh == 0u32 { 0u32 } else { (((1u64 << sh) - 1u64) as u32) };
+            frac.d[limb] = frac.d[limb] & mask;
+            let mut zi = limb + 1;
+            while zi < frac.n {
+                frac.d[zi] = 0u32;
+                zi = zi + 1;
+            }
+            frac.n = if frac.n > limb + 1 { limb + 1 } else { frac.n };
+            big_trim(mut_view(frac));
+            if leading_zero_run && digit == 0u8 {
+                x.dp = x.dp - 1;
+            } else {
+                leading_zero_run = false;
+                x.digits[x.n] = digit;
+                x.n = x.n + 1;
+            }
+        }
+    }
+    while x.n > 0 && x.digits[x.n - 1] == 0u8 {
+        x.n = x.n - 1;
+    }
+    x
+}
+
+// Rounds the digit string to `keep` digits (ties to even); keep < 0 gives zero.
+fn round_exact(x: mut_view<Exact>, keep: i32) {
+    let n = x.n as i32;
+    if keep >= n {
+        return;
+    }
+    if keep < 0 {
+        x.n = 0;
+        x.dp = 0;
+        return;
+    }
+    let k = keep as usize;
+    let d = x.digits[k];
+    let mut rest = false;
+    let mut i = k + 1;
+    while i < x.n {
+        if x.digits[i] != 0u8 {
+            rest = true;
+        }
+        i = i + 1;
+    }
+    let mut up = d > 5u8;
+    if d == 5u8 {
+        if rest {
+            up = true;
+        } else if k > 0 && (x.digits[k - 1] % 2u8) == 1u8 {
+            up = true;
+        }
+    }
+    x.n = k;
+    if up {
+        if k == 0 {
+            x.digits[0] = 1u8;
+            x.n = 1;
+            x.dp = x.dp + 1;
+        } else {
+            let mut j = k;
+            let mut carried = true;
+            while j > 0 && carried {
+                j = j - 1;
+                if x.digits[j] == 9u8 {
+                    x.digits[j] = 0u8;
+                } else {
+                    x.digits[j] = x.digits[j] + 1u8;
+                    carried = false;
+                }
+            }
+            if carried {
+                x.digits[0] = 1u8;
+                x.n = 1;
+                x.dp = x.dp + 1;
+            }
+        }
+    }
+    while x.n > 0 && x.digits[x.n - 1] == 0u8 {
+        x.n = x.n - 1;
+    }
+    if x.n == 0 {
+        x.dp = 0;
+    }
+}
+
+fn exact_digit_at(x: view<Exact>, index: i32) -> u8 {
+    if index < 0 || index >= (x.n as i32) {
+        0u8
+    } else {
+        x.digits[index as usize]
+    }
+}
+
+fn format_fixed_into(out: mut_view<String>, p: Parts, cat: FpCategory, precision: usize) {
+    if push_non_finite(mut_view(*out), cat, p.neg) {
+        return;
+    }
+    if p.neg {
+        string_push_char(mut_view(*out), '-');
+    }
+    let mut x = Exact { n: 0, dp: 0, digits: [0u8; 1400] };
+    if p.f != 0u64 {
+        x = exact_digits(p.f, p.e);
+        // Fractional digits beyond the exact expansion (1074) are zeros: clamp the rounding position.
+        let keep_wide = (x.dp as i64) + (precision as i64);
+        if keep_wide < 1500i64 {
+            round_exact(mut_view(x), keep_wide as i32);
+        }
+    }
+    if x.n == 0 || x.dp <= 0 {
+        string_push_char(mut_view(*out), '0');
+    } else {
+        let mut i: i32 = 0;
+        while i < x.dp {
+            push_digit(mut_view(*out), exact_digit_at(view(x), i));
+            i = i + 1;
+        }
+    }
+    if precision > 0 {
+        string_push_char(mut_view(*out), '.');
+        let mut j: usize = 0;
+        while j < precision {
+            let idx = x.dp + (j as i32);
+            if x.n == 0 {
+                string_push_char(mut_view(*out), '0');
+            } else {
+                push_digit(mut_view(*out), exact_digit_at(view(x), idx));
+            }
+            j = j + 1;
+        }
+    }
+}
+
+fn format_exp_into(out: mut_view<String>, p: Parts, cat: FpCategory, precision: usize) {
+    if push_non_finite(mut_view(*out), cat, p.neg) {
+        return;
+    }
+    if p.neg {
+        string_push_char(mut_view(*out), '-');
+    }
+    let mut x = Exact { n: 0, dp: 0, digits: [0u8; 1400] };
+    if p.f != 0u64 {
+        x = exact_digits(p.f, p.e);
+        let keep_wide = (precision as i64) + 1i64;
+        if keep_wide < 1500i64 {
+            round_exact(mut_view(x), keep_wide as i32);
+        }
+    }
+    push_digit(mut_view(*out), exact_digit_at(view(x), 0));
+    if precision > 0 {
+        string_push_char(mut_view(*out), '.');
+        let mut j: usize = 0;
+        while j < precision {
+            push_digit(mut_view(*out), exact_digit_at(view(x), (j as i32) + 1));
+            j = j + 1;
+        }
+    }
+    string_push_char(mut_view(*out), 'e');
+    let exponent = if x.n == 0 { 0 } else { x.dp - 1 };
+    push_exponent_padded(mut_view(*out), exponent);
+}
+
+// ================================================================================================
+// Public formatting API
+// ================================================================================================
+
+pub fn format_f64_into(out: mut_view<String>, val: f64) {
+    format_shortest_into(mut_view(*out), parts_f64(val), val.classify(), 53, -1074);
+}
+
+pub fn format_f32_into(out: mut_view<String>, val: f32) {
+    format_shortest_into(mut_view(*out), parts_f32(val), val.classify(), 24, -149);
+}
+
+pub fn format_f64_fixed_into(out: mut_view<String>, val: f64, precision: usize) {
+    format_fixed_into(mut_view(*out), parts_f64(val), val.classify(), precision);
+}
+
+pub fn format_f32_fixed_into(out: mut_view<String>, val: f32, precision: usize) {
+    format_fixed_into(mut_view(*out), parts_f32(val), val.classify(), precision);
+}
+
+pub fn format_f64_exp_into(out: mut_view<String>, val: f64, precision: usize) {
+    format_exp_into(mut_view(*out), parts_f64(val), val.classify(), precision);
+}
+
+pub fn format_f32_exp_into(out: mut_view<String>, val: f32, precision: usize) {
+    format_exp_into(mut_view(*out), parts_f32(val), val.classify(), precision);
+}
+
+pub fn format_f64(val: f64) -> String {
+    let mut s = string_new();
+    format_f64_into(mut_view(s), val);
+    s
+}
+
+pub fn format_f32(val: f32) -> String {
+    let mut s = string_new();
+    format_f32_into(mut_view(s), val);
+    s
+}
+
+pub fn format_f64_fixed(val: f64, precision: usize) -> String {
+    let mut s = string_new();
+    format_f64_fixed_into(mut_view(s), val, precision);
+    s
+}
+
+pub fn format_f32_fixed(val: f32, precision: usize) -> String {
+    let mut s = string_new();
+    format_f32_fixed_into(mut_view(s), val, precision);
+    s
+}
+
+pub fn format_f64_exp(val: f64, precision: usize) -> String {
+    let mut s = string_new();
+    format_f64_exp_into(mut_view(s), val, precision);
+    s
+}
+
+pub fn format_f32_exp(val: f32, precision: usize) -> String {
+    let mut s = string_new();
+    format_f32_exp_into(mut_view(s), val, precision);
+    s
+}
+
+// ================================================================================================
+// Exact decimal parsing
+// ================================================================================================
+
+// kind: 0 finite (m * 2^q, m == 0 is a zero), 1 infinity, 2 NaN, 3 empty input, 4 invalid syntax
+@derive(Copy)
+struct Parsed {
+    kind: u32,
+    neg: bool,
+    m: u64,
+    q: i32,
+}
+
+fn parsed(kind: u32, neg: bool, m: u64, q: i32) -> Parsed {
+    Parsed { kind: kind, neg: neg, m: m, q: q }
+}
+
+fn lower(c: u8) -> u8 {
+    if c >= b'A' && c <= b'Z' {
+        c + 32u8
+    } else {
+        c
+    }
+}
+
+// Case-insensitive match of bytes[start..] against `word` (lower-case ASCII, given as three-byte pieces).
+fn byte_at(p: *const u8, i: usize) -> u8 {
+    unsafe { *(p + i) }
+}
+
+fn rest_equals(p: *const u8, n: usize, start: usize, w0: u8, w1: u8, w2: u8, w3: u8, w4: u8, w5: u8, w6: u8, w7: u8, count: usize) -> bool {
+    if n != start + count {
+        return false;
+    }
+    let mut word: [8]u8 = [w0, w1, w2, w3, w4, w5, w6, w7];
+    let mut i: usize = 0;
+    while i < count {
+        if lower(byte_at(p, start + i)) != word[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn parse_decimal(p: *const u8, n: usize, prec: i32, qmin: i32) -> Parsed {
+    if n == 0 {
+        return parsed(3u32, false, 0u64, 0);
+    }
+    let mut i: usize = 0;
+    let mut neg = false;
+    if byte_at(p, 0) == b'-' {
+        neg = true;
+        i = 1;
+    } else if byte_at(p, 0) == b'+' {
+        i = 1;
+    }
+    if i >= n {
+        return parsed(4u32, neg, 0u64, 0);
+    }
+    // special words
+    if rest_equals(p, n, i, b'i', b'n', b'f', 0u8, 0u8, 0u8, 0u8, 0u8, 3) {
+        return parsed(1u32, neg, 0u64, 0);
+    }
+    if rest_equals(p, n, i, b'i', b'n', b'f', b'i', b'n', b'i', b't', b'y', 8) {
+        return parsed(1u32, neg, 0u64, 0);
+    }
+    if rest_equals(p, n, i, b'n', b'a', b'n', 0u8, 0u8, 0u8, 0u8, 0u8, 3) {
+        return parsed(2u32, false, 0u64, 0);
+    }
+    // digits: at most 800 significant digits are kept, the rest only matters as "something nonzero follows"
+    let mut d = big_new();
+    let mut nd: i32 = 0;
+    let mut exp10: i64 = 0i64;
+    let mut seen_digit = false;
+    let mut seen_dot = false;
+    let mut sticky = false;
+    let mut scanning = true;
+    while scanning && i < n {
+        let c = byte_at(p, i);
+        if c == b'.' {
+            if seen_dot {
+                return parsed(4u32, neg, 0u64, 0);
+            }
+            seen_dot = true;
+            i = i + 1;
+        } else if c >= b'0' && c <= b'9' {
+            seen_digit = true;
+            let digit = (c - b'0') as u32;
+            if nd == 0 && digit == 0u32 {
+                if seen_dot {
+                    exp10 = exp10 - 1i64;
+                }
+            } else if nd < 800 {
+                big_mul_small(mut_view(d), 10u32);
+                big_add_small(mut_view(d), digit);
+                nd = nd + 1;
+                if seen_dot {
+                    exp10 = exp10 - 1i64;
+                }
+            } else {
+                if digit != 0u32 {
+                    sticky = true;
+                }
+                if !seen_dot {
+                    exp10 = exp10 + 1i64;
+                }
+            }
+            i = i + 1;
+        } else {
+            scanning = false;
+        }
+    }
+    if !seen_digit {
+        return parsed(4u32, neg, 0u64, 0);
+    }
+    if i < n && (byte_at(p, i) == b'e' || byte_at(p, i) == b'E') {
+        i = i + 1;
+        let mut eneg = false;
+        if i < n && byte_at(p, i) == b'-' {
+            eneg = true;
+            i = i + 1;
+        } else if i < n && byte_at(p, i) == b'+' {
+            i = i + 1;
+        }
+        if i >= n {
+            return parsed(4u32, neg, 0u64, 0);
+        }
+        let mut ev: i64 = 0i64;
+        while i < n && byte_at(p, i) >= b'0' && byte_at(p, i) <= b'9' {
+            if ev < 100_000_000i64 {
+                ev = ev * 10i64 + ((byte_at(p, i) - b'0') as i64);
+            }
+            i = i + 1;
+        }
+        exp10 = if eneg { exp10 - ev } else { exp10 + ev };
+    }
+    if i != n {
+        return parsed(4u32, neg, 0u64, 0);
+    }
+    if big_is_zero(view(d)) {
+        return parsed(0u32, neg, 0u64, qmin);
+    }
+    if sticky {
+        big_mul_small(mut_view(d), 10u32);
+        big_add_small(mut_view(d), 1u32);
+        nd = nd + 1;
+        exp10 = exp10 - 1i64;
+    }
+    // value is in [10^(mag-1), 10^mag)
+    let mag = (nd as i64) + exp10;
+    if mag > 310i64 {
+        return parsed(1u32, neg, 0u64, 0);
+    }
+    if mag < -330i64 {
+        return parsed(0u32, neg, 0u64, qmin);
+    }
+    // value = u / v
+    let mut u = d;
+    let mut v = big_from_u64(1u64);
+    if exp10 >= 0i64 {
+        big_mul_pow10(mut_view(u), exp10 as u32);
+    } else {
+        big_mul_pow10(mut_view(v), (-exp10) as u32);
+    }
+    let l0 = (big_bit_len(view(u)) as i32) - (big_bit_len(view(v)) as i32);
+    let s = prec + 1 - l0;
+    if s >= 0 {
+        big_shl(mut_view(u), s as u32);
+    } else {
+        big_shl(mut_view(v), (-s) as u32);
+    }
+    // quotient q = floor(u / v) < 2^(prec+2) by binary long division
+    big_shl(mut_view(v), (prec + 1) as u32);
+    let mut quot: u64 = 0u64;
+    let mut j = prec + 1;
+    while j >= 0 {
+        if big_cmp(view(u), view(v)) >= 0 {
+            big_sub(mut_view(u), view(v));
+            quot = quot | (1u64 << (j as u32));
+        }
+        big_shr1(mut_view(v));
+        j = j - 1;
+    }
+    let remainder_nonzero = !big_is_zero(view(u));
+    // value = (quot + fraction) * 2^-s; round to `prec` bits, not below the quantum 2^qmin
+    let tq = 63 - (quot.leading_zeros() as i32);
+    let ev_top = tq - s;
+    let mut q = ev_top - (prec - 1);
+    if q < qmin {
+        q = qmin;
+    }
+    let r = q + s;
+    let mut m: u64 = 0u64;
+    if r < 64 {
+        let ru = r as u32;
+        m = quot >> ru;
+        let round_bit = ((quot >> (ru - 1u32)) & 1u64) != 0u64;
+        let low_mask = (1u64 << (ru - 1u32)) - 1u64;
+        let sticky_bits = (quot & low_mask) != 0u64 || remainder_nonzero;
+        if round_bit && (sticky_bits || (m & 1u64) != 0u64) {
+            m = m + 1u64;
+        }
+    }
+    parsed(0u32, neg, m, q)
+}
+
+fn pack_parsed_f64(p: Parsed) -> f64 {
+    let sign = if p.neg { 0x8000_0000_0000_0000u64 } else { 0u64 };
+    if p.kind == 1u32 {
+        return f64.from_bits(sign | F64_EXP);
+    }
+    if p.kind == 2u32 {
+        return f64.NAN;
+    }
+    let mut m = p.m;
+    let mut q = p.q;
+    if m == 0u64 {
+        return f64.from_bits(sign);
+    }
+    if m == (1u64 << 53u32) {
+        m = 1u64 << 52u32;
+        q = q + 1;
+    }
+    if m < (1u64 << 52u32) {
+        return f64.from_bits(sign | m);
+    }
+    let field = q + 1075;
+    if field >= 2047 {
+        return f64.from_bits(sign | F64_EXP);
+    }
+    f64.from_bits(sign | ((field as u64) << 52u32) | (m & F64_MANT))
+}
+
+fn pack_parsed_f32(p: Parsed) -> f32 {
+    let sign = if p.neg { 0x8000_0000u32 } else { 0u32 };
+    if p.kind == 1u32 {
+        return f32.from_bits(sign | F32_EXP);
+    }
+    if p.kind == 2u32 {
+        return f32.NAN;
+    }
+    let mut m = p.m;
+    let mut q = p.q;
+    if m == 0u64 {
+        return f32.from_bits(sign);
+    }
+    if m == (1u64 << 24u32) {
+        m = 1u64 << 23u32;
+        q = q + 1;
+    }
+    if m < (1u64 << 23u32) {
+        return f32.from_bits(sign | (m as u32));
+    }
+    let field = q + 150;
+    if field >= 255 {
+        return f32.from_bits(sign | F32_EXP);
+    }
+    f32.from_bits(sign | ((field as u32) << 23u32) | ((m as u32) & F32_MANT))
+}
+
+pub unsafe fn parse_f64_raw(text: *const u8, count: usize) -> Result<f64, ParseFloatError> {
+    let p = parse_decimal(text, count, 53, -1074);
+    if p.kind == 3u32 {
+        return Result.Err(ParseFloatError.Empty);
+    }
+    if p.kind == 4u32 {
+        return Result.Err(ParseFloatError.InvalidSyntax);
+    }
+    Result.Ok(pack_parsed_f64(p))
+}
+
+pub unsafe fn parse_f32_raw(text: *const u8, count: usize) -> Result<f32, ParseFloatError> {
+    let p = parse_decimal(text, count, 24, -149);
+    if p.kind == 3u32 {
+        return Result.Err(ParseFloatError.Empty);
+    }
+    if p.kind == 4u32 {
+        return Result.Err(ParseFloatError.InvalidSyntax);
+    }
+    Result.Ok(pack_parsed_f32(p))
+}
+
+pub fn parse_f64(bytes: view<[u8]>) -> Result<f64, ParseFloatError> {
+    if len(bytes) == 0 {
+        return Result.Err(ParseFloatError.Empty);
+    }
+    unsafe { parse_f64_raw(address_of(bytes[0]), len(bytes)) }
+}
+
+pub fn parse_f32(bytes: view<[u8]>) -> Result<f32, ParseFloatError> {
+    if len(bytes) == 0 {
+        return Result.Err(ParseFloatError.Empty);
+    }
+    unsafe { parse_f32_raw(address_of(bytes[0]), len(bytes)) }
+}
+
+pub fn parse_f64_str(s: view<String>) -> Result<f64, ParseFloatError> {
+    unsafe { parse_f64_raw(s.ptr as *const u8, s.len) }
+}
+
+pub fn parse_f32_str(s: view<String>) -> Result<f32, ParseFloatError> {
+    unsafe { parse_f32_raw(s.ptr as *const u8, s.len) }
+}

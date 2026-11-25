@@ -8,14 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T458, T459, T454, T458a, T458b]
 priority: 150
-status: doing
+status: done
 attempts: 1
 paths: [std/core/float.ax, std/text/fmt/float.ax, tests/std/float_fmt]
 locks: [std/core/prelude.ax, std/text/fmt/format.ax, tests/mir/float_interp]
 spec: [spec/SPEC-41-floating-point.md, spec/decisions/ADR-0049-float-intrinsics-minimal-set.md, tasks/0331, tasks/0338, tasks/0345]
 covers: [REQ-SIMD-160, REQ-SIMD-272, REQ-SIMD-322]
 started: 2026-11-25 14:52:02
-agent: T460-impl
+finished: 2026-11-25 18:48:10
 ---
 # T460 — E12.2 — Float formatting, exact parsing & std.core.float methods
 
@@ -47,3 +47,4 @@ Implement `std/core/float.ax` (`f32`/`f64` constants, classification, `total_cmp
 - 2026-11-03 00:30:00 created by T212 (P12 phase planning)
 - 2026-11-24 depends += T458a, T458b; derived float operations and REQ-SIMD-272 (explicit single-rounding mul_add) added; f16 members moved to T480 (architect, unblock-T458, ADR-0049)
 - 2026-11-25 14:52:02 started (attempt 1) T460-impl
+- 2026-11-25 18:48:10 accepted by QA -> done
