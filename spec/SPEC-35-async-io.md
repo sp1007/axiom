@@ -438,7 +438,8 @@ pub async fn write_all<W: AsyncWrite>(writer: mut_view<W>, src: *const u8, len: 
    - `write_all` loops over `write` until all `len` bytes are written, or returns `Result.Err(IoError.BrokenPipe)` if `write` returns `0`.
 
 **AXS-AIO-032** (`AsyncFile` resource ownership and positional/cursor overlapped I/O in `std/fs/async_file.ax`; `T427`, `0221 §19–20, §39 AIO-38..39`, `tasks/0335 §5–25, §100 AIO-41..48`).
-Module `std.fs.async_file` (`std/fs/async_file.ax`) provides asynchronous file operations bound to a `Reactor`:
+Module `std.fs.async_file` (`std/fs/async_file.ax`) provides asynchronous file operations bound to a `Reactor`.
+Every `AsyncFile`/`AsyncTcpListener`/`AsyncTcpStream`/`AsyncUdpSocket` constructor takes the reactor as `*mut Reactor`, not `view<Reactor>`: the returned resource and its futures keep the reactor reference across `.await`, which a view may not do (`AX_ASYNC_VIEW_ACROSS_AWAIT`); the caller guarantees the `Reactor` outlives every resource bound to it (triage 2026-11-25, `T427` report).
 
 ```axiom
 pub struct AsyncFile {
@@ -449,9 +450,9 @@ pub struct AsyncFile {
 }
 
 impl AsyncFile {
-    pub fn open(reactor: view<Reactor>, path: Str) -> Result<AsyncFile, IoError>
-    pub fn create(reactor: view<Reactor>, path: Str) -> Result<AsyncFile, IoError>
-    pub fn open_rw(reactor: view<Reactor>, path: Str) -> Result<AsyncFile, IoError>
+    pub fn open(reactor: *mut Reactor, path: Str) -> Result<AsyncFile, IoError>
+    pub fn create(reactor: *mut Reactor, path: Str) -> Result<AsyncFile, IoError>
+    pub fn open_rw(reactor: *mut Reactor, path: Str) -> Result<AsyncFile, IoError>
     pub fn read_at(self: view<AsyncFile>, offset: u64, dst: *mut u8, cap: usize) -> AsyncReadSliceFuture
     pub fn write_at(self: view<AsyncFile>, offset: u64, src: *const u8, count: usize) -> AsyncWriteSliceFuture
     pub fn read_buf_at(self: view<AsyncFile>, offset: u64, buf: IoBuf) -> AsyncReadBufFuture
@@ -533,7 +534,7 @@ pub struct AcceptFuture {
 }
 
 impl AsyncTcpListener {
-    pub fn bind(reactor: view<Reactor>, addr: SocketAddr) -> Result<AsyncTcpListener, IoError>
+    pub fn bind(reactor: *mut Reactor, addr: SocketAddr) -> Result<AsyncTcpListener, IoError>
     pub fn local_addr(self: view<AsyncTcpListener>) -> SocketAddr
     pub fn accept(self: view<AsyncTcpListener>) -> AcceptFuture
     pub fn close(self) -> Result<(), IoError>
@@ -564,7 +565,7 @@ pub struct AsyncTcpStream {
 }
 
 impl AsyncTcpStream {
-    pub fn connect(reactor: view<Reactor>, addr: SocketAddr) -> ConnectFuture
+    pub fn connect(reactor: *mut Reactor, addr: SocketAddr) -> ConnectFuture
     pub fn peer_addr(self: view<AsyncTcpStream>) -> SocketAddr
     pub fn read(self: mut_view<AsyncTcpStream>, dst: *mut u8, cap: usize) -> AsyncReadSliceFuture
     pub fn write(self: mut_view<AsyncTcpStream>, src: *const u8, count: usize) -> AsyncWriteSliceFuture
@@ -644,7 +645,7 @@ pub struct UdpSendToFuture {
 }
 
 impl AsyncUdpSocket {
-    pub fn bind(reactor: view<Reactor>, addr: SocketAddr) -> Result<AsyncUdpSocket, IoError>
+    pub fn bind(reactor: *mut Reactor, addr: SocketAddr) -> Result<AsyncUdpSocket, IoError>
     pub fn local_addr(self: view<AsyncUdpSocket>) -> SocketAddr
     pub fn send_to(self: view<AsyncUdpSocket>, src: *const u8, len: usize, target: SocketAddr) -> UdpSendToFuture
     pub fn recv_from(self: view<AsyncUdpSocket>, dst: *mut u8, cap: usize) -> UdpRecvFromFuture

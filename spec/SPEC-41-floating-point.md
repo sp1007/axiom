@@ -79,6 +79,8 @@ Every bit pattern $b$ belongs to exactly one of the five `FpCategory` states:
    - If the decimal magnitude of a literal exceeds `T.MAX` (i.e. $\ge (2 - 2^{-24}) \cdot 2^{128}$ for `f32` or $\ge (2 - 2^{-53}) \cdot 2^{1024}$ for `f64`), `typeck` emits `AX_TYPE_LITERAL_OUT_OF_RANGE` (`63u32`); programmers writing infinity must use `f32.INFINITY` / `f64.INFINITY` (or `1.0 / 0.0`). Non-zero literals smaller than half the minimum subnormal underflow to signed zero (`+0.0` or `-0.0`).
 4. **Compile-time constant representation (`SPEC-04 AXS-EXT-024`)**:
    - In `compiler/types/types.ax` and `compiler/mir/mir.ax`, floating-point constants use `CONST_FLOAT` / `MIR_CONST_FLOAT` storing the exact IEEE-754 bit pattern in `u64` (`bits: u64`, where `f32` occupies the low 32 bits `bits & 0xFFFF_FFFFu64` and `f64` occupies all 64 bits) together with `ty: TypeId` (`TY_F32` or `TY_F64`).
+   - **Array lengths are integer constant expressions** (triage 2026-11-25, `T458b` QA follow-up 3): an array length `[N]T` must fold with the integer constant folder; an expression that contains a float-typed subexpression — including an integer constant derived from a float, e.g. `const N: usize = 2.0 as usize` — is a valid `usize` constant *value* but is rejected as an array length with `AX_TYPE_ARRAY_SIZE`.
+   - **`@thread_local` float initializers** must be a float literal or a negated float literal (scalar or inside an aggregate) until `T499d` evaluates TLS initializers through the constant-evaluation session; any other float expression (e.g. `0.5 * 2.0`) is `AX_TYPE_INVALID_TLS_DECL` (`T458b` decision D2).
 
 ### AXS-FLT-004 — Associated Constants & Classification API (`std.core.float`, `T460`)
 
