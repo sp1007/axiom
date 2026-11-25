@@ -2120,7 +2120,7 @@
 | REQ-CONC-129 | concurrency | v1-full | Spawning a multi-threaded task MUST require captured values to implement Send, emitting diagnostic AX_SEND_0001 if unsatisfied. | 0160 §26 | - | T402 |
 | REQ-CONC-130 | concurrency | v1-full | Spawning a thread-local task (spawn_local) MUST NOT require captured values to implement Send. | 0160 §26 | - | T421 |
 | REQ-CONC-131 | concurrency | v1-full | The compiler MUST treat Send (ownership transfer across contexts) and Share (safe concurrent sharing) as distinct semantic properties. | 0160 §27 | - | T400 |
-| REQ-CAP-071 | capability | v1-full | Capabilities originating from unsafe blocks MUST establish trusted preconditions and remain subject to normal capability conflict verification. | 0160 §28 | - | T502 |
+| REQ-CAP-071 | capability | v1-full | Capabilities originating from unsafe blocks MUST establish trusted preconditions and remain subject to normal capability conflict verification. | 0160 §28 | - | T542 |
 | REQ-DRP-032 | drop | v1-core | Drop analysis MUST be performed after ownership analysis, dropping live local variables in reverse declaration order by default. | 0160 §29 | - | T113 | 
 | REQ-DRP-033 | drop | v1-core | The compiler MUST automatically emit drop cleanup operations for live variables along all early return and exit paths. | 0160 §30 | - | T113 | 
 | REQ-DRP-034 | drop | v1-core | Dropping a partially moved composite value MUST only drop unmoved fields and MUST NOT drop fields that have already been moved. | 0160 §31 | - | T113 | 

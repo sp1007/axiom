@@ -6,7 +6,7 @@ owner: axiom-qa
 reviewer: axiom-architect
 model: sonnet
 gate_model: sonnet
-depends: [T501, T502, T503, T504]
+depends: [T501, T502, T503, T504, T542]
 priority: 154
 status: todo
 attempts: 0
@@ -38,3 +38,4 @@ Certify E13.1 exit criteria with an end-to-end conformance suite covering `unsaf
 
 ## Log
 - 2026-11-03 01:58:00 created by T213 (P13 phase planning)
+- 2026-11-26 architect: depends on T542 (oracle UB-06 capability-alias detector split from T502; the suite covers aliasing rules)
