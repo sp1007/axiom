@@ -3949,6 +3949,11 @@ pub const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x00000040u32;
 pub const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x00000080u32;
 pub const IMAGE_SCN_LNK_INFO: u32 = 0x00000200u32;
 pub const IMAGE_SCN_LNK_REMOVE: u32 = 0x00000800u32;
+// PE/COFF spec: the section has more relocations than the 16-bit NumberOfRelocations field holds.
+// NumberOfRelocations is then 0xFFFF and the VirtualAddress of the first relocation entry holds the
+// real entry count, that first (placeholder) entry included (T461a).
+pub const IMAGE_SCN_LNK_NRELOC_OVFL: u32 = 0x01000000u32;
+pub const COFF_NRELOC_OVFL_MARK: u16 = 0xFFFFu16;
 
 pub const IMAGE_SCN_ALIGN_1BYTES: u32 = 0x00100000u32;
 pub const IMAGE_SCN_ALIGN_2BYTES: u32 = 0x00200000u32;
@@ -4225,6 +4230,38 @@ pub fn coff_decode_relocation(buf: *const u8, off: usize) -> CoffRelocation {
         symbol_table_index: coff_read_u32_le(buf, off + 4),
         reloc_type: coff_read_u16_le(buf, off + 8),
     }
+}
+
+// The real relocation entries of one COFF section: `count` entries of COFF_RELOC_SIZE bytes starting
+// at file offset `start`. Handles IMAGE_SCN_LNK_NRELOC_OVFL (T461a); `ok` is false when the overflow
+// header entry is missing or malformed (the caller reports a bad object).
+pub struct CoffRelocSpan {
+    pub start: usize,
+    pub count: usize,
+    pub ok: bool,
+}
+
+pub fn coff_section_reloc_span(buf: *const u8, buf_len: usize, shdr: view<CoffSectionHeader>) -> CoffRelocSpan {
+    let n16: u16 = shdr.number_of_relocations;
+    let ptr: usize = shdr.pointer_to_relocations as usize;
+    let ovfl: bool = (shdr.characteristics & IMAGE_SCN_LNK_NRELOC_OVFL) != 0u32;
+    if !ovfl || n16 != COFF_NRELOC_OVFL_MARK {
+        return CoffRelocSpan { start: ptr, count: n16 as usize, ok: true };
+    }
+    if ptr + COFF_RELOC_SIZE > buf_len {
+        return CoffRelocSpan { start: ptr, count: 0, ok: false };
+    }
+    let total: usize = coff_read_u32_le(buf, ptr) as usize;
+    if total == 0 {
+        return CoffRelocSpan { start: ptr, count: 0, ok: false };
+    }
+    CoffRelocSpan { start: ptr + COFF_RELOC_SIZE, count: total - 1, ok: true }
+}
+
+// Number of relocation table entries the writer emits for `rlen` relocations (one extra
+// placeholder entry when the count overflows the 16-bit header field).
+pub fn coff_reloc_entries(rlen: usize) -> usize {
+    if rlen >= (COFF_NRELOC_OVFL_MARK as usize) { rlen + 1 } else { rlen }
 }
 
 pub fn coff_decode_symbol_record(buf: *const u8, off: usize) -> CoffSymbolRecord {
@@ -5369,6 +5406,9 @@ use compiler.obj.coff.objmodel_get_symbol
 use compiler.obj.coff.section_reloc_at
 use compiler.obj.coff.coff_mul_usize
 use compiler.obj.coff.coff_mul_u32
+use compiler.obj.coff.coff_reloc_entries
+use compiler.obj.coff.IMAGE_SCN_LNK_NRELOC_OVFL
+use compiler.obj.coff.COFF_NRELOC_OVFL_MARK
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 @intrinsic fn align_of<T>() -> usize { 0 }
@@ -5418,11 +5458,17 @@ fn compute_strtab_size(model: view<ObjModel>) -> u32 {
 // Appends the complete deterministic Windows x64 COFF relocatable object (.obj)
 // binary image for `model` into `out`.
 pub fn coff_write_to_buf(model: view<ObjModel>, out: mut_view<CoffBuf>) -> bool {
+    // COFF format limits (T461a): fail instead of writing a truncated object. A false return is
+    // reported by the driver as a failed object emission; no broken file is produced.
+    if model.sections_len > 65279 {
+        return false;
+    }
     let num_sections: u32 = model.sections_len as u32;
     let num_symbols: u32 = model.symbols_len as u32;
 
     let size_of_headers: u32 = (COFF_FILE_HEADER_SIZE as u32) + coff_mul_u32(COFF_SECTION_HEADER_SIZE as u32, num_sections);
-    let mut current_offset: u32 = size_of_headers;
+    // File offsets are 32-bit: sum in u64 and refuse objects that do not fit.
+    let mut current_offset64: u64 = size_of_headers as u64;
 
     let mut i: u32 = 1u32;
     while i <= num_sections {
@@ -5430,17 +5476,16 @@ pub fn coff_write_to_buf(model: view<ObjModel>, out: mut_view<CoffBuf>) -> bool 
         if sec as usize != 0 {
             let blen = unsafe { (*sec).bytes_len };
             let rlen = unsafe { (*sec).relocs_len };
-            if blen > 0 {
-                current_offset = current_offset + (blen as u32);
-            }
-            if rlen > 0 {
-                current_offset = current_offset + coff_mul_u32(rlen as u32, COFF_RELOC_SIZE as u32);
+            current_offset64 = current_offset64 + (blen as u64);
+            current_offset64 = current_offset64 + (coff_reloc_entries(rlen) as u64) * (COFF_RELOC_SIZE as u64);
+            if current_offset64 > 0xFFFFFFFFu64 {
+                return false;
             }
         }
         i = i + 1u32;
     }
 
-    let symbol_table_offset: u32 = current_offset;
+    let symbol_table_offset: u32 = current_offset64 as u32;
     let strtab_size: u32 = compute_strtab_size(model);
     let total_size: usize = (symbol_table_offset as usize) + coff_mul_usize(num_symbols as usize, COFF_SYMBOL_SIZE) + (strtab_size as usize);
     coff_buf_reserve(mut_view(*out), total_size);
@@ -5491,15 +5536,25 @@ pub fn coff_write_to_buf(model: view<ObjModel>, out: mut_view<CoffBuf>) -> bool 
             0u32
         };
 
+        let rentries: usize = coff_reloc_entries(rlen);
         let ptr_to_relocs: u32 = if rlen > 0 {
             let off = running_offset;
-            running_offset = running_offset + coff_mul_u32(rlen as u32, COFF_RELOC_SIZE as u32);
+            running_offset = running_offset + ((rentries as u64) * (COFF_RELOC_SIZE as u64)) as u32;
             off
         } else {
             0u32
         };
 
-        let chars = coff_section_characteristics(sec_kind, sec_flags, sec_align);
+        // More than 0xFFFE relocations: NumberOfRelocations = 0xFFFF plus IMAGE_SCN_LNK_NRELOC_OVFL,
+        // the real count goes into the first relocation entry (T461a; truncating `rlen as u16`
+        // silently dropped relocations and produced images with unpatched `call rel32 = 0`).
+        let ovfl: bool = rentries != rlen;
+        let chars = if ovfl {
+            coff_section_characteristics(sec_kind, sec_flags, sec_align) | IMAGE_SCN_LNK_NRELOC_OVFL
+        } else {
+            coff_section_characteristics(sec_kind, sec_flags, sec_align)
+        };
+        let nrel16: u16 = if ovfl { COFF_NRELOC_OVFL_MARK } else { rlen as u16 };
 
         coff_buf_put_u32(mut_view(*out), 0u32); // VirtualSize
         coff_buf_put_u32(mut_view(*out), 0u32); // VirtualAddress
@@ -5507,7 +5562,7 @@ pub fn coff_write_to_buf(model: view<ObjModel>, out: mut_view<CoffBuf>) -> bool 
         coff_buf_put_u32(mut_view(*out), ptr_to_raw_data);
         coff_buf_put_u32(mut_view(*out), ptr_to_relocs);
         coff_buf_put_u32(mut_view(*out), 0u32); // PointerToLinenumbers
-        coff_buf_put_u16(mut_view(*out), rlen as u16); // NumberOfRelocations
+        coff_buf_put_u16(mut_view(*out), nrel16); // NumberOfRelocations
         coff_buf_put_u16(mut_view(*out), 0u16); // NumberOfLinenumbers
         coff_buf_put_u32(mut_view(*out), chars);
 
@@ -5559,6 +5614,14 @@ pub fn coff_write_to_buf(model: view<ObjModel>, out: mut_view<CoffBuf>) -> bool 
         }
 
         if rlen > 0 {
+            let rentries: usize = coff_reloc_entries(rlen);
+            if rentries != rlen {
+                // Overflow placeholder entry: VirtualAddress = entry count (itself included),
+                // SymbolTableIndex = 0, Type = IMAGE_REL_AMD64_ABSOLUTE (0).
+                coff_buf_put_u32(mut_view(*out), rentries as u32);
+                coff_buf_put_u32(mut_view(*out), 0u32);
+                coff_buf_put_u16(mut_view(*out), 0u16);
+            }
             let mut r: usize = 0;
             while r < rlen {
                 let rel = section_reloc_at(unsafe { view(*sec) }, r);
@@ -10585,6 +10648,7 @@ use compiler.obj.coff.CoffArchiveMember
 use compiler.obj.coff.COFF_FILE_HEADER_SIZE
 use compiler.obj.coff.COFF_SECTION_HEADER_SIZE
 use compiler.obj.coff.COFF_RELOC_SIZE
+use compiler.obj.coff.coff_section_reloc_span
 use compiler.obj.coff.COFF_SYMBOL_SIZE
 use compiler.obj.coff.COFF_ARCHIVE_MAGIC_SIZE
 use compiler.obj.coff.COFF_ARCHIVE_MEMBER_HEADER_SIZE
@@ -11516,11 +11580,13 @@ pub fn linker_load_coff_object_ex(
     s = 0;
     while s < num_secs {
         let shdr = coff_decode_section_header(obj_ptr, COFF_FILE_HEADER_SIZE + coff_mul_usize(s, COFF_SECTION_HEADER_SIZE));
-        let num_rels: usize = shdr.number_of_relocations as usize;
-        if num_rels > 0 {
-            let rel_table_off: usize = shdr.pointer_to_relocations as usize;
+        // T461a: IMAGE_SCN_LNK_NRELOC_OVFL sections carry more than 0xFFFE relocations.
+        let rspan = coff_section_reloc_span(obj_ptr, obj_len, view(shdr));
+        let num_rels: usize = rspan.count;
+        if num_rels > 0 || !rspan.ok {
+            let rel_table_off: usize = rspan.start;
             let rel_table_end: usize = rel_table_off + coff_mul_usize(num_rels, COFF_RELOC_SIZE);
-            if rel_table_end > obj_len {
+            if !rspan.ok || rel_table_end > obj_len {
                 unsafe {
                     free_sym_target_arrays(sym_secs, sym_offs, sym_names_cap);
                     heap_free(sym_names as *mut u8, coff_mul_usize(sym_names_cap, size_of<*const u8>()), align_of<*const u8>());
@@ -15363,11 +15429,13 @@ pub fn linker_load_coff_object_v2(
     s = 0;
     while s < num_secs {
         let shdr = coff_decode_section_header(obj_ptr, COFF_FILE_HEADER_SIZE + coff_mul_usize(s, COFF_SECTION_HEADER_SIZE));
-        let num_rels: usize = shdr.number_of_relocations as usize;
-        if num_rels > 0 {
-            let rel_table_off: usize = shdr.pointer_to_relocations as usize;
+        // T461a: IMAGE_SCN_LNK_NRELOC_OVFL sections carry more than 0xFFFE relocations.
+        let rspan = coff_section_reloc_span(obj_ptr, obj_len, view(shdr));
+        let num_rels: usize = rspan.count;
+        if num_rels > 0 || !rspan.ok {
+            let rel_table_off: usize = rspan.start;
             let rel_table_end: usize = rel_table_off + coff_mul_usize(num_rels, COFF_RELOC_SIZE);
-            if rel_table_end > obj_len {
+            if !rspan.ok || rel_table_end > obj_len {
                 unsafe {
                     heap_free(cands as *mut u8, coff_mul_usize(sym_names_cap, 4), 4);
                     free_sym_target_arrays(sym_secs, sym_offs, sym_names_cap);

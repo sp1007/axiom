@@ -8,7 +8,7 @@ model: opus
 gate_model: sonnet
 depends: []
 priority: 70
-status: doing
+status: done
 attempts: 1
 timeout_min: 300
 paths: [tests/build_native/large_program]
@@ -16,7 +16,7 @@ locks: [compiler/backend, compiler/lir, compiler/link, compiler/obj]
 spec: [spec/SPEC-00-bootstrap.md, spec/SPEC-27-separate-compilation-linker-v2.md]
 covers: [REQ-GEN-027, REQ-LAY-129]
 started: 2026-11-26 04:21:47
-agent: T461a-impl
+finished: 2026-11-26 05:56:42
 ---
 # T461a — Large native programs must run
 
@@ -46,3 +46,4 @@ relocation or jump-table offset; `.rdata` constant pool or string table growth; 
 ## Log
 - 2026-11-26 created by architect (`_workspaces/reports/unblock-T428a.md`, triage of T461-qa.md N4)
 - 2026-11-26 04:21:47 started (attempt 1) T461a-impl
+- 2026-11-26 05:56:42 accepted by QA -> done
