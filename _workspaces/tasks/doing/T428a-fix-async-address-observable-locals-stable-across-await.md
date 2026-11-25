@@ -8,13 +8,15 @@ model: opus
 gate_model: opus
 depends: []
 priority: 15
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 300
 paths: [tests/run/async/addr_stable_locals, tests/conformance/p11/e11_6_async_io/direct_slice_io_async_locals.ax]
 locks: [compiler/mir/async_lower.ax, compiler/mir/drop.ax, tests/conformance/p11/e11_6_async_io/tcp_framing_split.ax]
 spec: [spec/decisions/ADR-0050-async-address-observable-locals-in-place.md, spec/SPEC-33-async.md, spec/SPEC-35-async-io.md]
 covers: [REQ-ASY-122, REQ-ASY-047, REQ-ASY-157]
+started: 2026-11-25 19:38:31
+agent: T428a-impl
 ---
 # T428a — Address-observable `async fn` locals must be stable across `.await`
 
@@ -72,3 +74,4 @@ simplification. Layout packing must not overlap such a field with another live f
 
 ## Log
 - 2026-11-25 created by architect (triage after T428 accept, `_workspaces/reports/triage-2026-11-25-T428.md`)
+- 2026-11-25 19:38:31 started (attempt 1) T428a-impl

@@ -1,0 +1,254 @@
+module std.math.trig_core
+
+// std.math.trig_core (T461, SPEC-41 AXS-FLT-063): sin, cos, tan and sincos.
+//
+// Range reduction is Payne-Hanek for every |x| > pi/4: the exact product of the 53-bit significand of x with a
+// 192-bit window of the binary expansion of 2/pi (std.math.tables.TWO_OVER_PI) gives the quadrant n mod 4 and the
+// fraction to more than 150 bits, from which the reduced argument y (|y| <= pi/4, a double-double) is formed. There
+// is no Cody-Waite shortcut, so one code path covers 2^-1074 .. 2^1023 and a result near a multiple of pi/2 keeps
+// full relative accuracy. The kernels are Taylor series of y in double-double (14 and 15 terms); sin and cos are
+// within 0.51 ulp and tan, the quotient of two double-doubles, within 0.51 ulp.
+
+use std.core.float.to_bits_f64
+use std.math.dd.Dd
+use std.math.dd.dd_add
+use std.math.dd.dd_neg
+use std.math.dd.dd_mul
+use std.math.dd.dd_sqr
+use std.math.dd.dd_div
+use std.math.dd.fast_two_sum
+use std.math.dd.pow2
+use std.math.tables.SINC
+use std.math.tables.COSC
+use std.math.tables.PIO2_DD
+use std.math.tables.TWO_OVER_PI
+
+pub struct PioReduced {
+    pub n: i32,
+    pub y: Dd,
+}
+
+pub struct SinCos {
+    pub s: Dd,
+    pub c: Dd,
+}
+
+// ---- 256-bit helpers (four u64 limbs, l3 most significant) --------------------------------------
+
+@derive(Copy)
+struct Limbs {
+    l0: u64,
+    l1: u64,
+    l2: u64,
+    l3: u64,
+}
+
+fn shl_limbs(x: Limbs, sh: u32) -> Limbs {
+    let mut a0 = x.l0;
+    let mut a1 = x.l1;
+    let mut a2 = x.l2;
+    let mut a3 = x.l3;
+    let mut rest = sh;
+    while rest >= 64u32 {
+        a3 = a2;
+        a2 = a1;
+        a1 = a0;
+        a0 = 0u64;
+        rest = rest - 64u32;
+    }
+    if rest > 0u32 {
+        let back = 64u32 - rest;
+        a3 = (a3 << rest) | (a2 >> back);
+        a2 = (a2 << rest) | (a1 >> back);
+        a1 = (a1 << rest) | (a0 >> back);
+        a0 = a0 << rest;
+    }
+    Limbs { l0: a0, l1: a1, l2: a2, l3: a3 }
+}
+
+// The 64 bits of 2/pi that start at bit offset 64 q + r (0-based) plus 64 k.
+fn window_word(q: usize, r: u32, k: usize) -> u64 {
+    let a = TWO_OVER_PI[q + k];
+    if r == 0u32 {
+        return a;
+    }
+    let b = TWO_OVER_PI[q + k + 1];
+    (a << r) | (b >> (64u32 - r))
+}
+
+// u128 (1 << 64) + a - b - borrow, returned as (limb, borrow out).
+fn sub_borrow(a: u64, b: u64, borrow: u64) -> Limbs {
+    let top = 1u128 << 64u32;
+    let d = top + (a as u128) - (b as u128) - (borrow as u128);
+    let limb = (d & 0xFFFF_FFFF_FFFF_FFFFu128) as u64;
+    let out = if (d >> 64u32) == 0u128 { 1u64 } else { 0u64 };
+    Limbs { l0: limb, l1: out, l2: 0u64, l3: 0u64 }
+}
+
+// x = n pi/2 + y with |y| <= pi/4 (as a double-double), n taken mod 4. x is finite with |x| >= pi/4.
+pub fn reduce_pio2(x: f64) -> PioReduced {
+    let b = to_bits_f64(x);
+    let neg = (b >> 63u32) != 0u64;
+    let field = ((b >> 52u32) & 0x7FFu64) as i32;
+    let m = (b & 0x000F_FFFF_FFFF_FFFFu64) | 0x0010_0000_0000_0000u64;
+    let e = field - 1075;
+    let mut j0: i32 = 1;
+    if e >= 2 {
+        j0 = e - 1;
+    }
+    let o = j0 - 1;
+    let q = (o >> 6u32) as usize;
+    let r = (o & 63) as u32;
+    let w0 = window_word(q, r, 0usize);
+    let w1 = window_word(q, r, 1usize);
+    let w2 = window_word(q, r, 2usize);
+    // 256-bit product of m (53 bits) and the 192-bit window.
+    let mask = 0xFFFF_FFFF_FFFF_FFFFu128;
+    let mm = m as u128;
+    let p2 = mm * (w2 as u128);
+    let p1 = mm * (w1 as u128);
+    let p0 = mm * (w0 as u128);
+    let l0 = (p2 & mask) as u64;
+    let t1 = p1 + (p2 >> 64u32);
+    let l1 = (t1 & mask) as u64;
+    let t2 = p0 + (t1 >> 64u32);
+    let l2 = (t2 & mask) as u64;
+    let l3 = (t2 >> 64u32) as u64;
+    // The product has s = j0 + 191 - e fractional bits. Shift left by 254 - s: the two top bits are then the
+    // integer part mod 4 and the rest is the fraction (254 bits).
+    let s = j0 + 191 - e;
+    let sh = (254 - s) as u32;
+    let sr = shl_limbs(Limbs { l0: l0, l1: l1, l2: l2, l3: l3 }, sh);
+    let mut n = (sr.l3 >> 62u32) as i32;
+    let top_mask = (1u64 << 62u32) - 1u64;
+    let mut f0 = sr.l0;
+    let mut f1 = sr.l1;
+    let mut f2 = sr.l2;
+    let mut f3 = sr.l3 & top_mask;
+    let mut negf = false;
+    if ((f3 >> 61u32) & 1u64) != 0u64 {
+        // fraction >= 1/2: use 1 - fraction and the next quadrant.
+        n = (n + 1) & 3;
+        negf = true;
+        let d0 = sub_borrow(0u64, f0, 0u64);
+        let d1 = sub_borrow(0u64, f1, d0.l1);
+        let d2 = sub_borrow(0u64, f2, d1.l1);
+        f0 = d0.l0;
+        f1 = d1.l0;
+        f2 = d2.l0;
+        f3 = (1u64 << 62u32) - f3 - d2.l1;
+    }
+    let mut yd = Dd { hi: 0.0, lo: 0.0 };
+    if f3 != 0u64 || f2 != 0u64 || f1 != 0u64 || f0 != 0u64 {
+        let mut lz: u32 = 0u32;
+        if f3 != 0u64 {
+            lz = f3.leading_zeros();
+        } else if f2 != 0u64 {
+            lz = 64u32 + f2.leading_zeros();
+        } else if f1 != 0u64 {
+            lz = 128u32 + f1.leading_zeros();
+        } else {
+            lz = 192u32 + f0.leading_zeros();
+        }
+        let nr = shl_limbs(Limbs { l0: f0, l1: f1, l2: f2, l3: f3 }, lz);
+        let a = nr.l3;
+        let bb = nr.l2;
+        let scale_exp = -(62 + (lz as i32));
+        let hi = ((a >> 11u32) as f64) * pow2(scale_exp + 11);
+        let low11 = (a & 0x7FFu64) as f64;
+        let lo = (low11 * 18446744073709551616.0 + (bb as f64)) * pow2(scale_exp - 64);
+        yd = fast_two_sum(hi, lo);
+        if negf {
+            yd = dd_neg(yd);
+        }
+    }
+    let mut y = dd_mul(yd, PIO2_DD);
+    if neg {
+        n = (4 - n) & 3;
+        y = dd_neg(y);
+    }
+    PioReduced { n: n, y: y }
+}
+
+// ---- kernels on |y| <= pi/4 ---------------------------------------------------------------------
+
+pub fn sin_k(y: Dd) -> Dd {
+    let z = dd_sqr(y);
+    let mut acc = SINC[13];
+    let mut k: i32 = 12;
+    while k >= 0 {
+        acc = dd_add(dd_mul(acc, z), SINC[k as usize]);
+        k = k - 1;
+    }
+    dd_mul(acc, y)
+}
+
+pub fn cos_k(y: Dd) -> Dd {
+    let z = dd_sqr(y);
+    let mut acc = COSC[14];
+    let mut k: i32 = 13;
+    while k >= 0 {
+        acc = dd_add(dd_mul(acc, z), COSC[k as usize]);
+        k = k - 1;
+    }
+    acc
+}
+
+// (sin, cos) of a finite double as double-doubles.
+pub fn sincos_dd(x: f64) -> SinCos {
+    if x.abs() <= 0.7853981633974483 {
+        let y = Dd { hi: x, lo: 0.0 };
+        return SinCos { s: sin_k(y), c: cos_k(y) };
+    }
+    let red = reduce_pio2(x);
+    let s = sin_k(red.y);
+    let c = cos_k(red.y);
+    if red.n == 0 {
+        SinCos { s: s, c: c }
+    } else if red.n == 1 {
+        SinCos { s: c, c: dd_neg(s) }
+    } else if red.n == 2 {
+        SinCos { s: dd_neg(s), c: dd_neg(c) }
+    } else {
+        SinCos { s: dd_neg(c), c: s }
+    }
+}
+
+pub fn sin(x: f64) -> f64 {
+    if x != x || x.is_infinite() {
+        return f64.NAN;
+    }
+    if x == 0.0 {
+        return x;
+    }
+    sincos_dd(x).s.hi
+}
+
+pub fn cos(x: f64) -> f64 {
+    if x != x || x.is_infinite() {
+        return f64.NAN;
+    }
+    sincos_dd(x).c.hi
+}
+
+pub fn tan(x: f64) -> f64 {
+    if x != x || x.is_infinite() {
+        return f64.NAN;
+    }
+    if x == 0.0 {
+        return x;
+    }
+    let sc = sincos_dd(x);
+    dd_div(sc.s, sc.c).hi
+}
+
+pub fn sincos(x: f64) -> (f64, f64) {
+    if x != x || x.is_infinite() {
+        return (f64.NAN, f64.NAN);
+    }
+    if x == 0.0 {
+        return (x, 1.0);
+    }
+    let sc = sincos_dd(x);
+    (sc.s.hi, sc.c.hi)
+}

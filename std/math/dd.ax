@@ -1,0 +1,220 @@
+module std.math.dd
+
+// std.math.dd (T461, SPEC-41 AXS-FLT-060): double-double arithmetic and exact power-of-two scaling, the
+// building blocks of every elementary function in std.math.
+//
+// A Dd is an unevaluated sum hi + lo with |lo| <= ulp(hi) / 2; the operations below keep about 100 bits.
+// Only IEEE-754 double operations (+ - * / and the sqrt intrinsic) are used, with no fused multiply-add, so the
+// MIR interpreter and the native x86-64 code give the same bits (AXS-FLT-014). Veltkamp/Dekker splitting
+// multiplies by 2^27 + 1 and overflows above 2^996, so callers keep operands inside [2^-900, 2^900].
+
+use std.core.float.to_bits_f64
+use std.core.float.from_bits_f64
+use std.core.float.sqrt_f64
+
+@derive(Copy)
+pub struct Dd {
+    pub hi: f64,
+    pub lo: f64,
+}
+
+pub fn dd_new(hi: f64, lo: f64) -> Dd {
+    Dd { hi: hi, lo: lo }
+}
+
+// ---- error-free transformations ----------------------------------------------------------------
+
+pub fn two_sum(a: f64, b: f64) -> Dd {
+    let s = a + b;
+    let bb = s - a;
+    let e = (a - (s - bb)) + (b - bb);
+    Dd { hi: s, lo: e }
+}
+
+// Requires |a| >= |b| (or a == 0).
+pub fn fast_two_sum(a: f64, b: f64) -> Dd {
+    let s = a + b;
+    let e = b - (s - a);
+    Dd { hi: s, lo: e }
+}
+
+pub fn two_prod(a: f64, b: f64) -> Dd {
+    let p = a * b;
+    let c: f64 = 134217729.0;
+    let ca = c * a;
+    let ah = ca - (ca - a);
+    let al = a - ah;
+    let cb = c * b;
+    let bh = cb - (cb - b);
+    let bl = b - bh;
+    let e = ((ah * bh - p) + ah * bl + al * bh) + al * bl;
+    Dd { hi: p, lo: e }
+}
+
+// ---- double-double operations ------------------------------------------------------------------
+
+pub fn dd_add(x: Dd, y: Dd) -> Dd {
+    let s = two_sum(x.hi, y.hi);
+    let t = two_sum(x.lo, y.lo);
+    let e1 = s.lo + t.hi;
+    let u = fast_two_sum(s.hi, e1);
+    let e2 = u.lo + t.lo;
+    fast_two_sum(u.hi, e2)
+}
+
+pub fn dd_add_d(x: Dd, d: f64) -> Dd {
+    let s = two_sum(x.hi, d);
+    let e = s.lo + x.lo;
+    fast_two_sum(s.hi, e)
+}
+
+pub fn dd_neg(x: Dd) -> Dd {
+    Dd { hi: -x.hi, lo: -x.lo }
+}
+
+pub fn dd_mul(x: Dd, y: Dd) -> Dd {
+    let p = two_prod(x.hi, y.hi);
+    let e = p.lo + (x.hi * y.lo + x.lo * y.hi);
+    fast_two_sum(p.hi, e)
+}
+
+pub fn dd_mul_d(x: Dd, d: f64) -> Dd {
+    let p = two_prod(x.hi, d);
+    let e = p.lo + x.lo * d;
+    fast_two_sum(p.hi, e)
+}
+
+pub fn dd_sqr(x: Dd) -> Dd {
+    let p = two_prod(x.hi, x.hi);
+    let e = p.lo + 2.0 * x.hi * x.lo;
+    fast_two_sum(p.hi, e)
+}
+
+pub fn dd_div(x: Dd, y: Dd) -> Dd {
+    let q1 = x.hi / y.hi;
+    let r1 = dd_add(x, dd_neg(dd_mul_d(y, q1)));
+    let q2 = r1.hi / y.hi;
+    let r2 = dd_add(r1, dd_neg(dd_mul_d(y, q2)));
+    let q3 = r2.hi / y.hi;
+    let q = fast_two_sum(q1, q2);
+    dd_add_d(q, q3)
+}
+
+pub fn dd_div_d(x: Dd, d: f64) -> Dd {
+    let q1 = x.hi / d;
+    let p1 = two_prod(q1, d);
+    let r1 = dd_add(x, Dd { hi: -p1.hi, lo: -p1.lo });
+    let q2 = r1.hi / d;
+    let p2 = two_prod(q2, d);
+    let r2 = dd_add(r1, Dd { hi: -p2.hi, lo: -p2.lo });
+    let q3 = r2.hi / d;
+    let q = fast_two_sum(q1, q2);
+    dd_add_d(q, q3)
+}
+
+pub fn dd_sqrt(x: Dd) -> Dd {
+    if x.hi == 0.0 {
+        return Dd { hi: 0.0, lo: 0.0 };
+    }
+    let s = sqrt_f64(x.hi);
+    let p = two_prod(s, s);
+    let d = ((x.hi - p.hi) - p.lo) + x.lo;
+    let lo = d / (2.0 * s);
+    fast_two_sum(s, lo)
+}
+
+// Multiplication by a power of two (exact while nothing underflows).
+pub fn dd_scale(x: Dd, p2: f64) -> Dd {
+    Dd { hi: x.hi * p2, lo: x.lo * p2 }
+}
+
+// ---- exponent helpers --------------------------------------------------------------------------
+
+// 2^n for -1022 <= n <= 1023.
+pub fn pow2(n: i32) -> f64 {
+    from_bits_f64(((n + 1023) as u64) << 52u32)
+}
+
+// Unbiased exponent field of a positive normal double.
+pub fn exponent_of(x: f64) -> i32 {
+    (((to_bits_f64(x) >> 52u32) & 0x7FFu64) as i32) - 1023
+}
+
+// x * 2^n with a single rounding, also for results that overflow or turn subnormal (musl scale2).
+pub fn scale2(x: f64, n: i32) -> f64 {
+    let mut v = x;
+    let mut e = n;
+    if e > 1023 {
+        let big = from_bits_f64(0x7FE0_0000_0000_0000u64);
+        v = v * big;
+        e = e - 1023;
+        if e > 1023 {
+            v = v * big;
+            e = e - 1023;
+            if e > 1023 {
+                e = 1023;
+            }
+        }
+    } else if e < -1022 {
+        // 2^-1022 * 2^53 = 2^-969
+        let small = from_bits_f64(0x0360_0000_0000_0000u64);
+        v = v * small;
+        e = e + 969;
+        if e < -1022 {
+            v = v * small;
+            e = e + 969;
+            if e < -1022 {
+                e = -1022;
+            }
+        }
+    }
+    v * pow2(e)
+}
+
+// (x.hi + x.lo) * 2^n rounded once to double, also when the result is subnormal: the plain scaling of x.hi would
+// round twice (to 53 bits, then to the subnormal grid). Requires x normalised (|lo| <= ulp(hi) / 2) and x.hi normal.
+pub fn scale_dd(x: Dd, n: i32) -> f64 {
+    let a = x.hi.abs();
+    if a == 0.0 {
+        return x.hi;
+    }
+    let top = exponent_of(a) + n;
+    if top >= -1022 {
+        return scale2(x.hi, n);
+    }
+    let neg = x.hi < 0.0;
+    if top < -1075 {
+        if neg {
+            return -0.0;
+        }
+        return 0.0;
+    }
+    // The result is a multiple of 2^-1074: q is the value in units of that grid, qh + ql with qh < 2^52.
+    let sh = n + 1074;
+    let mut lo = x.lo;
+    if neg {
+        lo = -lo;
+    }
+    let qh = scale2(a, sh);
+    let ql = scale2(lo, sh);
+    let t0 = qh.floor();
+    let fr = qh - t0;
+    let mut t = t0 as u64;
+    let mut up = false;
+    if fr > 0.5 {
+        up = true;
+    } else if fr == 0.5 {
+        if ql > 0.0 {
+            up = true;
+        } else if ql == 0.0 {
+            up = (t & 1u64) != 0u64;
+        }
+    }
+    if up {
+        t = t + 1u64;
+    }
+    if neg {
+        return from_bits_f64(t | 0x8000_0000_0000_0000u64);
+    }
+    from_bits_f64(t)
+}

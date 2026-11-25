@@ -1,0 +1,296 @@
+module std.math.pow_core
+
+// std.math.pow_core (T461, SPEC-41 AXS-FLT-063/064): powf, powi, cbrt and hypot.
+//
+//  * powf(x, y) = 2^(y log2 |x|): the logarithm is a double-double (std.math.log_core), the product with y stays a
+//    double-double and exp2_dd (std.math.exp_core) finishes it, so the error is far below 1 ulp even when
+//    |y log2 x| is close to 1000. The IEEE-754 special-value table is applied first.
+//  * powi(x, n) multiplies in double-double with the exponent of the partial products kept in a separate integer,
+//    so nothing overflows or underflows early and n < 0 is a reciprocal of the double-double result.
+//  * cbrt: Newton iterations in double followed by one double-double correction step.
+//  * hypot: scaled sqrt(x^2 + y^2) with the sum of squares exact in double-double.
+
+use std.core.float.to_bits_f64
+use std.core.float.from_bits_f64
+use std.core.float.copysign_f64
+use std.math.dd.Dd
+use std.math.dd.two_sum
+use std.math.dd.two_prod
+use std.math.dd.dd_add
+use std.math.dd.dd_add_d
+use std.math.dd.dd_neg
+use std.math.dd.dd_mul
+use std.math.dd.dd_mul_d
+use std.math.dd.dd_sqr
+use std.math.dd.dd_div
+use std.math.dd.dd_sqrt
+use std.math.dd.dd_scale
+use std.math.dd.pow2
+use std.math.dd.exponent_of
+use std.math.dd.scale2
+use std.math.dd.scale_dd
+use std.math.exp_core.exp2_dd
+use std.math.log_core.log_dd
+use std.math.tables.LOG2E_DD
+
+const TWO_53: f64 = 9007199254740992.0;
+const TWO_54: f64 = 18014398509481984.0;
+const MIN_NORMAL: f64 = 2.2250738585072014e-308;
+
+fn is_integer(y: f64) -> bool {
+    y.abs() >= TWO_53 || y == y.floor()
+}
+
+fn is_odd_integer(y: f64) -> bool {
+    if y.abs() >= TWO_53 {
+        return false;
+    }
+    if y != y.floor() {
+        return false;
+    }
+    ((y as i64) & 1i64) != 0i64
+}
+
+pub fn powf(x: f64, y: f64) -> f64 {
+    if y == 0.0 {
+        return 1.0;
+    }
+    if x == 1.0 {
+        return 1.0;
+    }
+    if x != x || y != y {
+        return x + y;
+    }
+    let ax = x.abs();
+    let xneg = (to_bits_f64(x) >> 63u32) != 0u64;
+    if y == f64.INFINITY || y == f64.NEG_INFINITY {
+        if ax == 1.0 {
+            return 1.0;
+        }
+        if (ax < 1.0) == (y > 0.0) {
+            return 0.0;
+        }
+        return f64.INFINITY;
+    }
+    if x == 0.0 {
+        let odd = is_odd_integer(y);
+        if y < 0.0 {
+            if odd {
+                return copysign_f64(f64.INFINITY, x);
+            }
+            return f64.INFINITY;
+        }
+        if odd {
+            return copysign_f64(0.0, x);
+        }
+        return 0.0;
+    }
+    if ax == f64.INFINITY {
+        let odd = is_odd_integer(y);
+        if x > 0.0 {
+            if y > 0.0 {
+                return f64.INFINITY;
+            }
+            return 0.0;
+        }
+        if y < 0.0 {
+            if odd {
+                return -0.0;
+            }
+            return 0.0;
+        }
+        if odd {
+            return f64.NEG_INFINITY;
+        }
+        return f64.INFINITY;
+    }
+    let mut negate = false;
+    if xneg {
+        if !is_integer(y) {
+            return f64.NAN;
+        }
+        negate = is_odd_integer(y);
+    }
+    let mut r: f64 = 1.0;
+    if ax != 1.0 {
+        let lg = dd_mul(log_dd(ax), LOG2E_DD);
+        if y.abs() > 1.0e18 {
+            if (lg.hi > 0.0) == (y > 0.0) {
+                r = f64.INFINITY;
+            } else {
+                r = 0.0;
+            }
+        } else {
+            let t = dd_mul_d(lg, y);
+            if t.hi > 1024.0 {
+                r = f64.INFINITY;
+            } else if t.hi < -1080.0 {
+                r = 0.0;
+            } else {
+                r = exp2_dd(t);
+            }
+        }
+    }
+    if negate {
+        -r
+    } else {
+        r
+    }
+}
+
+// ---- powi -------------------------------------------------------------------------------------
+
+struct Scaled {
+    m: Dd,
+    e: i64,
+}
+
+// Moves the exponent of m.hi into e so that m.hi stays in [1, 2).
+fn renorm(m: Dd, e: i64) -> Scaled {
+    let d = exponent_of(m.hi);
+    Scaled { m: dd_scale(m, pow2(-d)), e: e + (d as i64) }
+}
+
+pub fn powi(x: f64, n: i32) -> f64 {
+    if n == 0 {
+        return 1.0;
+    }
+    if x != x {
+        return x + x;
+    }
+    let odd = (n & 1) != 0;
+    let xneg = (to_bits_f64(x) >> 63u32) != 0u64;
+    let neg_result = xneg && odd;
+    let mut ax = x.abs();
+    if ax == 0.0 {
+        let mut z: f64 = 0.0;
+        if n < 0 {
+            z = f64.INFINITY;
+        }
+        return if neg_result { -z } else { z };
+    }
+    if ax == f64.INFINITY {
+        let mut z: f64 = f64.INFINITY;
+        if n < 0 {
+            z = 0.0;
+        }
+        return if neg_result { -z } else { z };
+    }
+    let mut e0: i64 = 0;
+    if ax < MIN_NORMAL {
+        ax = ax * TWO_54;
+        e0 = -54;
+    }
+    let d0 = exponent_of(ax);
+    let base0 = Scaled { m: Dd { hi: scale2(ax, -d0), lo: 0.0 }, e: e0 + (d0 as i64) };
+    let mut cnt: i64 = n as i64;
+    if cnt < 0 {
+        cnt = -cnt;
+    }
+    let mut rm = Dd { hi: 1.0, lo: 0.0 };
+    let mut re: i64 = 0;
+    let mut bm = base0.m;
+    let mut be = base0.e;
+    while cnt > 0 {
+        if (cnt & 1i64) != 0i64 {
+            let t = renorm(dd_mul(rm, bm), re + be);
+            rm = t.m;
+            re = t.e;
+        }
+        cnt = cnt >> 1u32;
+        if cnt > 0 {
+            let u = renorm(dd_sqr(bm), be * 2);
+            bm = u.m;
+            be = u.e;
+        }
+    }
+    if n < 0 {
+        rm = dd_div(Dd { hi: 1.0, lo: 0.0 }, rm);
+        re = -re;
+    }
+    if re > 4000 {
+        re = 4000;
+    }
+    if re < -4000 {
+        re = -4000;
+    }
+    let r = scale_dd(rm, re as i32);
+    if neg_result {
+        -r
+    } else {
+        r
+    }
+}
+
+// ---- cbrt -------------------------------------------------------------------------------------
+
+pub fn cbrt(x: f64) -> f64 {
+    if x != x {
+        return x + x;
+    }
+    if x == 0.0 || x.abs() == f64.INFINITY {
+        return x;
+    }
+    let mut a = x.abs();
+    let mut e: i32 = 0;
+    if a < MIN_NORMAL {
+        a = a * TWO_54;
+        e = -54;
+    }
+    let ex = exponent_of(a);
+    let mut q = ex / 3;
+    if ex < 0 && ex % 3 != 0 {
+        q = q - 1;
+    }
+    let a_s = scale2(a, -3 * q);
+    let mut y = from_bits_f64(to_bits_f64(a_s) / 3u64 + 0x2AA0_0000_0000_0000u64);
+    let mut i: i32 = 0;
+    while i < 4 {
+        y = y - (y * y * y - a_s) / (3.0 * y * y);
+        i = i + 1;
+    }
+    let y2 = two_prod(y, y);
+    let y3 = dd_mul_d(y2, y);
+    let r = dd_add_d(dd_neg(y3), a_s);
+    let delta = r.hi / (3.0 * y2.hi);
+    let yy = two_sum(y, delta);
+    let res = scale2(yy.hi, q + e / 3);
+    copysign_f64(res, x)
+}
+
+// ---- hypot ------------------------------------------------------------------------------------
+
+pub fn hypot(x: f64, y: f64) -> f64 {
+    let ax = x.abs();
+    let ay = y.abs();
+    if ax == f64.INFINITY || ay == f64.INFINITY {
+        return f64.INFINITY;
+    }
+    if x != x || y != y {
+        return x + y;
+    }
+    let mut hi = ax;
+    let mut lo = ay;
+    if ay > ax {
+        hi = ay;
+        lo = ax;
+    }
+    if lo == 0.0 {
+        return hi;
+    }
+    if hi > lo * TWO_54 {
+        return hi;
+    }
+    let mut e: i32 = 0;
+    if hi < MIN_NORMAL {
+        hi = hi * TWO_54;
+        lo = lo * TWO_54;
+        e = -54;
+    }
+    let d = exponent_of(hi);
+    let hs = scale2(hi, -d);
+    let ls = scale2(lo, -d);
+    let s = dd_add(dd_sqr(Dd { hi: hs, lo: 0.0 }), dd_sqr(Dd { hi: ls, lo: 0.0 }));
+    let r = dd_sqrt(s);
+    scale_dd(r, d + e)
+}
