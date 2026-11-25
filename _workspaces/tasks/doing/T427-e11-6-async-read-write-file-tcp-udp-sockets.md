@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T426]
 priority: 150
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [std/io/async_io.ax, std/fs/async_file.ax, std/net, tests/std/async/io]
 locks: [std/io/io.ax, std/fs/fs.ax, std/sys/windows/iocp.ax]
 spec: [spec/SPEC-35-async-io.md, 0221, tasks/0335, tasks/0438, tasks/0441, tasks/0461]
 covers: [REQ-ASY-152, REQ-CONC-152, REQ-ASY-157]
+started: 2026-11-25 11:01:59
+agent: axiom-stdlib
 ---
 # T427 — E11.6 — Unified AsyncRead/AsyncWrite, AsyncFile & loopback AsyncTcp/Udp sockets
 
@@ -41,3 +43,4 @@ Implement `AsyncRead`/`AsyncWrite`, `AsyncFile`, and `std.net` (`AsyncTcpListene
 
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
+- 2026-11-25 11:01:59 started (attempt 1) axiom-stdlib

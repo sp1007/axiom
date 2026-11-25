@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T458, T459, T501]
 priority: 149
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/types, compiler/mir, tests/mir/float_intrinsics, tests/ui/float_intrinsics, tests/mir/float_interp, tests/opt/float_strict]
 locks: [compiler/verify/verifier.ax, compiler/interp, compiler/opt, compiler/lir, compiler/target/x64, compiler/backend/session.ax]
 spec: [spec/SPEC-41-floating-point.md, spec/SPEC-04-core-extensibility.md, spec/decisions/ADR-0049-float-intrinsics-minimal-set.md]
 covers: [REQ-SIMD-106]
+started: 2026-11-25 09:03:59
+finished: 2026-11-25 11:48:06
 ---
 # T458a — E12.2 — Float intrinsics: registration, MIR, oracle and native lowering
 
@@ -62,3 +64,5 @@ each with suffix `_f32` / `_f64`) and gets the same bits from `--interp` and fro
 
 ## Log
 - 2026-11-24 created by architect (unblock T458, ADR-0049)
+- 2026-11-25 09:03:59 started (attempt 1) axiom-semantics
+- 2026-11-25 11:48:06 accepted by QA -> done
