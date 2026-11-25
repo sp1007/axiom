@@ -14,6 +14,7 @@ paths: [tests/ui/security_profiles]
 locks: [compiler/types/typeck.ax, compiler/own/unsafe.ax, _workspaces/baseline-failures.txt]
 spec: [spec/SPEC-53-safety-profiles-capability-security.md, spec/SPEC-50-unsafe-ub-ffi.md, spec/decisions/ADR-0001-fixed-address-declarations.md]
 covers: [REQ-CAP-010, REQ-OWNER-008]
+started: 2026-11-26 01:42:36
 ---
 # T540 — Baseline fix: safety_profile_safe_neg vs the T501 `@addr` placement rule
 
@@ -49,3 +50,5 @@ bootstrap rejection (T526 already owns the `@addr` UI tests).
 
 ## Log
 - 2026-11-25 created by architect (triage after T427 accept, `_workspaces/reports/triage-2026-11-25-T427.md`)
+- 2026-11-26 01:42:36 started (attempt 1) T540-impl
+- 2026-11-26 01:42:45 requeue: orchestrator: baseline-failures.txt has an uncommitted edit from blocked T428a (and its unblock); wait (not charged: attempt refunded)

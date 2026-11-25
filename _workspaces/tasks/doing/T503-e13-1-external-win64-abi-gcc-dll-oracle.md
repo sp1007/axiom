@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T500, T459, T501]
 priority: 152
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tests/ffi/win64_abi_oracle, tests/mc/isel]
 spec: [spec/SPEC-50-unsafe-ub-ffi.md, spec/decisions/ADR-0034-oracle-independence.md, 0181, 0104]
 covers: [REQ-ABI-009, REQ-ABI-010, REQ-ABI-022, REQ-ABI-045, REQ-ABI-047, REQ-ABI-048, REQ-ABI-050, REQ-ABI-054, REQ-ABI-066, REQ-ABI-069, REQ-ABI-070, REQ-ABI-071, REQ-ABI-072, REQ-ABI-074, REQ-ABI-075, REQ-ABI-076, REQ-ABI-077, REQ-ABI-079, REQ-ABI-080, REQ-ABI-081, REQ-ABI-082, REQ-ABI-084, REQ-ABI-085, REQ-ABI-089, REQ-ABI-090, REQ-RES-142, REQ-RES-143, REQ-RES-164, REQ-RES-165, REQ-RES-166, REQ-ABI-092, REQ-ABI-094, REQ-ABI-104]
+started: 2026-11-26 01:42:51
+agent: T503-impl
 ---
 # T503 — E13.1 — External Windows x64 ABI oracle (gcc DLL 1..8 mixed args, 1..24B structs, offsetof table; ADR-0034 §8 OI-12)
 
@@ -41,3 +43,4 @@ Implement the ADR-0034 §8 (audit 2026-10-19 OI-12) external Windows x64 ABI ora
 
 ## Log
 - 2026-11-03 01:58:00 created by T213 (P13 phase planning)
+- 2026-11-26 01:42:51 started (attempt 1) T503-impl

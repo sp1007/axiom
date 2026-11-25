@@ -8,15 +8,15 @@ model: opus
 gate_model: opus
 depends: []
 priority: 15
-status: doing
-attempts: 1
+status: todo
+attempts: 0
 timeout_min: 300
 paths: [tests/run/async/addr_stable_locals, tests/conformance/p11/e11_6_async_io/direct_slice_io_async_locals.ax]
-locks: [compiler/mir/async_lower.ax, compiler/mir/drop.ax, tests/conformance/p11/e11_6_async_io/tcp_framing_split.ax]
+locks: [compiler/mir/async_lower.ax, compiler/mir/drop.ax, std/async/task.ax, tests/std/async/executor, tests/std/async/structured, tests/std/async/waker, tests/std/async/waker_qa, tests/conformance/p11/e11_5_executors, tests/conformance/p11/e11_6_async_io, tests/perf/p11_executor, _workspaces/baseline-failures.txt]
 spec: [spec/decisions/ADR-0050-async-address-observable-locals-in-place.md, spec/SPEC-33-async.md, spec/SPEC-35-async-io.md]
 covers: [REQ-ASY-122, REQ-ASY-047, REQ-ASY-157]
 started: 2026-11-25 19:38:31
-agent: T428a-impl
+unblocks: 1
 ---
 # T428a — Address-observable `async fn` locals must be stable across `.await`
 
@@ -75,3 +75,5 @@ simplification. Layout packing must not overlap such a field with another live f
 ## Log
 - 2026-11-25 created by architect (triage after T428 accept, `_workspaces/reports/triage-2026-11-25-T428.md`)
 - 2026-11-25 19:38:31 started (attempt 1) T428a-impl
+- 2026-11-26 01:42:03 block: round-1 fix done; taskgate fails on 2 e11_5 tests (spawn_affinity_vs_migration, fiber_in_async_and_threads) that cannot compile on live std: std.io vs std.text.string String/string_new collision when std.thread.spawn + executor imported; pre-existing (hidden by stale bundles); needs baseline entry + fix task
+- 2026-11-26 04:17:41 unblocked (cycle 1) 

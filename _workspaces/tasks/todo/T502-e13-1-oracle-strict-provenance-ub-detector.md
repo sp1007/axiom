@@ -8,11 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T501]
 priority: 152
-status: todo
-attempts: 0
+status: blocked
+attempts: 1
 paths: [compiler/interp, tests/run/unsafe/oracle_ub]
 spec: [spec/SPEC-50-unsafe-ub-ffi.md, 0071, 0044, tasks/0339]
 covers: [REQ-OWNER-008, REQ-CAP-001, REQ-CAP-002, REQ-CAP-005, REQ-CAP-007, REQ-CAP-019, REQ-CAP-037, REQ-CAP-038, REQ-CAP-041, REQ-CAP-048, REQ-FFI-027, REQ-FFI-038, REQ-FFI-044, REQ-FFI-045, REQ-CAP-059, REQ-CAP-071, REQ-CAP-078, REQ-CAP-084, REQ-CAP-087, REQ-CAP-088, REQ-CAP-091, REQ-CAP-095, REQ-CAP-098, REQ-CAP-103, REQ-CAP-111, REQ-FFI-085, REQ-FFI-088, REQ-CAP-124, REQ-CAP-126, REQ-CAP-133, REQ-MIR-142, REQ-CAP-145, REQ-FFI-128]
+started: 2026-11-26 00:15:38
 ---
 # T502 — E13.1 — Oracle strict-provenance & UB detector (use-after-free, unaligned, uninit, REQ-OWNER-008 round-trip)
 
@@ -40,3 +41,5 @@ Extend the MIR oracle (`--interp`) with strict pointer provenance tags, determin
 
 ## Log
 - 2026-11-03 01:58:00 created by T213 (P13 phase planning)
+- 2026-11-26 00:15:38 started (attempt 1) T502-impl
+- 2026-11-26 04:21:34 block: impl done; gate fails selfhost/obj_link_driver/qa_obj_link_driver_smoke: new UB detector flags real OOB read in compiler/target/x64/frame.ax (slot_offsets alloc n*4, x64_frame_has_meta probes 5 words past); one-line fix outside T502 paths

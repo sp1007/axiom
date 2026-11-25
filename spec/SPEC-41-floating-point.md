@@ -72,6 +72,7 @@ Every bit pattern $b$ belongs to exactly one of the five `FpCategory` states:
    - An unsuffixed floating-point literal (`1.5`, `0.5`, `6.0`, `1e-5`) receives a fresh floating-point inference variable `TY_FLOAT_VAR` (`Infer.FloatVar`).
    - `FloatVar` unifies with `f32` or `f64` from its surrounding typing context (type annotation, parameter type, return type, struct/array/tuple element type, or peer operand in a numeric expression per `§4`).
    - Any `FloatVar` remaining unconstrained at the end of the enclosing item/function body defaults deterministically to **`f64`** (`tasks/0331 §63`, `tasks/0427 §24`).
+   - **Literal method receivers (`ADR-0051`)**: when the receiver of a method call, field access or associated-item access (`recv.name(..)`, `recv.name`) still has an unconstrained `FloatVar` (or `IntVar`) type at lookup time, typeck applies the default (`f64` / `i32`) to it before the lookup. `1.0.exp()` is `exp` on `f64`; `1.max(2)` is `max` on `i32`; `1.max(2i64)` is `AX_TYPE_MISMATCH` (write `1i64.max(2i64)`). A receiver already constrained by its context keeps that type.
    - Unifying a `FloatVar` with a non-floating-point type (outside the `REQ-OWNER-007` promotion rules where the peer is promoted *to* the float type, `§4`) emits `AX_TYPE_MISMATCH`.
 3. **Exact round-to-nearest-even decimal-to-binary conversion (`SPEC-01 §11`, `ANUM-44`)**:
    - Once the target type (`f32` or `f64`) of a float literal is known, the compiler converts the exact decimal rational value $d = m \cdot 10^k$ to the target IEEE-754 binary format using **roundTiesToEven** (Clinger / Eisel–Lemire algorithm with exact multiprecision fallback).
@@ -223,7 +224,7 @@ Every floating-point type `T` in `{f32, f64}` (`self: f32` in `impl f32`, `self:
 3. `pub fn trunc(self: f32) -> f32` / `pub fn trunc(self: f64) -> f64`: integral floating-point value nearest to $self$ whose magnitude is $\le |self|$ (`roundTowardZero`). For $x \in (-1.0, 0.0)$, `(-0.5).trunc() == -0.0`.
 4. `pub fn round(self: f32) -> f32` / `pub fn round(self: f64) -> f64`: integral floating-point value nearest to $self$, rounding half-way cases **away from zero** (`roundTiesToAway`: `2.5.round() == 3.0`, `(-2.5).round() == -3.0`, `(-0.4).round() == -0.0`).
 5. `pub fn round_ties_even(self: f32) -> f32` / `pub fn round_ties_even(self: f64) -> f64`: integral floating-point value nearest to $self$, rounding half-way cases to the **even** integer (`roundTiesToEven`: `2.5.round_ties_even() == 2.0`, `3.5.round_ties_even() == 4.0`, `(-2.5).round_ties_even() == -2.0`).
-6. `pub fn fract(self: f32) -> f32` / `pub fn fract(self: f64) -> f64`: fractional part `self - self.trunc()` (`NaN` for `±inf` and `NaN`, `+0.0` for `+0.0`, `-0.0` for `-0.0` in `self - self.trunc()` or sign-preserving zero).
+6. `pub fn fract(self: f32) -> f32` / `pub fn fract(self: f64) -> f64`: fractional part, defined as exactly the IEEE-754 value of `self - self.trunc()` under `roundTiesToEven` (`NaN` for `±inf` and `NaN`). Consequently every zero result is `+0.0`: `fract(+0.0) == +0.0`, `fract(-0.0) == +0.0`, `fract(-3.0) == +0.0`; a non-zero result carries the sign of `self`. (`modf` in `AXS-FLT-062` is the sign-carrying variant.) [T460-qa.md follow-up 3, unblock-T428a 2026-11-26]
 7. `pub fn next_up(self: f32) -> f32` / `pub fn next_up(self: f64) -> f64` and `pub fn next_down(self: f32) -> f32` / `pub fn next_down(self: f64) -> f64` (IEEE-754 `nextUp` / `nextDown`):
    - `next_up`: smallest representable value strictly greater than `self` (`(-0.0).next_up() == (+0.0).next_up() == MIN_POSITIVE_SUBNORMAL`, `(-inf).next_up() == MIN`, `MAX.next_up() == +inf`, `(+inf).next_up() == +inf`, `NaN.next_up() == NaN`).
    - `next_down`: largest representable value strictly less than `self` (`(+0.0).next_down() == (-0.0).next_down() == -MIN_POSITIVE_SUBNORMAL`, `(+inf).next_down() == MAX`, `MIN.next_down() == -inf`, `(-inf).next_down() == -inf`, `NaN.next_down() == NaN`).
@@ -674,9 +675,11 @@ Normative guarantees:
    - For every finite `x: f64`, `parse_f64(format_f64(x).as_str()).unwrap().to_bits() == x.to_bits()`.
    - Among all decimal strings that round back to `x` under `roundTiesToEven`, `format_f32` / `format_f64` selects the shortest significand (using Ryu / Dragonbox / Grisu-exact interval refinement), breaking ties in favor of the even last digit.
    - Whole-number finite values in decimal notation include `.0` in `Debug` / canonical float mode (e.g., `1.0`, `-0.0`, `42.0`) so floating-point outputs remain visually distinct from integers.
+   - Notation thresholds (normative, pinned by the T460 vectors; equal to Rust's `Debug`): a finite `x` with `x == ±0.0` or `1e-4 <= |x| < 1e16` is written in plain decimal (`0.0001`, `123.5`, `1e15` as `1000000000000000.0`); every other finite `x` is written `[-]d[.ddd]e[-]N` with the shortest significand digits, no `+` sign and no padding in the exponent (`1e16`, `1.5e-5`, `-2.5e300`). [T460-qa.md D1]
 2. **Fixed-Precision Mode (`format_f64_fixed(val, precision)`)**:
    - Rounds `val` to `precision` digits after the decimal point using IEEE-754 `roundTiesToEven` (halfway to even), not round-half-away-from-zero.
    - When `precision == 0`, no decimal point or fractional digits are emitted.
+   - The sign is that of `val`, also when the rounded digits are all zero: `format_f64_fixed(-0.001, 2) == "-0.00"`, `format_f64_fixed(-0.0, 1) == "-0.0"` (as C `printf` and Rust). [T460-qa.md follow-up 3]
 3. **Scientific Notation Mode (`format_f64_exp(val, precision)`)**:
    - Emits `[-]d.dddde±dd` with one non-zero leading decimal digit (or `0` when `val == ±0.0`), `precision` fractional digits, lowercase `'e'`, explicit `'+'` or `'-'` exponent sign, and at least two exponent digits (or minimum necessary digits without leading padding if specified by the format spec).
 
@@ -684,8 +687,12 @@ Normative guarantees:
 
 `std.text.fmt.float` provides exact decimal-to-binary parsing functions:
 
-- `pub fn parse_f32(s: Str) -> Result<f32, ParseFloatError>`
-- `pub fn parse_f64(s: Str) -> Result<f64, ParseFloatError>`
+- `pub fn parse_f32(bytes: view<[u8]>) -> Result<f32, ParseFloatError>`
+- `pub fn parse_f64(bytes: view<[u8]>) -> Result<f64, ParseFloatError>`
+- `pub fn parse_f32_str(s: view<String>) -> Result<f32, ParseFloatError>` / `pub fn parse_f64_str(s: view<String>) -> Result<f64, ParseFloatError>`
+- `pub unsafe fn parse_f32_raw(text: *const u8, count: usize) -> Result<f32, ParseFloatError>` / `parse_f64_raw` (same contract; `text` valid for `count` bytes)
+
+The primary input is a byte view (UTF-8 text), like the integer parsers of `std.text.fmt.int`, because `Str` is not indexable in the bootstrap language. When `Str` gains indexing, `parse_f32(s: Str)` / `parse_f64(s: Str)` overloads-by-name are **not** added (no overloading, `REQ-RES-074`); a `Str` form is then added as `parse_f64_s` only if needed. All forms accept exactly the grammar below. [T460-qa.md D2, unblock-T428a 2026-11-26]
 
 ```axiom
 pub enum ParseFloatError {
@@ -757,7 +764,7 @@ The following operations MUST be exact ($\le 0.5\text{ ULP}$, correctly rounded 
    - `next_up(x) -> T`, `next_down(x) -> T` — adjacent IEEE-754 floating-point values (`AXS-FLT-015`).
 3. **Euclidean Division & Remainder**:
    - `div_euclid(a, b) -> T` — returns integer quotient $q$ such that $a = q \cdot b + r$ with $0.0 \le r < |b|$.
-   - `rem_euclid(a, b) -> T` — returns non-negative remainder $r \in [0.0, |b|)$ (returns `NaN` if `b == 0.0` or either input is `NaN`).
+   - `rem_euclid(a, b) -> T` — returns the non-negative remainder computed as `r = a % b; if r < 0 { r + |b| } else { r }` (one rounding at the final addition). Mathematically $r \in [0.0, |b|)$, but the rounded result is in $[0.0, |b|]$: it equals `|b|` exactly when `a` is negative and $|a \bmod b|$ is below half an ULP of `|b|` (e.g. `rem_euclid(-1e-20, 3.0) == 3.0`, as Rust). Returns `NaN` if `b == 0.0` or either input is `NaN`. `div_euclid` is consistent with this `r`. [T461-qa.md N3, unblock-T428a 2026-11-26]
 4. **Linear Interpolation & Radian/Degree Scaling**:
    - `lerp(a, b, t) -> T` — computes $a + t \cdot (b - a)$ (monotonic, exact at $t = 0.0 \implies a$, and special-cased or two-term blended so $t = 1.0 \implies b$ for finite `a, b`).
    - `to_radians(deg) -> T` (`deg * (PI / 180.0)`), `to_degrees(rad) -> T` (`rad * (180.0 / PI)`).
@@ -776,6 +783,8 @@ The following operations MUST be exact ($\le 0.5\text{ ULP}$, correctly rounded 
 | Inverse Trigonometric | `asin(x)`, `acos(x)`, `atan(x)`, `atan2(y, x)` | Argument folding ($\|x\| > 0.5 \implies \sqrt{\frac{1 - \|x\|}{2}}$ for `asin`/`acos`; 4-interval octant reduction for `atan`/`atan2`) + Remez rational/polynomial kernel | $\le 1.0\text{ ULP}$ |
 | Hyperbolic | `sinh(x)`, `cosh(x)`, `tanh(x)`, `asinh(x)`, `acosh(x)`, `atanh(x)` | `expm1`-based evaluation for small $\|x\|$ to avoid catastrophic cancellation; `ln_1p`-based evaluation for inverse hyperbolics | $\le 1.5\text{ ULP}$ |
 | Error Functions | `erf(x)`, `erfc(x)` | Piecewise rational Chebyshev approximations on $[0, 0.84375]$, $[0.84375, 1.25]$, and asymptotic $e^{-x^2}/x$ expansion for large $\|x\|$ | $\le 1.5\text{ ULP}$ |
+
+`log(x, base)` is `ln(x) / ln(base)` for valid bases; `base == 1.0`, `base < 0.0`, `x < 0.0` or a `NaN` operand give `NaN` (base 1 is not a logarithm base, so the result is `NaN` rather than the `±inf` the plain quotient `ln(x)/0.0` would give). [T461-qa.md N3, unblock-T428a 2026-11-26]
 
 ### AXS-FLT-064 — IEEE-754 Special-Value Table for `std.math`
 
