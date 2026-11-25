@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T460]
 priority: 151
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [std/math, tests/std/math]
 locks: [std/core/prelude.ax]
 spec: [spec/SPEC-41-floating-point.md, spec/decisions/ADR-0049-float-intrinsics-minimal-set.md, tasks/0334, tasks/0338, tasks/0345, tasks/0469]
 covers: [REQ-SIMD-142, REQ-SIMD-143, REQ-SIMD-304, REQ-SIMD-305]
+started: 2026-11-25 18:48:43
+agent: T461-impl
 ---
 # T461 — E12.2 — std.math deterministic elementary & transcendental library
 
@@ -42,3 +44,4 @@ Implement `std/math/` in pure Axiom (zero CRT/libm dependency), delivering deter
 ## Log
 - 2026-11-03 00:30:00 created by T212 (P12 phase planning)
 - 2026-11-24 elementary operations re-export std.core.float (T460); float intrinsics and const tables come through T460's closure (T458a, T458b) (architect, unblock-T458, ADR-0049)
+- 2026-11-25 18:48:43 started (attempt 1) T461-impl

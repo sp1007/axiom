@@ -7,7 +7,7 @@ reviewer: axiom-architect
 model: sonnet
 gate_model: sonnet
 depends: [T449a]
-priority: 120
+priority: 25
 status: todo
 attempts: 0
 paths: [.claude/skills/axiom-tasks/scripts/bundles.py, tests/std/async/executor/gen_tests.py, tests/std/async/structured/gen_tests.py, tests/std/async/waker/gen_tests.py, tests/std/async/waker_qa/gen_tests.py, tests/std/channel/gen_tests.py, tests/std/fiber/gen_tests.py, tests/std/sync/gen_tests.py, tests/std/thread/native_panic_hook/gen_tests.py]
@@ -54,3 +54,4 @@ fixed once by T449a). This task removes the class of failure instead of re-fixin
 
 ## Log
 - 2026-11-25 created by architect (triage after T427 accept, `_workspaces/reports/triage-2026-11-25-T427.md`)
+- 2026-11-25 priority 120 -> 25 by architect (T428 triage: T428d/T428e/T428f edit std/async and wait for the harness-owned std bundle regeneration)

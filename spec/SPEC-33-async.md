@@ -54,6 +54,7 @@ From this separation, three hard invariants follow:
 1. **No `Pin<T>` in Core v1.0 (`REQ-ASY-047`, `REQ-ASY-121`)**: Axiom does not introduce `Pin<T>` or `Unpin` into the core type system. Because v1.0 forbids holding `view<T>` or `mut_view<T>` capabilities across `.await` suspension boundaries (`AXS-ASY-034`), compiler-generated state machines contain no raw self-referential pointers across states and remain safely relocatable by value move (`Move`) between polls unless an explicit address-observability contract is active.
 2. **No implicit semantic lifetime extension (`REQ-ASY-119`)**: The compiler never silently extends the semantic ownership or capability lifetime of a borrowed local variable to satisfy an async suspension; while the optimizer may adjust physical stack/frame slot lifetimes, semantic owner and capability rules are enforced strictly (`0135 §47`).
 3. **Explicit stable-address contract (`REQ-ASY-120`, `REQ-ASY-122`)**: When an asynchronous operation (such as an OS I/O completion port buffer, DMA transfer, or raw pointer derived via `address_of` / `address_of_mut`) requires a stable physical memory address across suspension, that requirement is represented as an explicit storage contract (`Box<T>`, `StableStorage<T>`, or reactor-owned buffer transfer in `SPEC-35`) (`REQ-ASY-120`). Once a storage location's address is observable (`address_observable == true`, `SPEC-71 AXS-ESC-004`), the compiler and optimizer MUST NOT relocate or promote that storage across `.await` in a way that violates address stability (`REQ-ASY-122`).
+4. **Address-observable async locals (`ADR-0050`, `REQ-ASY-122`, `SPEC-35 AXS-AIO-012` item 2)**: A local of an `async fn` whose address is observable and which is live across at least one `.await` lives in place in its state-machine field for its whole lifetime (`AXS-ASY-043` item 7), so a raw pointer to it (for example a slice I/O destination `address_of_mut(buf[0])`) stays valid across suspensions. Once such a future has been polled it must not be moved in memory; `std` executors and `block_on` never move a future after its first poll. Moving a polled future while a raw pointer into it is live is undefined behaviour of the `unsafe` code that created the pointer.
 
 **AXS-ASY-006** (Creation of a `Future` vs starting an external operation; `REQ-ASY-103`, `REQ-ASY-104`, `REQ-ASY-105`, `0135 §13`, `tasks/0297 §2`).
 1. Constructing a `Future` value is semantically distinct from starting an external asynchronous operation (`REQ-ASY-103`).
@@ -390,7 +391,7 @@ For each `__AsyncState_f`, `async_lower.ax` synthesizes the `Future.poll(self: m
 +------------------+
 ```
 
-The generated `poll` body enforces six state-transition invariants (`REQ-ASY-058`, `REQ-ASY-079`, `REQ-ASY-081`, `REQ-ASY-082`):
+The generated `poll` body enforces seven state-transition invariants (`REQ-ASY-058`, `REQ-ASY-079`, `REQ-ASY-081`, `REQ-ASY-082`):
 1. **Entry dispatch**: `bb_dispatch` reads `(*self).state_tag` and branches via `SwitchInt`:
    - `0u32`: moves/copies `(*self).param_i` into the function's parameter locals, sets `(*self).state_tag = 0xFFFF_FFFEu32` (so an unexpected panic during the synchronous segment knows the fields are currently owned by local frame variables rather than `*self`), and jumps to `bb0`.
    - `(k + 1) as u32` ($0 \le k < N$): jumps directly to `bb_poll_k`.
@@ -411,6 +412,10 @@ The generated `poll` body enforces six state-transition invariants (`REQ-ASY-058
    - If an assertion, arithmetic overflow trap, division by zero, bounds check, or explicit `panic(...)` fires while executing a synchronous segment inside `poll`, `(*self).state_tag` remains `0xFFFF_FFFEu32` (`STATE_PANICKED`) and the panic unwinds or aborts according to the active target panic profile (`SPEC-03`, `SPEC-30 AXS-CONC-006`).
 6. **Synchronization preservation (`REQ-ASY-082`)**:
    - Lowering preserves the exact `Ordering` and sequence of all `MIR_STMT_ATOMIC`, fences, channel operations, and host calls on both side of every `.await` transition.
+7. **Address-observable locals stay in place (`ADR-0050`, `AXS-ASY-005` item 4)**:
+   - A local $v \in \bigcup_k \text{LiveAcross}(SP_k)$ that is the base of an address-of or borrow rvalue anywhere in the body (conservative MIR test) is never saved/restored by items 2–3: every use of $v$ in every synchronous segment is rewritten to the place `(*self).live_v`, so its address is the same in every poll.
+   - Items 2–3 (move into `(*self).live_v` on suspension, move back on resume) apply only to the other live locals; an implementation may place all live-across-await locals in place.
+   - Layout packing (`AXS-ASY-041` item 2) never overlaps such a field with another field in a state where $v$ is initialized.
 
 **AXS-ASY-044** (State-derived cancellation `Drop` glue; `T088`, `REQ-ASY-009`, `REQ-ASY-013`, `REQ-ASY-018`, `REQ-ASY-034`, `REQ-ASY-052`, `REQ-ASY-073`, `REQ-ASY-080`, `REQ-ASY-110`, `REQ-ASY-111`, `REQ-ASY-114`, `0093 §24–25`, `0118 §173–174, §210 AASYNC-25, 29`, `0126 §69`, `0127 §21–22, §50, §64 AASYNC-29, 36`, `0135 §30–35, §62`, `0248 §28, §36–37`, `tasks/0619 §15–17`).
 1. **Cancellation is deterministic ownership destruction, not a panic or thread kill (`REQ-ASY-013`, `REQ-ASY-034`, `REQ-ASY-110`, `REQ-ASY-111`)**:

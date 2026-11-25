@@ -6,7 +6,7 @@ owner: axiom-qa
 reviewer: axiom-architect
 model: opus
 gate_model: opus
-depends: [T211, T088, T089, T090, T400, T401, T402, T403, T404, T405, T406, T407, T408, T409, T410, T411, T412, T413, T414, T415, T416, T417, T418, T419, T420, T421, T422, T423, T424, T425, T426, T427, T428, T429, T434, T435, T436, T430, T431, T432, T433, T438, T439, T440, T441, T442, T443, T444, T445, T446, T447, T448, T449, T421a, T422a, T422b, T422c, T444a, T444b, T444c, T164, T423a, T423b, T423c, T423d, T423e, T423f, T445a]
+depends: [T211, T088, T089, T090, T400, T401, T402, T403, T404, T405, T406, T407, T408, T409, T410, T411, T412, T413, T414, T415, T416, T417, T418, T419, T420, T421, T422, T423, T424, T425, T426, T427, T428, T429, T434, T435, T436, T430, T431, T432, T433, T438, T439, T440, T441, T442, T443, T444, T445, T446, T447, T448, T449, T421a, T422a, T422b, T422c, T444a, T444b, T444c, T164, T423a, T423b, T423c, T423d, T423e, T423f, T445a, T428a, T428b, T428c, T428d, T428e, T428f]
 priority: 311
 status: todo
 attempts: 0
@@ -22,6 +22,7 @@ Certify that phase P11 meets the exit criteria of every epic (`E11.1`–`E11.6`)
 ## Scope
 - Run the full suite on `axiomc2.exe` (`--exclude-requires axiom0-internal`) and run each P11 epic's exit-criterion conformance suite (`tests/conformance/p11/e11_1_concurrency` through `tests/conformance/p11/e11_6_async_io` and `tests/perf/p11_executor`).
 - Verify `python .claude/skills/axiom-tasks/scripts/reqcov.py --phase P11-concurrency-async` and `reqcov.py --strict`: every requirement mapped to P11 is implemented (`done`) with 0 gaps and 0 problems.
+- E11.6 direct forms: confirm that T428a–T428f replaced the T428 workarounds (F1–F8) with direct-form tests, and rewrite the "Implementation limits the tests are written around" section of `tests/conformance/p11/e11_6_async_io/README.md` to list only limits that remain (none expected).
 - Collect the phase conformance summary into `tests/conformance/p11/` and write the phase review `_workspaces/reports/phase-P11-review.md` (starting with a Vietnamese `## Tóm tắt` section).
 
 ## Acceptance
@@ -39,3 +40,4 @@ Certify that phase P11 meets the exit criteria of every epic (`E11.1`–`E11.6`)
 - 2026-10-06 02:23:54 covers += REQ-ASY-167, REQ-ASY-168 (metadata only)
 - 2026-11-03 00:10:00 updated depends to include T400-T428 in T211 (P11 phase planning)
 - 2026-11-13 07:40:00 depends += T434, T435, T436, T430, T431, T432, T433 (ADR-0041 baseline fix tasks; the phase gate runs `--no-cache` and needs an empty-or-admitted baseline)
+- 2026-11-25 depends += T428a, T428b, T428c, T428d, T428e, T428f (T428 follow-ups F1–F8: spec violations and interp/native divergences in async I/O; `_workspaces/reports/triage-2026-11-25-T428.md`)
