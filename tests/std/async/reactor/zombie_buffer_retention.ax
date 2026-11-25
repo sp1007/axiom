@@ -1,0 +1,120 @@
+// test: run
+// modes: interp native
+// timeout: 60
+// covers: REQ-ASY-158
+// stdout: OK zombie_buffer_retention 1 1 0 0 0 1\n
+
+module test.zombie_buffer_retention
+
+use std.core.prelude.Future
+use std.core.prelude.Poll
+use std.core.prelude.Context
+use std.core.option.Option
+use std.core.host.heap_alloc
+use std.core.host.aio_tcp_bind
+use std.core.host.aio_submit_accept
+use std.core.host.aio_close
+use std.asyn.executor.LocalExecutor
+use std.asyn.reactor.Reactor
+use std.asyn.reactor.IoOpId
+use std.asyn.reactor.IoCompletion
+
+pub struct AbandonedIoFuture {
+    pub reactor: *mut Reactor,
+    pub op_id: IoOpId,
+    pub completed: bool,
+}
+
+impl Future for AbandonedIoFuture {
+    type Output = IoCompletion;
+
+    fn poll(self: mut_view<AbandonedIoFuture>, cx: mut_view<Context>) -> Poll<IoCompletion> {
+        let r = self.reactor;
+        match unsafe { (*r).poll_op(self.op_id, mut_view(*cx)) } {
+            Poll.Ready(c) => {
+                self.completed = true;
+                Poll.Ready(c)
+            },
+            Poll.Pending => Poll.Pending,
+        }
+    }
+}
+
+impl Drop for AbandonedIoFuture {
+    fn drop(self: mut_view<AbandonedIoFuture>) {
+        if !self.completed && (self.reactor as usize) != 0 {
+            // Mandatory Drop protocol (SPEC-35 AXS-AIO-005): transitions to CancellingZombie,
+            // retains owned buffer until OS completion, and issues host.aio_cancel.
+            let r = self.reactor;
+            unsafe { (*r).cancel_op(self.op_id); }
+        }
+    }
+}
+
+pub fn main() -> i32 {
+    let mut exec = LocalExecutor.new();
+    let r_ptr = exec.reactor;
+    let r_handle = unsafe { view(*r_ptr).os_handle() };
+
+    // Bind a loopback TCP listener and submit an accept that will stay pending (no client connects)
+    let listener = aio_tcp_bind(r_handle, 0x7F000001u32, 0u16);
+    if listener <= 0i64 {
+        print("ERR tcp_bind\n");
+        return 1i32;
+    }
+
+    // Allocate an owned buffer that MUST stay alive in the Reactor until the OS completion packet arrives
+    let owned_buf = unsafe { heap_alloc(64usize, 8usize) };
+    let op_id = aio_submit_accept(r_handle, listener);
+    if op_id <= 0i64 {
+        print("ERR submit_accept\n");
+        return 2i32;
+    }
+    let reg_id = unsafe {
+        mut_view(*r_ptr).register_op(op_id as u64, listener, owned_buf, 64usize, 0 as *mut u8, 0usize, true)
+    };
+
+    // Create Future and drop it immediately BEFORE completion!
+    {
+        let _fut = AbandonedIoFuture {
+            reactor: r_ptr,
+            op_id: reg_id,
+            completed: false,
+        };
+    }
+
+    // Right after Future drop (before aio_wait reaps the OS abort packet):
+    // in_flight == 1, zombie == 1, reclaimed == 0 (buffer is STILL pinned in Reactor!).
+    let inflight_before = unsafe { view(*r_ptr).in_flight_count() };
+    let zombie_before = unsafe { view(*r_ptr).zombie_count() };
+    let reclaimed_before = unsafe { view(*r_ptr).reclaimed_zombie_count() };
+
+    // Now turn the reactor to reap the CancelIoEx / ERROR_OPERATION_ABORTED completion packet.
+    let mut iters: usize = 0;
+    while unsafe { view(*r_ptr).in_flight_count() } > 0 && iters < 64 {
+        let _ = unsafe { mut_view(*r_ptr).turn(Option.Some(5_000_000u64)) };
+        iters = iters + 1;
+    }
+
+    let inflight_after = unsafe { view(*r_ptr).in_flight_count() };
+    let zombie_after = unsafe { view(*r_ptr).zombie_count() };
+    let reclaimed_after = unsafe { view(*r_ptr).reclaimed_zombie_count() };
+
+    let _ = aio_close(r_handle, listener);
+    mut_view(exec).shutdown();
+
+    print("OK zombie_buffer_retention ");
+    print_int(inflight_before as i64);
+    print(" ");
+    print_int(zombie_before as i64);
+    print(" ");
+    print_int(reclaimed_before as i64);
+    print(" ");
+    print_int(inflight_after as i64);
+    print(" ");
+    print_int(zombie_after as i64);
+    print(" ");
+    print_int(reclaimed_after as i64);
+    print("\n");
+    0i32
+}

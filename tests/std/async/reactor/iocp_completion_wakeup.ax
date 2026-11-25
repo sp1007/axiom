@@ -1,0 +1,168 @@
+// test: run
+// modes: interp native
+// timeout: 60
+// covers: REQ-ASY-153, REQ-ASY-158
+// stdout: OK iocp_completion_wakeup 11 AXIOM-IOCP!\n
+
+module test.iocp_completion_wakeup
+
+use std.core.prelude.Future
+use std.core.prelude.Poll
+use std.core.prelude.Context
+use std.core.result.Result
+use std.core.option.Option
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.core.host.remove
+use std.core.host.aio_file_open
+use std.core.host.aio_submit_write_at
+use std.core.host.aio_submit_read_at
+use std.core.host.aio_submit_flush
+use std.core.host.aio_close
+use std.asyn.executor.LocalExecutor
+use std.asyn.reactor.Reactor
+use std.asyn.reactor.IoOpId
+use std.asyn.reactor.IoCompletion
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+pub struct AioOpFuture {
+    pub reactor: *mut Reactor,
+    pub op_id: IoOpId,
+    pub completed: bool,
+}
+
+impl Future for AioOpFuture {
+    type Output = IoCompletion;
+
+    fn poll(self: mut_view<AioOpFuture>, cx: mut_view<Context>) -> Poll<IoCompletion> {
+        let r = self.reactor;
+        match unsafe { (*r).poll_op(self.op_id, mut_view(*cx)) } {
+            Poll.Ready(comp) => {
+                self.completed = true;
+                Poll.Ready(comp)
+            },
+            Poll.Pending => Poll.Pending,
+        }
+    }
+}
+
+impl Drop for AioOpFuture {
+    fn drop(self: mut_view<AioOpFuture>) {
+        if !self.completed && (self.reactor as usize) != 0 {
+            let r = self.reactor;
+            unsafe { (*r).cancel_op(self.op_id); }
+        }
+    }
+}
+
+pub fn main() -> i32 {
+    let mut exec = LocalExecutor.new();
+    let r_ptr = exec.reactor;
+    let r_handle = unsafe { view(*r_ptr).os_handle() };
+    if r_handle <= 0i64 {
+        print("ERR reactor_handle\n");
+        return 1i32;
+    }
+
+    // Wakeup check (PostQueuedCompletionStatus / oracle woken flag)
+    unsafe { view(*r_ptr).wake(); }
+    let _ = unsafe { mut_view(*r_ptr).poll_nonblocking() };
+
+    // "build/t426_iocp_test.bin" (24 bytes)
+    let path_bytes: [24]u8 = [
+        98u8, 117u8, 105u8, 108u8, 100u8, 47u8,
+        116u8, 52u8, 50u8, 54u8, 95u8,
+        105u8, 111u8, 99u8, 112u8, 95u8,
+        116u8, 101u8, 115u8, 116u8, 46u8,
+        98u8, 105u8, 110u8
+    ];
+    let path_len: usize = 24;
+    let path_ptr = unsafe { address_of(path_bytes[0]) };
+
+    // 1. Open file with FILE_FLAG_OVERLAPPED and bind to IOCP reactor
+    let fw = unsafe { aio_file_open(r_handle, path_ptr, path_len, 1u32) };
+    if fw <= 0i64 {
+        print("ERR open_write\n");
+        return 2i32;
+    }
+
+    // "AXIOM-IOCP!" (11 bytes)
+    let msg_bytes: [11]u8 = [
+        65u8, 88u8, 73u8, 79u8, 77u8, 45u8, 73u8, 79u8, 67u8, 80u8, 33u8
+    ];
+    let msg_len: usize = 11;
+    let wbuf = unsafe { heap_alloc(16usize, 8usize) };
+    let mut i: usize = 0;
+    while i < msg_len {
+        unsafe { *(wbuf + i) = msg_bytes[i]; }
+        i = i + 1;
+    }
+
+    let wop = unsafe { aio_submit_write_at(r_handle, fw, 0u64, wbuf as *const u8, msg_len) };
+    if wop <= 0i64 {
+        print("ERR submit_write\n");
+        return 3i32;
+    }
+    let w_id = unsafe { mut_view(*r_ptr).register_op(wop as u64, fw, wbuf, 16usize, 0 as *mut u8, 0usize, true) };
+    let w_fut = AioOpFuture { reactor: r_ptr, op_id: w_id, completed: false };
+    let w_comp = mut_view(exec).block_on(w_fut);
+    unsafe { heap_free(wbuf, 16usize, 8usize); }
+    if w_comp.result != 11i64 {
+        print("ERR write_len\n");
+        return 4i32;
+    }
+
+    // Flush and close write handle
+    let fop = aio_submit_flush(r_handle, fw);
+    if fop > 0i64 {
+        let f_id = unsafe { mut_view(*r_ptr).register_op(fop as u64, fw, 0 as *mut u8, 0usize, 0 as *mut u8, 0usize, false) };
+        let _ = mut_view(exec).block_on(AioOpFuture { reactor: r_ptr, op_id: f_id, completed: false });
+    }
+    let _ = aio_close(r_handle, fw);
+
+    // 2. Re-open for overlapped read and await IOCP completion wakeup inside LocalExecutor
+    let fr = unsafe { aio_file_open(r_handle, path_ptr, path_len, 0u32) };
+    if fr <= 0i64 {
+        print("ERR open_read\n");
+        return 5i32;
+    }
+    let rbuf = unsafe { heap_alloc(16usize, 8usize) };
+    let rop = unsafe { aio_submit_read_at(r_handle, fr, 0u64, rbuf, 16usize) };
+    if rop <= 0i64 {
+        print("ERR submit_read\n");
+        return 6i32;
+    }
+    let r_id = unsafe { mut_view(*r_ptr).register_op(rop as u64, fr, rbuf, 16usize, 0 as *mut u8, 0usize, true) };
+    let r_comp = mut_view(exec).block_on(AioOpFuture { reactor: r_ptr, op_id: r_id, completed: false });
+    let _ = aio_close(r_handle, fr);
+    let _ = unsafe { remove(path_ptr, path_len) };
+
+    if r_comp.result != 11i64 {
+        unsafe { heap_free(rbuf, 16usize, 8usize); }
+        print("ERR read_len\n");
+        return 7i32;
+    }
+
+    // Verify exact payload bytes
+    let mut ok = true;
+    i = 0;
+    while i < msg_len {
+        if (unsafe { *(rbuf + i) }) != msg_bytes[i] {
+            ok = false;
+        }
+        i = i + 1;
+    }
+    unsafe { heap_free(rbuf, 16usize, 8usize); }
+    mut_view(exec).shutdown();
+
+    if !ok {
+        print("ERR payload_mismatch\n");
+        return 8i32;
+    }
+
+    print("OK iocp_completion_wakeup ");
+    print_int(r_comp.result);
+    print(" AXIOM-IOCP!\n");
+    0i32
+}

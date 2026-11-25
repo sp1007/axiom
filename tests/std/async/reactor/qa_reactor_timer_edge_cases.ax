@@ -1,0 +1,303 @@
+// test: run
+// modes: interp native
+// timeout: 60
+// covers: REQ-ASY-153, REQ-ASY-154, REQ-ASY-158, REQ-ASY-159
+// stdout: OK qa_reactor_timer_edge_cases 1 1 1 1 1\n
+
+module test.qa_reactor_timer_edge_cases
+
+use std.core.prelude.Future
+use std.core.prelude.Poll
+use std.core.prelude.Context
+use std.core.option.Option
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.core.host.monotonic_ns
+use std.core.host.remove
+use std.core.host.aio_file_open
+use std.core.host.aio_submit_write_at
+use std.core.host.aio_submit_read_at
+use std.core.host.aio_tcp_bind
+use std.core.host.aio_submit_accept
+use std.core.host.aio_close
+use std.asyn.executor.LocalExecutor
+use std.asyn.reactor.Reactor
+use std.asyn.reactor.IoOpId
+use std.asyn.reactor.IoCompletion
+use std.asyn.timeout.Deadline
+use std.asyn.timer.SleepFuture
+use std.asyn.timer.sleep_until
+use std.asyn.timer.sleep_ns
+use std.asyn.timer.Interval
+use std.asyn.timer.MissedTickBehavior
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+pub struct TieLog {
+    pub ids: *mut u64,
+    pub len: usize,
+}
+
+pub struct TieTask {
+    pub id: u64,
+    pub fut: SleepFuture,
+    pub log: *mut TieLog,
+}
+
+impl Future for TieTask {
+    type Output = u64;
+
+    fn poll(self: mut_view<TieTask>, cx: mut_view<Context>) -> Poll<u64> {
+        match mut_view(self.fut).poll(mut_view(*cx)) {
+            Poll.Pending => Poll.Pending,
+            Poll.Ready(_) => {
+                unsafe {
+                    let idx = (*self.log).len;
+                    *((*self.log).ids + idx) = self.id;
+                    (*self.log).len = idx + 1;
+                }
+                Poll.Ready(self.id)
+            },
+        }
+    }
+}
+
+pub struct QaIoFuture {
+    pub reactor: *mut Reactor,
+    pub op_id: IoOpId,
+    pub completed: bool,
+}
+
+impl Future for QaIoFuture {
+    type Output = IoCompletion;
+
+    fn poll(self: mut_view<QaIoFuture>, cx: mut_view<Context>) -> Poll<IoCompletion> {
+        let r = self.reactor;
+        match unsafe { (*r).poll_op(self.op_id, mut_view(*cx)) } {
+            Poll.Ready(c) => {
+                self.completed = true;
+                Poll.Ready(c)
+            },
+            Poll.Pending => Poll.Pending,
+        }
+    }
+}
+
+impl Drop for QaIoFuture {
+    fn drop(self: mut_view<QaIoFuture>) {
+        if !self.completed && (self.reactor as usize) != 0 {
+            let r = self.reactor;
+            unsafe { (*r).cancel_op(self.op_id); }
+        }
+    }
+}
+
+pub fn main() -> i32 {
+    let mut exec = LocalExecutor.new();
+    let r_ptr = exec.reactor;
+    let r_handle = unsafe { view(*r_ptr).os_handle() };
+
+    // -------------------------------------------------------------------------
+    // 1. TimerWheel tie-breaking: 10 timers with identical deadline fire in FIFO timer_id order
+    // -------------------------------------------------------------------------
+    let tie_n: usize = 10;
+    let tie_buf = unsafe { heap_alloc(tie_n * 8usize, 8usize) as *mut u64 };
+    let tie_log = unsafe { heap_alloc(16usize, 8usize) as *mut TieLog };
+    unsafe {
+        (*tie_log).ids = tie_buf;
+        (*tie_log).len = 0;
+    }
+
+    let same_dl = Deadline.at_ns(monotonic_ns() + 500_000_000u64); // 500ms lead so all 10 register before firing in MIR interp
+    let mut i: usize = 0;
+    while i < tie_n {
+        let t = TieTask {
+            id: i as u64,
+            fut: sleep_until(same_dl),
+            log: tie_log,
+        };
+        let h = mut_view(exec).spawn_local(t);
+        h.detach();
+        i = i + 1;
+    }
+    mut_view(exec).run();
+
+    let mut tie_ok = unsafe { (*tie_log).len } == tie_n;
+    i = 0;
+    while i < tie_n {
+        if (unsafe { *(tie_buf + i) }) != (i as u64) {
+            tie_ok = false;
+        }
+        i = i + 1;
+    }
+    unsafe {
+        heap_free(tie_buf as *mut u8, tie_n * 8usize, 8usize);
+        heap_free(tie_log as *mut u8, 16usize, 8usize);
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. TimerWheel mid-heap cancellation via SleepFuture Drop
+    // -------------------------------------------------------------------------
+    // Manually register 3 timers directly into the wheel and cancel the earliest & middle
+    let base_c = monotonic_ns() + 50_000_000u64;
+    let t_early = unsafe { mut_view((*r_ptr).timers).register_raw(base_c + 1_000_000u64, 0 as *const u8, 0 as *const std.core.prelude.RawWakerVTable) };
+    let t_mid = unsafe { mut_view((*r_ptr).timers).register_raw(base_c + 5_000_000u64, 0 as *const u8, 0 as *const std.core.prelude.RawWakerVTable) };
+    let t_late = unsafe { mut_view((*r_ptr).timers).register_raw(base_c + 10_000_000u64, 0 as *const u8, 0 as *const std.core.prelude.RawWakerVTable) };
+    let active_3 = unsafe { view((*r_ptr).timers).active_count() };
+    unsafe {
+        mut_view((*r_ptr).timers).cancel(t_early);
+        mut_view((*r_ptr).timers).cancel(t_mid);
+    }
+    let active_1 = unsafe { view((*r_ptr).timers).active_count() };
+    let next_dl_ok = match unsafe { mut_view((*r_ptr).timers).next_deadline_ns() } {
+        Option.Some(d) => d == base_c + 10_000_000u64,
+        Option.None => false,
+    };
+    let woke_cancelled = unsafe { mut_view((*r_ptr).timers).advance_to(base_c + 10_000_000u64) };
+    let active_0 = unsafe { view((*r_ptr).timers).active_count() };
+    let cancel_ok = active_3 == 3 && active_1 == 1 && next_dl_ok && woke_cancelled == 1 && active_0 == 0 && t_late != 0u64;
+
+    // -------------------------------------------------------------------------
+    // 3. Interval edge cases: period == 0 clamp (no div-by-zero on Skip) & reset()
+    // -------------------------------------------------------------------------
+    let mut iv_zero = Interval.every_ns(0u64).with_missed_tick_behavior(MissedTickBehavior.Skip);
+    mut_view(exec).block_on(sleep_ns(500_000u64));
+    let z_fut = mut_view(iv_zero).tick();
+    mut_view(exec).block_on(z_fut);
+    let mut iv_rst = Interval.every_ns(5_000_000u64);
+    let old_next = view(iv_rst).next_tick_ns();
+    mut_view(exec).block_on(sleep_ns(2_000_000u64));
+    mut_view(iv_rst).reset();
+    let new_next = view(iv_rst).next_tick_ns();
+    let interval_edge_ok = iv_zero.period_ns == 1u64 && new_next > old_next;
+
+    // -------------------------------------------------------------------------
+    // 4. Overlapped file write + non-zero offset read (offset 7 -> "PAYLOAD!")
+    // -------------------------------------------------------------------------
+    // "build/t426_qa_edge.bin" (22 bytes)
+    let path_bytes: [22]u8 = [
+        98u8, 117u8, 105u8, 108u8, 100u8, 47u8,
+        116u8, 52u8, 50u8, 54u8, 95u8,
+        113u8, 97u8, 95u8, 101u8, 100u8, 103u8, 101u8, 46u8,
+        98u8, 105u8, 110u8
+    ];
+    let path_ptr = unsafe { address_of(path_bytes[0]) };
+    let fw = unsafe { aio_file_open(r_handle, path_ptr, 22usize, 1u32) };
+    let mut file_offset_ok = fw > 0i64;
+    if file_offset_ok {
+        // "HEADER:PAYLOAD!" (15 bytes)
+        let full_msg: [15]u8 = [
+            72u8, 69u8, 65u8, 68u8, 69u8, 82u8, 58u8,
+            80u8, 65u8, 89u8, 76u8, 79u8, 65u8, 68u8, 33u8
+        ];
+        let wbuf = unsafe { heap_alloc(16usize, 8usize) };
+        i = 0;
+        while i < 15 {
+            unsafe { *(wbuf + i) = full_msg[i]; }
+            i = i + 1;
+        }
+        let wop = unsafe { aio_submit_write_at(r_handle, fw, 0u64, wbuf as *const u8, 15usize) };
+        if wop > 0i64 {
+            let wid = unsafe { mut_view(*r_ptr).register_op(wop as u64, fw, wbuf, 16usize, 0 as *mut u8, 0usize, true) };
+            let wc = mut_view(exec).block_on(QaIoFuture { reactor: r_ptr, op_id: wid, completed: false });
+            if wc.result != 15i64 {
+                file_offset_ok = false;
+            }
+        } else {
+            file_offset_ok = false;
+        }
+        unsafe { heap_free(wbuf, 16usize, 8usize); }
+        let _ = aio_close(r_handle, fw);
+
+        let fr = unsafe { aio_file_open(r_handle, path_ptr, 22usize, 0u32) };
+        if fr > 0i64 {
+            let rbuf = unsafe { heap_alloc(16usize, 8usize) };
+            let rop = unsafe { aio_submit_read_at(r_handle, fr, 7u64, rbuf, 8usize) };
+            if rop > 0i64 {
+                let rid = unsafe { mut_view(*r_ptr).register_op(rop as u64, fr, rbuf, 16usize, 0 as *mut u8, 0usize, true) };
+                let rc = mut_view(exec).block_on(QaIoFuture { reactor: r_ptr, op_id: rid, completed: false });
+                if rc.result != 8i64 {
+                    file_offset_ok = false;
+                } else {
+                    let mut j: usize = 0;
+                    while j < 8 {
+                        if (unsafe { *(rbuf + j) }) != full_msg[7 + j] {
+                            file_offset_ok = false;
+                        }
+                        j = j + 1;
+                    }
+                }
+            } else {
+                file_offset_ok = false;
+            }
+            unsafe { heap_free(rbuf, 16usize, 8usize); }
+            let _ = aio_close(r_handle, fr);
+        } else {
+            file_offset_ok = false;
+        }
+        let _ = unsafe { remove(path_ptr, 22usize) };
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. CancellingZombie slot reclamation + subsequent slot reuse
+    // -------------------------------------------------------------------------
+    let listener = aio_tcp_bind(r_handle, 0x7F000001u32, 0u16);
+    let mut zombie_reuse_ok = listener > 0i64;
+    if zombie_reuse_ok {
+        let zbuf1 = unsafe { heap_alloc(64usize, 8usize) };
+        let zop1 = aio_submit_accept(r_handle, listener);
+        if zop1 > 0i64 {
+            let zid1 = unsafe { mut_view(*r_ptr).register_op(zop1 as u64, listener, zbuf1, 64usize, 0 as *mut u8, 0usize, true) };
+            {
+                let _abandoned1 = QaIoFuture { reactor: r_ptr, op_id: zid1, completed: false };
+            }
+            let mut it: usize = 0;
+            while unsafe { view(*r_ptr).in_flight_count() } > 0 && it < 64 {
+                let _ = unsafe { mut_view(*r_ptr).turn(Option.Some(5_000_000u64)) };
+                it = it + 1;
+            }
+        } else {
+            zombie_reuse_ok = false;
+        }
+
+        // Reuse the freed slot with a second abandoned op
+        let zbuf2 = unsafe { heap_alloc(64usize, 8usize) };
+        let zop2 = aio_submit_accept(r_handle, listener);
+        if zop2 > 0i64 {
+            let zid2 = unsafe { mut_view(*r_ptr).register_op(zop2 as u64, listener, zbuf2, 64usize, 0 as *mut u8, 0usize, true) };
+            {
+                let _abandoned2 = QaIoFuture { reactor: r_ptr, op_id: zid2, completed: false };
+            }
+            let mut it2: usize = 0;
+            while unsafe { view(*r_ptr).in_flight_count() } > 0 && it2 < 64 {
+                let _ = unsafe { mut_view(*r_ptr).turn(Option.Some(5_000_000u64)) };
+                it2 = it2 + 1;
+            }
+        } else {
+            zombie_reuse_ok = false;
+        }
+
+        let r_inflight = unsafe { view(*r_ptr).in_flight_count() };
+        let r_zombie = unsafe { view(*r_ptr).zombie_count() };
+        let r_reclaimed = unsafe { view(*r_ptr).reclaimed_zombie_count() };
+        if r_inflight != 0 || r_zombie != 0 || r_reclaimed != 2 {
+            zombie_reuse_ok = false;
+        }
+        let _ = aio_close(r_handle, listener);
+    }
+
+    mut_view(exec).shutdown();
+
+    print("OK qa_reactor_timer_edge_cases ");
+    print_int(if tie_ok { 1i64 } else { 0i64 });
+    print(" ");
+    print_int(if cancel_ok { 1i64 } else { 0i64 });
+    print(" ");
+    print_int(if interval_edge_ok { 1i64 } else { 0i64 });
+    print(" ");
+    print_int(if file_offset_ok { 1i64 } else { 0i64 });
+    print(" ");
+    print_int(if zombie_reuse_ok { 1i64 } else { 0i64 });
+    print("\n");
+    0i32
+}

@@ -1,0 +1,523 @@
+// std.asyn.reactor - Unified Completion/Readiness Reactor & Safe Buffer Retention (SPEC-35 §1-2, T426)
+module std.asyn.reactor
+
+use std.core.prelude.RawWaker
+use std.core.prelude.RawWakerVTable
+use std.core.prelude.Waker
+use std.core.prelude.Context
+use std.core.prelude.Poll
+use std.core.option.Option
+use std.core.result.Result
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.core.host.monotonic_ns
+use std.core.host.thread_yield
+use std.core.host.aio_create
+use std.core.host.aio_destroy
+use std.core.host.aio_wake
+use std.core.host.aio_wait
+use std.core.host.aio_cancel
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.io.IoError
+use std.io.io_error_from_code
+use std.asyn.timer.TimerWheel
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+@derive(Copy)
+pub struct IoOpId {
+    pub raw: u64,
+}
+
+@derive(Copy)
+pub enum IoOpState {
+    Submitted,
+    Completed,
+    CancellingZombie,
+    Free,
+}
+
+pub struct IoCompletion {
+    pub result: i64,
+    pub aux: u64,
+    pub owned_buf_ptr: *mut u8,
+    pub owned_buf_cap: usize,
+}
+
+pub struct IoOpSlot {
+    pub op_id: u64,
+    pub state: IoOpState,
+    pub handle: i64,
+    pub result: i64,
+    pub aux: u64,
+    pub waker_data: *const u8,
+    pub waker_vtable: *const RawWakerVTable,
+    pub owned_buf_ptr: *mut u8,
+    pub owned_buf_cap: usize,
+    pub user_dst_ptr: *mut u8,
+    pub user_dst_len: usize,
+    pub free_owned_on_reclaim: bool,
+}
+
+pub struct Reactor {
+    pub os_handle: i64,
+    pub lock: Atomic<u32>,
+    pub slots: *mut IoOpSlot,
+    pub slot_len: usize,
+    pub slot_cap: usize,
+    pub timers: TimerWheel,
+    pub in_flight_count: usize,
+    pub zombie_count: usize,
+    pub reclaimed_zombie_count: usize,
+    pub is_closed: bool,
+}
+
+unsafe fn op_slot_at(base: *mut IoOpSlot, idx: usize) -> *mut IoOpSlot {
+    ((base as usize) + idx * size_of<IoOpSlot>()) as *mut IoOpSlot
+}
+
+fn reactor_lock(r: mut_view<Reactor>) {
+    while r.lock.compare_exchange(0u32, 1u32, Ordering.Acquire, Ordering.Relaxed).val != 0u32 {
+        unsafe { thread_yield(); }
+    }
+}
+
+fn reactor_unlock(r: mut_view<Reactor>) {
+    r.lock.store(0u32, Ordering.Release);
+}
+
+fn io_state_is_free(st: IoOpState) -> bool {
+    match st {
+        IoOpState.Free => true,
+        _ => false,
+    }
+}
+
+fn io_state_is_submitted(st: IoOpState) -> bool {
+    match st {
+        IoOpState.Submitted => true,
+        _ => false,
+    }
+}
+
+fn io_state_is_completed(st: IoOpState) -> bool {
+    match st {
+        IoOpState.Completed => true,
+        _ => false,
+    }
+}
+
+fn io_state_is_zombie(st: IoOpState) -> bool {
+    match st {
+        IoOpState.CancellingZombie => true,
+        _ => false,
+    }
+}
+
+unsafe fn reactor_drop_waker(data: *const u8, vtable: *const RawWakerVTable) {
+    if (vtable as usize) != 0 {
+        ((*vtable).drop_waker)(data);
+    }
+}
+
+unsafe fn reactor_wake_waker(data: *const u8, vtable: *const RawWakerVTable) {
+    if (vtable as usize) != 0 {
+        ((*vtable).wake)(data);
+    }
+}
+
+unsafe fn reactor_clone_cx_waker(cx: mut_view<Context>) -> RawWaker {
+    let vt = cx.waker_val.raw.vtable;
+    if (vt as usize) != 0 {
+        return ((*vt).clone)(cx.waker_val.raw.data);
+    }
+    RawWaker { data: 0 as *const u8, vtable: 0 as *const RawWakerVTable }
+}
+
+impl Reactor {
+    pub fn new() -> Result<Reactor, IoError> {
+        let h = aio_create();
+        if h < 0i64 {
+            return Result.Err(io_error_from_code(h));
+        }
+        Result.Ok(Reactor {
+            os_handle: h,
+            lock: Atomic.new(0u32),
+            slots: 0 as *mut IoOpSlot,
+            slot_len: 0,
+            slot_cap: 0,
+            timers: TimerWheel.new(),
+            in_flight_count: 0,
+            zombie_count: 0,
+            reclaimed_zombie_count: 0,
+            is_closed: false,
+        })
+    }
+
+    pub fn os_handle(self: view<Reactor>) -> i64 {
+        self.os_handle
+    }
+
+    pub fn has_pending_work(self: view<Reactor>) -> bool {
+        self.in_flight_count > 0 || !view(self.timers).is_empty()
+    }
+
+    pub fn in_flight_count(self: view<Reactor>) -> usize {
+        self.in_flight_count
+    }
+
+    pub fn zombie_count(self: view<Reactor>) -> usize {
+        self.zombie_count
+    }
+
+    pub fn reclaimed_zombie_count(self: view<Reactor>) -> usize {
+        self.reclaimed_zombie_count
+    }
+
+    pub fn next_timer_delay_ns(self: mut_view<Reactor>) -> Option<u64> {
+        mut_view(self.timers).next_expiration_delay_ns()
+    }
+
+    pub fn register_op(
+        self: mut_view<Reactor>,
+        op_id: u64,
+        handle: i64,
+        owned_buf_ptr: *mut u8,
+        owned_buf_cap: usize,
+        user_dst_ptr: *mut u8,
+        user_dst_len: usize,
+        free_owned_on_reclaim: bool
+    ) -> IoOpId {
+        reactor_lock(mut_view(*self));
+        let mut target_idx: usize = self.slot_len;
+        let mut i: usize = 0;
+        while i < self.slot_len {
+            let s = unsafe { op_slot_at(self.slots, i) };
+            if io_state_is_free(unsafe { (*s).state }) {
+                target_idx = i;
+                break;
+            }
+            i = i + 1;
+        }
+        if target_idx == self.slot_len {
+            if self.slot_len >= self.slot_cap {
+                let new_cap: usize = if self.slot_cap == 0 { 64 } else { self.slot_cap * 2 };
+                let new_bytes = new_cap * size_of<IoOpSlot>();
+                let new_arr = unsafe { heap_alloc(new_bytes, align_of<IoOpSlot>()) as *mut IoOpSlot };
+                if self.slot_len > 0 && (self.slots as usize) != 0 {
+                    let mut k: usize = 0;
+                    while k < self.slot_len {
+                        unsafe { *op_slot_at(new_arr, k) = *op_slot_at(self.slots, k); }
+                        k = k + 1;
+                    }
+                    let old_bytes = self.slot_cap * size_of<IoOpSlot>();
+                    unsafe { heap_free(self.slots as *mut u8, old_bytes, align_of<IoOpSlot>()); }
+                }
+                self.slots = new_arr;
+                self.slot_cap = new_cap;
+            }
+            self.slot_len = self.slot_len + 1;
+        }
+        let slot = unsafe { op_slot_at(self.slots, target_idx) };
+        unsafe {
+            (*slot).op_id = op_id;
+            (*slot).state = IoOpState.Submitted;
+            (*slot).handle = handle;
+            (*slot).result = 0i64;
+            (*slot).aux = 0u64;
+            (*slot).waker_data = 0 as *const u8;
+            (*slot).waker_vtable = 0 as *const RawWakerVTable;
+            (*slot).owned_buf_ptr = owned_buf_ptr;
+            (*slot).owned_buf_cap = owned_buf_cap;
+            (*slot).user_dst_ptr = user_dst_ptr;
+            (*slot).user_dst_len = user_dst_len;
+            (*slot).free_owned_on_reclaim = free_owned_on_reclaim;
+        }
+        self.in_flight_count = self.in_flight_count + 1;
+        reactor_unlock(mut_view(*self));
+        IoOpId { raw: op_id }
+    }
+
+    pub fn poll_op(self: mut_view<Reactor>, id: IoOpId, cx: mut_view<Context>) -> Poll<IoCompletion> {
+        reactor_lock(mut_view(*self));
+        let mut i: usize = 0;
+        while i < self.slot_len {
+            let s = unsafe { op_slot_at(self.slots, i) };
+            if unsafe { (*s).op_id } == id.raw {
+                let st = unsafe { (*s).state };
+                if io_state_is_completed(st) {
+                    let out = IoCompletion {
+                        result: unsafe { (*s).result },
+                        aux: unsafe { (*s).aux },
+                        owned_buf_ptr: unsafe { (*s).owned_buf_ptr },
+                        owned_buf_cap: unsafe { (*s).owned_buf_cap },
+                    };
+                    unsafe {
+                        (*s).state = IoOpState.Free;
+                        (*s).op_id = 0u64;
+                        (*s).waker_data = 0 as *const u8;
+                        (*s).waker_vtable = 0 as *const RawWakerVTable;
+                        (*s).owned_buf_ptr = 0 as *mut u8;
+                        (*s).owned_buf_cap = 0;
+                        (*s).user_dst_ptr = 0 as *mut u8;
+                        (*s).user_dst_len = 0;
+                    }
+                    reactor_unlock(mut_view(*self));
+                    return Poll.Ready(out);
+                }
+                if io_state_is_submitted(st) {
+                    let old_d = unsafe { (*s).waker_data };
+                    let old_v = unsafe { (*s).waker_vtable };
+                    let rw = unsafe { reactor_clone_cx_waker(mut_view(*cx)) };
+                    unsafe {
+                        (*s).waker_data = rw.data;
+                        (*s).waker_vtable = rw.vtable;
+                    }
+                    reactor_unlock(mut_view(*self));
+                    unsafe { reactor_drop_waker(old_d, old_v); }
+                    return Poll.Pending;
+                }
+                break;
+            }
+            i = i + 1;
+        }
+        reactor_unlock(mut_view(*self));
+        Poll.Ready(IoCompletion {
+            result: -6i64,
+            aux: 0u64,
+            owned_buf_ptr: 0 as *mut u8,
+            owned_buf_cap: 0,
+        })
+    }
+
+    // Mandatory Drop protocol for in-flight I/O futures (SPEC-35 AXS-AIO-005, REQ-ASY-152, 157, 158):
+    // Transitions Submitted -> CancellingZombie, clears waker & user_dst_ptr, retains owned_buf_ptr
+    // until OS completion arrives, and calls host.aio_cancel.
+    pub fn cancel_op(self: mut_view<Reactor>, id: IoOpId) {
+        let mut need_os_cancel = false;
+        let mut drop_d: *const u8 = 0 as *const u8;
+        let mut drop_v: *const RawWakerVTable = 0 as *const RawWakerVTable;
+        let os_h = self.os_handle;
+        reactor_lock(mut_view(*self));
+        let mut i: usize = 0;
+        while i < self.slot_len {
+            let s = unsafe { op_slot_at(self.slots, i) };
+            if unsafe { (*s).op_id } == id.raw {
+                let st = unsafe { (*s).state };
+                if io_state_is_submitted(st) {
+                    unsafe {
+                        drop_d = (*s).waker_data;
+                        drop_v = (*s).waker_vtable;
+                        (*s).state = IoOpState.CancellingZombie;
+                        (*s).waker_data = 0 as *const u8;
+                        (*s).waker_vtable = 0 as *const RawWakerVTable;
+                        (*s).user_dst_ptr = 0 as *mut u8;
+                        (*s).user_dst_len = 0;
+                    }
+                    self.zombie_count = self.zombie_count + 1;
+                    need_os_cancel = true;
+                } else if io_state_is_completed(st) {
+                    // Kernel already finished; reclaim owned buffer immediately.
+                    let bp = unsafe { (*s).owned_buf_ptr };
+                    let bc = unsafe { (*s).owned_buf_cap };
+                    let do_free = unsafe { (*s).free_owned_on_reclaim };
+                    unsafe {
+                        drop_d = (*s).waker_data;
+                        drop_v = (*s).waker_vtable;
+                        (*s).state = IoOpState.Free;
+                        (*s).op_id = 0u64;
+                        (*s).waker_data = 0 as *const u8;
+                        (*s).waker_vtable = 0 as *const RawWakerVTable;
+                        (*s).owned_buf_ptr = 0 as *mut u8;
+                        (*s).owned_buf_cap = 0;
+                        (*s).user_dst_ptr = 0 as *mut u8;
+                        (*s).user_dst_len = 0;
+                    }
+                    if do_free && (bp as usize) != 0 && bc > 0 {
+                        unsafe { heap_free(bp, bc, 8); }
+                    }
+                }
+                break;
+            }
+            i = i + 1;
+        }
+        reactor_unlock(mut_view(*self));
+        unsafe { reactor_drop_waker(drop_d, drop_v); }
+        if need_os_cancel {
+            let _ = aio_cancel(os_h, id.raw);
+        }
+    }
+
+    pub fn poll_nonblocking(self: mut_view<Reactor>) -> Result<usize, IoError> {
+        self.turn(Option.Some(0u64))
+    }
+
+    pub fn turn(self: mut_view<Reactor>, max_wait_ns: Option<u64>) -> Result<usize, IoError> {
+        if self.is_closed {
+            return Result.Ok(0);
+        }
+        // Compute effective timeout bounded by the timer wheel's next expiration
+        let mut timeout_ns: i64 = match max_wait_ns {
+            Option.None => -1i64,
+            Option.Some(v) => v as i64,
+        };
+        match mut_view(self.timers).next_expiration_delay_ns() {
+            Option.Some(t_ns) => {
+                let ti = t_ns as i64;
+                if timeout_ns < 0i64 || ti < timeout_ns {
+                    timeout_ns = ti;
+                }
+            },
+            Option.None => {},
+        }
+
+        let mut raw_events: [192]u64 = [0u64; 192]; // 64 events * 3 u64s
+        let n = unsafe { aio_wait(self.os_handle, address_of_mut(raw_events[0]), 64, timeout_ns) };
+        if n < 0i64 {
+            return Result.Err(io_error_from_code(n));
+        }
+
+        let mut woke_data: [64]usize = [0usize; 64];
+        let mut woke_vt: [64]usize = [0usize; 64];
+        let mut woke_len: usize = 0;
+
+        if n > 0i64 {
+            reactor_lock(mut_view(*self));
+            let count = n as usize;
+            let mut k: usize = 0;
+            while k < count {
+                let ev_op = raw_events[k * 3 + 0];
+                let ev_res = raw_events[k * 3 + 1] as i64;
+                let ev_aux = raw_events[k * 3 + 2];
+                let mut i: usize = 0;
+                while i < self.slot_len {
+                    let s = unsafe { op_slot_at(self.slots, i) };
+                    if unsafe { (*s).op_id } == ev_op {
+                        let st = unsafe { (*s).state };
+                        if io_state_is_submitted(st) {
+                            unsafe {
+                                (*s).state = IoOpState.Completed;
+                                (*s).result = ev_res;
+                                (*s).aux = ev_aux;
+                            }
+                            if self.in_flight_count > 0 {
+                                self.in_flight_count = self.in_flight_count - 1;
+                            }
+                            let wd = unsafe { (*s).waker_data as usize };
+                            let wv = unsafe { (*s).waker_vtable as usize };
+                            unsafe {
+                                (*s).waker_data = 0 as *const u8;
+                                (*s).waker_vtable = 0 as *const RawWakerVTable;
+                            }
+                            if wv != 0usize && woke_len < 64 {
+                                woke_data[woke_len] = wd;
+                                woke_vt[woke_len] = wv;
+                                woke_len = woke_len + 1;
+                            }
+                        } else if io_state_is_zombie(st) {
+                            // Kernel completion arrived for abandoned op: NOW safe to free owned buffer!
+                            let bp = unsafe { (*s).owned_buf_ptr };
+                            let bc = unsafe { (*s).owned_buf_cap };
+                            let do_free = unsafe { (*s).free_owned_on_reclaim };
+                            unsafe {
+                                (*s).state = IoOpState.Free;
+                                (*s).op_id = 0u64;
+                                (*s).waker_data = 0 as *const u8;
+                                (*s).waker_vtable = 0 as *const RawWakerVTable;
+                                (*s).owned_buf_ptr = 0 as *mut u8;
+                                (*s).owned_buf_cap = 0;
+                                (*s).user_dst_ptr = 0 as *mut u8;
+                                (*s).user_dst_len = 0;
+                            }
+                            if self.in_flight_count > 0 {
+                                self.in_flight_count = self.in_flight_count - 1;
+                            }
+                            if self.zombie_count > 0 {
+                                self.zombie_count = self.zombie_count - 1;
+                            }
+                            self.reclaimed_zombie_count = self.reclaimed_zombie_count + 1;
+                            if do_free && (bp as usize) != 0 && bc > 0 {
+                                unsafe { heap_free(bp, bc, 8); }
+                            }
+                        }
+                        break;
+                    }
+                    i = i + 1;
+                }
+                k = k + 1;
+            }
+            reactor_unlock(mut_view(*self));
+        }
+
+        // Wake I/O waiters outside the reactor lock
+        let mut wi: usize = 0;
+        while wi < woke_len {
+            let wd = woke_data[wi] as *const u8;
+            let wv = woke_vt[wi] as *const RawWakerVTable;
+            unsafe { reactor_wake_waker(wd, wv); }
+            wi = wi + 1;
+        }
+
+        // Advance timer wheel to current monotonic time
+        let timers_woke = mut_view(self.timers).advance_to(monotonic_ns());
+        Result.Ok((n as usize) + timers_woke)
+    }
+
+    pub fn wake(self: view<Reactor>) {
+        if !self.is_closed && self.os_handle > 0i64 {
+            let _ = aio_wake(self.os_handle);
+        }
+    }
+
+    pub fn shutdown(self: mut_view<Reactor>) {
+        if self.is_closed {
+            return;
+        }
+        // Cancel all remaining submitted operations
+        reactor_lock(mut_view(*self));
+        let mut i: usize = 0;
+        while i < self.slot_len {
+            let s = unsafe { op_slot_at(self.slots, i) };
+            let st = unsafe { (*s).state };
+            if io_state_is_submitted(st) {
+                let oid = unsafe { (*s).op_id };
+                let wd = unsafe { (*s).waker_data };
+                let wv = unsafe { (*s).waker_vtable };
+                unsafe {
+                    (*s).state = IoOpState.CancellingZombie;
+                    (*s).waker_data = 0 as *const u8;
+                    (*s).waker_vtable = 0 as *const RawWakerVTable;
+                    (*s).user_dst_ptr = 0 as *mut u8;
+                    (*s).user_dst_len = 0;
+                    reactor_drop_waker(wd, wv);
+                }
+                self.zombie_count = self.zombie_count + 1;
+                let _ = aio_cancel(self.os_handle, oid);
+            }
+            i = i + 1;
+        }
+        reactor_unlock(mut_view(*self));
+
+        // Drain in-flight / zombie completions (bounded loop so shutdown never hangs)
+        let mut drain_iters: usize = 0;
+        while self.in_flight_count > 0 && drain_iters < 128 {
+            let _ = self.turn(Option.Some(1_000_000u64));
+            drain_iters = drain_iters + 1;
+        }
+
+        mut_view(self.timers).clear();
+        if (self.slots as usize) != 0 && self.slot_cap > 0 {
+            let bytes = self.slot_cap * size_of<IoOpSlot>();
+            unsafe { heap_free(self.slots as *mut u8, bytes, align_of<IoOpSlot>()); }
+        }
+        self.slots = 0 as *mut IoOpSlot;
+        self.slot_len = 0;
+        self.slot_cap = 0;
+        let _ = aio_destroy(self.os_handle);
+        self.os_handle = 0i64;
+        self.is_closed = true;
+    }
+}

@@ -1,0 +1,1327 @@
+module std.sys.windows.iocp
+
+// Native Windows x64 IOCP & Winsock2 overlapped backend for host.aio_* (SPEC-35 AXS-AIO-006, AXS-AIO-050, T426).
+
+@link("kernel32")
+extern "system" {
+    fn GetProcessHeap() -> *mut u8;
+    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;
+    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;
+    fn InitializeCriticalSection(lpCriticalSection: *mut u8);
+    fn EnterCriticalSection(lpCriticalSection: *mut u8);
+    fn LeaveCriticalSection(lpCriticalSection: *mut u8);
+    fn CreateIoCompletionPort(
+        fileHandle: *mut u8,
+        existingCompletionPort: *mut u8,
+        completionKey: usize,
+        numberOfConcurrentThreads: u32
+    ) -> *mut u8;
+    fn GetQueuedCompletionStatusEx(
+        completionPort: *mut u8,
+        lpCompletionPortEntries: *mut u8,
+        ulCount: u32,
+        ulNumEntriesRemoved: *mut u32,
+        dwMilliseconds: u32,
+        fAlertable: i32
+    ) -> i32;
+    fn PostQueuedCompletionStatus(
+        completionPort: *mut u8,
+        dwNumberOfBytesTransferred: u32,
+        dwCompletionKey: usize,
+        lpOverlapped: *mut u8
+    ) -> i32;
+    fn CancelIoEx(hFile: *mut u8, lpOverlapped: *mut u8) -> i32;
+    fn CreateFileW(
+        lpFileName: *const u16,
+        dwDesiredAccess: u32,
+        dwShareMode: u32,
+        lpSecurityAttributes: *mut u8,
+        dwCreationDisposition: u32,
+        dwFlagsAndAttributes: u32,
+        hTemplateFile: *mut u8
+    ) -> *mut u8;
+    fn ReadFile(
+        hFile: *mut u8,
+        lpBuffer: *mut u8,
+        nNumberOfBytesToRead: u32,
+        lpNumberOfBytesRead: *mut u32,
+        lpOverlapped: *mut u8
+    ) -> i32;
+    fn WriteFile(
+        hFile: *mut u8,
+        lpBuffer: *const u8,
+        nNumberOfBytesToWrite: u32,
+        lpNumberOfBytesWritten: *mut u32,
+        lpOverlapped: *mut u8
+    ) -> i32;
+    fn FlushFileBuffers(hFile: *mut u8) -> i32;
+    fn CloseHandle(hObject: *mut u8) -> i32;
+    fn GetLastError() -> u32;
+}
+
+@link("ws2_32")
+extern "system" {
+    fn WSAStartup(wVersionRequested: u16, lpWSAData: *mut u8) -> i32;
+    fn WSASocketW(
+        af: i32,
+        sockType: i32,
+        protocol: i32,
+        lpProtocolInfo: *mut u8,
+        g: u32,
+        dwFlags: u32
+    ) -> usize;
+    fn bind(s: usize, name: *const u8, namelen: i32) -> i32;
+    fn listen(s: usize, backlog: i32) -> i32;
+    fn getsockname(s: usize, name: *mut u8, namelen: *mut i32) -> i32;
+    fn getpeername(s: usize, name: *mut u8, namelen: *mut i32) -> i32;
+    fn shutdown(s: usize, how: i32) -> i32;
+    fn closesocket(s: usize) -> i32;
+    fn setsockopt(s: usize, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32;
+    fn WSARecv(
+        s: usize,
+        lpBuffers: *mut u8,
+        dwBufferCount: u32,
+        lpNumberOfBytesRecvd: *mut u32,
+        lpFlags: *mut u32,
+        lpOverlapped: *mut u8,
+        lpCompletionRoutine: *mut u8
+    ) -> i32;
+    fn WSASend(
+        s: usize,
+        lpBuffers: *mut u8,
+        dwBufferCount: u32,
+        lpNumberOfBytesSent: *mut u32,
+        dwFlags: u32,
+        lpOverlapped: *mut u8,
+        lpCompletionRoutine: *mut u8
+    ) -> i32;
+    fn WSARecvFrom(
+        s: usize,
+        lpBuffers: *mut u8,
+        dwBufferCount: u32,
+        lpNumberOfBytesRecvd: *mut u32,
+        lpFlags: *mut u32,
+        lpFrom: *mut u8,
+        lpFromlen: *mut i32,
+        lpOverlapped: *mut u8,
+        lpCompletionRoutine: *mut u8
+    ) -> i32;
+    fn WSASendTo(
+        s: usize,
+        lpBuffers: *mut u8,
+        dwBufferCount: u32,
+        lpNumberOfBytesSent: *mut u32,
+        dwFlags: u32,
+        lpTo: *const u8,
+        iToLen: i32,
+        lpOverlapped: *mut u8,
+        lpCompletionRoutine: *mut u8
+    ) -> i32;
+    fn WSAIoctl(
+        s: usize,
+        dwIoControlCode: u32,
+        lpvInBuffer: *mut u8,
+        cbInBuffer: u32,
+        lpvOutBuffer: *mut u8,
+        cbOutBuffer: u32,
+        lpcbBytesReturned: *mut u32,
+        lpOverlapped: *mut u8,
+        lpCompletionRoutine: *mut u8
+    ) -> i32;
+    fn WSAGetLastError() -> i32;
+}
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+const MAX_IOCP_REACTORS: usize = 32;
+const MAX_IOCP_HANDLES: usize = 256;
+const MAX_IOCP_OPS: usize = 512;
+
+const HANDLE_KIND_FILE: u32 = 1u32;
+const HANDLE_KIND_TCP_LISTENER: u32 = 2u32;
+const HANDLE_KIND_TCP_STREAM: u32 = 3u32;
+const HANDLE_KIND_UDP_SOCK: u32 = 4u32;
+
+const OP_KIND_READ_WRITE: u32 = 1u32;
+const OP_KIND_SYNTH: u32 = 2u32;
+const OP_KIND_ACCEPT: u32 = 3u32;
+const OP_KIND_CONNECT: u32 = 4u32;
+const OP_KIND_RECV_FROM: u32 = 5u32;
+
+const KEY_WAKEUP: usize = 0x57414B45usize;
+const KEY_SYNTH: usize = 0x53594E54usize;
+const INVALID_HANDLE_VAL: usize = 0xFFFFFFFFFFFFFFFFusize;
+const INVALID_SOCKET_VAL: usize = 0xFFFFFFFFFFFFFFFFusize;
+
+// Win32 OVERLAPPED (32 bytes on x64) followed by Axiom operation metadata.
+@repr(C)
+struct AioOverlapped {
+    internal: usize,
+    internal_high: usize,
+    offset_lo: u32,
+    offset_hi: u32,
+    h_event: *mut u8,
+    op_id: u64,
+    op_kind: u32,
+    pad0: u32,
+    reactor_id: i64,
+    handle_id: i64,
+    os_handle: *mut u8,
+    aux_handle_id: i64,
+    aux_socket: usize,
+    synth_result: i64,
+    wsa_buf_len: u32,
+    wsa_buf_pad: u32,
+    wsa_buf_ptr: *mut u8,
+    wsa_flags: u32,
+    from_len: i32,
+    addr_buf: [64]u8,
+}
+
+@repr(C)
+struct OverlappedEntry {
+    completion_key: usize,
+    overlapped: *mut u8,
+    internal: usize,
+    bytes_transferred: u32,
+    pad0: u32,
+}
+
+@repr(C)
+struct WinAioReactor {
+    in_use: u32,
+    pad0: u32,
+    iocp: *mut u8,
+}
+
+@repr(C)
+struct WinAioHandle {
+    in_use: u32,
+    kind: u32,
+    reactor_id: i64,
+    os_handle: *mut u8,
+}
+
+@repr(C)
+struct WinAioRt {
+    cs: [6]u64,
+    wsa_inited: u32,
+    pad0: u32,
+    next_op_id: u64,
+    accept_ex_fn: usize,
+    connect_ex_fn: usize,
+    reactors: [32]WinAioReactor,
+    handles: [256]WinAioHandle,
+    ops: [512]*mut AioOverlapped,
+}
+
+static mut WIN_AIO_RT: *mut WinAioRt = 0 as *mut WinAioRt;
+
+unsafe fn win_aio_rt_get() -> *mut WinAioRt {
+    let existing = WIN_AIO_RT;
+    if (existing as usize) != 0 {
+        return existing;
+    }
+    let heap = GetProcessHeap();
+    if (heap as usize) == 0 {
+        return 0 as *mut WinAioRt;
+    }
+    let rt = HeapAlloc(heap, 8u32, size_of<WinAioRt>()) as *mut WinAioRt;
+    if (rt as usize) == 0 {
+        return 0 as *mut WinAioRt;
+    }
+    InitializeCriticalSection(address_of_mut((*rt).cs[0]) as *mut u8);
+    (*rt).next_op_id = 1u64;
+    WIN_AIO_RT = rt;
+    rt
+}
+
+unsafe fn win_aio_ensure_wsa(rt: *mut WinAioRt) -> bool {
+    if (*rt).wsa_inited != 0u32 {
+        return true;
+    }
+    let mut wsa_data: [512]u8 = [0u8; 512];
+    let rc = WSAStartup(0x0202u16, address_of_mut(wsa_data[0]));
+    if rc != 0 {
+        return false;
+    }
+    (*rt).wsa_inited = 1u32;
+    true
+}
+
+unsafe fn win_aio_ensure_ext_fns(rt: *mut WinAioRt, sock: usize) {
+    if (*rt).accept_ex_fn == 0usize {
+        let mut guid_acc: [16]u8 = [
+            0xF1u8, 0x7Du8, 0x36u8, 0xB5u8,
+            0xACu8, 0xCBu8,
+            0xCFu8, 0x11u8,
+            0x95u8, 0xCAu8, 0x00u8, 0x80u8, 0x5Fu8, 0x48u8, 0xA1u8, 0x92u8
+        ];
+        let mut fn_ptr: usize = 0usize;
+        let mut out_bytes: u32 = 0u32;
+        let rc = WSAIoctl(
+            sock,
+            0xC8000006u32,
+            address_of_mut(guid_acc[0]),
+            16u32,
+            address_of_mut(fn_ptr) as *mut u8,
+            8u32,
+            address_of_mut(out_bytes),
+            0 as *mut u8,
+            0 as *mut u8
+        );
+        if rc == 0 {
+            (*rt).accept_ex_fn = fn_ptr;
+        }
+    }
+    if (*rt).connect_ex_fn == 0usize {
+        let mut guid_con: [16]u8 = [
+            0xB9u8, 0x07u8, 0xA2u8, 0x25u8,
+            0xF3u8, 0xDDu8,
+            0x60u8, 0x46u8,
+            0x8Eu8, 0xE9u8, 0x76u8, 0xE5u8, 0x8Cu8, 0x74u8, 0x06u8, 0x3Eu8
+        ];
+        let mut fn_ptr: usize = 0usize;
+        let mut out_bytes: u32 = 0u32;
+        let rc = WSAIoctl(
+            sock,
+            0xC8000006u32,
+            address_of_mut(guid_con[0]),
+            16u32,
+            address_of_mut(fn_ptr) as *mut u8,
+            8u32,
+            address_of_mut(out_bytes),
+            0 as *mut u8,
+            0 as *mut u8
+        );
+        if rc == 0 {
+            (*rt).connect_ex_fn = fn_ptr;
+        }
+    }
+}
+
+fn map_win32_error(err: u32) -> i64 {
+    if err == 2u32 || err == 3u32 { return -1i64; }
+    if err == 5u32 { return -2i64; }
+    if err == 80u32 || err == 183u32 { return -3i64; }
+    if err == 6u32 { return -4i64; }
+    if err == 258u32 || err == 1460u32 || err == 10060u32 { return -5i64; }
+    if err == 995u32 { return -6i64; }
+    if err == 10061u32 { return -7i64; }
+    if err == 10054u32 { return -8i64; }
+    if err == 109u32 || err == 232u32 || err == 10053u32 { return -10i64; }
+    if err == 10048u32 { return -11i64; }
+    -9i64
+}
+
+fn map_ntstatus(status: usize) -> i64 {
+    let s32 = (status & 0xFFFFFFFFusize) as u32;
+    if s32 == 0u32 { return 0i64; }
+    if s32 == 0xC0000011u32 { return 0i64; } // STATUS_END_OF_FILE
+    if s32 == 0xC0000120u32 { return -6i64; } // STATUS_CANCELLED
+    if s32 == 0xC000014Bu32 { return -10i64; } // STATUS_PIPE_BROKEN
+    if s32 == 0xC000020Du32 { return -8i64; } // STATUS_CONNECTION_RESET
+    if s32 == 0xC0000236u32 { return -7i64; } // STATUS_CONNECTION_REFUSED
+    if (s32 & 0xC0000000u32) == 0xC0000000u32 { return -9i64; }
+    0i64
+}
+
+unsafe fn win_aio_get_iocp(rt: *mut WinAioRt, rid: i64) -> *mut u8 {
+    if rid < 1i64 || (rid as usize) > MAX_IOCP_REACTORS {
+        return 0 as *mut u8;
+    }
+    let idx = (rid - 1i64) as usize;
+    if (*rt).reactors[idx].in_use == 0u32 {
+        return 0 as *mut u8;
+    }
+    (*rt).reactors[idx].iocp
+}
+
+unsafe fn win_aio_alloc_handle(rt: *mut WinAioRt, kind: u32, rid: i64, os_h: *mut u8) -> i64 {
+    let mut i: usize = 0;
+    while i < MAX_IOCP_HANDLES {
+        if (*rt).handles[i].in_use == 0u32 {
+            (*rt).handles[i].in_use = 1u32;
+            (*rt).handles[i].kind = kind;
+            (*rt).handles[i].reactor_id = rid;
+            (*rt).handles[i].os_handle = os_h;
+            return (i + 1) as i64;
+        }
+        i = i + 1;
+    }
+    -9i64
+}
+
+unsafe fn win_aio_alloc_ov(rt: *mut WinAioRt, kind: u32, rid: i64, hid: i64, os_h: *mut u8) -> *mut AioOverlapped {
+    let heap = GetProcessHeap();
+    let ov = HeapAlloc(heap, 8u32, size_of<AioOverlapped>()) as *mut AioOverlapped;
+    if (ov as usize) == 0 {
+        return 0 as *mut AioOverlapped;
+    }
+    let op_id = (*rt).next_op_id;
+    (*rt).next_op_id = op_id + 1u64;
+    (*ov).op_id = op_id;
+    (*ov).op_kind = kind;
+    (*ov).reactor_id = rid;
+    (*ov).handle_id = hid;
+    (*ov).os_handle = os_h;
+
+    let mut i: usize = 0;
+    while i < MAX_IOCP_OPS {
+        if ((*rt).ops[i] as usize) == 0 {
+            (*rt).ops[i] = ov;
+            return ov;
+        }
+        i = i + 1;
+    }
+    HeapFree(heap, 0u32, ov as *mut u8);
+    0 as *mut AioOverlapped
+}
+
+unsafe fn win_aio_remove_ov(rt: *mut WinAioRt, ov: *mut AioOverlapped) {
+    let mut i: usize = 0;
+    while i < MAX_IOCP_OPS {
+        if (*rt).ops[i] == ov {
+            (*rt).ops[i] = 0 as *mut AioOverlapped;
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+fn fill_sockaddr_in(buf: *mut u8, ip_host: u32, port_host: u16) {
+    unsafe {
+        let mut i: usize = 0;
+        while i < 16 {
+            *(buf + i) = 0u8;
+            i = i + 1;
+        }
+        // AF_INET = 2 (little-endian u16)
+        *(buf + 0) = 2u8;
+        *(buf + 1) = 0u8;
+        // sin_port (big-endian)
+        *(buf + 2) = ((port_host >> 8u16) & 0xFFu16) as u8;
+        *(buf + 3) = (port_host & 0xFFu16) as u8;
+        // sin_addr (big-endian)
+        *(buf + 4) = ((ip_host >> 24u32) & 0xFFu32) as u8;
+        *(buf + 5) = ((ip_host >> 16u32) & 0xFFu32) as u8;
+        *(buf + 6) = ((ip_host >> 8u32) & 0xFFu32) as u8;
+        *(buf + 7) = (ip_host & 0xFFu32) as u8;
+    }
+}
+
+fn read_sockaddr_in_aux(buf: *const u8) -> u64 {
+    unsafe {
+        let p_hi = *(buf + 2) as u64;
+        let p_lo = *(buf + 3) as u64;
+        let port = (p_hi << 8u64) | p_lo;
+        let a0 = *(buf + 4) as u64;
+        let a1 = *(buf + 5) as u64;
+        let a2 = *(buf + 6) as u64;
+        let a3 = *(buf + 7) as u64;
+        let ip = (a0 << 24u64) | (a1 << 16u64) | (a2 << 8u64) | a3;
+        (ip << 16u64) | port
+    }
+}
+
+pub fn __ax_host_aio_create() -> i64 {
+    unsafe {
+        let rt = win_aio_rt_get();
+        if (rt as usize) == 0 {
+            return -9i64;
+        }
+        let iocp = CreateIoCompletionPort(INVALID_HANDLE_VAL as *mut u8, 0 as *mut u8, 0usize, 0u32);
+        if (iocp as usize) == 0 {
+            return map_win32_error(GetLastError());
+        }
+        let cs = address_of_mut((*rt).cs[0]) as *mut u8;
+        EnterCriticalSection(cs);
+        let mut i: usize = 0;
+        while i < MAX_IOCP_REACTORS {
+            if (*rt).reactors[i].in_use == 0u32 {
+                (*rt).reactors[i].in_use = 1u32;
+                (*rt).reactors[i].iocp = iocp;
+                LeaveCriticalSection(cs);
+                return (i + 1) as i64;
+            }
+            i = i + 1;
+        }
+        LeaveCriticalSection(cs);
+        CloseHandle(iocp);
+        -9i64
+    }
+}
+
+pub fn __ax_host_aio_destroy(reactor: i64) -> i64 {
+    unsafe {
+        let rt = win_aio_rt_get();
+        if (rt as usize) == 0 || reactor < 1i64 || (reactor as usize) > MAX_IOCP_REACTORS {
+            return -4i64;
+        }
+        let cs = address_of_mut((*rt).cs[0]) as *mut u8;
+        EnterCriticalSection(cs);
+        let idx = (reactor - 1i64) as usize;
+        if (*rt).reactors[idx].in_use == 0u32 {
+            LeaveCriticalSection(cs);
+            return -4i64;
+        }
+        let iocp = (*rt).reactors[idx].iocp;
+        (*rt).reactors[idx].in_use = 0u32;
+        (*rt).reactors[idx].iocp = 0 as *mut u8;
+        LeaveCriticalSection(cs);
+        if (iocp as usize) != 0 {
+            let _ = CloseHandle(iocp);
+        }
+        0i64
+    }
+}
+
+pub fn __ax_host_aio_wake(reactor: i64) -> i64 {
+    unsafe {
+        let rt = win_aio_rt_get();
+        if (rt as usize) == 0 {
+            return -4i64;
+        }
+        let cs = address_of_mut((*rt).cs[0]) as *mut u8;
+        EnterCriticalSection(cs);
+        let iocp = win_aio_get_iocp(rt, reactor);
+        LeaveCriticalSection(cs);
+        if (iocp as usize) == 0 {
+            return -4i64;
+        }
+        let ok = PostQueuedCompletionStatus(iocp, 0u32, KEY_WAKEUP, 0 as *mut u8);
+        if ok == 0 {
+            return map_win32_error(GetLastError());
+        }
+        0i64
+    }
+}
+
+pub unsafe fn __ax_host_aio_wait(reactor: i64, events_out: *mut u64, max_events: usize, timeout_ns: i64) -> i64 {
+    let rt = win_aio_rt_get();
+    if (rt as usize) == 0 {
+        return -4i64;
+    }
+    let cs = address_of_mut((*rt).cs[0]) as *mut u8;
+    EnterCriticalSection(cs);
+    let iocp = win_aio_get_iocp(rt, reactor);
+    LeaveCriticalSection(cs);
+    if (iocp as usize) == 0 {
+        return -4i64;
+    }
+
+    let mut ms: u32 = 0u32;
+    if timeout_ns < 0i64 {
+        ms = 0xFFFFFFFFu32;
+    } else if timeout_ns > 0i64 {
+        let m64 = ((timeout_ns as u64) + 999999u64) / 1000000u64;
+        if m64 == 0u64 {
+            ms = 1u32;
+        } else if m64 >= 0xFFFFFFFEu64 {
+            ms = 0xFFFFFFFEu32;
+        } else {
+            ms = m64 as u32;
+        }
+    }
+
+    let mut cap_u32: u32 = if max_events == 0 { 1u32 } else if max_events > 64 { 64u32 } else { max_events as u32 };
+    let mut entries: [64]OverlappedEntry = [OverlappedEntry {
+        completion_key: 0usize,
+        overlapped: 0 as *mut u8,
+        internal: 0usize,
+        bytes_transferred: 0u32,
+        pad0: 0u32,
+    }; 64];
+    let mut removed: u32 = 0u32;
+
+    let ok = GetQueuedCompletionStatusEx(
+        iocp,
+        address_of_mut(entries[0]) as *mut u8,
+        cap_u32,
+        address_of_mut(removed),
+        ms,
+        0
+    );
+    if ok == 0 {
+        let err = GetLastError();
+        if err == 258u32 {
+            return 0i64;
+        }
+        return map_win32_error(err);
+    }
+
+    let heap = GetProcessHeap();
+    let mut out_count: usize = 0;
+    let mut i: usize = 0;
+    while i < (removed as usize) {
+        let key = entries[i].completion_key;
+        let ov_raw = entries[i].overlapped;
+        if key == KEY_WAKEUP || (ov_raw as usize) == 0 {
+            i = i + 1;
+            continue;
+        }
+        let ov = ov_raw as *mut AioOverlapped;
+        let op_id = (*ov).op_id;
+        let op_kind = (*ov).op_kind;
+        let mut res: i64 = 0i64;
+        let mut aux: u64 = 0u64;
+
+        if key == KEY_SYNTH || op_kind == OP_KIND_SYNTH {
+            res = (*ov).synth_result;
+        } else {
+            let st_rc = map_ntstatus((*ov).internal);
+            if st_rc < 0i64 {
+                res = st_rc;
+            } else if op_kind == OP_KIND_ACCEPT {
+                let mut l_sock: usize = (*ov).os_handle as usize;
+                let a_sock = (*ov).aux_socket;
+                let _ = setsockopt(a_sock, 0xFFFF, 0x700B, address_of(l_sock) as *const u8, 8);
+                let mut peer_sa: [16]u8 = [0u8; 16];
+                let mut peer_len: i32 = 16;
+                if getpeername(a_sock, address_of_mut(peer_sa[0]), address_of_mut(peer_len)) == 0 {
+                    aux = read_sockaddr_in_aux(address_of(peer_sa[0]));
+                }
+                res = (*ov).aux_handle_id;
+            } else if op_kind == OP_KIND_CONNECT {
+                let c_sock = (*ov).aux_socket;
+                let _ = setsockopt(c_sock, 0xFFFF, 0x7010, 0 as *const u8, 0);
+                res = (*ov).aux_handle_id;
+            } else if op_kind == OP_KIND_RECV_FROM {
+                res = entries[i].bytes_transferred as i64;
+                aux = read_sockaddr_in_aux(address_of((*ov).addr_buf[0]));
+            } else {
+                res = entries[i].bytes_transferred as i64;
+            }
+        }
+
+        EnterCriticalSection(cs);
+        win_aio_remove_ov(rt, ov);
+        LeaveCriticalSection(cs);
+        HeapFree(heap, 0u32, ov as *mut u8);
+
+        if out_count < max_events && (events_out as usize) != 0 {
+            let base = out_count * 3;
+            *(events_out + base + 0) = op_id;
+            *(events_out + base + 1) = res as u64;
+            *(events_out + base + 2) = aux;
+            out_count = out_count + 1;
+        }
+        i = i + 1;
+    }
+    out_count as i64
+}
+
+pub fn __ax_host_aio_cancel(reactor: i64, op_id: u64) -> i64 {
+    unsafe {
+        let rt = win_aio_rt_get();
+        if (rt as usize) == 0 {
+            return -4i64;
+        }
+        let cs = address_of_mut((*rt).cs[0]) as *mut u8;
+        EnterCriticalSection(cs);
+        let iocp = win_aio_get_iocp(rt, reactor);
+        if (iocp as usize) == 0 {
+            LeaveCriticalSection(cs);
+            return -4i64;
+        }
+        let mut target_ov: *mut AioOverlapped = 0 as *mut AioOverlapped;
+        let mut target_h: *mut u8 = 0 as *mut u8;
+        let mut i: usize = 0;
+        while i < MAX_IOCP_OPS {
+            let cur = (*rt).ops[i];
+            if (cur as usize) != 0 && (*cur).op_id == op_id && (*cur).reactor_id == reactor {
+                target_ov = cur;
+                target_h = (*cur).os_handle;
+                break;
+            }
+            i = i + 1;
+        }
+        LeaveCriticalSection(cs);
+        if (target_ov as usize) == 0 || (target_h as usize) == 0 {
+            return 0i64;
+        }
+        let _ = CancelIoEx(target_h, target_ov as *mut u8);
+        0i64
+    }
+}
+
+pub unsafe fn __ax_host_aio_file_open(reactor: i64, path: *const u8, path_len: usize, mode: u32) -> i64 {
+    let rt = win_aio_rt_get();
+    if (rt as usize) == 0 || path_len == 0 {
+        return -4i64;
+    }
+    let cs = address_of_mut((*rt).cs[0]) as *mut u8;
+    EnterCriticalSection(cs);
+    let iocp = win_aio_get_iocp(rt, reactor);
+    LeaveCriticalSection(cs);
+    if (iocp as usize) == 0 {
+        return -4i64;
+    }
+
+    let mut wpath: [1024]u16 = [0u16; 1024];
+    let mut ip: usize = 0;
+    let mut op: usize = 0;
+    while ip < path_len && op + 2 < 1024 {
+        let b0 = *(path + ip) as u32;
+        let mut cp: u32 = b0;
+        let mut step: usize = 1;
+        if b0 < 0x80u32 {
+            cp = b0;
+            step = 1;
+        } else if (b0 & 0xE0u32) == 0xC0u32 && ip + 1 < path_len {
+            cp = ((b0 & 0x1Fu32) << 6u32) | ((*(path + ip + 1) as u32) & 0x3Fu32);
+            step = 2;
+        } else if (b0 & 0xF0u32) == 0xE0u32 && ip + 2 < path_len {
+            cp = ((b0 & 0x0Fu32) << 12u32) | (((*(path + ip + 1) as u32) & 0x3Fu32) << 6u32) | ((*(path + ip + 2) as u32) & 0x3Fu32);
+            step = 3;
+        } else if (b0 & 0xF8u32) == 0xF0u32 && ip + 3 < path_len {
+            cp = ((b0 & 0x07u32) << 18u32) | (((*(path + ip + 1) as u32) & 0x3Fu32) << 12u32) | (((*(path + ip + 2) as u32) & 0x3Fu32) << 6u32) | ((*(path + ip + 3) as u32) & 0x3Fu32);
+            step = 4;
+        } else {
+            cp = 0xFFFDu32;
+        }
+        ip = ip + step;
+        if cp <= 0xFFFFu32 {
+            wpath[op] = cp as u16;
+            op = op + 1;
+        } else {
+            wpath[op] = (0xD800u32 + ((cp - 0x10000u32) >> 10u32)) as u16;
+            wpath[op + 1] = (0xDC00u32 + ((cp - 0x10000u32) & 0x3FFu32)) as u16;
+            op = op + 2;
+        }
+    }
+    wpath[op] = 0u16;
+
+    let mut access: u32 = 0u32;
+    let mut disp: u32 = 0u32;
+    if mode == 0u32 {
+        access = 0x80000000u32;
+        disp = 3u32;
+    } else if mode == 1u32 {
+        access = 0xC0000000u32;
+        disp = 2u32;
+    } else if mode == 2u32 {
+        access = 0x80000004u32;
+        disp = 4u32;
+    } else if mode == 3u32 {
+        access = 0xC0000000u32;
+        disp = 4u32;
+    } else {
+        return -4i64;
+    }
+
+    // FILE_ATTRIBUTE_NORMAL (0x80) | FILE_FLAG_OVERLAPPED (0x40000000)
+    let h = CreateFileW(address_of(wpath[0]), access, 7u32, 0 as *mut u8, disp, 0x40000080u32, 0 as *mut u8);
+    if (h as usize) == INVALID_HANDLE_VAL {
+        return map_win32_error(GetLastError());
+    }
+    let assoc = CreateIoCompletionPort(h, iocp, 0usize, 0u32);
+    if (assoc as usize) == 0 {
+        let err = GetLastError();
+        CloseHandle(h);
+        return map_win32_error(err);
+    }
+
+    EnterCriticalSection(cs);
+    let hid = win_aio_alloc_handle(rt, HANDLE_KIND_FILE, reactor, h);
+    LeaveCriticalSection(cs);
+    if hid < 0i64 {
+        CloseHandle(h);
+    }
+    hid
+}
+
+pub unsafe fn __ax_host_aio_submit_read_at(reactor: i64, handle: i64, offset: u64, buf: *mut u8, len: usize) -> i64 {
+    let rt = win_aio_rt_get();
+    if (rt as usize) == 0 || handle < 1i64 || (handle as usize) > MAX_IOCP_HANDLES {
+        return -4i64;
+    }
+    let cs = address_of_mut((*rt).cs[0]) as *mut u8;
+    EnterCriticalSection(cs);
+    let iocp = win_aio_get_iocp(rt, reactor);
+    let hidx = (handle - 1i64) as usize;
+    if (iocp as usize) == 0 || (*rt).handles[hidx].in_use == 0u32 || (*rt).handles[hidx].kind != HANDLE_KIND_FILE {
+        LeaveCriticalSection(cs);
+        return -4i64;
+    }
+    let os_h = (*rt).handles[hidx].os_handle;
+    let ov = win_aio_alloc_ov(rt, OP_KIND_READ_WRITE, reactor, handle, os_h);
+    LeaveCriticalSection(cs);
+    if (ov as usize) == 0 {
+        return -9i64;
+    }
+    (*ov).offset_lo = (offset & 0xFFFFFFFFu64) as u32;
+    (*ov).offset_hi = ((offset >> 32u64) & 0xFFFFFFFFu64) as u32;
+    let op_id = (*ov).op_id;
+    let mut nread: u32 = 0u32;
+    let ok = ReadFile(os_h, buf, len as u32, address_of_mut(nread), ov as *mut u8);
+    if ok == 0 {
+        let err = GetLastError();
+        if err != 997u32 {
+            // ERROR_HANDLE_EOF (38) -> synthetic 0-byte completion; other error -> synthetic error
+            (*ov).op_kind = OP_KIND_SYNTH;
+            (*ov).synth_result = if err == 38u32 { 0i64 } else { map_win32_error(err) };
+            let _ = PostQueuedCompletionStatus(iocp, 0u32, KEY_SYNTH, ov as *mut u8);
+        }
+    }
+    op_id as i64
+}
+
+pub unsafe fn __ax_host_aio_submit_write_at(reactor: i64, handle: i64, offset: u64, buf: *const u8, len: usize) -> i64 {
+    let rt = win_aio_rt_get();
+    if (rt as usize) == 0 || handle < 1i64 || (handle as usize) > MAX_IOCP_HANDLES {
+        return -4i64;
+    }
+    let cs = address_of_mut((*rt).cs[0]) as *mut u8;
+    EnterCriticalSection(cs);
+    let iocp = win_aio_get_iocp(rt, reactor);
+    let hidx = (handle - 1i64) as usize;
+    if (iocp as usize) == 0 || (*rt).handles[hidx].in_use == 0u32 || (*rt).handles[hidx].kind != HANDLE_KIND_FILE {
+        LeaveCriticalSection(cs);
+        return -4i64;
+    }
+    let os_h = (*rt).handles[hidx].os_handle;
+    let ov = win_aio_alloc_ov(rt, OP_KIND_READ_WRITE, reactor, handle, os_h);
+    LeaveCriticalSection(cs);
+    if (ov as usize) == 0 {
+        return -9i64;
+    }
+    (*ov).offset_lo = (offset & 0xFFFFFFFFu64) as u32;
+    (*ov).offset_hi = ((offset >> 32u64) & 0xFFFFFFFFu64) as u32;
+    let op_id = (*ov).op_id;
+    let mut nwritten: u32 = 0u32;
+    let ok = WriteFile(os_h, buf, len as u32, address_of_mut(nwritten), ov as *mut u8);
+    if ok == 0 {
+        let err = GetLastError();
+        if err != 997u32 {
+            (*ov).op_kind = OP_KIND_SYNTH;
+            (*ov).synth_result = map_win32_error(err);
+            let _ = PostQueuedCompletionStatus(iocp, 0u32, KEY_SYNTH, ov as *mut u8);
+        }
+    }
+    op_id as i64
+}
+
+pub fn __ax_host_aio_submit_flush(reactor: i64, handle: i64) -> i64 {
+    unsafe {
+        let rt = win_aio_rt_get();
+        if (rt as usize) == 0 || handle < 1i64 || (handle as usize) > MAX_IOCP_HANDLES {
+            return -4i64;
+        }
+        let cs = address_of_mut((*rt).cs[0]) as *mut u8;
+        EnterCriticalSection(cs);
+        let iocp = win_aio_get_iocp(rt, reactor);
+        let hidx = (handle - 1i64) as usize;
+        if (iocp as usize) == 0 || (*rt).handles[hidx].in_use == 0u32 || (*rt).handles[hidx].kind != HANDLE_KIND_FILE {
+            LeaveCriticalSection(cs);
+            return -4i64;
+        }
+        let os_h = (*rt).handles[hidx].os_handle;
+        let ov = win_aio_alloc_ov(rt, OP_KIND_SYNTH, reactor, handle, os_h);
+        LeaveCriticalSection(cs);
+        if (ov as usize) == 0 {
+            return -9i64;
+        }
+        let ok = FlushFileBuffers(os_h);
+        (*ov).synth_result = if ok != 0 { 0i64 } else { map_win32_error(GetLastError()) };
+        let op_id = (*ov).op_id;
+        let _ = PostQueuedCompletionStatus(iocp, 0u32, KEY_SYNTH, ov as *mut u8);
+        op_id as i64
+    }
+}
+
+pub fn __ax_host_aio_tcp_bind(reactor: i64, addr_ipv4: u32, port: u16) -> i64 {
+    unsafe {
+        let rt = win_aio_rt_get();
+        if (rt as usize) == 0 {
+            return -9i64;
+        }
+        let cs = address_of_mut((*rt).cs[0]) as *mut u8;
+        EnterCriticalSection(cs);
+        let iocp = win_aio_get_iocp(rt, reactor);
+        let wsa_ok = win_aio_ensure_wsa(rt);
+        LeaveCriticalSection(cs);
+        if (iocp as usize) == 0 {
+            return -4i64;
+        }
+        if !wsa_ok {
+            return -9i64;
+        }
+        // AF_INET=2, SOCK_STREAM=1, IPPROTO_TCP=6, WSA_FLAG_OVERLAPPED=1
+        let sock = WSASocketW(2, 1, 6, 0 as *mut u8, 0u32, 1u32);
+        if sock == INVALID_SOCKET_VAL {
+            return map_win32_error(WSAGetLastError() as u32);
+        }
+        let mut sa: [16]u8 = [0u8; 16];
+        fill_sockaddr_in(address_of_mut(sa[0]), addr_ipv4, port);
+        if bind(sock, address_of(sa[0]), 16) != 0 {
+            let err = WSAGetLastError() as u32;
+            let _ = closesocket(sock);
+            return map_win32_error(err);
+        }
+        if listen(sock, 128) != 0 {
+            let err = WSAGetLastError() as u32;
+            let _ = closesocket(sock);
+            return map_win32_error(err);
+        }
+        let assoc = CreateIoCompletionPort(sock as *mut u8, iocp, 0usize, 0u32);
+        if (assoc as usize) == 0 {
+            let err = GetLastError();
+            let _ = closesocket(sock);
+            return map_win32_error(err);
+        }
+        EnterCriticalSection(cs);
+        win_aio_ensure_ext_fns(rt, sock);
+        let hid = win_aio_alloc_handle(rt, HANDLE_KIND_TCP_LISTENER, reactor, sock as *mut u8);
+        LeaveCriticalSection(cs);
+        if hid < 0i64 {
+            let _ = closesocket(sock);
+        }
+        hid
+    }
+}
+
+pub fn __ax_host_aio_socket_local_port(handle: i64) -> i64 {
+    unsafe {
+        let rt = win_aio_rt_get();
+        if (rt as usize) == 0 || handle < 1i64 || (handle as usize) > MAX_IOCP_HANDLES {
+            return -4i64;
+        }
+        let cs = address_of_mut((*rt).cs[0]) as *mut u8;
+        EnterCriticalSection(cs);
+        let hidx = (handle - 1i64) as usize;
+        if (*rt).handles[hidx].in_use == 0u32 {
+            LeaveCriticalSection(cs);
+            return -4i64;
+        }
+        let sock = (*rt).handles[hidx].os_handle as usize;
+        LeaveCriticalSection(cs);
+        let mut sa: [16]u8 = [0u8; 16];
+        let mut salen: i32 = 16;
+        if getsockname(sock, address_of_mut(sa[0]), address_of_mut(salen)) != 0 {
+            return map_win32_error(WSAGetLastError() as u32);
+        }
+        let p_hi = sa[2] as u64;
+        let p_lo = sa[3] as u64;
+        ((p_hi << 8u64) | p_lo) as i64
+    }
+}
+
+pub fn __ax_host_aio_submit_accept(reactor: i64, listener: i64) -> i64 {
+    unsafe {
+        let rt = win_aio_rt_get();
+        if (rt as usize) == 0 || listener < 1i64 || (listener as usize) > MAX_IOCP_HANDLES {
+            return -4i64;
+        }
+        let cs = address_of_mut((*rt).cs[0]) as *mut u8;
+        EnterCriticalSection(cs);
+        let iocp = win_aio_get_iocp(rt, reactor);
+        let hidx = (listener - 1i64) as usize;
+        if (iocp as usize) == 0 || (*rt).handles[hidx].in_use == 0u32 || (*rt).handles[hidx].kind != HANDLE_KIND_TCP_LISTENER {
+            LeaveCriticalSection(cs);
+            return -4i64;
+        }
+        let l_sock = (*rt).handles[hidx].os_handle as usize;
+        let acc_fn_addr = (*rt).accept_ex_fn;
+        LeaveCriticalSection(cs);
+        if acc_fn_addr == 0usize {
+            return -9i64;
+        }
+        let a_sock = WSASocketW(2, 1, 6, 0 as *mut u8, 0u32, 1u32);
+        if a_sock == INVALID_SOCKET_VAL {
+            return map_win32_error(WSAGetLastError() as u32);
+        }
+        let assoc = CreateIoCompletionPort(a_sock as *mut u8, iocp, 0usize, 0u32);
+        if (assoc as usize) == 0 {
+            let err = GetLastError();
+            let _ = closesocket(a_sock);
+            return map_win32_error(err);
+        }
+        EnterCriticalSection(cs);
+        let a_hid = win_aio_alloc_handle(rt, HANDLE_KIND_TCP_STREAM, reactor, a_sock as *mut u8);
+        if a_hid < 0i64 {
+            LeaveCriticalSection(cs);
+            let _ = closesocket(a_sock);
+            return -9i64;
+        }
+        let ov = win_aio_alloc_ov(rt, OP_KIND_ACCEPT, reactor, listener, l_sock as *mut u8);
+        LeaveCriticalSection(cs);
+        if (ov as usize) == 0 {
+            let _ = closesocket(a_sock);
+            return -9i64;
+        }
+        (*ov).aux_handle_id = a_hid;
+        (*ov).aux_socket = a_sock;
+        let op_id = (*ov).op_id;
+        let acc_fn: fn(usize, usize, *mut u8, u32, u32, u32, *mut u32, *mut u8) -> i32 =
+            *(address_of(acc_fn_addr) as *const fn(usize, usize, *mut u8, u32, u32, u32, *mut u32, *mut u8) -> i32);
+        let mut bytes_recvd: u32 = 0u32;
+        let ok = acc_fn(l_sock, a_sock, address_of_mut((*ov).addr_buf[0]), 0u32, 32u32, 32u32, address_of_mut(bytes_recvd), ov as *mut u8);
+        if ok == 0 {
+            let err = WSAGetLastError() as u32;
+            if err != 997u32 {
+                (*ov).op_kind = OP_KIND_SYNTH;
+                (*ov).synth_result = map_win32_error(err);
+                let _ = PostQueuedCompletionStatus(iocp, 0u32, KEY_SYNTH, ov as *mut u8);
+            }
+        }
+        op_id as i64
+    }
+}
+
+pub fn __ax_host_aio_submit_connect(reactor: i64, addr_ipv4: u32, port: u16) -> i64 {
+    unsafe {
+        let rt = win_aio_rt_get();
+        if (rt as usize) == 0 {
+            return -9i64;
+        }
+        let cs = address_of_mut((*rt).cs[0]) as *mut u8;
+        EnterCriticalSection(cs);
+        let iocp = win_aio_get_iocp(rt, reactor);
+        let wsa_ok = win_aio_ensure_wsa(rt);
+        LeaveCriticalSection(cs);
+        if (iocp as usize) == 0 {
+            return -4i64;
+        }
+        if !wsa_ok {
+            return -9i64;
+        }
+        let c_sock = WSASocketW(2, 1, 6, 0 as *mut u8, 0u32, 1u32);
+        if c_sock == INVALID_SOCKET_VAL {
+            return map_win32_error(WSAGetLastError() as u32);
+        }
+        // ConnectEx requires socket to be bound to local ephemeral port first
+        let mut local_sa: [16]u8 = [0u8; 16];
+        fill_sockaddr_in(address_of_mut(local_sa[0]), 0u32, 0u16);
+        if bind(c_sock, address_of(local_sa[0]), 16) != 0 {
+            let err = WSAGetLastError() as u32;
+            let _ = closesocket(c_sock);
+            return map_win32_error(err);
+        }
+        let assoc = CreateIoCompletionPort(c_sock as *mut u8, iocp, 0usize, 0u32);
+        if (assoc as usize) == 0 {
+            let err = GetLastError();
+            let _ = closesocket(c_sock);
+            return map_win32_error(err);
+        }
+        EnterCriticalSection(cs);
+        win_aio_ensure_ext_fns(rt, c_sock);
+        let con_fn_addr = (*rt).connect_ex_fn;
+        let c_hid = win_aio_alloc_handle(rt, HANDLE_KIND_TCP_STREAM, reactor, c_sock as *mut u8);
+        let ov = if c_hid > 0i64 && con_fn_addr != 0usize {
+            win_aio_alloc_ov(rt, OP_KIND_CONNECT, reactor, c_hid, c_sock as *mut u8)
+        } else {
+            0 as *mut AioOverlapped
+        };
+        LeaveCriticalSection(cs);
+        if (ov as usize) == 0 {
+            let _ = closesocket(c_sock);
+            return -9i64;
+        }
+        (*ov).aux_handle_id = c_hid;
+        (*ov).aux_socket = c_sock;
+        fill_sockaddr_in(address_of_mut((*ov).addr_buf[0]), addr_ipv4, port);
+        let op_id = (*ov).op_id;
+        let con_fn: fn(usize, *const u8, i32, *mut u8, u32, *mut u32, *mut u8) -> i32 =
+            *(address_of(con_fn_addr) as *const fn(usize, *const u8, i32, *mut u8, u32, *mut u32, *mut u8) -> i32);
+        let mut sent: u32 = 0u32;
+        let ok = con_fn(c_sock, address_of((*ov).addr_buf[0]), 16, 0 as *mut u8, 0u32, address_of_mut(sent), ov as *mut u8);
+        if ok == 0 {
+            let err = WSAGetLastError() as u32;
+            if err != 997u32 {
+                (*ov).op_kind = OP_KIND_SYNTH;
+                (*ov).synth_result = map_win32_error(err);
+                let _ = PostQueuedCompletionStatus(iocp, 0u32, KEY_SYNTH, ov as *mut u8);
+            }
+        }
+        op_id as i64
+    }
+}
+
+pub unsafe fn __ax_host_aio_submit_recv(reactor: i64, stream: i64, buf: *mut u8, len: usize) -> i64 {
+    let rt = win_aio_rt_get();
+    if (rt as usize) == 0 || stream < 1i64 || (stream as usize) > MAX_IOCP_HANDLES {
+        return -4i64;
+    }
+    let cs = address_of_mut((*rt).cs[0]) as *mut u8;
+    EnterCriticalSection(cs);
+    let iocp = win_aio_get_iocp(rt, reactor);
+    let hidx = (stream - 1i64) as usize;
+    if (iocp as usize) == 0 || (*rt).handles[hidx].in_use == 0u32 || (*rt).handles[hidx].kind != HANDLE_KIND_TCP_STREAM {
+        LeaveCriticalSection(cs);
+        return -4i64;
+    }
+    let sock = (*rt).handles[hidx].os_handle as usize;
+    let ov = win_aio_alloc_ov(rt, OP_KIND_READ_WRITE, reactor, stream, sock as *mut u8);
+    LeaveCriticalSection(cs);
+    if (ov as usize) == 0 {
+        return -9i64;
+    }
+    (*ov).wsa_buf_len = len as u32;
+    (*ov).wsa_buf_ptr = buf;
+    (*ov).wsa_flags = 0u32;
+    let op_id = (*ov).op_id;
+    let mut recvd: u32 = 0u32;
+    let rc = WSARecv(
+        sock,
+        address_of_mut((*ov).wsa_buf_len) as *mut u8,
+        1u32,
+        address_of_mut(recvd),
+        address_of_mut((*ov).wsa_flags),
+        ov as *mut u8,
+        0 as *mut u8
+    );
+    if rc != 0 {
+        let err = WSAGetLastError() as u32;
+        if err != 997u32 {
+            (*ov).op_kind = OP_KIND_SYNTH;
+            (*ov).synth_result = map_win32_error(err);
+            let _ = PostQueuedCompletionStatus(iocp, 0u32, KEY_SYNTH, ov as *mut u8);
+        }
+    }
+    op_id as i64
+}
+
+pub unsafe fn __ax_host_aio_submit_send(reactor: i64, stream: i64, buf: *const u8, len: usize) -> i64 {
+    let rt = win_aio_rt_get();
+    if (rt as usize) == 0 || stream < 1i64 || (stream as usize) > MAX_IOCP_HANDLES {
+        return -4i64;
+    }
+    let cs = address_of_mut((*rt).cs[0]) as *mut u8;
+    EnterCriticalSection(cs);
+    let iocp = win_aio_get_iocp(rt, reactor);
+    let hidx = (stream - 1i64) as usize;
+    if (iocp as usize) == 0 || (*rt).handles[hidx].in_use == 0u32 || (*rt).handles[hidx].kind != HANDLE_KIND_TCP_STREAM {
+        LeaveCriticalSection(cs);
+        return -4i64;
+    }
+    let sock = (*rt).handles[hidx].os_handle as usize;
+    let ov = win_aio_alloc_ov(rt, OP_KIND_READ_WRITE, reactor, stream, sock as *mut u8);
+    LeaveCriticalSection(cs);
+    if (ov as usize) == 0 {
+        return -9i64;
+    }
+    (*ov).wsa_buf_len = len as u32;
+    (*ov).wsa_buf_ptr = buf as *mut u8;
+    let op_id = (*ov).op_id;
+    let mut sent: u32 = 0u32;
+    let rc = WSASend(
+        sock,
+        address_of_mut((*ov).wsa_buf_len) as *mut u8,
+        1u32,
+        address_of_mut(sent),
+        0u32,
+        ov as *mut u8,
+        0 as *mut u8
+    );
+    if rc != 0 {
+        let err = WSAGetLastError() as u32;
+        if err != 997u32 {
+            (*ov).op_kind = OP_KIND_SYNTH;
+            (*ov).synth_result = map_win32_error(err);
+            let _ = PostQueuedCompletionStatus(iocp, 0u32, KEY_SYNTH, ov as *mut u8);
+        }
+    }
+    op_id as i64
+}
+
+pub fn __ax_host_aio_tcp_shutdown(stream: i64, how: u32) -> i64 {
+    unsafe {
+        let rt = win_aio_rt_get();
+        if (rt as usize) == 0 || stream < 1i64 || (stream as usize) > MAX_IOCP_HANDLES {
+            return -4i64;
+        }
+        let cs = address_of_mut((*rt).cs[0]) as *mut u8;
+        EnterCriticalSection(cs);
+        let hidx = (stream - 1i64) as usize;
+        if (*rt).handles[hidx].in_use == 0u32 || (*rt).handles[hidx].kind != HANDLE_KIND_TCP_STREAM {
+            LeaveCriticalSection(cs);
+            return -4i64;
+        }
+        let sock = (*rt).handles[hidx].os_handle as usize;
+        LeaveCriticalSection(cs);
+        if shutdown(sock, how as i32) != 0 {
+            return map_win32_error(WSAGetLastError() as u32);
+        }
+        0i64
+    }
+}
+
+pub fn __ax_host_aio_udp_bind(reactor: i64, addr_ipv4: u32, port: u16) -> i64 {
+    unsafe {
+        let rt = win_aio_rt_get();
+        if (rt as usize) == 0 {
+            return -9i64;
+        }
+        let cs = address_of_mut((*rt).cs[0]) as *mut u8;
+        EnterCriticalSection(cs);
+        let iocp = win_aio_get_iocp(rt, reactor);
+        let wsa_ok = win_aio_ensure_wsa(rt);
+        LeaveCriticalSection(cs);
+        if (iocp as usize) == 0 {
+            return -4i64;
+        }
+        if !wsa_ok {
+            return -9i64;
+        }
+        // AF_INET=2, SOCK_DGRAM=2, IPPROTO_UDP=17, WSA_FLAG_OVERLAPPED=1
+        let sock = WSASocketW(2, 2, 17, 0 as *mut u8, 0u32, 1u32);
+        if sock == INVALID_SOCKET_VAL {
+            return map_win32_error(WSAGetLastError() as u32);
+        }
+        let mut sa: [16]u8 = [0u8; 16];
+        fill_sockaddr_in(address_of_mut(sa[0]), addr_ipv4, port);
+        if bind(sock, address_of(sa[0]), 16) != 0 {
+            let err = WSAGetLastError() as u32;
+            let _ = closesocket(sock);
+            return map_win32_error(err);
+        }
+        let assoc = CreateIoCompletionPort(sock as *mut u8, iocp, 0usize, 0u32);
+        if (assoc as usize) == 0 {
+            let err = GetLastError();
+            let _ = closesocket(sock);
+            return map_win32_error(err);
+        }
+        EnterCriticalSection(cs);
+        let hid = win_aio_alloc_handle(rt, HANDLE_KIND_UDP_SOCK, reactor, sock as *mut u8);
+        LeaveCriticalSection(cs);
+        if hid < 0i64 {
+            let _ = closesocket(sock);
+        }
+        hid
+    }
+}
+
+pub unsafe fn __ax_host_aio_submit_recv_from(reactor: i64, sock_h: i64, buf: *mut u8, len: usize) -> i64 {
+    let rt = win_aio_rt_get();
+    if (rt as usize) == 0 || sock_h < 1i64 || (sock_h as usize) > MAX_IOCP_HANDLES {
+        return -4i64;
+    }
+    let cs = address_of_mut((*rt).cs[0]) as *mut u8;
+    EnterCriticalSection(cs);
+    let iocp = win_aio_get_iocp(rt, reactor);
+    let hidx = (sock_h - 1i64) as usize;
+    if (iocp as usize) == 0 || (*rt).handles[hidx].in_use == 0u32 || (*rt).handles[hidx].kind != HANDLE_KIND_UDP_SOCK {
+        LeaveCriticalSection(cs);
+        return -4i64;
+    }
+    let sock = (*rt).handles[hidx].os_handle as usize;
+    let ov = win_aio_alloc_ov(rt, OP_KIND_RECV_FROM, reactor, sock_h, sock as *mut u8);
+    LeaveCriticalSection(cs);
+    if (ov as usize) == 0 {
+        return -9i64;
+    }
+    (*ov).wsa_buf_len = len as u32;
+    (*ov).wsa_buf_ptr = buf;
+    (*ov).wsa_flags = 0u32;
+    (*ov).from_len = 16;
+    let op_id = (*ov).op_id;
+    let mut recvd: u32 = 0u32;
+    let rc = WSARecvFrom(
+        sock,
+        address_of_mut((*ov).wsa_buf_len) as *mut u8,
+        1u32,
+        address_of_mut(recvd),
+        address_of_mut((*ov).wsa_flags),
+        address_of_mut((*ov).addr_buf[0]),
+        address_of_mut((*ov).from_len),
+        ov as *mut u8,
+        0 as *mut u8
+    );
+    if rc != 0 {
+        let err = WSAGetLastError() as u32;
+        if err != 997u32 {
+            (*ov).op_kind = OP_KIND_SYNTH;
+            (*ov).synth_result = map_win32_error(err);
+            let _ = PostQueuedCompletionStatus(iocp, 0u32, KEY_SYNTH, ov as *mut u8);
+        }
+    }
+    op_id as i64
+}
+
+pub unsafe fn __ax_host_aio_submit_send_to(
+    reactor: i64,
+    sock_h: i64,
+    buf: *const u8,
+    len: usize,
+    addr_ipv4: u32,
+    port: u16
+) -> i64 {
+    let rt = win_aio_rt_get();
+    if (rt as usize) == 0 || sock_h < 1i64 || (sock_h as usize) > MAX_IOCP_HANDLES {
+        return -4i64;
+    }
+    let cs = address_of_mut((*rt).cs[0]) as *mut u8;
+    EnterCriticalSection(cs);
+    let iocp = win_aio_get_iocp(rt, reactor);
+    let hidx = (sock_h - 1i64) as usize;
+    if (iocp as usize) == 0 || (*rt).handles[hidx].in_use == 0u32 || (*rt).handles[hidx].kind != HANDLE_KIND_UDP_SOCK {
+        LeaveCriticalSection(cs);
+        return -4i64;
+    }
+    let sock = (*rt).handles[hidx].os_handle as usize;
+    let ov = win_aio_alloc_ov(rt, OP_KIND_READ_WRITE, reactor, sock_h, sock as *mut u8);
+    LeaveCriticalSection(cs);
+    if (ov as usize) == 0 {
+        return -9i64;
+    }
+    (*ov).wsa_buf_len = len as u32;
+    (*ov).wsa_buf_ptr = buf as *mut u8;
+    fill_sockaddr_in(address_of_mut((*ov).addr_buf[0]), addr_ipv4, port);
+    let op_id = (*ov).op_id;
+    let mut sent: u32 = 0u32;
+    let rc = WSASendTo(
+        sock,
+        address_of_mut((*ov).wsa_buf_len) as *mut u8,
+        1u32,
+        address_of_mut(sent),
+        0u32,
+        address_of((*ov).addr_buf[0]),
+        16,
+        ov as *mut u8,
+        0 as *mut u8
+    );
+    if rc != 0 {
+        let err = WSAGetLastError() as u32;
+        if err != 997u32 {
+            (*ov).op_kind = OP_KIND_SYNTH;
+            (*ov).synth_result = map_win32_error(err);
+            let _ = PostQueuedCompletionStatus(iocp, 0u32, KEY_SYNTH, ov as *mut u8);
+        }
+    }
+    op_id as i64
+}
+
+pub fn __ax_host_aio_close(reactor: i64, handle: i64) -> i64 {
+    unsafe {
+        let rt = win_aio_rt_get();
+        if (rt as usize) == 0 || handle < 1i64 || (handle as usize) > MAX_IOCP_HANDLES {
+            return -4i64;
+        }
+        let cs = address_of_mut((*rt).cs[0]) as *mut u8;
+        EnterCriticalSection(cs);
+        let hidx = (handle - 1i64) as usize;
+        if (*rt).handles[hidx].in_use == 0u32 {
+            LeaveCriticalSection(cs);
+            return -4i64;
+        }
+        let kind = (*rt).handles[hidx].kind;
+        let os_h = (*rt).handles[hidx].os_handle;
+        (*rt).handles[hidx].in_use = 0u32;
+        (*rt).handles[hidx].os_handle = 0 as *mut u8;
+        LeaveCriticalSection(cs);
+
+        let _ = reactor;
+        if (os_h as usize) != 0 {
+            let _ = CancelIoEx(os_h, 0 as *mut u8);
+            if kind == HANDLE_KIND_FILE {
+                let _ = CloseHandle(os_h);
+            } else {
+                let _ = closesocket(os_h as usize);
+            }
+        }
+        0i64
+    }
+}

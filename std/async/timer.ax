@@ -1,0 +1,614 @@
+// std.asyn.timer - Zero-OS-Thread Reactor Timer Wheel, sleep & Interval (SPEC-35 §3, T426)
+module std.asyn.timer
+
+use std.core.prelude.RawWaker
+use std.core.prelude.RawWakerVTable
+use std.core.prelude.Waker
+use std.core.prelude.Context
+use std.core.prelude.Future
+use std.core.prelude.Poll
+use std.core.option.Option
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.core.host.monotonic_ns
+use std.core.host.thread_current_id
+use std.core.host.thread_yield
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.time.Duration
+use std.asyn.timeout.Deadline
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+
+// -----------------------------------------------------------------------------
+// TimerWheel (Min-Heap ordered by (deadline_ns, timer_id), SPEC-35 AXS-AIO-020)
+// -----------------------------------------------------------------------------
+
+pub struct TimerEntry {
+    pub timer_id: u64,
+    pub deadline_ns: u64,
+    pub waker_data: *const u8,
+    pub waker_vtable: *const RawWakerVTable,
+    pub cancelled: bool,
+}
+
+pub struct TimerWheel {
+    pub lock: Atomic<u32>,
+    pub entries: *mut TimerEntry,
+    pub len: usize,
+    pub cap: usize,
+    pub active: usize,
+    pub next_id: u64,
+}
+
+unsafe fn timer_entry_at(base: *mut TimerEntry, idx: usize) -> *mut TimerEntry {
+    ((base as usize) + idx * size_of<TimerEntry>()) as *mut TimerEntry
+}
+
+fn tw_entry_less(a: *const TimerEntry, b: *const TimerEntry) -> bool {
+    let da = unsafe { (*a).deadline_ns };
+    let db = unsafe { (*b).deadline_ns };
+    if da != db {
+        return da < db;
+    }
+    unsafe { (*a).timer_id < (*b).timer_id }
+}
+
+unsafe fn tw_swap(base: *mut TimerEntry, i: usize, j: usize) {
+    let pi = timer_entry_at(base, i);
+    let pj = timer_entry_at(base, j);
+    let tmp = *pi;
+    *pi = *pj;
+    *pj = tmp;
+}
+
+unsafe fn tw_sift_up(base: *mut TimerEntry, mut idx: usize) {
+    while idx > 0 {
+        let parent = (idx - 1) / 2;
+        if tw_entry_less(timer_entry_at(base, idx) as *const TimerEntry, timer_entry_at(base, parent) as *const TimerEntry) {
+            tw_swap(base, idx, parent);
+            idx = parent;
+        } else {
+            break;
+        }
+    }
+}
+
+unsafe fn tw_sift_down(base: *mut TimerEntry, n: usize, mut idx: usize) {
+    loop {
+        let left = idx * 2 + 1;
+        let right = left + 1;
+        let mut smallest = idx;
+        if left < n && tw_entry_less(timer_entry_at(base, left) as *const TimerEntry, timer_entry_at(base, smallest) as *const TimerEntry) {
+            smallest = left;
+        }
+        if right < n && tw_entry_less(timer_entry_at(base, right) as *const TimerEntry, timer_entry_at(base, smallest) as *const TimerEntry) {
+            smallest = right;
+        }
+        if smallest != idx {
+            tw_swap(base, idx, smallest);
+            idx = smallest;
+        } else {
+            break;
+        }
+    }
+}
+
+fn tw_lock(tw: mut_view<TimerWheel>) {
+    while tw.lock.compare_exchange(0u32, 1u32, Ordering.Acquire, Ordering.Relaxed).val != 0u32 {
+        unsafe { thread_yield(); }
+    }
+}
+
+fn tw_unlock(tw: mut_view<TimerWheel>) {
+    tw.lock.store(0u32, Ordering.Release);
+}
+
+unsafe fn tw_drop_raw_waker(data: *const u8, vtable: *const RawWakerVTable) {
+    if (vtable as usize) != 0 {
+        ((*vtable).drop_waker)(data);
+    }
+}
+
+unsafe fn tw_wake_raw_waker(data: *const u8, vtable: *const RawWakerVTable) {
+    if (vtable as usize) != 0 {
+        ((*vtable).wake)(data);
+    }
+}
+
+unsafe fn tw_clone_from_cx(cx: mut_view<Context>) -> RawWaker {
+    let vt = cx.waker_val.raw.vtable;
+    if (vt as usize) != 0 {
+        return ((*vt).clone)(cx.waker_val.raw.data);
+    }
+    RawWaker { data: 0 as *const u8, vtable: 0 as *const RawWakerVTable }
+}
+
+impl TimerWheel {
+    pub fn new() -> TimerWheel {
+        TimerWheel {
+            lock: Atomic.new(0u32),
+            entries: 0 as *mut TimerEntry,
+            len: 0,
+            cap: 0,
+            active: 0,
+            next_id: 1u64,
+        }
+    }
+
+    pub fn is_empty(self: view<TimerWheel>) -> bool {
+        self.active == 0
+    }
+
+    pub fn active_count(self: view<TimerWheel>) -> usize {
+        self.active
+    }
+
+    pub fn register_raw(self: mut_view<TimerWheel>, deadline_ns: u64, waker_data: *const u8, waker_vtable: *const RawWakerVTable) -> u64 {
+        tw_lock(mut_view(*self));
+        if self.len >= self.cap {
+            let new_cap: usize = if self.cap == 0 { 64 } else { self.cap * 2 };
+            let new_bytes = new_cap * size_of<TimerEntry>();
+            let new_arr = unsafe { heap_alloc(new_bytes, align_of<TimerEntry>()) as *mut TimerEntry };
+            if (new_arr as usize) == 0 {
+                tw_unlock(mut_view(*self));
+                unsafe { tw_drop_raw_waker(waker_data, waker_vtable); }
+                return 0u64;
+            }
+            if self.len > 0 && (self.entries as usize) != 0 {
+                let mut i: usize = 0;
+                while i < self.len {
+                    unsafe {
+                        *timer_entry_at(new_arr, i) = *timer_entry_at(self.entries, i);
+                    }
+                    i = i + 1;
+                }
+                let old_bytes = self.cap * size_of<TimerEntry>();
+                unsafe { heap_free(self.entries as *mut u8, old_bytes, align_of<TimerEntry>()); }
+            }
+            self.entries = new_arr;
+            self.cap = new_cap;
+        }
+        let tid = self.next_id;
+        self.next_id = tid + 1u64;
+        let idx = self.len;
+        unsafe {
+            let slot = timer_entry_at(self.entries, idx);
+            (*slot).timer_id = tid;
+            (*slot).deadline_ns = deadline_ns;
+            (*slot).waker_data = waker_data;
+            (*slot).waker_vtable = waker_vtable;
+            (*slot).cancelled = false;
+            self.len = idx + 1;
+            self.active = self.active + 1;
+            tw_sift_up(self.entries, idx);
+        }
+        tw_unlock(mut_view(*self));
+        tid
+    }
+
+    pub fn cancel(self: mut_view<TimerWheel>, timer_id: u64) {
+        if timer_id == 0u64 {
+            return;
+        }
+        let mut drop_data: *const u8 = 0 as *const u8;
+        let mut drop_vt: *const RawWakerVTable = 0 as *const RawWakerVTable;
+        tw_lock(mut_view(*self));
+        let mut i: usize = 0;
+        while i < self.len {
+            let e = unsafe { timer_entry_at(self.entries, i) };
+            if unsafe { (*e).timer_id } == timer_id {
+                if !(unsafe { (*e).cancelled }) {
+                    unsafe {
+                        (*e).cancelled = true;
+                        drop_data = (*e).waker_data;
+                        drop_vt = (*e).waker_vtable;
+                        (*e).waker_data = 0 as *const u8;
+                        (*e).waker_vtable = 0 as *const RawWakerVTable;
+                    }
+                    if self.active > 0 {
+                        self.active = self.active - 1;
+                    }
+                }
+                break;
+            }
+            i = i + 1;
+        }
+        tw_unlock(mut_view(*self));
+        unsafe { tw_drop_raw_waker(drop_data, drop_vt); }
+    }
+
+    pub fn next_deadline_ns(self: mut_view<TimerWheel>) -> Option<u64> {
+        tw_lock(mut_view(*self));
+        while self.len > 0 {
+            let top = unsafe { timer_entry_at(self.entries, 0) };
+            if unsafe { (*top).cancelled } {
+                let last = self.len - 1;
+                self.len = last;
+                if last > 0 {
+                    unsafe {
+                        *timer_entry_at(self.entries, 0) = *timer_entry_at(self.entries, last);
+                        tw_sift_down(self.entries, last, 0);
+                    }
+                }
+            } else {
+                let d = unsafe { (*top).deadline_ns };
+                tw_unlock(mut_view(*self));
+                return Option.Some(d);
+            }
+        }
+        tw_unlock(mut_view(*self));
+        Option.None
+    }
+
+    pub fn next_expiration_delay_ns(self: mut_view<TimerWheel>) -> Option<u64> {
+        match self.next_deadline_ns() {
+            Option.None => Option.None,
+            Option.Some(d) => {
+                let now = monotonic_ns();
+                if d <= now {
+                    Option.Some(0u64)
+                } else {
+                    Option.Some(d - now)
+                }
+            },
+        }
+    }
+
+    pub fn advance_to(self: mut_view<TimerWheel>, now_ns: u64) -> usize {
+        // Collect expired wakers under the lock, then wake them outside the lock.
+        let mut woke_total: usize = 0;
+        loop {
+            let mut batch_data: [32]usize = [0usize; 32];
+            let mut batch_vt: [32]usize = [0usize; 32];
+            let mut batch_len: usize = 0;
+
+            tw_lock(mut_view(*self));
+            while self.len > 0 && batch_len < 32 {
+                let top = unsafe { timer_entry_at(self.entries, 0) };
+                let cancelled = unsafe { (*top).cancelled };
+                let dl = unsafe { (*top).deadline_ns };
+                if !cancelled && dl > now_ns {
+                    break;
+                }
+                let wd = unsafe { (*top).waker_data as usize };
+                let wv = unsafe { (*top).waker_vtable as usize };
+                let last = self.len - 1;
+                self.len = last;
+                if last > 0 {
+                    unsafe {
+                        *timer_entry_at(self.entries, 0) = *timer_entry_at(self.entries, last);
+                        tw_sift_down(self.entries, last, 0);
+                    }
+                }
+                if !cancelled {
+                    if self.active > 0 {
+                        self.active = self.active - 1;
+                    }
+                    batch_data[batch_len] = wd;
+                    batch_vt[batch_len] = wv;
+                    batch_len = batch_len + 1;
+                }
+            }
+            tw_unlock(mut_view(*self));
+
+            if batch_len == 0 {
+                break;
+            }
+            let mut i: usize = 0;
+            while i < batch_len {
+                let wd = batch_data[i] as *const u8;
+                let wv = batch_vt[i] as *const RawWakerVTable;
+                unsafe { tw_wake_raw_waker(wd, wv); }
+                woke_total = woke_total + 1;
+                i = i + 1;
+            }
+        }
+        woke_total
+    }
+
+    pub fn clear(self: mut_view<TimerWheel>) {
+        tw_lock(mut_view(*self));
+        let mut i: usize = 0;
+        while i < self.len {
+            let e = unsafe { timer_entry_at(self.entries, i) };
+            if !(unsafe { (*e).cancelled }) {
+                unsafe { tw_drop_raw_waker((*e).waker_data, (*e).waker_vtable); }
+            }
+            i = i + 1;
+        }
+        if (self.entries as usize) != 0 && self.cap > 0 {
+            let bytes = self.cap * size_of<TimerEntry>();
+            unsafe { heap_free(self.entries as *mut u8, bytes, align_of<TimerEntry>()); }
+        }
+        self.entries = 0 as *mut TimerEntry;
+        self.len = 0;
+        self.cap = 0;
+        self.active = 0;
+        tw_unlock(mut_view(*self));
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Active Thread-Local TimerWheel Context Hook (avoids circular imports with Reactor)
+// -----------------------------------------------------------------------------
+
+const MAX_TW_THREADS: usize = 32;
+
+struct TwThreadSlot {
+    tid: u64,
+    wheel: *mut TimerWheel,
+}
+
+static mut TW_CTX_LOCK: Atomic<u32> = Atomic.new(0u32);
+static mut TW_CTX_SLOTS: [32]TwThreadSlot = [TwThreadSlot { tid: 0u64, wheel: 0 as *mut TimerWheel }; 32];
+
+fn tw_ctx_lock() {
+    while unsafe { TW_CTX_LOCK.compare_exchange(0u32, 1u32, Ordering.Acquire, Ordering.Relaxed).val != 0u32 } {
+        unsafe { thread_yield(); }
+    }
+}
+
+fn tw_ctx_unlock() {
+    unsafe { TW_CTX_LOCK.store(0u32, Ordering.Release); }
+}
+
+pub fn timer_wheel_enter(tw: *mut TimerWheel) -> *mut TimerWheel {
+    let me = unsafe { thread_current_id() };
+    tw_ctx_lock();
+    let mut prev: *mut TimerWheel = 0 as *mut TimerWheel;
+    let mut found_idx: usize = MAX_TW_THREADS;
+    let mut free_idx: usize = MAX_TW_THREADS;
+    let mut i: usize = 0;
+    while i < MAX_TW_THREADS {
+        let stid = unsafe { TW_CTX_SLOTS[i].tid };
+        if stid == me {
+            found_idx = i;
+            break;
+        }
+        if stid == 0u64 && free_idx == MAX_TW_THREADS {
+            free_idx = i;
+        }
+        i = i + 1;
+    }
+    if found_idx < MAX_TW_THREADS {
+        prev = unsafe { TW_CTX_SLOTS[found_idx].wheel };
+        unsafe { TW_CTX_SLOTS[found_idx].wheel = tw; }
+    } else if free_idx < MAX_TW_THREADS {
+        unsafe {
+            TW_CTX_SLOTS[free_idx].tid = me;
+            TW_CTX_SLOTS[free_idx].wheel = tw;
+        }
+    }
+    tw_ctx_unlock();
+    prev
+}
+
+pub fn timer_wheel_leave(prev: *mut TimerWheel) {
+    let me = unsafe { thread_current_id() };
+    tw_ctx_lock();
+    let mut i: usize = 0;
+    while i < MAX_TW_THREADS {
+        if unsafe { TW_CTX_SLOTS[i].tid } == me {
+            if (prev as usize) == 0 {
+                unsafe {
+                    TW_CTX_SLOTS[i].tid = 0u64;
+                    TW_CTX_SLOTS[i].wheel = 0 as *mut TimerWheel;
+                }
+            } else {
+                unsafe { TW_CTX_SLOTS[i].wheel = prev; }
+            }
+            break;
+        }
+        i = i + 1;
+    }
+    tw_ctx_unlock();
+}
+
+pub fn current_timer_wheel() -> *mut TimerWheel {
+    let me = unsafe { thread_current_id() };
+    tw_ctx_lock();
+    let mut res: *mut TimerWheel = 0 as *mut TimerWheel;
+    let mut i: usize = 0;
+    while i < MAX_TW_THREADS {
+        if unsafe { TW_CTX_SLOTS[i].tid } == me {
+            res = unsafe { TW_CTX_SLOTS[i].wheel };
+            break;
+        }
+        i = i + 1;
+    }
+    tw_ctx_unlock();
+    res
+}
+
+// -----------------------------------------------------------------------------
+// One-Shot Async Timers: SleepFuture, sleep, sleep_ns, sleep_ms, sleep_until (AXS-AIO-021)
+// -----------------------------------------------------------------------------
+
+pub struct SleepFuture {
+    pub timer_id: u64,
+    pub deadline: Deadline,
+    pub registered: bool,
+    pub completed: bool,
+    pub wheel: *mut TimerWheel,
+}
+
+impl Future for SleepFuture {
+    type Output = ();
+
+    fn poll(self: mut_view<SleepFuture>, cx: mut_view<Context>) -> Poll<()> {
+        if self.deadline.is_expired() {
+            if self.registered && (self.wheel as usize) != 0 {
+                unsafe { (*self.wheel).cancel(self.timer_id); }
+                self.registered = false;
+            }
+            self.completed = true;
+            return Poll.Ready(());
+        }
+        if !self.registered {
+            let tw = current_timer_wheel();
+            if (tw as usize) != 0 {
+                let rw = unsafe { tw_clone_from_cx(mut_view(*cx)) };
+                let tid = unsafe { (*tw).register_raw(self.deadline.deadline_ns, rw.data, rw.vtable) };
+                self.timer_id = tid;
+                self.wheel = tw;
+                self.registered = true;
+                return Poll.Pending;
+            }
+            let w = cx.waker();
+            view(w).wake_by_ref();
+            return Poll.Pending;
+        }
+        Poll.Pending
+    }
+}
+
+impl Drop for SleepFuture {
+    fn drop(self: mut_view<SleepFuture>) {
+        if self.registered && !self.completed && (self.wheel as usize) != 0 {
+            unsafe { (*self.wheel).cancel(self.timer_id); }
+            self.registered = false;
+        }
+    }
+}
+
+pub fn sleep_until(deadline: Deadline) -> SleepFuture {
+    SleepFuture {
+        timer_id: 0u64,
+        deadline: deadline,
+        registered: false,
+        completed: false,
+        wheel: 0 as *mut TimerWheel,
+    }
+}
+
+pub fn sleep_ns(duration_ns: u64) -> SleepFuture {
+    sleep_until(Deadline.after_ns(duration_ns))
+}
+
+pub fn sleep_ms(duration_ms: u64) -> SleepFuture {
+    sleep_until(Deadline.after_ms(duration_ms))
+}
+
+pub fn sleep(duration: Duration) -> SleepFuture {
+    sleep_ns(duration.nanos)
+}
+
+// -----------------------------------------------------------------------------
+// Periodic Interval with Explicit Mode & MissedTickBehavior (SPEC-35 AXS-AIO-022, REQ-ASY-159)
+// -----------------------------------------------------------------------------
+
+@derive(Copy)
+pub enum IntervalMode {
+    FixedRate,
+    FixedDelay,
+}
+
+@derive(Copy)
+pub enum MissedTickBehavior {
+    Burst,
+    Skip,
+    Delay,
+}
+
+pub struct Interval {
+    pub period_ns: u64,
+    pub next_tick_ns: u64,
+    pub mode: IntervalMode,
+    pub missed_policy: MissedTickBehavior,
+}
+
+impl Interval {
+    pub fn every_ns(period_ns: u64) -> Interval {
+        let p = if period_ns == 0u64 { 1u64 } else { period_ns };
+        let now = monotonic_ns();
+        Interval {
+            period_ns: p,
+            next_tick_ns: now + p,
+            mode: IntervalMode.FixedRate,
+            missed_policy: MissedTickBehavior.Burst,
+        }
+    }
+
+    pub fn every_ms(period_ms: u64) -> Interval {
+        Interval.every_ns(period_ms * 1_000_000u64)
+    }
+
+    pub fn with_mode(self: Interval, mode: IntervalMode) -> Interval {
+        Interval {
+            period_ns: self.period_ns,
+            next_tick_ns: self.next_tick_ns,
+            mode: mode,
+            missed_policy: self.missed_policy,
+        }
+    }
+
+    pub fn with_missed_tick_behavior(self: Interval, policy: MissedTickBehavior) -> Interval {
+        Interval {
+            period_ns: self.period_ns,
+            next_tick_ns: self.next_tick_ns,
+            mode: self.mode,
+            missed_policy: policy,
+        }
+    }
+
+    pub fn mode(self: view<Interval>) -> IntervalMode {
+        self.mode
+    }
+
+    pub fn missed_tick_behavior(self: view<Interval>) -> MissedTickBehavior {
+        self.missed_policy
+    }
+
+    pub fn next_tick_ns(self: view<Interval>) -> u64 {
+        self.next_tick_ns
+    }
+
+    pub fn reset(self: mut_view<Interval>) {
+        self.next_tick_ns = monotonic_ns() + self.period_ns;
+    }
+
+    pub fn tick(self: mut_view<Interval>) -> SleepFuture {
+        let now = monotonic_ns();
+        let p = self.period_ns;
+        let is_fixed_delay = match self.mode {
+            IntervalMode.FixedDelay => true,
+            IntervalMode.FixedRate => false,
+        };
+        if is_fixed_delay {
+            let target = now + p;
+            self.next_tick_ns = target;
+            return sleep_until(Deadline.at_ns(target));
+        }
+
+        // FixedRate mode
+        if now < self.next_tick_ns + p {
+            // On time or within current period: fire at next_tick_ns and advance by 1 period.
+            let target = self.next_tick_ns;
+            self.next_tick_ns = target + p;
+            return sleep_until(Deadline.at_ns(target));
+        }
+
+        // One or more ticks were missed (now >= next_tick_ns + p)
+        match self.missed_policy {
+            MissedTickBehavior.Burst => {
+                let target = self.next_tick_ns;
+                self.next_tick_ns = target + p;
+                sleep_until(Deadline.at_ns(target))
+            },
+            MissedTickBehavior.Skip => {
+                let elapsed = now - self.next_tick_ns;
+                let steps = (elapsed / p) + 1u64;
+                let target = self.next_tick_ns + steps * p;
+                self.next_tick_ns = target + p;
+                sleep_until(Deadline.at_ns(target))
+            },
+            MissedTickBehavior.Delay => {
+                let target = now + p;
+                self.next_tick_ns = target + p;
+                sleep_until(Deadline.at_ns(target))
+            },
+        }
+    }
+}

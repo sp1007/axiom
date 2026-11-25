@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T425, T422, T423]
 priority: 149
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [std/sys/windows/iocp.ax, std/async/reactor.ax, std/async/timer.ax, tests/std/async/reactor]
 locks: [std/core/host.ax, std/async/mod.ax, std/async/executor.ax, compiler/interp/oracle.ax, compiler/interp/interp.ax, compiler/types/typeck.ax, compiler/lir/builder.ax]
 spec: [spec/SPEC-35-async-io.md, 0221, tasks/0335, tasks/0438, tasks/0440, tasks/0464]
 covers: [REQ-ASY-153, REQ-ASY-154, REQ-ASY-158, REQ-ASY-159]
+started: 2026-11-25 06:47:15
+finished: 2026-11-25 09:02:44
 ---
 # T426 — E11.6 — Windows IOCP reactor, timer wheel & oracle async I/O backend
 
@@ -41,3 +43,5 @@ Implement the Windows IOCP completion reactor (`std/sys/windows/iocp.ax`, `std/a
 
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
+- 2026-11-25 06:47:15 started (attempt 1) axiom-stdlib
+- 2026-11-25 09:02:44 accepted by QA -> done

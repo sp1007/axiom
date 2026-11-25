@@ -41,6 +41,10 @@ use std.asyn.task.LocalTaskHandle
 use std.asyn.task.TaskControlBlock
 use std.asyn.task.default_task_drop
 use std.asyn.task.task_poll_fn
+use std.asyn.reactor.Reactor
+use std.asyn.timer.TimerWheel
+use std.asyn.timer.timer_wheel_enter
+use std.asyn.timer.timer_wheel_leave
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 @intrinsic fn align_of<T>() -> usize { 0 }
@@ -84,6 +88,8 @@ pub struct LocalExecutor {
     pub active_tasks: usize,
     pub next_task_id: u64,
     pub waker_vtable: *const RawWakerVTable,
+    pub reactor: *mut Reactor,
+    pub poll_ticks: usize,
 }
 
 fn local_schedule(task: *mut TaskHeader) {
@@ -130,6 +136,19 @@ fn local_dequeue(exec: *mut LocalExecutor) -> *mut TaskHeader {
     h
 }
 
+fn alloc_reactor_box() -> *mut Reactor {
+    match Reactor.new() {
+        Result.Ok(r) => {
+            let raw = unsafe { heap_alloc(size_of<Reactor>(), align_of<Reactor>()) as *mut Reactor };
+            if (raw as usize) != 0 {
+                unsafe { *raw = r; }
+            }
+            raw
+        },
+        Result.Err(_) => 0 as *mut Reactor,
+    }
+}
+
 impl LocalExecutor {
     pub fn new() -> LocalExecutor {
         LocalExecutor {
@@ -139,6 +158,29 @@ impl LocalExecutor {
             active_tasks: 0,
             next_task_id: 1,
             waker_vtable: new_task_waker_vtable(),
+            reactor: alloc_reactor_box(),
+            poll_ticks: 0,
+        }
+    }
+
+    pub fn reactor(self: view<LocalExecutor>) -> *mut Reactor {
+        self.reactor
+    }
+
+    pub fn reactor_handle(self: view<LocalExecutor>) -> i64 {
+        if (self.reactor as usize) == 0 {
+            return -4i64;
+        }
+        unsafe { (*self.reactor).os_handle }
+    }
+
+    pub fn shutdown(self: mut_view<LocalExecutor>) {
+        if (self.reactor as usize) != 0 {
+            unsafe {
+                mut_view(*self.reactor).shutdown();
+                heap_free(self.reactor as *mut u8, size_of<Reactor>(), align_of<Reactor>());
+            }
+            self.reactor = 0 as *mut Reactor;
         }
     }
 
@@ -181,14 +223,26 @@ impl LocalExecutor {
     }
 
     pub fn try_tick(self: mut_view<LocalExecutor>) -> bool {
+        self.poll_ticks = self.poll_ticks + 1;
+        if (self.reactor as usize) != 0 && ((self.ready_head as usize) == 0 || (self.poll_ticks & 31usize) == 0usize) {
+            let _ = unsafe { mut_view(*self.reactor).poll_nonblocking() };
+        }
         let p_self = unsafe { address_of_mut(*self) as *mut LocalExecutor };
         let task = local_dequeue(p_self);
         if (task as usize) == 0 {
             return false;
         }
+        let prev_tw = if (self.reactor as usize) != 0 {
+            timer_wheel_enter(unsafe { address_of_mut((*self.reactor).timers) })
+        } else {
+            0 as *mut TimerWheel
+        };
         let w = make_task_waker(task);
         let mut cx = Context { waker_val: w };
         let st: u32 = unsafe { ((*task).poll_fn)(task as *mut u8, address_of_mut<Context>(cx) as *mut u8) };
+        if (self.reactor as usize) != 0 {
+            timer_wheel_leave(prev_tw);
+        }
         if st >= TASK_COMPLETED {
             if self.active_tasks > 0 {
                 self.active_tasks = self.active_tasks - 1;
@@ -201,8 +255,13 @@ impl LocalExecutor {
     pub fn run(self: mut_view<LocalExecutor>) {
         while self.active_tasks > 0 {
             if !self.try_tick() {
-                unsafe {
-                    thread_yield();
+                if (self.reactor as usize) != 0 && unsafe { view(*self.reactor).has_pending_work() } {
+                    let delay = unsafe { mut_view(*self.reactor).next_timer_delay_ns() };
+                    let _ = unsafe { mut_view(*self.reactor).turn(delay) };
+                } else {
+                    unsafe {
+                        thread_yield();
+                    }
                 }
             }
         }
@@ -218,19 +277,37 @@ impl LocalExecutor {
             },
         };
         loop {
-            match main_fut.poll(mut_view(cx)) {
+            let prev_tw = if (self.reactor as usize) != 0 {
+                timer_wheel_enter(unsafe { address_of_mut((*self.reactor).timers) })
+            } else {
+                0 as *mut TimerWheel
+            };
+            let poll_res = main_fut.poll(mut_view(cx));
+            if (self.reactor as usize) != 0 {
+                timer_wheel_leave(prev_tw);
+            }
+            match poll_res {
                 Poll.Ready(val) => {
                     return val;
                 },
                 Poll.Pending => {
                     if !self.try_tick() {
-                        unsafe {
-                            thread_yield();
+                        if (self.reactor as usize) != 0 && unsafe { view(*self.reactor).has_pending_work() } {
+                            let delay = unsafe { mut_view(*self.reactor).next_timer_delay_ns() };
+                            let _ = unsafe { mut_view(*self.reactor).turn(delay) };
+                        } else {
+                            unsafe {
+                                thread_yield();
+                            }
                         }
                     }
                 },
             }
         }
+    }
+
+    pub fn block_on<F: Future<Output = T>, T>(self: mut_view<LocalExecutor>, fut: F) -> T {
+        self.run_until(fut)
     }
 
     pub fn active_task_count(self: view<LocalExecutor>) -> usize {
@@ -277,6 +354,7 @@ pub struct ExecutorInner {
     pub next_task_id: Atomic<u64>,
     pub waker_vtable: *const RawWakerVTable,
     pub steal_count: Atomic<usize>,
+    pub reactor: *mut Reactor,
 }
 
 // A copyable handle to the shared executor state (like an Arc handle): tasks may hold a copy to spawn
@@ -441,7 +519,16 @@ fn executor_try_help_one(inner: *mut ExecutorInner) -> bool {
     }
     let w = make_task_waker(task);
     let mut cx = Context { waker_val: w };
+    let r = unsafe { (*inner).reactor };
+    let prev_tw = if (r as usize) != 0 {
+        timer_wheel_enter(unsafe { address_of_mut((*r).timers) })
+    } else {
+        0 as *mut TimerWheel
+    };
     let st: u32 = unsafe { ((*task).poll_fn)(task as *mut u8, address_of_mut<Context>(cx) as *mut u8) };
+    if (r as usize) != 0 {
+        timer_wheel_leave(prev_tw);
+    }
     if st >= TASK_COMPLETED {
         unsafe {
             (*inner).active_tasks.fetch_sub(1usize, Ordering.Release);
@@ -510,10 +597,19 @@ fn worker_thread_main(ctx: *mut u8) -> i64 {
         }
 
         // 5. If task found, execute poll
+        let r = unsafe { (*inner).reactor };
         if (task as usize) != 0 {
+            let prev_tw = if (r as usize) != 0 {
+                timer_wheel_enter(unsafe { address_of_mut((*r).timers) })
+            } else {
+                0 as *mut TimerWheel
+            };
             let task_w = make_task_waker(task);
             let mut cx = Context { waker_val: task_w };
             let st: u32 = unsafe { ((*task).poll_fn)(task as *mut u8, address_of_mut<Context>(cx) as *mut u8) };
+            if (r as usize) != 0 {
+                timer_wheel_leave(prev_tw);
+            }
             if st >= TASK_COMPLETED {
                 unsafe {
                     (*inner).active_tasks.fetch_sub(1usize, Ordering.Release);
@@ -521,9 +617,13 @@ fn worker_thread_main(ctx: *mut u8) -> i64 {
                 task_dec_ref(task);
             }
         } else {
-            // No work found across all sources: yield or wait
-            unsafe {
-                thread_yield();
+            // No work found across all sources: poll/turn reactor if pending work, else yield
+            if (r as usize) != 0 && unsafe { view(*r).has_pending_work() } {
+                let _ = unsafe { mut_view(*r).turn(Option.Some(1_000_000u64)) };
+            } else {
+                unsafe {
+                    thread_yield();
+                }
             }
         }
     }
@@ -556,6 +656,7 @@ impl Executor {
             (*inner).next_task_id = Atomic.new(1u64);
             (*inner).waker_vtable = new_task_waker_vtable();
             (*inner).steal_count = Atomic.new(0usize);
+            (*inner).reactor = alloc_reactor_box();
 
             let mut i: usize = 0usize;
             while i < count {
@@ -636,20 +737,47 @@ impl Executor {
                 },
             },
         };
+        let r = unsafe { (*self.inner).reactor };
         loop {
-            match fut.poll(mut_view(cx)) {
+            let prev_tw = if (r as usize) != 0 {
+                timer_wheel_enter(unsafe { address_of_mut((*r).timers) })
+            } else {
+                0 as *mut TimerWheel
+            };
+            let poll_res = fut.poll(mut_view(cx));
+            if (r as usize) != 0 {
+                timer_wheel_leave(prev_tw);
+            }
+            match poll_res {
                 Poll.Ready(val) => {
                     return val;
                 },
                 Poll.Pending => {
                     if !executor_try_help_one(self.inner) {
-                        unsafe {
-                            thread_yield();
+                        if (r as usize) != 0 && unsafe { view(*r).has_pending_work() } {
+                            let delay = unsafe { mut_view(*r).next_timer_delay_ns() };
+                            let _ = unsafe { mut_view(*r).turn(delay) };
+                        } else {
+                            unsafe {
+                                thread_yield();
+                            }
                         }
                     }
                 },
             }
         }
+    }
+
+    pub fn reactor(self: view<Executor>) -> *mut Reactor {
+        unsafe { (*self.inner).reactor }
+    }
+
+    pub fn reactor_handle(self: view<Executor>) -> i64 {
+        let r = unsafe { (*self.inner).reactor };
+        if (r as usize) == 0 {
+            return -4i64;
+        }
+        unsafe { (*r).os_handle }
     }
 
     pub fn worker_count(self: view<Executor>) -> usize {
@@ -670,6 +798,10 @@ impl Executor {
             (*inner).shutdown.store(true, Ordering.Release);
             (*inner).park_word.fetch_add(1u32, Ordering.Release);
             futex_wake(address_of((*inner).park_word) as *const u32, (*inner).worker_count as u32);
+            let r = (*inner).reactor;
+            if (r as usize) != 0 {
+                view(*r).wake();
+            }
 
             let count = (*inner).worker_count;
             let mut i: usize = 0usize;
@@ -682,6 +814,11 @@ impl Executor {
                     (*w).thread_handle = 0i64;
                 }
                 i = i + 1usize;
+            }
+            if (r as usize) != 0 {
+                mut_view(*r).shutdown();
+                heap_free(r as *mut u8, size_of<Reactor>(), align_of<Reactor>());
+                (*inner).reactor = 0 as *mut Reactor;
             }
         }
     }
