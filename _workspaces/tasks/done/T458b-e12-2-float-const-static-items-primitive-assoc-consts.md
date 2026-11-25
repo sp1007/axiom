@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T458, T459, T501]
 priority: 149
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/types, compiler/interp_opt, compiler/resolve, tests/run/float_const, tests/ui/float_const]
 locks: [compiler/hir, compiler/mir, compiler/interp, compiler/opt/const_fold.ax, compiler/lir/builder.ax, compiler/backend/session.ax, compiler/driver/pipeline.ax, compiler/diag/code.ax]
 spec: [spec/SPEC-41-floating-point.md, spec/SPEC-04-core-extensibility.md, spec/decisions/ADR-0049-float-intrinsics-minimal-set.md]
 covers: [REQ-OWNER-007]
+started: 2026-11-25 13:07:08
+finished: 2026-11-25 14:51:13
 ---
 # T458b — E12.2 — Float const/static items, `f32.`/`f64.` path heads & primitive associated constants
 
@@ -56,3 +58,7 @@ float constants, constant tables, and `f64.NAME` / `f64.f(...)`.
 
 ## Log
 - 2026-11-24 created by architect (unblock T458, ADR-0049)
+- 2026-11-25 11:49:11 started (attempt 1) axiom-semantics
+- 2026-11-25 13:07:02 requeue:  (not charged: attempt refunded)
+- 2026-11-25 13:07:08 started (attempt 1) T458b-impl
+- 2026-11-25 14:51:13 accepted by QA -> done

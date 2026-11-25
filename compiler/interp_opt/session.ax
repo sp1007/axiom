@@ -72,6 +72,7 @@ use compiler.hir.hir.HirExpr
 use compiler.hir.hir.HirFieldDecl
 use compiler.hir.hir.HirFile
 use compiler.hir.hir.HirItem
+use compiler.hir.hir.HirGenericParams
 use compiler.hir.hir.HirMatchArm
 use compiler.hir.hir.HirParam
 use compiler.hir.hir.HirStmt
@@ -103,6 +104,7 @@ use compiler.types.types.CONST_INT
 use compiler.types.types.CONST_FLOAT
 use compiler.types.types.TY_F32
 use compiler.types.types.TY_F64
+use compiler.types.types.TY_FLOAT_VAR
 use compiler.types.types.CONST_STR
 use compiler.types.types.CONST_UNIT
 use compiler.types.types.CONST_AGGREGATE
@@ -137,6 +139,7 @@ use compiler.mir.mir.MIR_RVALUE_AGGREGATE
 use compiler.mir.mir.MIR_BORROW_MUT
 use compiler.mir.mir.MIR_OP_COPY
 use compiler.mir.mir.MIR_OP_CONST
+use compiler.mir.mir.MIR_CONST_INT
 use compiler.mir.mir.MIR_TERM_CALL
 use compiler.mir.mir.MirLocalId
 use compiler.mir.mir.MirOperand
@@ -307,6 +310,10 @@ pub fn session_is_valid_const_type(thir: view<Thir>, ty_id: TypeId) -> bool {
         return true;
     }
     if k >= TY_I8 && k <= TY_USIZE {
+        return true;
+    }
+    // T458b (SPEC-41 AXS-FLT-003 rule 4): float constants are IEEE-754 bit patterns evaluated by the oracle.
+    if k == TY_F32 || k == TY_F64 || k == TY_FLOAT_VAR {
         return true;
     }
     if k == TY_ARRAY {
@@ -521,8 +528,11 @@ fn session_eval_const_expr_into(
     expr: *mut HirExpr,
     expected_ty: TypeId,
     limits: ConstLimits,
+    pend: view<SessPendingConsts>,
+    out_deferred: mut_view<bool>,
     out_res: mut_view<ConstEvalResult>
 ) {
+    *out_deferred = false;
     out_res.ok = false;
     out_res.val.kind = CONST_INT;
     out_res.val.ty = TypeId { v: expected_ty.v };
@@ -574,6 +584,14 @@ fn session_eval_const_expr_into(
     );
     if (body as usize) == 0 {
         out_res.err_code = AX_CONST_OVERFLOW as u16;
+        interp_ctx_free_allocs(unsafe { mut_view(*ictx_ptr) });
+        interp_host_cleanup(unsafe { mut_view(*ictx_ptr) });
+        interp_ctx_dealloc(ictx_ptr);
+        return;
+    }
+
+    if pend.allow_defer && pend.count > 0 && sess_body_reads_pending(unsafe { view(*body) }, pend) {
+        *out_deferred = true;
         interp_ctx_free_allocs(unsafe { mut_view(*ictx_ptr) });
         interp_host_cleanup(unsafe { mut_view(*ictx_ptr) });
         interp_ctx_dealloc(ictx_ptr);
@@ -713,6 +731,177 @@ fn session_eval_const_expr_into(
     interp_ctx_dealloc(ictx_ptr);
 }
 
+// T458b: constants still waiting for a value (typeck could not fold them) while the session evaluates the worklist.
+struct SessPendingConsts {
+    syms: *mut u32,
+    done: *mut u8,
+    count: usize,
+    allow_defer: bool,
+}
+
+fn sess_impl_is_generic(it: *const HirItem) -> bool {
+    let gps: *mut HirGenericParams = unsafe { (*it).generic_params };
+    (gps as usize) != 0 && (unsafe { (*gps).params } as usize) != 0
+}
+
+// Item-level const / non-TLS static with an initializer; for an impl member: a const that typeck typed but could
+// not fold.
+fn sess_is_eval_item(thir: view<Thir>, it: *const HirItem, is_member: bool) -> bool {
+    if (it as usize) == 0 { return false; }
+    let sp = unsafe { (*it).span };
+    if sp.file.v == 0u32 { return false; }
+    let ik = unsafe { (*it).kind };
+    if (unsafe { (*it).expr } as usize) == 0 { return false; }
+    if !is_member {
+        return ik == HIR_ITEM_CONST || (ik == HIR_ITEM_STATIC && !(unsafe { (*it).is_tls }));
+    }
+    if ik != HIR_ITEM_CONST { return false; }
+    let sym_v = unsafe { (*it).symbol.v };
+    if sym_v == 0u32 { return false; }
+    if (thir_get_item_type(thir, it) as usize) == 0 { return false; }
+    (sym_constmap_get(view(thir.symbol_consts), SymbolId { v: sym_v }) as usize) == 0
+}
+
+fn sess_worklist_add(thir: view<Thir>, items: *mut usize, pend: mut_view<SessPendingConsts>, k: mut_view<usize>, it: *const HirItem) {
+    unsafe { *(((items as usize) + *k * 8) as *mut usize) = it as usize; }
+    *k = *k + 1;
+    let sym_v = unsafe { (*it).symbol.v };
+    if (unsafe { (*it).kind }) == HIR_ITEM_CONST && sym_v != 0u32 &&
+        (sym_constmap_get(view(thir.symbol_consts), SymbolId { v: sym_v }) as usize) == 0 {
+        unsafe {
+            *(((pend.syms as usize) + pend.count * 4) as *mut u32) = sym_v;
+            *(pend.done + pend.count) = 0u8;
+        }
+        pend.count = pend.count + 1;
+    }
+}
+
+fn sess_pending_mark_done(pend: mut_view<SessPendingConsts>, sym_v: u32) {
+    let mut i: usize = 0;
+    while i < pend.count {
+        if (unsafe { *(((pend.syms as usize) + i * 4) as *const u32) }) == sym_v {
+            unsafe { *(pend.done + i) = 1u8; }
+        }
+        i = i + 1;
+    }
+}
+
+// A constant operand that stands for a still-pending const item: the MIR builder lowers a const path that has no
+// value yet to `MIR_CONST_INT` carrying the item's symbol.
+fn sess_op_is_pending(op: *const MirOperand, pend: view<SessPendingConsts>) -> bool {
+    if (op as usize) == 0 || (unsafe { (*op).kind }) != MIR_OP_CONST { return false; }
+    if (unsafe { (*op).constant.kind }) != MIR_CONST_INT { return false; }
+    let sym_v = unsafe { (*op).constant.sym.v };
+    if sym_v == 0u32 { return false; }
+    let mut i: usize = 0;
+    while i < pend.count {
+        if (unsafe { *(((pend.syms as usize) + i * 4) as *const u32) }) == sym_v && (unsafe { *(pend.done + i) }) == 0u8 {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn sess_body_reads_pending(body: view<MirBody>, pend: view<SessPendingConsts>) -> bool {
+    let mut b: usize = 0;
+    while b < body.bb_count {
+        let bb = unsafe { mir_bb_at(body.bbs, b) };
+        let sc = unsafe { (*bb).stmt_count };
+        let stmts = unsafe { (*bb).stmts };
+        let mut s: usize = 0;
+        while s < sc {
+            let st = unsafe { mir_stmt_at(stmts, s) };
+            if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN {
+                if sess_op_is_pending(unsafe { address_of((*st).rvalue.use_op) as *const MirOperand }, pend) { return true; }
+                if sess_op_is_pending(unsafe { address_of((*st).rvalue.lhs) as *const MirOperand }, pend) { return true; }
+                if sess_op_is_pending(unsafe { address_of((*st).rvalue.rhs) as *const MirOperand }, pend) { return true; }
+                if sess_op_is_pending(unsafe { (*st).rvalue.repeat_count_op as *const MirOperand }, pend) { return true; }
+                let oc = unsafe { (*st).rvalue.operand_count };
+                let ops = unsafe { (*st).rvalue.operands };
+                let mut oi: usize = 0;
+                while oi < oc && (ops as usize) != 0 {
+                    if sess_op_is_pending(unsafe { mir_op_at(ops, oi) as *const MirOperand }, pend) { return true; }
+                    oi = oi + 1;
+                }
+            }
+            s = s + 1;
+        }
+        if unsafe { (*bb).has_terminator } {
+            if sess_op_is_pending(unsafe { address_of((*bb).terminator.discr) as *const MirOperand }, pend) { return true; }
+            if sess_op_is_pending(unsafe { address_of((*bb).terminator.cond) as *const MirOperand }, pend) { return true; }
+            let ac = unsafe { (*bb).terminator.arg_count };
+            let args = unsafe { (*bb).terminator.args };
+            let mut ai: usize = 0;
+            while ai < ac && (args as usize) != 0 {
+                if sess_op_is_pending(unsafe { mir_op_at(args, ai) as *const MirOperand }, pend) { return true; }
+                ai = ai + 1;
+            }
+        }
+        b = b + 1;
+    }
+    false
+}
+
+// Evaluates one worklist item into thir.symbol_consts (or reports its diagnostic). Returns true when the item was
+// deferred because its initializer reads a constant that has no value yet.
+fn sess_eval_const_item(
+    sess: mut_view<CompilerSession>,
+    eval_arena: mut_view<Arena>,
+    cctx: view<InterpConstEvalCtx>,
+    thir: mut_view<Thir>,
+    it: *mut HirItem,
+    pend: view<SessPendingConsts>,
+    res_ptr: *mut ConstEvalResult
+) -> bool {
+    let cexpr = unsafe { (*it).expr };
+    let mut expected_ty = TypeId { v: 0u32 };
+    let item_ty_ptr = thir_get_item_type(view(*thir), it as *const HirItem);
+    if (item_ty_ptr as usize) != 0 {
+        expected_ty.v = unsafe { (*item_ty_ptr).v };
+    } else {
+        let expr_ty_ptr = thir_get_expr_type(view(*thir), cexpr as *const HirExpr);
+        if (expr_ty_ptr as usize) != 0 {
+            expected_ty.v = unsafe { (*expr_ty_ptr).v };
+        }
+    }
+    let sym_v = unsafe { (*it).symbol.v };
+    let mut deferred = false;
+    session_eval_const_expr_into(
+        mut_view(*eval_arena),
+        cctx,
+        mut_view(*thir),
+        cexpr,
+        expected_ty,
+        ConstLimits { max_steps: 100000, max_call_depth: 100 },
+        pend,
+        mut_view(deferred),
+        unsafe { mut_view(*res_ptr) }
+    );
+    if deferred {
+        return true;
+    }
+    let ok = unsafe { (*res_ptr).ok };
+    if !ok {
+        let err_code_u16 = unsafe { (*res_ptr).err_code };
+        let code_v: u32 = if err_code_u16 != 0u16 { err_code_u16 as u32 } else { AX_CONST_OVERFLOW };
+        let err_sp_file = unsafe { (*res_ptr).err_span.file.v };
+        if err_sp_file != 0u32 {
+            let esp_start = unsafe { (*res_ptr).err_span.start };
+            let esp_end = unsafe { (*res_ptr).err_span.end };
+            report_typeck_diag(mut_view(sess.diag_sink), code_v, err_sp_file, esp_start, esp_end);
+        } else {
+            let expr_sp = unsafe { (*cexpr).span };
+            report_typeck_diag(mut_view(sess.diag_sink), code_v, expr_sp.file.v, expr_sp.start, expr_sp.end);
+        }
+    } else if sym_v != 0u32 {
+        unsafe {
+            sym_constmap_insert(mut_view(thir.symbol_consts), SymbolId { v: sym_v }, view((*res_ptr).val));
+        }
+    }
+    false
+}
+
 pub fn session_comptime_check_and_eval(
     sess: mut_view<CompilerSession>,
     ast: view<Ast>,
@@ -792,54 +981,79 @@ pub fn session_comptime_check_and_eval(
     let mut eval_arena = arena_new();
     let res_ptr = arena_alloc_raw(mut_view(eval_arena), size_of<ConstEvalResult>(), align_of<ConstEvalResult>()) as *mut ConstEvalResult;
 
+    // T458b: the evaluation worklist. Every item-level `const` / non-TLS `static` is evaluated in source order exactly
+    // as before; associated constants of non-generic impls that typeck could not fold are added. A constant typeck
+    // could not fold (a float constant, or an integer constant computed from one) may be read by an item before its
+    // own definition has been evaluated: such an item is deferred (`SessPendingConsts`) and retried once its
+    // dependencies have values, so source order never changes a value.
+    let mut n_items: usize = 0;
     it = hir.items;
     while (it as usize) != 0 {
-        let it_sp = unsafe { (*it).span };
-        let ik = unsafe { (*it).kind };
-        if it_sp.file.v != 0u32 && (ik == HIR_ITEM_CONST || (ik == HIR_ITEM_STATIC && !(unsafe { (*it).is_tls }))) {
-            let cexpr = unsafe { (*it).expr };
-            if (cexpr as usize) != 0 {
-                let mut expected_ty = TypeId { v: 0u32 };
-                let item_ty_ptr = thir_get_item_type(view(*thir), it as *const HirItem);
-                if (item_ty_ptr as usize) != 0 {
-                    expected_ty.v = unsafe { (*item_ty_ptr).v };
-                } else {
-                    let expr_ty_ptr = thir_get_expr_type(view(*thir), cexpr as *const HirExpr);
-                    if (expr_ty_ptr as usize) != 0 {
-                        expected_ty.v = unsafe { (*expr_ty_ptr).v };
-                    }
-                }
-                let sym_v = unsafe { (*it).symbol.v };
-                session_eval_const_expr_into(
-                    mut_view(eval_arena),
-                    view(cctx),
-                    mut_view(*thir),
-                    cexpr,
-                    expected_ty,
-                    ConstLimits { max_steps: 100000, max_call_depth: 100 },
-                    unsafe { mut_view(*res_ptr) }
-                );
-                let ok = unsafe { (*res_ptr).ok };
-                if !ok {
-                    let err_code_u16 = unsafe { (*res_ptr).err_code };
-                    let code_v: u32 = if err_code_u16 != 0u16 { err_code_u16 as u32 } else { AX_CONST_OVERFLOW };
-                    let err_sp_file = unsafe { (*res_ptr).err_span.file.v };
-                    if err_sp_file != 0u32 {
-                        let esp_start = unsafe { (*res_ptr).err_span.start };
-                        let esp_end = unsafe { (*res_ptr).err_span.end };
-                        report_typeck_diag(mut_view(sess.diag_sink), code_v, err_sp_file, esp_start, esp_end);
-                    } else {
-                        let expr_sp = unsafe { (*cexpr).span };
-                        report_typeck_diag(mut_view(sess.diag_sink), code_v, expr_sp.file.v, expr_sp.start, expr_sp.end);
-                    }
-                } else if sym_v != 0u32 {
-                    unsafe {
-                        sym_constmap_insert(mut_view(thir.symbol_consts), SymbolId { v: sym_v }, view((*res_ptr).val));
-                    }
-                }
+        if sess_is_eval_item(view(*thir), it as *const HirItem, false) { n_items = n_items + 1; }
+        if (unsafe { (*it).kind }) == HIR_ITEM_IMPL && !sess_impl_is_generic(it as *const HirItem) {
+            let mut m: *mut HirItem = unsafe { (*it).members };
+            while (m as usize) != 0 {
+                if sess_is_eval_item(view(*thir), m as *const HirItem, true) { n_items = n_items + 1; }
+                m = unsafe { (*m).next };
             }
         }
         it = unsafe { (*it).next };
+    }
+    let cap = if n_items == 0 { 1 } else { n_items };
+    let items = arena_alloc_raw(mut_view(eval_arena), cap * 8, 8) as *mut usize;
+    let mut pend_v = SessPendingConsts {
+        syms: arena_alloc_raw(mut_view(eval_arena), cap * 4, 4) as *mut u32,
+        done: arena_alloc_raw(mut_view(eval_arena), cap, 1),
+        count: 0,
+        allow_defer: true,
+    };
+    let mut k: usize = 0;
+    it = hir.items;
+    while (it as usize) != 0 {
+        if sess_is_eval_item(view(*thir), it as *const HirItem, false) {
+            sess_worklist_add(view(*thir), items, mut_view(pend_v), mut_view(k), it as *const HirItem);
+        }
+        if (unsafe { (*it).kind }) == HIR_ITEM_IMPL && !sess_impl_is_generic(it as *const HirItem) {
+            let mut m: *mut HirItem = unsafe { (*it).members };
+            while (m as usize) != 0 {
+                if sess_is_eval_item(view(*thir), m as *const HirItem, true) {
+                    sess_worklist_add(view(*thir), items, mut_view(pend_v), mut_view(k), m as *const HirItem);
+                }
+                m = unsafe { (*m).next };
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+    let item_done = arena_alloc_raw(mut_view(eval_arena), cap, 1);
+    let mut z: usize = 0;
+    while z < cap {
+        unsafe { *(item_done + z) = 0u8; }
+        z = z + 1;
+    }
+    let mut remaining = n_items;
+    while remaining > 0 {
+        let mut progress = false;
+        let mut i: usize = 0;
+        while i < n_items {
+            if (unsafe { *(item_done + i) }) == 0u8 {
+                let cur = (unsafe { *(((items as usize) + i * 8) as *const usize) }) as *mut HirItem;
+                let deferred = sess_eval_const_item(
+                    mut_view(*sess), mut_view(eval_arena), view(cctx), mut_view(*thir), cur, view(pend_v), res_ptr
+                );
+                if !deferred {
+                    unsafe { *(item_done + i) = 1u8; }
+                    sess_pending_mark_done(mut_view(pend_v), unsafe { (*cur).symbol.v });
+                    remaining = remaining - 1;
+                    progress = true;
+                }
+            }
+            i = i + 1;
+        }
+        if !progress {
+            // Only a dependency cycle (reported by typeck as AX_CONST_CYCLE) or a dependency whose evaluation failed
+            // is left: evaluate the rest without deferral so that each item reports its own diagnostic once.
+            pend_v.allow_defer = false;
+        }
     }
 
     arena_destroy(mut_view(eval_arena));
