@@ -1,0 +1,240 @@
+// test: run
+// modes: interp native
+// timeout: 90
+// covers: REQ-ASY-155 REQ-ASY-152 REQ-ASY-157 REQ-ASY-158
+// stdout: OK timeout_reads_buffer_safety timed_out=3 churn=1 stack=1 zombies=0 reclaimed=3 late=1 file=1 inflight=0\n
+
+// AXS-AIO-005, AXS-AIO-023: I/O timeout (`with_io_timeout_ms`, the timer-wheel `Timeout` adapter for I/O) cancellation of in-flight reads and buffer memory safety after the read
+// Future is dropped. Three reads that cannot complete (IoBuf TCP read, slice TCP read into a stack buffer, UDP
+// recv_from into a stack buffer) are cancelled by a 20 ms `with_io_timeout_ms`. WITHOUT draining the reactor first,
+// fresh heap buffers carrying a sentinel pattern are allocated (the allocator would hand out a prematurely freed
+// IoBuf) and data is sent to both sockets, so the aborted kernel operations are still unwinding while the data
+// arrives. After the zombies are drained the sentinels and both stack buffers must be untouched, no zombie may
+// remain and all three must have been reclaimed. A positional file read dropped right after submission is checked
+// the same way, and a fresh read of the same region still returns exact bytes.
+
+module test.timeout_reads_buffer_safety
+
+use std.core.result.Result
+use std.core.option.Option
+use std.core.host.remove
+use std.asyn.executor.LocalExecutor
+use std.io.async_io.with_io_timeout_ms
+use std.io.async_io.IoBuf
+use std.fs.async_file.AsyncFile
+use std.net.SocketAddr
+use std.net.AsyncTcpListener
+use std.net.AsyncTcpStream
+use std.net.AsyncUdpSocket
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+fn sentinel() -> IoBuf {
+    let s: [64]u8 = [165u8; 64];
+    IoBuf.from_slice(view(s))
+}
+
+fn intact(b: view<IoBuf>) -> bool {
+    if b.len() != 64usize {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < 64usize {
+        match b.get(i) {
+            Option.Some(v) => {
+                if v != 165u8 {
+                    return false;
+                }
+            },
+            Option.None => return false,
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn byte_is(b: view<IoBuf>, idx: usize, want: u8) -> bool {
+    match b.get(idx) {
+        Option.Some(v) => v == want,
+        Option.None => false,
+    }
+}
+
+fn all_cc(p: *const u8, n: usize) -> bool {
+    let mut i: usize = 0;
+    while i < n {
+        if unsafe { *(p + i) } != 204u8 {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+pub fn main() -> i32 {
+    let mut exec = LocalExecutor.new();
+    let r = view(exec).reactor();
+
+    let listener = match AsyncTcpListener.bind(r, SocketAddr.localhost(0u16)) {
+        Result.Ok(l) => l,
+        Result.Err(_) => return 1i32,
+    };
+    let addr = view(listener).local_addr();
+    let acc = view(listener).accept();
+    let con = AsyncTcpStream.connect(r, addr);
+    let mut client = match mut_view(exec).block_on(con) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 2i32,
+    };
+    let mut server = match mut_view(exec).block_on(acc) {
+        Result.Ok(p) => p.0,
+        Result.Err(_) => return 3i32,
+    };
+    let ua = match AsyncUdpSocket.bind(r, SocketAddr.localhost(0u16)) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 4i32,
+    };
+    let ub = match AsyncUdpSocket.bind(r, SocketAddr.localhost(0u16)) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 5i32,
+    };
+    let addr_b = view(ub).local_addr();
+
+    let reclaimed_before = unsafe { view(*r).reclaimed_zombie_count() };
+
+    // Three reads that time out
+    let mut t_count: i64 = 0i64;
+    match mut_view(exec).block_on(with_io_timeout_ms(20u64, mut_view(client).read_buf(IoBuf.with_capacity(64usize)))) {
+        Result.Ok(_) => {},
+        Result.Err(_) => { t_count = t_count + 1i64; },
+    }
+    let mut sbuf: [32]u8 = [204u8; 32];
+    match mut_view(exec).block_on(with_io_timeout_ms(20u64, mut_view(client).read(unsafe { address_of_mut(sbuf[0]) }, 32usize))) {
+        Result.Ok(_) => {},
+        Result.Err(_) => { t_count = t_count + 1i64; },
+    }
+    let mut ubuf: [32]u8 = [204u8; 32];
+    match mut_view(exec).block_on(with_io_timeout_ms(20u64, view(ub).recv_from(unsafe { address_of_mut(ubuf[0]) }, 32usize))) {
+        Result.Ok(_) => {},
+        Result.Err(_) => { t_count = t_count + 1i64; },
+    }
+
+    // Heap churn with sentinels while the aborted operations may still be unwinding, then send data to both
+    // sockets so the kernel has something to deliver into whatever buffer it still believes it owns.
+    let c0 = sentinel();
+    let c1 = sentinel();
+    let c2 = sentinel();
+    let c3 = sentinel();
+    let late: [4]u8 = [76u8, 65u8, 84u8, 69u8]; // "LATE"
+    match mut_view(exec).block_on(mut_view(server).write_all(unsafe { address_of(late[0]) }, 4usize)) {
+        Result.Ok(_) => {},
+        Result.Err(_) => return 6i32,
+    }
+    let _ = mut_view(exec).block_on(view(ua).send_to(unsafe { address_of(late[0]) }, 4usize, addr_b));
+
+    let mut iters: usize = 0;
+    while unsafe { view(*r).in_flight_count() } > 0 && iters < 64 {
+        let _ = unsafe { mut_view(*r).turn(Option.Some(5_000_000u64)) };
+        iters = iters + 1;
+    }
+    let churn_ok = intact(view(c0)) && intact(view(c1)) && intact(view(c2)) && intact(view(c3));
+    let stack_ok = all_cc(unsafe { address_of(sbuf[0]) }, 32usize) && all_cc(unsafe { address_of(ubuf[0]) }, 32usize);
+    let zombies = unsafe { view(*r).zombie_count() } as i64;
+    let reclaimed = (unsafe { view(*r).reclaimed_zombie_count() } - reclaimed_before) as i64;
+
+    // The data that arrived after the cancellation is either still queued on the socket (delivered intact to a
+    // fresh read) or was consumed by the aborted operation (fresh read times out). It is never corrupted.
+    let mut late_ok: i64 = 0i64;
+    match mut_view(exec).block_on(with_io_timeout_ms(200u64, mut_view(client).read_buf(IoBuf.with_capacity(16usize)))) {
+        Result.Ok(out) => {
+            let n_ok = match out.res {
+                Result.Ok(n) => n == 4usize,
+                Result.Err(_) => false,
+            };
+            if n_ok && byte_is(view(out.buf), 0usize, 76u8) && byte_is(view(out.buf), 3usize, 69u8) {
+                late_ok = 1i64;
+            }
+        },
+        Result.Err(_) => { late_ok = 1i64; },
+    }
+
+    // A file read future dropped immediately after submission.
+    // "build/t428_cancel_file.bin" (26)
+    let path: [26]u8 = [
+        98u8, 117u8, 105u8, 108u8, 100u8, 47u8,
+        116u8, 52u8, 50u8, 56u8, 95u8,
+        99u8, 97u8, 110u8, 99u8, 101u8, 108u8, 95u8,
+        102u8, 105u8, 108u8, 101u8, 46u8, 98u8, 105u8, 110u8
+    ];
+    let f = match AsyncFile.create_bytes(r, view(path)) {
+        Result.Ok(f) => f,
+        Result.Err(_) => return 7i32,
+    };
+    let content: [16]u8 = [1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8, 9u8, 10u8, 11u8, 12u8, 13u8, 14u8, 15u8, 16u8];
+    match mut_view(exec).block_on(view(f).write_buf_at(0u64, IoBuf.from_slice(view(content)))).res {
+        Result.Ok(_) => {},
+        Result.Err(_) => return 8i32,
+    }
+    {
+        let dropped = view(f).read_buf_at(0u64, IoBuf.with_capacity(16usize));
+        // dropped at the end of this block without ever being polled
+    }
+    let d0 = sentinel();
+    let d1 = sentinel();
+    let mut it2: usize = 0;
+    while unsafe { view(*r).in_flight_count() } > 0 && it2 < 64 {
+        let _ = unsafe { mut_view(*r).turn(Option.Some(5_000_000u64)) };
+        it2 = it2 + 1;
+    }
+    let mut file_ok: i64 = 0i64;
+    let again = mut_view(exec).block_on(view(f).read_buf_at(0u64, IoBuf.with_capacity(16usize)));
+    let again_n = match again.res {
+        Result.Ok(n) => n,
+        Result.Err(_) => 0usize,
+    };
+    let mut same = again_n == 16usize;
+    let mut q: usize = 0;
+    while q < 16usize {
+        if !byte_is(view(again.buf), q, content[q]) {
+            same = false;
+        }
+        q = q + 1;
+    }
+    if same && intact(view(d0)) && intact(view(d1)) {
+        file_ok = 1i64;
+    }
+    match mut_view(exec).block_on(f.close()) {
+        Result.Ok(_) => {},
+        Result.Err(_) => return 9i32,
+    }
+    let _ = unsafe { remove(address_of(path[0]), 26usize) };
+
+    let inflight = unsafe { view(*r).in_flight_count() } as i64;
+
+    let _ = ua.close();
+    let _ = ub.close();
+    let _ = client.close();
+    let _ = server.close();
+    let _ = listener.close();
+    mut_view(exec).shutdown();
+
+    print("OK timeout_reads_buffer_safety timed_out=");
+    print_int(t_count);
+    print(" churn=");
+    print_int(if churn_ok { 1i64 } else { 0i64 });
+    print(" stack=");
+    print_int(if stack_ok { 1i64 } else { 0i64 });
+    print(" zombies=");
+    print_int(zombies);
+    print(" reclaimed=");
+    print_int(reclaimed);
+    print(" late=");
+    print_int(late_ok);
+    print(" file=");
+    print_int(file_ok);
+    print(" inflight=");
+    print_int(inflight);
+    print("\n");
+    0i32
+}

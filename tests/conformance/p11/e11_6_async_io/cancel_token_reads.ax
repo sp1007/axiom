@@ -1,0 +1,219 @@
+// test: run
+// modes: interp native
+// timeout: 90
+// covers: REQ-ASY-155 REQ-ASY-152 REQ-ASY-157 REQ-ASY-158 REQ-CONC-153
+// stdout: OK cancel_token_reads tcp=10 udp=10 again=10 late_tcp=1 late_udp=1 inflight=0\n
+
+// AXS-AIO-005, AXS-AIO-023, REQ-ASY-157/158: CancellationToken cancellation of in-flight socket reads.
+// A `CancelRace` adapter (the shape a `select { read, token.cancelled() }` lowers to) polls the I/O future and
+// `token.cancelled()`. A TCP IoBuf read and a UDP `recv_from` block on sockets nobody writes to while a cancel task
+// (sleeping 20 ms / 40 ms) cancels their token. After the cancel the dropped read futures must have moved their ops
+// to the zombie state: the reactor drains to zero in-flight operations, a read started on the already cancelled
+// token is refused at once, and bytes that arrive AFTER the cancellation reach the next fresh read on the same
+// sockets intact (the zombie op neither consumed them nor wrote them into freed memory).
+
+module test.cancel_token_reads
+
+use std.core.result.Result
+use std.core.option.Option
+use std.core.prelude.Future
+use std.core.prelude.Poll
+use std.core.prelude.Context
+use std.asyn.executor.LocalExecutor
+use std.asyn.task.TaskResult
+use std.asyn.task.LocalTaskHandle
+use std.asyn.reactor.Reactor
+use std.asyn.cancel.CancellationSource
+use std.asyn.cancel.CancellationToken
+use std.asyn.cancel.CancelledFuture
+use std.asyn.timer.sleep_ms
+use std.io.IoError
+use std.io.async_io.IoBuf
+use std.net.SocketAddr
+use std.net.AsyncTcpListener
+use std.net.AsyncTcpStream
+use std.net.AsyncUdpSocket
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+pub struct CancelRace<F, T> {
+    pub fut: F,
+    pub cancelled: CancelledFuture,
+    pub output_marker: *const T,
+}
+
+impl<F: Future<Output = T>, T> Future for CancelRace<F, T> {
+    type Output = Result<T, IoError>;
+
+    fn poll(self: mut_view<CancelRace<F, T>>, cx: mut_view<Context>) -> Poll<Result<T, IoError>> {
+        match self.fut.poll(mut_view(*cx)) {
+            Poll.Ready(val) => {
+                return Poll.Ready(Result.Ok(val));
+            },
+            Poll.Pending => {
+                match self.cancelled.poll(mut_view(*cx)) {
+                    Poll.Ready(_) => {
+                        return Poll.Ready(Result.Err(IoError.Cancelled));
+                    },
+                    Poll.Pending => {
+                        return Poll.Pending;
+                    },
+                }
+            },
+        }
+    }
+}
+
+pub fn race<F: Future<Output = T>, T>(tok: view<CancellationToken>, fut: F) -> CancelRace<F, T> {
+    CancelRace {
+        fut: fut,
+        cancelled: tok.cancelled(),
+        output_marker: 0 as *const T,
+    }
+}
+
+// 10 = Cancelled, 6 = TimedOut, 1000+n = completed with n bytes, 99 = other error
+fn kind(e: IoError) -> i64 {
+    match e {
+        IoError.Cancelled => 10i64,
+        IoError.TimedOut => 6i64,
+        _ => 99i64,
+    }
+}
+
+async fn canceller(src: *const CancellationSource, ms: u64) -> i64 {
+    sleep_ms(ms).await;
+    unsafe { view(*src).cancel(); }
+    0i64
+}
+
+fn join_i64(exec: mut_view<LocalExecutor>, h: LocalTaskHandle<i64>) -> i64 {
+    match exec.block_on(h.join()) {
+        TaskResult.Completed(v) => v,
+        _ => -100i64,
+    }
+}
+
+pub fn main() -> i32 {
+    let mut exec = LocalExecutor.new();
+    let r = view(exec).reactor();
+
+    // TCP pair (nothing is sent until after the cancellation)
+    let listener = match AsyncTcpListener.bind(r, SocketAddr.localhost(0u16)) {
+        Result.Ok(l) => l,
+        Result.Err(_) => return 1i32,
+    };
+    let addr = view(listener).local_addr();
+    let acc = view(listener).accept();
+    let con = AsyncTcpStream.connect(r, addr);
+    let mut client = match mut_view(exec).block_on(con) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 2i32,
+    };
+    let mut server = match mut_view(exec).block_on(acc) {
+        Result.Ok(p) => p.0,
+        Result.Err(_) => return 3i32,
+    };
+
+    // UDP pair
+    let ua = match AsyncUdpSocket.bind(r, SocketAddr.localhost(0u16)) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 4i32,
+    };
+    let ub = match AsyncUdpSocket.bind(r, SocketAddr.localhost(0u16)) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 5i32,
+    };
+    let addr_b = view(ub).local_addr();
+
+    let src1 = CancellationSource.new();
+    let tok1 = src1.token();
+    let src2 = CancellationSource.new();
+    let tok2 = src2.token();
+    let mut udp_dst: [32]u8 = [0u8; 32];
+
+    // Two cancel tasks fire while `main` blocks in the raced reads (block_on drives them as ordinary tasks). The race
+    // futures are dropped by `block_on` itself: an operand that is only `.await`ed inside an `async fn` is not
+    // dropped when the await completes (report follow-up F5), which would leave the I/O op un-cancelled.
+    let h_c1 = mut_view(exec).spawn_local(canceller(unsafe { address_of(src1) }, 20u64));
+    let h_c2 = mut_view(exec).spawn_local(canceller(unsafe { address_of(src2) }, 40u64));
+
+    let tcp_kind: i64 = match mut_view(exec).block_on(race(view(tok1), mut_view(client).read_buf(IoBuf.with_capacity(64usize)))) {
+        Result.Ok(_) => 1000i64,
+        Result.Err(e) => kind(e),
+    };
+    let udp_kind: i64 = match mut_view(exec).block_on(race(view(tok2), view(ub).recv_from(unsafe { address_of_mut(udp_dst[0]) }, 32usize))) {
+        Result.Ok(_) => 1000i64,
+        Result.Err(e) => kind(e),
+    };
+    let _ = join_i64(mut_view(exec), h_c1);
+    let _ = join_i64(mut_view(exec), h_c2);
+
+    // A read started on an already cancelled token is refused at once.
+    let again_kind: i64 = match mut_view(exec).block_on(race(view(tok1), mut_view(client).read_buf(IoBuf.with_capacity(64usize)))) {
+        Result.Ok(_) => 1000i64,
+        Result.Err(e) => kind(e),
+    };
+
+    // Drain the zombie operations through reactor turns.
+    let mut iters: usize = 0;
+    while unsafe { view(*r).in_flight_count() } > 0 && iters < 64 {
+        let _ = unsafe { mut_view(*r).turn(Option.Some(5_000_000u64)) };
+        iters = iters + 1;
+    }
+    let inflight = unsafe { view(*r).in_flight_count() } as i64;
+
+    // Late data: sent after the cancellation, must be received intact by fresh reads.
+    let late: [4]u8 = [76u8, 65u8, 84u8, 69u8]; // "LATE"
+    let mut late_tcp: i64 = 0i64;
+    match mut_view(exec).block_on(mut_view(server).write_all(unsafe { address_of(late[0]) }, 4usize)) {
+        Result.Ok(_) => {},
+        Result.Err(_) => return 6i32,
+    }
+    let mut tbuf: [4]u8 = [0u8; 4];
+    match mut_view(exec).block_on(mut_view(client).read_exact(unsafe { address_of_mut(tbuf[0]) }, 4usize)) {
+        Result.Ok(_) => {
+            if tbuf[0] == 76u8 && tbuf[1] == 65u8 && tbuf[2] == 84u8 && tbuf[3] == 69u8 {
+                late_tcp = 1i64;
+            }
+        },
+        Result.Err(_) => {},
+    }
+
+    let mut late_udp: i64 = 0i64;
+    let mut ubuf: [8]u8 = [0u8; 8];
+    let rf = view(ub).recv_from(unsafe { address_of_mut(ubuf[0]) }, 8usize);
+    let sf = view(ua).send_to(unsafe { address_of(late[0]) }, 4usize, addr_b);
+    let _ = mut_view(exec).block_on(sf);
+    match mut_view(exec).block_on(rf) {
+        Result.Ok(p) => {
+            if p.0 == 4usize && ubuf[0] == 76u8 && ubuf[3] == 69u8 && udp_dst[0] == 0u8 {
+                late_udp = 1i64;
+            }
+        },
+        Result.Err(_) => {},
+    }
+
+    let _ = ua.close();
+    let _ = ub.close();
+    let _ = client.close();
+    let _ = server.close();
+    let _ = listener.close();
+    mut_view(exec).shutdown();
+
+    print("OK cancel_token_reads tcp=");
+    print_int(tcp_kind);
+    print(" udp=");
+    print_int(udp_kind);
+    print(" again=");
+    print_int(again_kind);
+    print(" late_tcp=");
+    print_int(late_tcp);
+    print(" late_udp=");
+    print_int(late_udp);
+    print(" inflight=");
+    print_int(inflight);
+    print("\n");
+    0i32
+}

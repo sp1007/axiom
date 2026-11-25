@@ -1,0 +1,207 @@
+// test: run
+// modes: interp native
+// timeout: 90
+// covers: REQ-ASY-155 REQ-ASY-152 REQ-ASY-157
+// stdout: OK file_pipeline_tasks 64 64 64 1 1\n
+
+// AXS-AIO-010..012, AXS-AIO-031/033: a three-stage AsyncFile pipeline run as concurrent local tasks.
+//   stage 1: four writer tasks fill disjoint 16-byte chunks of file A with overlapped positional writes;
+//   stage 2: four transform tasks read chunk i of A, XOR it with 0xFF and write it to chunk (3 - i) of file B
+//            (reversed order, so every task touches a different offset in each file);
+//   stage 3: B is read back sequentially through AsyncRead + read_exact and checked byte by byte.
+
+module test.file_pipeline_tasks
+
+use std.core.result.Result
+use std.core.option.Option
+use std.core.host.remove
+use std.asyn.executor.LocalExecutor
+use std.asyn.task.TaskResult
+use std.asyn.task.LocalTaskHandle
+use std.io.async_io.IoBuf
+use std.io.async_io.read_exact
+use std.fs.async_file.AsyncFile
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+// Byte j of chunk i of file A.
+fn pattern(chunk: u64, j: usize) -> u8 {
+    (chunk * 16u64 + (j as u64) + 1u64) as u8
+}
+
+async fn writer_stage(f: *const AsyncFile, chunk: u64) -> i64 {
+    let mut data: [16]u8 = [0u8; 16];
+    let mut j: usize = 0;
+    while j < 16usize {
+        data[j] = pattern(chunk, j);
+        j = j + 1;
+    }
+    let out = unsafe { view(*f).write_buf_at(chunk * 16u64, IoBuf.from_slice(view(data))).await };
+    match out.res {
+        Result.Ok(n) => n as i64,
+        Result.Err(_) => -1i64,
+    }
+}
+
+async fn transform_stage(a: *const AsyncFile, b: *const AsyncFile, chunk: u64) -> i64 {
+    let mut rd = unsafe { view(*a).read_buf_at(chunk * 16u64, IoBuf.with_capacity(16usize)).await };
+    let mut buf = mut_view(rd).take_buf();
+    let got = match rd.res {
+        Result.Ok(n) => n,
+        Result.Err(_) => return -1i64,
+    };
+    if got != 16usize {
+        return -2i64;
+    }
+    let mut j: usize = 0;
+    while j < 16usize {
+        let v = match view(buf).get(j) {
+            Option.Some(x) => x,
+            Option.None => return -3i64,
+        };
+        let _ = mut_view(buf).set(j, v ^ 255u8);
+        j = j + 1;
+    }
+    let dst_off = (3u64 - chunk) * 16u64;
+    let wr = unsafe { view(*b).write_buf_at(dst_off, buf).await };
+    match wr.res {
+        Result.Ok(n) => n as i64,
+        Result.Err(_) => -4i64,
+    }
+}
+
+fn join_i64(exec: mut_view<LocalExecutor>, h: LocalTaskHandle<i64>) -> i64 {
+    match exec.block_on(h.join()) {
+        TaskResult.Completed(v) => v,
+        _ => -100i64,
+    }
+}
+
+pub fn main() -> i32 {
+    let mut exec = LocalExecutor.new();
+    let r = view(exec).reactor();
+
+    // "build/t428_pipe_a.bin" (21) and "build/t428_pipe_b.bin" (21)
+    let path_a: [21]u8 = [
+        98u8, 117u8, 105u8, 108u8, 100u8, 47u8,
+        116u8, 52u8, 50u8, 56u8, 95u8,
+        112u8, 105u8, 112u8, 101u8, 95u8, 97u8,
+        46u8, 98u8, 105u8, 110u8
+    ];
+    let path_b: [21]u8 = [
+        98u8, 117u8, 105u8, 108u8, 100u8, 47u8,
+        116u8, 52u8, 50u8, 56u8, 95u8,
+        112u8, 105u8, 112u8, 101u8, 95u8, 98u8,
+        46u8, 98u8, 105u8, 110u8
+    ];
+
+    let fa = match AsyncFile.create_bytes(r, view(path_a)) {
+        Result.Ok(f) => f,
+        Result.Err(_) => return 1i32,
+    };
+    let fb = match AsyncFile.create_bytes(r, view(path_b)) {
+        Result.Ok(f) => f,
+        Result.Err(_) => return 2i32,
+    };
+    let pa = unsafe { address_of(fa) };
+    let pb = unsafe { address_of(fb) };
+
+    // Stage 1: four concurrent writers
+    let w0 = mut_view(exec).spawn_local(writer_stage(pa, 0u64));
+    let w1 = mut_view(exec).spawn_local(writer_stage(pa, 1u64));
+    let w2 = mut_view(exec).spawn_local(writer_stage(pa, 2u64));
+    let w3 = mut_view(exec).spawn_local(writer_stage(pa, 3u64));
+    let wrote = join_i64(mut_view(exec), w0) + join_i64(mut_view(exec), w1) +
+        join_i64(mut_view(exec), w2) + join_i64(mut_view(exec), w3);
+    match mut_view(exec).block_on(view(fa).flush()) {
+        Result.Ok(_) => {},
+        Result.Err(_) => return 3i32,
+    }
+    let size_a: i64 = match view(fa).file_size() {
+        Result.Ok(s) => s as i64,
+        Result.Err(_) => -1i64,
+    };
+
+    // Stage 2: four concurrent transform tasks (A chunk i -> B chunk 3-i)
+    let t0 = mut_view(exec).spawn_local(transform_stage(pa, pb, 0u64));
+    let t1 = mut_view(exec).spawn_local(transform_stage(pa, pb, 1u64));
+    let t2 = mut_view(exec).spawn_local(transform_stage(pa, pb, 2u64));
+    let t3 = mut_view(exec).spawn_local(transform_stage(pa, pb, 3u64));
+    let moved = join_i64(mut_view(exec), t0) + join_i64(mut_view(exec), t1) +
+        join_i64(mut_view(exec), t2) + join_i64(mut_view(exec), t3);
+    match mut_view(exec).block_on(view(fb).flush()) {
+        Result.Ok(_) => {},
+        Result.Err(_) => return 4i32,
+    }
+    let size_b: i64 = match view(fb).file_size() {
+        Result.Ok(s) => s as i64,
+        Result.Err(_) => -1i64,
+    };
+
+    match mut_view(exec).block_on(fa.close()) {
+        Result.Ok(_) => {},
+        Result.Err(_) => return 5i32,
+    }
+    match mut_view(exec).block_on(fb.close()) {
+        Result.Ok(_) => {},
+        Result.Err(_) => return 6i32,
+    }
+
+    // Stage 3: sequential verification of B through AsyncRead + read_exact
+    let mut verify = match AsyncFile.open_bytes(r, view(path_b)) {
+        Result.Ok(f) => f,
+        Result.Err(_) => return 7i32,
+    };
+    let mut all: [64]u8 = [0u8; 64];
+    match mut_view(exec).block_on(read_exact(mut_view(verify), unsafe { address_of_mut(all[0]) }, 64usize)) {
+        Result.Ok(_) => {},
+        Result.Err(_) => return 8i32,
+    }
+    let mut ok = true;
+    let mut c: u64 = 0;
+    while c < 4u64 {
+        // B chunk position p holds A chunk (3 - p) XOR 0xFF
+        let src_chunk = 3u64 - c;
+        let mut j: usize = 0;
+        while j < 16usize {
+            let want = pattern(src_chunk, j) ^ 255u8;
+            if all[(c * 16u64) as usize + j] != want {
+                ok = false;
+            }
+            j = j + 1;
+        }
+        c = c + 1u64;
+    }
+    // A read past the end of the file completes with 0 bytes, not an error.
+    let mut past: [4]u8 = [9u8; 4];
+    let eof_ok = match mut_view(exec).block_on(view(verify).read_at(64u64, unsafe { address_of_mut(past[0]) }, 4usize)) {
+        Result.Ok(n) => n == 0usize && past[0] == 9u8,
+        Result.Err(_) => false,
+    };
+    match mut_view(exec).block_on(verify.close()) {
+        Result.Ok(_) => {},
+        Result.Err(_) => return 9i32,
+    }
+
+    let _ = unsafe { remove(address_of(path_a[0]), 21usize) };
+    let _ = unsafe { remove(address_of(path_b[0]), 21usize) };
+    mut_view(exec).shutdown();
+
+    if !ok {
+        print("ERR content mismatch\n");
+        return 10i32;
+    }
+    print("OK file_pipeline_tasks ");
+    print_int(size_a);
+    print(" ");
+    print_int(wrote);
+    print(" ");
+    print_int(size_b);
+    print(" ");
+    print_int(if moved == 64i64 { 1i64 } else { 0i64 });
+    print(" ");
+    print_int(if eof_ok { 1i64 } else { 0i64 });
+    print("\n");
+    0i32
+}

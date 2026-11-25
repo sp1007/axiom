@@ -1,0 +1,207 @@
+// test: run
+// modes: interp native
+// timeout: 90
+// covers: REQ-ASY-155 REQ-ASY-152 REQ-ASY-157 REQ-CONC-153
+// stdout: OK tcp_multi_client_echo 4 44 44 4 1\n
+
+// AXS-AIO-030..032, AXS-AIO-040/041: a loopback AsyncTcpListener serves four simultaneous clients. One accept
+// task spawns a dedicated echo task per accepted connection; each client sends a message of a distinct length
+// (5, 9, 13, 17 bytes), reads the exact echo back piecewise, half-closes its write side and then sees
+// EOF (a 0-byte read, not an error) once the server task has drained and closed its end.
+
+module test.tcp_multi_client_echo
+
+use std.core.result.Result
+use std.core.option.Option
+use std.asyn.executor.LocalExecutor
+use std.asyn.executor.yield_now
+use std.asyn.task.TaskResult
+use std.asyn.reactor.Reactor
+use std.io.async_io.IoBuf
+use std.net.SocketAddr
+use std.net.ShutdownMode
+use std.net.AsyncTcpListener
+use std.net.AsyncTcpStream
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+fn msg_byte(idx: u64, k: usize) -> u8 {
+    (idx * 37u64 + (k as u64) * 3u64 + 1u64) as u8
+}
+
+// Echo task for one accepted connection: read, write back, until the peer half-closes.
+async fn echo_conn(mut s: AsyncTcpStream, slot: *mut i64) -> i64 {
+    let mut total: i64 = 0i64;
+    loop {
+        let mut out = mut_view(s).read_buf(IoBuf.with_capacity(64usize)).await;
+        let b = mut_view(out).take_buf();
+        match out.res {
+            Result.Ok(n) => {
+                if n == 0usize {
+                    break;
+                }
+                let w = mut_view(s).write_buf(b).await;
+                match w.res {
+                    Result.Ok(wn) => { total = total + (wn as i64); },
+                    Result.Err(_) => return -1i64,
+                }
+            },
+            Result.Err(_) => return -2i64,
+        }
+    }
+    let _ = s.close();
+    unsafe { *slot = total; }
+    total
+}
+
+// Accept `n` connections and spawn one echo task each; returns how many were accepted.
+//
+// The oracle listener has a single pending-accept slot and no backlog (see the report, follow-up F2): a connection
+// that arrives while no accept is pending is never delivered. `gate` therefore publishes "accept number i is posted"
+// and every client waits for its own accept before it connects; the data phase of all four connections still runs
+// concurrently.
+async fn accept_loop(l: *const AsyncTcpListener, ex: *mut LocalExecutor, n: usize, slots: *mut i64, gate: *mut i64) -> i64 {
+    let mut accepted: i64 = 0i64;
+    let mut i: usize = 0;
+    while i < n {
+        let acc = unsafe { view(*l).accept() };
+        unsafe { *gate = (i as i64) + 1i64; }
+        let pair = match acc.await {
+            Result.Ok(p) => p,
+            Result.Err(_) => return -1i64,
+        };
+        if pair.1.port == 0u16 {
+            return -2i64;
+        }
+        let h = unsafe { mut_view(*ex).spawn_local(echo_conn(pair.0, (unsafe { slots + i }))) };
+        h.detach();
+        accepted = accepted + 1i64;
+        i = i + 1;
+    }
+    accepted
+}
+
+fn make_msg(idx: u64, n: usize) -> IoBuf {
+    let mut b = IoBuf.with_capacity(n);
+    mut_view(b).set_len(n);
+    let mut k: usize = 0;
+    while k < n {
+        let _ = mut_view(b).set(k, msg_byte(idx, k));
+        k = k + 1;
+    }
+    b
+}
+
+fn byte_is(b: view<IoBuf>, idx: usize, want: u8) -> bool {
+    match b.get(idx) {
+        Option.Some(v) => v == want,
+        Option.None => false,
+    }
+}
+
+// Slice-based `read_exact`/`write_all` keep a raw pointer to the stream they work on, and a raw pointer to a local of
+// an `async fn` is not stable across `.await` (SPEC-33: state machines are relocatable). Tasks that own their stream
+// therefore use the owned-buffer `read_buf`/`write_buf` path, which holds no pointer into the task frame.
+async fn client_task(r: *mut Reactor, addr: SocketAddr, idx: u64, gate: *mut i64) -> i64 {
+    while unsafe { *gate } <= (idx as i64) {
+        yield_now().await;
+    }
+    let mut s = match AsyncTcpStream.connect(r, addr).await {
+        Result.Ok(s) => s,
+        Result.Err(_) => return -1i64,
+    };
+    let n = 5usize + (idx as usize) * 4usize;
+    let w = mut_view(s).write_buf(make_msg(idx, n)).await;
+    match w.res {
+        Result.Ok(wn) => {
+            if wn != n {
+                return -2i64;
+            }
+        },
+        Result.Err(_) => return -2i64,
+    }
+    // read the echo back in as many pieces as TCP delivers it
+    let mut got: usize = 0;
+    while got < n {
+        let mut out = mut_view(s).read_buf(IoBuf.with_capacity(n - got)).await;
+        let b = mut_view(out).take_buf();
+        match out.res {
+            Result.Ok(k) => {
+                if k == 0usize {
+                    return -3i64;
+                }
+                let mut i: usize = 0;
+                while i < k {
+                    if !byte_is(view(b), i, msg_byte(idx, got + i)) {
+                        return -4i64;
+                    }
+                    i = i + 1;
+                }
+                got = got + k;
+            },
+            Result.Err(_) => return -3i64,
+        }
+    }
+    let _ = view(s).shutdown(ShutdownMode.Write);
+    let eof = mut_view(s).read_buf(IoBuf.with_capacity(4usize)).await;
+    match eof.res {
+        Result.Ok(k) => {
+            if k != 0usize {
+                return -5i64;
+            }
+        },
+        Result.Err(_) => return -6i64,
+    }
+    let _ = s.close();
+    n as i64
+}
+
+fn join_i64(exec: mut_view<LocalExecutor>, h: std.asyn.task.LocalTaskHandle<i64>) -> i64 {
+    match exec.block_on(h.join()) {
+        TaskResult.Completed(v) => v,
+        _ => -100i64,
+    }
+}
+
+pub fn main() -> i32 {
+    let mut exec = LocalExecutor.new();
+    let r = view(exec).reactor();
+
+    let listener = match AsyncTcpListener.bind(r, SocketAddr.localhost(0u16)) {
+        Result.Ok(l) => l,
+        Result.Err(_) => return 1i32,
+    };
+    let addr = view(listener).local_addr();
+
+    let mut slots: [4]i64 = [0i64; 4];
+    let mut gate: i64 = 0i64;
+    let p_gate = unsafe { address_of_mut(gate) };
+    let p_exec = unsafe { address_of_mut(exec) };
+    let acc = mut_view(exec).spawn_local(accept_loop(unsafe { address_of(listener) }, p_exec, 4usize, unsafe { address_of_mut(slots[0]) }, p_gate));
+    let c0 = mut_view(exec).spawn_local(client_task(r, addr, 0u64, p_gate));
+    let c1 = mut_view(exec).spawn_local(client_task(r, addr, 1u64, p_gate));
+    let c2 = mut_view(exec).spawn_local(client_task(r, addr, 2u64, p_gate));
+    let c3 = mut_view(exec).spawn_local(client_task(r, addr, 3u64, p_gate));
+
+    let client_total = join_i64(mut_view(exec), c0) + join_i64(mut_view(exec), c1) +
+        join_i64(mut_view(exec), c2) + join_i64(mut_view(exec), c3);
+    let accepted = join_i64(mut_view(exec), acc);
+    // Let the per-connection echo tasks finish (they end when their peer half-closed).
+    mut_view(exec).run();
+    let server_total = slots[0] + slots[1] + slots[2] + slots[3];
+
+    let _ = listener.close();
+    mut_view(exec).shutdown();
+
+    print("OK tcp_multi_client_echo 4 ");
+    print_int(client_total);
+    print(" ");
+    print_int(server_total);
+    print(" ");
+    print_int(accepted);
+    print(" ");
+    print_int(if client_total == server_total { 1i64 } else { 0i64 });
+    print("\n");
+    0i32
+}

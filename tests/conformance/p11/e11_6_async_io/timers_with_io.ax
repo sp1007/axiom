@@ -1,0 +1,154 @@
+// test: run
+// modes: interp native
+// timeout: 90
+// covers: REQ-ASY-155 REQ-ASY-159 REQ-ASY-152
+// stdout: OK timers_with_io order=123 sleeps=1 interval=4 io_timeout=1 leak=0\n
+
+// AXS-AIO-020..023: the reactor timer wheel and the IOCP completion port cooperate on one LocalExecutor.
+// Part 1: three tasks wake in deadline/completion order although they wait on different sources: a 10 ms
+//         `sleep`, a UDP `recv_from` that is satisfied by a datagram another task sends after 100 ms, and a
+//         400 ms `sleep`; no wake may happen before its deadline (monotonic clock check).
+// Part 2: `Interval.every_ms(15)` yields four ticks, the fourth no earlier than 60 ms after creation.
+// Part 3: `with_io_timeout_ms(5000, recv_from)` completes `Ok` long before its deadline and, because dropping
+//         the `SleepFuture` cancels the timer, the reactor reports no pending work afterwards (no leaked timer).
+
+module test.timers_with_io
+
+use std.core.result.Result
+use std.core.option.Option
+use std.core.host.monotonic_ns
+use std.asyn.executor.LocalExecutor
+use std.asyn.task.TaskResult
+use std.asyn.task.LocalTaskHandle
+use std.asyn.timer.sleep_ms
+use std.asyn.timer.Interval
+use std.io.async_io.with_io_timeout_ms
+use std.net.SocketAddr
+use std.net.AsyncUdpSocket
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+fn push(log: *mut i64, cur: *mut usize, id: i64) {
+    unsafe {
+        let i = *cur;
+        if i < 3usize {
+            *(log + i) = id;
+        }
+        *cur = i + 1usize;
+    }
+}
+
+async fn sleeper(log: *mut i64, cur: *mut usize, ms: u64, id: i64, start: u64, el: *mut u64) -> i64 {
+    sleep_ms(ms).await;
+    push(log, cur, id);
+    unsafe { *el = monotonic_ns() - start; }
+    0i64
+}
+
+// `buf` points to 8 bytes owned by `main` (raw pointers into an async fn's own locals are not stable across `.await`).
+async fn io_waiter(b: *const AsyncUdpSocket, log: *mut i64, cur: *mut usize, start: u64, el: *mut u64, buf: *mut u8) -> i64 {
+    let n = match unsafe { view(*b).recv_from(buf, 8usize).await } {
+        Result.Ok(p) => p.0,
+        Result.Err(_) => return -1i64,
+    };
+    push(log, cur, 2i64);
+    unsafe { *el = monotonic_ns() - start; }
+    if n == 3usize && unsafe { *buf } == 84u8 { 0i64 } else { -2i64 }
+}
+
+async fn delayed_sender(a: *const AsyncUdpSocket, target: SocketAddr, ms: u64) -> i64 {
+    sleep_ms(ms).await;
+    let d: [3]u8 = [84u8, 73u8, 77u8]; // "TIM"
+    match unsafe { view(*a).send_to(address_of(d[0]), 3usize, target).await } {
+        Result.Ok(_) => 0i64,
+        Result.Err(_) => -1i64,
+    }
+}
+
+fn join_i64(exec: mut_view<LocalExecutor>, h: LocalTaskHandle<i64>) -> i64 {
+    match exec.block_on(h.join()) {
+        TaskResult.Completed(v) => v,
+        _ => -100i64,
+    }
+}
+
+pub fn main() -> i32 {
+    let mut exec = LocalExecutor.new();
+    let r = view(exec).reactor();
+
+    let sa = match AsyncUdpSocket.bind(r, SocketAddr.localhost(0u16)) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 1i32,
+    };
+    let sb = match AsyncUdpSocket.bind(r, SocketAddr.localhost(0u16)) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 2i32,
+    };
+    let addr_b = view(sb).local_addr();
+
+    // Part 1
+    let mut log: [3]i64 = [0i64; 3];
+    let mut cur: usize = 0;
+    let mut el: [3]u64 = [0u64; 3];
+    let mut iobuf: [8]u8 = [0u8; 8];
+    let start = monotonic_ns();
+    let plog = unsafe { address_of_mut(log[0]) };
+    let pcur = unsafe { address_of_mut(cur) };
+    let pel = unsafe { address_of_mut(el[0]) };
+
+    let h_late = mut_view(exec).spawn_local(sleeper(plog, pcur, 400u64, 3i64, start, (unsafe { pel + 2usize })));
+    let h_io = mut_view(exec).spawn_local(io_waiter(unsafe { address_of(sb) }, plog, pcur, start, (unsafe { pel + 1usize }), unsafe { address_of_mut(iobuf[0]) }));
+    let h_send = mut_view(exec).spawn_local(delayed_sender(unsafe { address_of(sa) }, addr_b, 100u64));
+    let h_early = mut_view(exec).spawn_local(sleeper(plog, pcur, 10u64, 1i64, start, pel));
+
+    let r_early = join_i64(mut_view(exec), h_early);
+    let r_send = join_i64(mut_view(exec), h_send);
+    let r_io = join_i64(mut_view(exec), h_io);
+    let r_late = join_i64(mut_view(exec), h_late);
+    let order = log[0] * 100i64 + log[1] * 10i64 + log[2];
+    let sleeps_ok = r_early == 0i64 && r_send == 0i64 && r_io == 0i64 && r_late == 0i64 &&
+        el[0] >= 10_000_000u64 && el[1] >= 100_000_000u64 && el[2] >= 400_000_000u64;
+
+    // Part 2
+    let mut iv = Interval.every_ms(15u64);
+    let iv_start = monotonic_ns();
+    let mut ticks: i64 = 0i64;
+    while ticks < 4i64 {
+        mut_view(exec).block_on(mut_view(iv).tick());
+        ticks = ticks + 1i64;
+    }
+    let iv_ok = (monotonic_ns() - iv_start) >= 60_000_000u64;
+
+    // Part 3
+    let d: [3]u8 = [84u8, 73u8, 77u8];
+    let mut rb: [8]u8 = [0u8; 8];
+    let rf = with_io_timeout_ms(5000u64, view(sb).recv_from(unsafe { address_of_mut(rb[0]) }, 8usize));
+    let sf = view(sa).send_to(unsafe { address_of(d[0]) }, 3usize, addr_b);
+    let _ = mut_view(exec).block_on(sf);
+    let io_timeout_ok = match mut_view(exec).block_on(rf) {
+        Result.Ok(inner) => match inner {
+            Result.Ok(p) => p.0 == 3usize && rb[2] == 77u8,
+            Result.Err(_) => false,
+        },
+        Result.Err(_) => false,
+    };
+    let leak: i64 = if unsafe { view(*r).has_pending_work() } { 1i64 } else { 0i64 };
+
+    let _ = sa.close();
+    let _ = sb.close();
+    mut_view(exec).shutdown();
+
+    print("OK timers_with_io order=");
+    print_int(order);
+    print(" sleeps=");
+    print_int(if sleeps_ok { 1i64 } else { 0i64 });
+    print(" interval=");
+    print_int(if iv_ok { ticks } else { 0i64 });
+    print(" io_timeout=");
+    print_int(if io_timeout_ok { 1i64 } else { 0i64 });
+    print(" leak=");
+    print_int(leak);
+    print("\n");
+    0i32
+}

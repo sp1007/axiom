@@ -1,0 +1,160 @@
+// test: run
+// modes: interp native
+// timeout: 90
+// covers: REQ-ASY-155 REQ-ASY-152 REQ-ASY-157
+// stdout: OK udp_burst_exchange 8 36 8 1\n
+
+// AXS-AIO-050..052: AsyncUdpSocket burst exchange between two sockets driven by two concurrent tasks. The sender
+// fires a burst of eight datagrams of distinct length (1..8 bytes, content derived from the sequence number)
+// without waiting; the receiver checks that every datagram keeps its boundary, length and content, acknowledges
+// each one to the address it came from, and the sender collects the eight acknowledgements. All checks are
+// order-insensitive (a bitmask keyed by sequence number) because UDP does not promise ordering.
+
+module test.udp_burst_exchange
+
+use std.core.result.Result
+use std.asyn.executor.LocalExecutor
+use std.asyn.task.TaskResult
+use std.asyn.task.LocalTaskHandle
+use std.net.SocketAddr
+use std.net.AsyncUdpSocket
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+// Both tasks use 64 bytes of `scratch` owned by `main` (a stable frame); raw pointers into an async fn's own
+// locals are not stable across `.await` (SPEC-33: state machines are relocatable).
+
+// Sender: burst of 8, then 8 acks. Returns acks_mask (bits 0..7) or a negative error.
+async fn sender_task(a: *const AsyncUdpSocket, target: SocketAddr, scratch: *mut u8) -> i64 {
+    let d = scratch;
+    let ack = unsafe { scratch + 16usize };
+    let mut seq: usize = 0;
+    while seq < 8usize {
+        let mut k: usize = 0;
+        while k <= seq {
+            unsafe { *(d + k) = (seq as u8) + 100u8; }
+            k = k + 1;
+        }
+        match unsafe { view(*a).send_to(d as *const u8, seq + 1usize, target).await } {
+            Result.Ok(n) => {
+                if n != seq + 1usize {
+                    return -1i64;
+                }
+            },
+            Result.Err(_) => return -2i64,
+        }
+        seq = seq + 1;
+    }
+    let mut mask: i64 = 0i64;
+    let mut got: usize = 0;
+    while got < 8usize {
+        match unsafe { view(*a).recv_from(ack, 4usize).await } {
+            Result.Ok(p) => {
+                let a0 = unsafe { *ack };
+                let a1 = unsafe { *(ack + 1usize) };
+                if p.0 != 2usize || a1 != 77u8 || a0 >= 8u8 {
+                    return -3i64;
+                }
+                mask = mask | (1i64 << (a0 as i64));
+            },
+            Result.Err(_) => return -4i64,
+        }
+        got = got + 1;
+    }
+    mask
+}
+
+// Receiver: returns recv_mask | (total_len << 8), or a negative error.
+async fn receiver_task(b: *const AsyncUdpSocket, scratch: *mut u8) -> i64 {
+    let buf = scratch;
+    let ack = unsafe { scratch + 32usize };
+    let mut mask: i64 = 0i64;
+    let mut total: i64 = 0i64;
+    let mut got: usize = 0;
+    while got < 8usize {
+        let (n, from) = match unsafe { view(*b).recv_from(buf, 16usize).await } {
+            Result.Ok(p) => p,
+            Result.Err(_) => return -1i64,
+        };
+        if n == 0usize || n > 8usize {
+            return -2i64;
+        }
+        let b0 = unsafe { *buf };
+        if b0 < 100u8 || b0 >= 108u8 {
+            return -3i64;
+        }
+        let seq = (b0 - 100u8) as usize;
+        if n != seq + 1usize {
+            return -3i64;
+        }
+        let mut k: usize = 0;
+        while k < n {
+            if unsafe { *(buf + k) } != b0 {
+                return -4i64;
+            }
+            k = k + 1;
+        }
+        mask = mask | (1i64 << (seq as i64));
+        total = total + (n as i64);
+        // acknowledge to the sender's address: [seq, 77]
+        unsafe {
+            *ack = seq as u8;
+            *(ack + 1usize) = 77u8;
+        }
+        match unsafe { view(*b).send_to(ack as *const u8, 2usize, from).await } {
+            Result.Ok(_) => {},
+            Result.Err(_) => return -5i64,
+        }
+        got = got + 1;
+    }
+    mask | (total << 8i64)
+}
+
+fn join_i64(exec: mut_view<LocalExecutor>, h: LocalTaskHandle<i64>) -> i64 {
+    match exec.block_on(h.join()) {
+        TaskResult.Completed(v) => v,
+        _ => -100i64,
+    }
+}
+
+pub fn main() -> i32 {
+    let mut exec = LocalExecutor.new();
+    let r = view(exec).reactor();
+
+    let sock_a = match AsyncUdpSocket.bind(r, SocketAddr.localhost(0u16)) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 1i32,
+    };
+    let sock_b = match AsyncUdpSocket.bind(r, SocketAddr.localhost(0u16)) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 2i32,
+    };
+    let addr_b = view(sock_b).local_addr();
+
+    let mut scratch: [128]u8 = [0u8; 128];
+    let p_scratch = unsafe { address_of_mut(scratch[0]) };
+    let h_rx = mut_view(exec).spawn_local(receiver_task(unsafe { address_of(sock_b) }, (unsafe { p_scratch + 64usize })));
+    let h_tx = mut_view(exec).spawn_local(sender_task(unsafe { address_of(sock_a) }, addr_b, p_scratch));
+
+    let acks = join_i64(mut_view(exec), h_tx);
+    let rx = join_i64(mut_view(exec), h_rx);
+
+    let _ = sock_a.close();
+    let _ = sock_b.close();
+    mut_view(exec).shutdown();
+
+    let rx_mask = rx & 255i64;
+    let rx_total = rx >> 8i64;
+    let ok = rx >= 0i64 && acks == 255i64 && rx_mask == 255i64;
+    print("OK udp_burst_exchange ");
+    print_int(if rx_mask == 255i64 { 8i64 } else { 0i64 });
+    print(" ");
+    print_int(rx_total);
+    print(" ");
+    print_int(if acks == 255i64 { 8i64 } else { 0i64 });
+    print(" ");
+    print_int(if ok { 1i64 } else { 0i64 });
+    print("\n");
+    0i32
+}

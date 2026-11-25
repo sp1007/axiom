@@ -1,0 +1,228 @@
+// test: run
+// modes: interp native
+// timeout: 90
+// covers: REQ-ASY-155 REQ-ASY-152 REQ-CONC-153
+// stdout: OK tcp_framing_split 6 30 6 30 1\n
+
+// AXS-AIO-031, AXS-AIO-043: length-prefixed framing over `split()` halves. A client writer task sends six frames
+// (1-byte length header + payload, including an empty frame, with one frame trickled out one byte per write so the
+// peer sees partial reads); a server task owns the other connection's two halves and returns every frame with each
+// payload byte incremented; a client reader task reassembles the echoed frames with read_exact. The stream ends
+// with a half-close: header-level `read_exact` reports `UnexpectedEof` which both readers treat as clean end.
+
+module test.tcp_framing_split
+
+use std.core.result.Result
+use std.core.option.Option
+use std.asyn.executor.LocalExecutor
+use std.asyn.task.TaskResult
+use std.asyn.task.LocalTaskHandle
+use std.io.IoError
+use std.net.SocketAddr
+use std.net.AsyncTcpListener
+use std.net.AsyncTcpStream
+use std.net.TcpReadHalf
+use std.net.TcpWriteHalf
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+fn frame_len(i: usize) -> usize {
+    if i == 0usize { 3usize }
+    else if i == 1usize { 0usize }
+    else if i == 2usize { 9usize }
+    else if i == 3usize { 1usize }
+    else if i == 4usize { 12usize }
+    else { 5usize }
+}
+
+fn frame_byte(i: usize, k: usize) -> u8 {
+    ((i * 16usize + k) as u8) + 1u8
+}
+
+fn is_eof(e: IoError) -> bool {
+    match e {
+        IoError.UnexpectedEof => true,
+        _ => false,
+    }
+}
+
+// The split halves and the 128-byte scratch areas are owned by `main` (a stable frame) and lent to the tasks as raw
+// pointers: `read_exact`/`write_all` keep a pointer to the half they work on, and a pointer to a local of an `async fn`
+// is not stable across `.await` (SPEC-33: state machines are relocatable).
+async fn client_writer(cw: *mut TcpWriteHalf, scratch: *mut u8) -> i64 {
+    let hdr = scratch;
+    let body = unsafe { scratch + 16usize };
+    let mut i: usize = 0;
+    while i < 6usize {
+        let n = frame_len(i);
+        unsafe { *hdr = n as u8; }
+        match unsafe { mut_view(*cw).write_all(hdr as *const u8, 1usize).await } {
+            Result.Ok(_) => {},
+            Result.Err(_) => return -1i64,
+        }
+        let mut k: usize = 0;
+        while k < n {
+            unsafe { *(body + k) = frame_byte(i, k); }
+            k = k + 1;
+        }
+        if i == 4usize {
+            // trickle: one byte per write
+            let mut b: usize = 0;
+            while b < n {
+                match unsafe { mut_view(*cw).write_all((unsafe { body + b }) as *const u8, 1usize).await } {
+                    Result.Ok(_) => {},
+                    Result.Err(_) => return -2i64,
+                }
+                b = b + 1;
+            }
+        } else if n > 0usize {
+            match unsafe { mut_view(*cw).write_all(body as *const u8, n).await } {
+                Result.Ok(_) => {},
+                Result.Err(_) => return -3i64,
+            }
+        }
+        i = i + 1;
+    }
+    let _ = unsafe { mut_view(*cw).shutdown_write() };
+    i as i64
+}
+
+// Returns frames * 1000 + payload bytes, or a negative error.
+async fn server_task(sr: *mut TcpReadHalf, sw: *mut TcpWriteHalf, scratch: *mut u8) -> i64 {
+    let hdr = scratch;
+    let body = unsafe { scratch + 16usize };
+    let out = unsafe { scratch + 48usize };
+    let mut frames: i64 = 0i64;
+    let mut bytes: i64 = 0i64;
+    loop {
+        match unsafe { mut_view(*sr).read_exact(hdr, 1usize).await } {
+            Result.Ok(_) => {},
+            Result.Err(e) => {
+                if is_eof(e) {
+                    break;
+                }
+                return -1i64;
+            },
+        }
+        let n = unsafe { *hdr } as usize;
+        // out[0] = header, out[1..] = payload + 1
+        unsafe { *out = n as u8; }
+        if n > 0usize {
+            match unsafe { mut_view(*sr).read_exact(body, n).await } {
+                Result.Ok(_) => {},
+                Result.Err(_) => return -2i64,
+            }
+            let mut k: usize = 0;
+            while k < n {
+                unsafe { *(out + 1usize + k) = *(body + k) + 1u8; }
+                k = k + 1;
+            }
+        }
+        match unsafe { mut_view(*sw).write_all(out as *const u8, 1usize + n).await } {
+            Result.Ok(_) => {},
+            Result.Err(_) => return -3i64,
+        }
+        frames = frames + 1i64;
+        bytes = bytes + (n as i64);
+    }
+    let _ = unsafe { mut_view(*sw).shutdown_write() };
+    frames * 1000i64 + bytes
+}
+
+async fn client_reader(cr: *mut TcpReadHalf, scratch: *mut u8) -> i64 {
+    let hdr = scratch;
+    let body = unsafe { scratch + 16usize };
+    let mut frames: i64 = 0i64;
+    let mut bytes: i64 = 0i64;
+    loop {
+        match unsafe { mut_view(*cr).read_exact(hdr, 1usize).await } {
+            Result.Ok(_) => {},
+            Result.Err(e) => {
+                if is_eof(e) {
+                    break;
+                }
+                return -1i64;
+            },
+        }
+        let i = frames as usize;
+        let n = unsafe { *hdr } as usize;
+        if i >= 6usize || n != frame_len(i) {
+            return -4i64;
+        }
+        if n > 0usize {
+            match unsafe { mut_view(*cr).read_exact(body, n).await } {
+                Result.Ok(_) => {},
+                Result.Err(_) => return -2i64,
+            }
+            let mut k: usize = 0;
+            while k < n {
+                if unsafe { *(body + k) } != frame_byte(i, k) + 1u8 {
+                    return -5i64;
+                }
+                k = k + 1;
+            }
+        }
+        frames = frames + 1i64;
+        bytes = bytes + (n as i64);
+    }
+    frames * 1000i64 + bytes
+}
+
+fn join_i64(exec: mut_view<LocalExecutor>, h: LocalTaskHandle<i64>) -> i64 {
+    match exec.block_on(h.join()) {
+        TaskResult.Completed(v) => v,
+        _ => -100i64,
+    }
+}
+
+pub fn main() -> i32 {
+    let mut exec = LocalExecutor.new();
+    let r = view(exec).reactor();
+
+    let listener = match AsyncTcpListener.bind(r, SocketAddr.localhost(0u16)) {
+        Result.Ok(l) => l,
+        Result.Err(_) => return 1i32,
+    };
+    let addr = view(listener).local_addr();
+    let acc = view(listener).accept();
+    let con = AsyncTcpStream.connect(r, addr);
+    let client = match mut_view(exec).block_on(con) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 2i32,
+    };
+    let server = match mut_view(exec).block_on(acc) {
+        Result.Ok(p) => p.0,
+        Result.Err(_) => return 3i32,
+    };
+    let mut scratch: [384]u8 = [0u8; 384];
+    let p_scratch = unsafe { address_of_mut(scratch[0]) };
+    let (mut cr, mut cw) = client.split();
+    let (mut sr, mut sw) = server.split();
+
+    let h_srv = mut_view(exec).spawn_local(server_task(unsafe { address_of_mut(sr) }, unsafe { address_of_mut(sw) }, (unsafe { p_scratch + 128usize })));
+    let h_rd = mut_view(exec).spawn_local(client_reader(unsafe { address_of_mut(cr) }, (unsafe { p_scratch + 256usize })));
+    let h_wr = mut_view(exec).spawn_local(client_writer(unsafe { address_of_mut(cw) }, p_scratch));
+
+    let sent = join_i64(mut_view(exec), h_wr);
+    let srv = join_i64(mut_view(exec), h_srv);
+    let rd = join_i64(mut_view(exec), h_rd);
+
+    let _ = listener.close();
+    mut_view(exec).shutdown();
+
+    // 6 frames, 3+0+9+1+12+5 = 30 payload bytes
+    let ok = sent == 6i64 && srv == 6030i64 && rd == 6030i64;
+    print("OK tcp_framing_split ");
+    print_int(sent);
+    print(" ");
+    print_int(srv - 6000i64);
+    print(" ");
+    print_int(rd / 1000i64);
+    print(" ");
+    print_int(rd - 6000i64);
+    print(" ");
+    print_int(if ok { 1i64 } else { 0i64 });
+    print("\n");
+    0i32
+}
