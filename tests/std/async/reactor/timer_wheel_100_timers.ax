@@ -54,7 +54,21 @@ impl Future for TimedTask {
     }
 }
 
-pub fn main() -> i32 {
+pub struct Outcome {
+    pub setup_ok: bool,
+    pub completed: usize,
+    pub ordered_ok: bool,
+    pub same_thread: bool,
+    pub remaining_timers: usize,
+}
+
+// One run of the scenario. The ordering property only holds when every task has registered its timer
+// before the earliest deadline fires, so the setup is verified explicitly instead of being assumed from a
+// wall-clock margin: the executor is driven by hand until its ready queue is empty (every task has been
+// polled once and parked on the wheel), then `setup_ok` records that all `total` timers are registered
+// and none has completed. A run whose setup was disturbed (a stalled machine) is still run to completion
+// and reported with `setup_ok = false` so the caller can repeat it with a longer lead time.
+fn run_scenario(lead_ns: u64) -> Outcome {
     let mut exec = LocalExecutor.new();
     let main_tid = unsafe { thread_current_id() };
     let total: usize = 120;
@@ -68,13 +82,11 @@ pub fn main() -> i32 {
         (*log).same_thread_all = true;
     }
 
-    // Spawn 120 concurrent timers with interleaved deadlines (reverse-shuffled into 120 distinct buckets).
-    // 2s lead time ensures all 120 tasks register in the TimerWheel before the earliest deadline even under MIR interp.
-    // Step = 100us (100_000ns) -> total span ~2.012s in native, instant virtual-clock jumps in oracle interp.
-    let base_ns = monotonic_ns() + 2_000_000_000u64;
+    // Spawn 120 concurrent timers with distinct deadlines 100us apart (reverse-shuffled: the spawn order is
+    // permuted with the coprime step 37 mod 120, so insertion order differs from deadline order).
+    let base_ns = monotonic_ns() + lead_ns;
     let mut i: usize = 0;
     while i < total {
-        // Permute spawn order using coprime step 37 mod 120 so insertion order is scrambled
         let rank: usize = (i * 37) % total;
         let dl = Deadline.at_ns(base_ns + ((rank as u64) + 1u64) * 100_000u64);
         let task = TimedTask {
@@ -86,6 +98,14 @@ pub fn main() -> i32 {
         h.detach();
         i = i + 1;
     }
+
+    // Registration sweep: poll every task once (each registers on the wheel and returns Pending) until the
+    // ready queue is empty. No timer can complete before this ends unless the machine stalled for `lead_ns`.
+    while mut_view(exec).try_tick() {
+    }
+    let registered = unsafe { view((*exec.reactor).timers).active_count() };
+    let completed_early = unsafe { (*log).count };
+    let setup_ok = registered == total && completed_early == 0;
 
     // Also verify early Drop cancellation of a long-lived SleepFuture leaves 0 dangling timers
     {
@@ -118,14 +138,38 @@ pub fn main() -> i32 {
     }
     mut_view(exec).shutdown();
 
+    Outcome {
+        setup_ok: setup_ok,
+        completed: completed,
+        ordered_ok: ordered_ok,
+        same_thread: same_thread,
+        remaining_timers: remaining_timers,
+    }
+}
+
+pub fn main() -> i32 {
+    // Lead time 1s, doubled after every disturbed setup (up to 1+2+4+8+16 s).
+    let mut lead_ns: u64 = 1_000_000_000u64;
+    let mut attempt: usize = 0;
+    let mut out = run_scenario(lead_ns);
+    while !out.setup_ok && attempt < 4 {
+        lead_ns = lead_ns * 2u64;
+        attempt = attempt + 1;
+        out = run_scenario(lead_ns);
+    }
+    if !out.setup_ok {
+        print("FAIL timer_wheel_100_timers setup never completed before the first deadline\n");
+        return 1i32;
+    }
+
     print("OK timer_wheel_100_timers ");
-    print_int(completed as i64);
+    print_int(out.completed as i64);
     print(" ");
-    print_int(if ordered_ok { 1i64 } else { 0i64 });
+    print_int(if out.ordered_ok { 1i64 } else { 0i64 });
     print(" ");
-    print_int(if same_thread { 1i64 } else { 0i64 });
+    print_int(if out.same_thread { 1i64 } else { 0i64 });
     print(" ");
-    print_int(remaining_timers as i64);
+    print_int(out.remaining_timers as i64);
     print("\n");
     0i32
 }

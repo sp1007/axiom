@@ -8,13 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 20
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [std/async/timer.ax, std/async/timeout.ax, tests/std/async/reactor, tests/std/async/executor, tests/std/async/structured, tests/std/async/waker, tests/std/async/waker_qa]
 locks: [_workspaces/baseline-failures.txt]
 spec: [spec/SPEC-35-async-io.md, spec/SPEC-34-executors-fibers.md]
 covers: [REQ-ASY-154, REQ-TST-072]
-started: 2026-11-25 18:42:13
+started: 2026-11-25 22:15:22
+finished: 2026-11-26 00:14:46
 ---
 # T449a — Baseline fix: std/async stale bundles, timer flake, missing waker import
 
@@ -61,3 +62,5 @@ T427 and were admitted to `_workspaces/baseline-failures.txt` on 2026-11-25 with
 - 2026-11-25 created by architect (triage after T427 accept, `_workspaces/reports/triage-2026-11-25-T427.md`)
 - 2026-11-25 18:42:13 started (attempt 1) T449a-impl
 - 2026-11-25 18:49:10 requeue: API error: Sonnet safeguards flagged request (invalid_request) (infrastructure failure: attempt refunded)
+- 2026-11-25 22:15:22 started (attempt 1) T449a-impl2
+- 2026-11-26 00:14:46 accepted by QA -> done

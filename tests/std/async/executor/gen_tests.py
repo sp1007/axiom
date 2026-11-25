@@ -3,27 +3,27 @@
 
 Generates in-tree test bundles for std.asyn executors and async sync primitives
 by concatenating verbatim standard library source files with test harness logic.
-Ensures zero test divergence from live std/async/*.ax implementations.
+Ensures zero test divergence from live std/async/*.ax implementations. The `*_SOURCES` lists are seeds:
+the generator adds the dependency closure of their imports and of the test program's imports
+(`structured/bundle_closure.py`), so a std module that gains an import cannot make the bundles stale
+or incomplete (T449a).
 """
 
 import argparse
 import os
 import sys
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "structured"))
+from bundle_closure import bundle_sources  # noqa: E402  (shared helper, T449a)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
 
-COMMON_PREREQS = [
-    "std/sync/atomic.ax",
-    "std/sys/windows/heap.ax",
-    "std/sys/windows/time.ax",
-    "std/sys/windows/thread.ax",
-    "std/time/time.ax",
-    "std/text/utf8.ax",
-    "std/text/string.ax",
-    "std/thread/local.ax",
-    "std/thread/mod.ax",
-]
+# The tests need no std module beyond the import closure that `bundle_sources` derives from the sources
+# listed below and from the test program. In particular std.text.string / std.thread are not bundled any
+# more: they are not imported by std.asyn.*, and bundling them next to std.io (which defines its own
+# `String`/`string_new`) makes the compiler report AX_TYPE_MISMATCH on `Result.Ok(string_new())`.
+COMMON_PREREQS = []
 
 # -----------------------------------------------------------------------------
 # Test Definitions
@@ -1207,7 +1207,7 @@ def read_source(rel_path):
 
 def build_bundle(header, sources, main_code):
     parts = [header.rstrip("\n")]
-    for src in sources:
+    for src in bundle_sources(ROOT, sources, main_code):
         content = read_source(src).strip()
         parts.append(content)
     parts.append(main_code.strip())
