@@ -1,0 +1,96 @@
+// test: run
+// modes: interp native
+// timeout: 60
+// covers: REQ-ASY-152, REQ-ASY-157
+// stdout: OK async_socket_timeout_cancel 1 1 1 0\n
+
+module test.async_socket_timeout_cancel
+
+use std.core.result.Result
+use std.core.option.Option
+use std.asyn.executor.LocalExecutor
+use std.io.async_io.IoBuf
+use std.io.async_io.with_io_timeout_ms
+use std.net.SocketAddr
+use std.net.AsyncTcpListener
+use std.net.AsyncTcpStream
+use std.net.AsyncUdpSocket
+
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+pub fn main() -> i32 {
+    let mut exec = LocalExecutor.new();
+    let r = view(exec).reactor();
+
+    // 1. Setup connected TCP pair where server sends nothing; client read_buf times out
+    let listener = match AsyncTcpListener.bind(r, SocketAddr.localhost(0u16)) {
+        Result.Ok(l) => l,
+        Result.Err(_) => return 1i32,
+    };
+    let bind_addr = view(listener).local_addr();
+    let acc_fut = view(listener).accept();
+    let con_fut = AsyncTcpStream.connect(r, bind_addr);
+    let mut client = match mut_view(exec).block_on(con_fut) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 2i32,
+    };
+    let server = match mut_view(exec).block_on(acc_fut) {
+        Result.Ok(pair) => pair.0,
+        Result.Err(_) => return 3i32,
+    };
+
+    // Blocked IoBuf read cancelled by Timeout (triggers CancellingZombie buffer retention!)
+    let tcp_timed_out: i64 = match mut_view(exec).block_on(
+        with_io_timeout_ms(20u64, mut_view(client).read_buf(IoBuf.with_capacity(64usize)))
+    ) {
+        Result.Ok(_) => 0i64,
+        Result.Err(_) => 1i64,
+    };
+
+    // 2. Blocked slice read cancelled by Timeout (staging buffer stays pinned in Reactor!)
+    let mut stack_buf: [32]u8 = [0u8; 32];
+    let slice_timed_out: i64 = match mut_view(exec).block_on(
+        with_io_timeout_ms(20u64, mut_view(client).read(unsafe { address_of_mut(stack_buf[0]) }, 32usize))
+    ) {
+        Result.Ok(_) => 0i64,
+        Result.Err(_) => 1i64,
+    };
+
+    // 3. Blocked UDP recv_from cancelled by Timeout
+    let udp = match AsyncUdpSocket.bind(r, SocketAddr.localhost(0u16)) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 4i32,
+    };
+    let mut udp_buf: [32]u8 = [0u8; 32];
+    let udp_timed_out: i64 = match mut_view(exec).block_on(
+        with_io_timeout_ms(20u64, view(udp).recv_from(unsafe { address_of_mut(udp_buf[0]) }, 32usize))
+    ) {
+        Result.Ok(_) => 0i64,
+        Result.Err(_) => 1i64,
+    };
+
+    // Drain cancelled zombie operations via reactor turns
+    let mut iters: usize = 0;
+    while unsafe { view(*r).in_flight_count() } > 0 && iters < 64 {
+        let _ = unsafe { mut_view(*r).turn(Option.Some(5_000_000u64)) };
+        iters = iters + 1;
+    }
+    let remaining_inflight = unsafe { view(*r).in_flight_count() } as i64;
+
+    let _ = udp.close();
+    let _ = client.close();
+    let _ = server.close();
+    let _ = listener.close();
+    mut_view(exec).shutdown();
+
+    print("OK async_socket_timeout_cancel ");
+    print_int(tcp_timed_out);
+    print(" ");
+    print_int(slice_timed_out);
+    print(" ");
+    print_int(udp_timed_out);
+    print(" ");
+    print_int(remaining_inflight);
+    print("\n");
+    0i32
+}

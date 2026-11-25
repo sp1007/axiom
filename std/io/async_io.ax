@@ -1,0 +1,858 @@
+// std.io.async_io - Completion-Safe IoBuf, AsyncRead/AsyncWrite & Helper Futures (SPEC-35 §2, §4, T427)
+module std.io.async_io
+
+use std.core.prelude.Future
+use std.core.prelude.Poll
+use std.core.prelude.Context
+use std.core.option.Option
+use std.core.result.Result
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.bytes.byte_buf.ByteBuf
+use std.io.IoError
+use std.io.io_error_from_code
+use std.asyn.reactor.Reactor
+use std.asyn.reactor.IoOpId
+use std.asyn.reactor.IoCompletion
+use std.asyn.timer.SleepFuture
+use std.asyn.timer.sleep_ns
+use std.asyn.timer.sleep_ms
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+// -----------------------------------------------------------------------------
+// Completion-Safe Owned Buffer `IoBuf` & `IoResultBuf` (AXS-AIO-011)
+// -----------------------------------------------------------------------------
+
+pub struct IoBuf {
+    pub ptr: *mut u8,
+    pub len: usize,
+    pub cap: usize,
+}
+
+unsafe impl Send for IoBuf {}
+unsafe impl Share for IoBuf {}
+impl !Copy for IoBuf {}
+
+impl Drop for IoBuf {
+    fn drop(self: mut_view<IoBuf>) {
+        if (self.ptr as usize) != 0 && self.cap > 0 {
+            unsafe {
+                heap_free(self.ptr, self.cap, 8);
+            }
+        }
+        self.ptr = 0 as *mut u8;
+        self.len = 0;
+        self.cap = 0;
+    }
+}
+
+pub struct IoResultBuf {
+    pub buf: IoBuf,
+    pub res: Result<usize, IoError>,
+}
+
+unsafe impl Send for IoResultBuf {}
+impl !Copy for IoResultBuf {}
+
+impl IoResultBuf {
+    pub fn take_buf(self: mut_view<IoResultBuf>) -> IoBuf {
+        let p = self.buf.ptr;
+        let l = self.buf.len;
+        let c = self.buf.cap;
+        self.buf.ptr = 0 as *mut u8;
+        self.buf.len = 0;
+        self.buf.cap = 0;
+        IoBuf { ptr: p, len: l, cap: c }
+    }
+}
+
+impl IoBuf {
+    pub fn new() -> IoBuf {
+        IoBuf {
+            ptr: 0 as *mut u8,
+            len: 0,
+            cap: 0,
+        }
+    }
+
+    pub fn with_capacity(cap: usize) -> IoBuf {
+        if cap == 0 {
+            return IoBuf.new();
+        }
+        let raw = unsafe { heap_alloc(cap, 8) };
+        IoBuf {
+            ptr: raw as *mut u8,
+            len: 0,
+            cap: cap,
+        }
+    }
+
+    pub fn from_raw_bytes(src: *const u8, count: usize) -> IoBuf {
+        if count == 0 || (src as usize) == 0 {
+            return IoBuf.new();
+        }
+        let raw = unsafe { heap_alloc(count, 8) };
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(src, raw, count);
+        }
+        IoBuf {
+            ptr: raw,
+            len: count,
+            cap: count,
+        }
+    }
+
+    pub fn from_slice(src: view<[u8]>) -> IoBuf {
+        let n = len(src);
+        if n == 0 {
+            return IoBuf.new();
+        }
+        let raw = unsafe { heap_alloc(n, 8) };
+        let mut i: usize = 0;
+        while i < n {
+            unsafe { *(raw + i) = src[i]; }
+            i = i + 1;
+        }
+        IoBuf {
+            ptr: raw,
+            len: n,
+            cap: n,
+        }
+    }
+
+    pub fn from_str(s: Str) -> IoBuf {
+        let n = len(s);
+        if n == 0 {
+            return IoBuf.new();
+        }
+        let p = unsafe { *(address_of(s) as *const *const u8) };
+        IoBuf.from_raw_bytes(p, n)
+    }
+
+    pub fn from_byte_buf(mut buf: ByteBuf) -> IoBuf {
+        let p = buf.ptr;
+        let l = buf.len;
+        let c = buf.cap;
+        buf.ptr = 0 as *mut u8;
+        buf.len = 0;
+        buf.cap = 0;
+        IoBuf {
+            ptr: p,
+            len: l,
+            cap: c,
+        }
+    }
+
+    pub fn into_byte_buf(mut self: IoBuf) -> ByteBuf {
+        let p = self.ptr;
+        let l = self.len;
+        let c = self.cap;
+        self.ptr = 0 as *mut u8;
+        self.len = 0;
+        self.cap = 0;
+        ByteBuf {
+            ptr: p,
+            len: l,
+            cap: c,
+        }
+    }
+
+    pub fn len(self: view<IoBuf>) -> usize {
+        self.len
+    }
+
+    pub fn capacity(self: view<IoBuf>) -> usize {
+        self.cap
+    }
+
+    pub fn is_empty(self: view<IoBuf>) -> bool {
+        self.len == 0
+    }
+
+    pub fn get(self: view<IoBuf>, idx: usize) -> Option<u8> {
+        if idx >= self.len || (self.ptr as usize) == 0 {
+            return Option.None;
+        }
+        Option.Some(unsafe { *(self.ptr + idx) })
+    }
+
+    pub fn set(self: mut_view<IoBuf>, idx: usize, val: u8) -> bool {
+        if idx >= self.len || (self.ptr as usize) == 0 {
+            return false;
+        }
+        unsafe {
+            *(self.ptr + idx) = val;
+        }
+        true
+    }
+
+    pub fn as_ptr(self: view<IoBuf>) -> *const u8 {
+        self.ptr as *const u8
+    }
+
+    pub fn as_mut_ptr(self: mut_view<IoBuf>) -> *mut u8 {
+        self.ptr
+    }
+
+    pub fn clear(self: mut_view<IoBuf>) {
+        self.len = 0;
+    }
+
+    pub fn set_len(self: mut_view<IoBuf>, new_len: usize) {
+        if new_len <= self.cap {
+            self.len = new_len;
+        } else {
+            self.len = self.cap;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Core Completion-Safe Async I/O Futures (AXS-AIO-010..012, AXS-AIO-031)
+// -----------------------------------------------------------------------------
+
+pub struct AsyncReadBufFuture {
+    pub reactor: *mut Reactor,
+    pub op_id: IoOpId,
+    pub completed: bool,
+    pub immediate_done: bool,
+    pub immediate_code: i64,
+    pub held_ptr: *mut u8,
+    pub held_len: usize,
+    pub held_cap: usize,
+    pub cursor_ptr: *mut u64,
+}
+
+unsafe impl Send for AsyncReadBufFuture {}
+impl !Copy for AsyncReadBufFuture {}
+
+impl AsyncReadBufFuture {
+    pub fn pending(reactor: *mut Reactor, op_id: IoOpId, cursor_ptr: *mut u64) -> AsyncReadBufFuture {
+        AsyncReadBufFuture {
+            reactor: reactor,
+            op_id: op_id,
+            completed: false,
+            immediate_done: false,
+            immediate_code: 0i64,
+            held_ptr: 0 as *mut u8,
+            held_len: 0,
+            held_cap: 0,
+            cursor_ptr: cursor_ptr,
+        }
+    }
+
+    pub fn ready_immediate(mut buf: IoBuf, code: i64) -> AsyncReadBufFuture {
+        let p = buf.ptr;
+        let l = buf.len;
+        let c = buf.cap;
+        buf.ptr = 0 as *mut u8;
+        buf.len = 0;
+        buf.cap = 0;
+        AsyncReadBufFuture {
+            reactor: 0 as *mut Reactor,
+            op_id: IoOpId { raw: 0u64 },
+            completed: false,
+            immediate_done: true,
+            immediate_code: code,
+            held_ptr: p,
+            held_len: l,
+            held_cap: c,
+            cursor_ptr: 0 as *mut u64,
+        }
+    }
+}
+
+impl Future for AsyncReadBufFuture {
+    type Output = IoResultBuf;
+
+    fn poll(self: mut_view<AsyncReadBufFuture>, cx: mut_view<Context>) -> Poll<IoResultBuf> {
+        if self.immediate_done {
+            self.completed = true;
+            let p = self.held_ptr;
+            let l = self.held_len;
+            let c = self.held_cap;
+            self.held_ptr = 0 as *mut u8;
+            self.held_len = 0;
+            self.held_cap = 0;
+            let b = IoBuf { ptr: p, len: l, cap: c };
+            if self.immediate_code < 0i64 {
+                return Poll.Ready(IoResultBuf {
+                    buf: b,
+                    res: Result.Err(io_error_from_code(self.immediate_code)),
+                });
+            }
+            return Poll.Ready(IoResultBuf {
+                buf: b,
+                res: Result.Ok(self.immediate_code as usize),
+            });
+        }
+        let r = self.reactor;
+        match unsafe { (*r).poll_op(self.op_id, mut_view(*cx)) } {
+            Poll.Pending => Poll.Pending,
+            Poll.Ready(comp) => {
+                self.completed = true;
+                if comp.result < 0i64 {
+                    let b = IoBuf {
+                        ptr: comp.owned_buf_ptr,
+                        len: 0,
+                        cap: comp.owned_buf_cap,
+                    };
+                    return Poll.Ready(IoResultBuf {
+                        buf: b,
+                        res: Result.Err(io_error_from_code(comp.result)),
+                    });
+                }
+                let n = comp.result as usize;
+                if (self.cursor_ptr as usize) != 0 && n > 0 {
+                    unsafe {
+                        *self.cursor_ptr = *self.cursor_ptr + (n as u64);
+                    }
+                }
+                let b = IoBuf {
+                    ptr: comp.owned_buf_ptr,
+                    len: n,
+                    cap: comp.owned_buf_cap,
+                };
+                Poll.Ready(IoResultBuf {
+                    buf: b,
+                    res: Result.Ok(n),
+                })
+            },
+        }
+    }
+}
+
+impl Drop for AsyncReadBufFuture {
+    fn drop(self: mut_view<AsyncReadBufFuture>) {
+        if !self.completed {
+            if self.immediate_done {
+                if (self.held_ptr as usize) != 0 && self.held_cap > 0 {
+                    unsafe { heap_free(self.held_ptr, self.held_cap, 8); }
+                }
+                self.held_ptr = 0 as *mut u8;
+                self.held_len = 0;
+                self.held_cap = 0;
+            } else if (self.reactor as usize) != 0 && self.op_id.raw != 0u64 {
+                // AXS-AIO-005 / AXS-AIO-011: transition slot to CancellingZombie,
+                // keep IoBuf pinned in Reactor until OS completion packet arrives.
+                let r = self.reactor;
+                unsafe { (*r).cancel_op(self.op_id); }
+            }
+            self.completed = true;
+        }
+    }
+}
+
+pub struct AsyncWriteBufFuture {
+    pub reactor: *mut Reactor,
+    pub op_id: IoOpId,
+    pub completed: bool,
+    pub immediate_done: bool,
+    pub immediate_code: i64,
+    pub orig_len: usize,
+    pub held_ptr: *mut u8,
+    pub held_cap: usize,
+    pub cursor_ptr: *mut u64,
+}
+
+unsafe impl Send for AsyncWriteBufFuture {}
+impl !Copy for AsyncWriteBufFuture {}
+
+impl AsyncWriteBufFuture {
+    pub fn pending(reactor: *mut Reactor, op_id: IoOpId, orig_len: usize, cursor_ptr: *mut u64) -> AsyncWriteBufFuture {
+        AsyncWriteBufFuture {
+            reactor: reactor,
+            op_id: op_id,
+            completed: false,
+            immediate_done: false,
+            immediate_code: 0i64,
+            orig_len: orig_len,
+            held_ptr: 0 as *mut u8,
+            held_cap: 0,
+            cursor_ptr: cursor_ptr,
+        }
+    }
+
+    pub fn ready_immediate(mut buf: IoBuf, code: i64) -> AsyncWriteBufFuture {
+        let p = buf.ptr;
+        let l = buf.len;
+        let c = buf.cap;
+        buf.ptr = 0 as *mut u8;
+        buf.len = 0;
+        buf.cap = 0;
+        AsyncWriteBufFuture {
+            reactor: 0 as *mut Reactor,
+            op_id: IoOpId { raw: 0u64 },
+            completed: false,
+            immediate_done: true,
+            immediate_code: code,
+            orig_len: l,
+            held_ptr: p,
+            held_cap: c,
+            cursor_ptr: 0 as *mut u64,
+        }
+    }
+}
+
+impl Future for AsyncWriteBufFuture {
+    type Output = IoResultBuf;
+
+    fn poll(self: mut_view<AsyncWriteBufFuture>, cx: mut_view<Context>) -> Poll<IoResultBuf> {
+        if self.immediate_done {
+            self.completed = true;
+            let p = self.held_ptr;
+            let l = self.orig_len;
+            let c = self.held_cap;
+            self.held_ptr = 0 as *mut u8;
+            self.held_cap = 0;
+            let b = IoBuf { ptr: p, len: l, cap: c };
+            if self.immediate_code < 0i64 {
+                return Poll.Ready(IoResultBuf {
+                    buf: b,
+                    res: Result.Err(io_error_from_code(self.immediate_code)),
+                });
+            }
+            return Poll.Ready(IoResultBuf {
+                buf: b,
+                res: Result.Ok(self.immediate_code as usize),
+            });
+        }
+        let r = self.reactor;
+        match unsafe { (*r).poll_op(self.op_id, mut_view(*cx)) } {
+            Poll.Pending => Poll.Pending,
+            Poll.Ready(comp) => {
+                self.completed = true;
+                let b = IoBuf {
+                    ptr: comp.owned_buf_ptr,
+                    len: self.orig_len,
+                    cap: comp.owned_buf_cap,
+                };
+                if comp.result < 0i64 {
+                    return Poll.Ready(IoResultBuf {
+                        buf: b,
+                        res: Result.Err(io_error_from_code(comp.result)),
+                    });
+                }
+                let n = comp.result as usize;
+                if (self.cursor_ptr as usize) != 0 && n > 0 {
+                    unsafe {
+                        *self.cursor_ptr = *self.cursor_ptr + (n as u64);
+                    }
+                }
+                Poll.Ready(IoResultBuf {
+                    buf: b,
+                    res: Result.Ok(n),
+                })
+            },
+        }
+    }
+}
+
+impl Drop for AsyncWriteBufFuture {
+    fn drop(self: mut_view<AsyncWriteBufFuture>) {
+        if !self.completed {
+            if self.immediate_done {
+                if (self.held_ptr as usize) != 0 && self.held_cap > 0 {
+                    unsafe { heap_free(self.held_ptr, self.held_cap, 8); }
+                }
+                self.held_ptr = 0 as *mut u8;
+                self.held_cap = 0;
+            } else if (self.reactor as usize) != 0 && self.op_id.raw != 0u64 {
+                let r = self.reactor;
+                unsafe { (*r).cancel_op(self.op_id); }
+            }
+            self.completed = true;
+        }
+    }
+}
+
+pub struct AsyncReadSliceFuture {
+    pub reactor: *mut Reactor,
+    pub op_id: IoOpId,
+    pub dst_ptr: *mut u8,
+    pub dst_cap: usize,
+    pub completed: bool,
+    pub immediate_done: bool,
+    pub immediate_code: i64,
+    pub cursor_ptr: *mut u64,
+}
+
+unsafe impl Send for AsyncReadSliceFuture {}
+impl !Copy for AsyncReadSliceFuture {}
+
+impl AsyncReadSliceFuture {
+    pub fn empty() -> AsyncReadSliceFuture {
+        AsyncReadSliceFuture {
+            reactor: 0 as *mut Reactor,
+            op_id: IoOpId { raw: 0u64 },
+            dst_ptr: 0 as *mut u8,
+            dst_cap: 0,
+            completed: true,
+            immediate_done: true,
+            immediate_code: 0i64,
+            cursor_ptr: 0 as *mut u64,
+        }
+    }
+
+    pub fn pending(
+        reactor: *mut Reactor,
+        op_id: IoOpId,
+        dst_ptr: *mut u8,
+        dst_cap: usize,
+        cursor_ptr: *mut u64
+    ) -> AsyncReadSliceFuture {
+        AsyncReadSliceFuture {
+            reactor: reactor,
+            op_id: op_id,
+            dst_ptr: dst_ptr,
+            dst_cap: dst_cap,
+            completed: false,
+            immediate_done: false,
+            immediate_code: 0i64,
+            cursor_ptr: cursor_ptr,
+        }
+    }
+
+    pub fn ready_immediate(code: i64) -> AsyncReadSliceFuture {
+        AsyncReadSliceFuture {
+            reactor: 0 as *mut Reactor,
+            op_id: IoOpId { raw: 0u64 },
+            dst_ptr: 0 as *mut u8,
+            dst_cap: 0,
+            completed: false,
+            immediate_done: true,
+            immediate_code: code,
+            cursor_ptr: 0 as *mut u64,
+        }
+    }
+}
+
+impl Future for AsyncReadSliceFuture {
+    type Output = Result<usize, IoError>;
+
+    fn poll(self: mut_view<AsyncReadSliceFuture>, cx: mut_view<Context>) -> Poll<Result<usize, IoError>> {
+        if self.immediate_done {
+            self.completed = true;
+            if self.immediate_code < 0i64 {
+                return Poll.Ready(Result.Err(io_error_from_code(self.immediate_code)));
+            }
+            return Poll.Ready(Result.Ok(self.immediate_code as usize));
+        }
+        let r = self.reactor;
+        match unsafe { (*r).poll_op(self.op_id, mut_view(*cx)) } {
+            Poll.Pending => Poll.Pending,
+            Poll.Ready(comp) => {
+                self.completed = true;
+                if comp.result > 0i64 && (self.dst_ptr as usize) != 0 && (comp.owned_buf_ptr as usize) != 0 {
+                    let mut n = comp.result as usize;
+                    if n > self.dst_cap {
+                        n = self.dst_cap;
+                    }
+                    unsafe {
+                        ptr_copy_nonoverlapping<u8>(comp.owned_buf_ptr as *const u8, self.dst_ptr, n);
+                    }
+                }
+                if (comp.owned_buf_ptr as usize) != 0 && comp.owned_buf_cap > 0 {
+                    unsafe {
+                        heap_free(comp.owned_buf_ptr, comp.owned_buf_cap, 8);
+                    }
+                }
+                if comp.result < 0i64 {
+                    return Poll.Ready(Result.Err(io_error_from_code(comp.result)));
+                }
+                let n_out = comp.result as usize;
+                if (self.cursor_ptr as usize) != 0 && n_out > 0 {
+                    unsafe {
+                        *self.cursor_ptr = *self.cursor_ptr + (n_out as u64);
+                    }
+                }
+                Poll.Ready(Result.Ok(n_out))
+            },
+        }
+    }
+}
+
+impl Drop for AsyncReadSliceFuture {
+    fn drop(self: mut_view<AsyncReadSliceFuture>) {
+        if !self.completed {
+            if !self.immediate_done && (self.reactor as usize) != 0 && self.op_id.raw != 0u64 {
+                // AXS-AIO-012: cancel op; staging buffer stays pinned in Reactor until OS completion.
+                let r = self.reactor;
+                unsafe { (*r).cancel_op(self.op_id); }
+            }
+            self.completed = true;
+        }
+    }
+}
+
+pub struct AsyncWriteSliceFuture {
+    pub reactor: *mut Reactor,
+    pub op_id: IoOpId,
+    pub completed: bool,
+    pub immediate_done: bool,
+    pub immediate_code: i64,
+    pub cursor_ptr: *mut u64,
+}
+
+unsafe impl Send for AsyncWriteSliceFuture {}
+impl !Copy for AsyncWriteSliceFuture {}
+
+impl AsyncWriteSliceFuture {
+    pub fn empty() -> AsyncWriteSliceFuture {
+        AsyncWriteSliceFuture {
+            reactor: 0 as *mut Reactor,
+            op_id: IoOpId { raw: 0u64 },
+            completed: true,
+            immediate_done: true,
+            immediate_code: 0i64,
+            cursor_ptr: 0 as *mut u64,
+        }
+    }
+
+    pub fn pending(reactor: *mut Reactor, op_id: IoOpId, cursor_ptr: *mut u64) -> AsyncWriteSliceFuture {
+        AsyncWriteSliceFuture {
+            reactor: reactor,
+            op_id: op_id,
+            completed: false,
+            immediate_done: false,
+            immediate_code: 0i64,
+            cursor_ptr: cursor_ptr,
+        }
+    }
+
+    pub fn ready_immediate(code: i64) -> AsyncWriteSliceFuture {
+        AsyncWriteSliceFuture {
+            reactor: 0 as *mut Reactor,
+            op_id: IoOpId { raw: 0u64 },
+            completed: false,
+            immediate_done: true,
+            immediate_code: code,
+            cursor_ptr: 0 as *mut u64,
+        }
+    }
+}
+
+impl Future for AsyncWriteSliceFuture {
+    type Output = Result<usize, IoError>;
+
+    fn poll(self: mut_view<AsyncWriteSliceFuture>, cx: mut_view<Context>) -> Poll<Result<usize, IoError>> {
+        if self.immediate_done {
+            self.completed = true;
+            if self.immediate_code < 0i64 {
+                return Poll.Ready(Result.Err(io_error_from_code(self.immediate_code)));
+            }
+            return Poll.Ready(Result.Ok(self.immediate_code as usize));
+        }
+        let r = self.reactor;
+        match unsafe { (*r).poll_op(self.op_id, mut_view(*cx)) } {
+            Poll.Pending => Poll.Pending,
+            Poll.Ready(comp) => {
+                self.completed = true;
+                if (comp.owned_buf_ptr as usize) != 0 && comp.owned_buf_cap > 0 {
+                    unsafe {
+                        heap_free(comp.owned_buf_ptr, comp.owned_buf_cap, 8);
+                    }
+                }
+                if comp.result < 0i64 {
+                    return Poll.Ready(Result.Err(io_error_from_code(comp.result)));
+                }
+                let n_out = comp.result as usize;
+                if (self.cursor_ptr as usize) != 0 && n_out > 0 {
+                    unsafe {
+                        *self.cursor_ptr = *self.cursor_ptr + (n_out as u64);
+                    }
+                }
+                Poll.Ready(Result.Ok(n_out))
+            },
+        }
+    }
+}
+
+impl Drop for AsyncWriteSliceFuture {
+    fn drop(self: mut_view<AsyncWriteSliceFuture>) {
+        if !self.completed {
+            if !self.immediate_done && (self.reactor as usize) != 0 && self.op_id.raw != 0u64 {
+                let r = self.reactor;
+                unsafe { (*r).cancel_op(self.op_id); }
+            }
+            self.completed = true;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Unified `AsyncRead` / `AsyncWrite` Traits & `read_exact` / `write_all` (AXS-AIO-031)
+// -----------------------------------------------------------------------------
+
+pub trait AsyncRead {
+    fn read_buf(self: mut_view<Self>, buf: IoBuf) -> AsyncReadBufFuture;
+    fn read(self: mut_view<Self>, dst: *mut u8, cap: usize) -> AsyncReadSliceFuture;
+}
+
+pub trait AsyncWrite {
+    fn write_buf(self: mut_view<Self>, buf: IoBuf) -> AsyncWriteBufFuture;
+    fn write(self: mut_view<Self>, src: *const u8, count: usize) -> AsyncWriteSliceFuture;
+}
+
+pub struct ReadExactFuture<R> {
+    pub reader: *mut R,
+    pub dst: *mut u8,
+    pub total_len: usize,
+    pub offset: usize,
+    pub has_in_flight: bool,
+    pub in_flight: AsyncReadSliceFuture,
+}
+
+unsafe impl<R: Send> Send for ReadExactFuture<R> {}
+impl<R> !Copy for ReadExactFuture<R> {}
+
+impl<R: AsyncRead> Future for ReadExactFuture<R> {
+    type Output = Result<(), IoError>;
+
+    fn poll(self: mut_view<ReadExactFuture<R>>, cx: mut_view<Context>) -> Poll<Result<(), IoError>> {
+        loop {
+            if self.offset >= self.total_len {
+                return Poll.Ready(Result.Ok(()));
+            }
+            if !self.has_in_flight {
+                let rem = self.total_len - self.offset;
+                let ptr = unsafe { ((self.dst as usize) + self.offset) as *mut u8 };
+                self.in_flight = unsafe { mut_view(*self.reader).read(ptr, rem) };
+                self.has_in_flight = true;
+            }
+            match mut_view(self.in_flight).poll(mut_view(*cx)) {
+                Poll.Pending => return Poll.Pending,
+                Poll.Ready(res) => {
+                    self.has_in_flight = false;
+                    match res {
+                        Result.Ok(n) => {
+                            if n == 0usize {
+                                return Poll.Ready(Result.Err(IoError.UnexpectedEof));
+                            }
+                            self.offset = self.offset + n;
+                        },
+                        Result.Err(e) => return Poll.Ready(Result.Err(e)),
+                    }
+                },
+            }
+        }
+    }
+}
+
+pub fn read_exact<R: AsyncRead>(reader: mut_view<R>, dst: *mut u8, count: usize) -> ReadExactFuture<R> {
+    ReadExactFuture {
+        reader: unsafe { address_of_mut(*reader) },
+        dst: dst,
+        total_len: count,
+        offset: 0,
+        has_in_flight: false,
+        in_flight: AsyncReadSliceFuture.empty(),
+    }
+}
+
+pub struct WriteAllFuture<W> {
+    pub writer: *mut W,
+    pub src: *const u8,
+    pub total_len: usize,
+    pub offset: usize,
+    pub has_in_flight: bool,
+    pub in_flight: AsyncWriteSliceFuture,
+}
+
+unsafe impl<W: Send> Send for WriteAllFuture<W> {}
+impl<W> !Copy for WriteAllFuture<W> {}
+
+impl<W: AsyncWrite> Future for WriteAllFuture<W> {
+    type Output = Result<(), IoError>;
+
+    fn poll(self: mut_view<WriteAllFuture<W>>, cx: mut_view<Context>) -> Poll<Result<(), IoError>> {
+        loop {
+            if self.offset >= self.total_len {
+                return Poll.Ready(Result.Ok(()));
+            }
+            if !self.has_in_flight {
+                let rem = self.total_len - self.offset;
+                let ptr = unsafe { ((self.src as usize) + self.offset) as *const u8 };
+                self.in_flight = unsafe { mut_view(*self.writer).write(ptr, rem) };
+                self.has_in_flight = true;
+            }
+            match mut_view(self.in_flight).poll(mut_view(*cx)) {
+                Poll.Pending => return Poll.Pending,
+                Poll.Ready(res) => {
+                    self.has_in_flight = false;
+                    match res {
+                        Result.Ok(n) => {
+                            if n == 0usize {
+                                return Poll.Ready(Result.Err(IoError.BrokenPipe));
+                            }
+                            self.offset = self.offset + n;
+                        },
+                        Result.Err(e) => return Poll.Ready(Result.Err(e)),
+                    }
+                },
+            }
+        }
+    }
+}
+
+pub fn write_all<W: AsyncWrite>(writer: mut_view<W>, src: *const u8, count: usize) -> WriteAllFuture<W> {
+    WriteAllFuture {
+        writer: unsafe { address_of_mut(*writer) },
+        src: src,
+        total_len: count,
+        offset: 0,
+        has_in_flight: false,
+        in_flight: AsyncWriteSliceFuture.empty(),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Reactor TimerWheel-Backed I/O Timeout Adapter (AXS-AIO-023)
+// -----------------------------------------------------------------------------
+
+pub struct IoTimeout<F, T> {
+    pub fut: F,
+    pub timer: SleepFuture,
+    pub output_marker: *const T,
+}
+
+impl<F: Future<Output = T>, T> Future for IoTimeout<F, T> {
+    type Output = Result<T, IoError>;
+
+    fn poll(self: mut_view<IoTimeout<F, T>>, cx: mut_view<Context>) -> Poll<Result<T, IoError>> {
+        match self.fut.poll(mut_view(*cx)) {
+            Poll.Ready(val) => {
+                return Poll.Ready(Result.Ok(val));
+            },
+            Poll.Pending => {
+                match self.timer.poll(mut_view(*cx)) {
+                    Poll.Ready(_) => {
+                        return Poll.Ready(Result.Err(IoError.TimedOut));
+                    },
+                    Poll.Pending => {
+                        return Poll.Pending;
+                    },
+                }
+            },
+        }
+    }
+}
+
+pub fn with_io_timeout_ns<F: Future<Output = T>, T>(duration_ns: u64, fut: F) -> IoTimeout<F, T> {
+    IoTimeout {
+        fut: fut,
+        timer: sleep_ns(duration_ns),
+        output_marker: 0 as *const T,
+    }
+}
+
+pub fn with_io_timeout_ms<F: Future<Output = T>, T>(duration_ms: u64, fut: F) -> IoTimeout<F, T> {
+    IoTimeout {
+        fut: fut,
+        timer: sleep_ms(duration_ms),
+        output_marker: 0 as *const T,
+    }
+}

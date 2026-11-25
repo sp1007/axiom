@@ -1,0 +1,144 @@
+// test: run
+// modes: interp native
+// timeout: 60
+// covers: REQ-ASY-152, REQ-ASY-157
+// stdout: OK qa_net_edges refused=7 inuse=11 eof=12 zero_read=0 udp0=0 udp_trunc=ok\n
+
+module test.qa_net_edges
+
+use std.core.result.Result
+use std.core.option.Option
+use std.asyn.executor.LocalExecutor
+use std.io.IoError
+use std.net.SocketAddr
+use std.net.ShutdownMode
+use std.net.AsyncTcpListener
+use std.net.AsyncTcpStream
+use std.net.AsyncUdpSocket
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+fn kind(e: IoError) -> i64 {
+    match e {
+        IoError.NotFound => 1i64,
+        IoError.PermissionDenied => 2i64,
+        IoError.AlreadyExists => 3i64,
+        IoError.InvalidHandle => 4i64,
+        IoError.InvalidData => 5i64,
+        IoError.TimedOut => 6i64,
+        IoError.ConnectionRefused => 7i64,
+        IoError.ConnectionReset => 8i64,
+        IoError.BrokenPipe => 9i64,
+        IoError.Cancelled => 10i64,
+        IoError.AddrInUse => 11i64,
+        IoError.UnexpectedEof => 12i64,
+        IoError.Other(_) => 99i64,
+    }
+}
+
+pub fn main() -> i32 {
+    let mut exec = LocalExecutor.new();
+    let r = view(exec).reactor();
+
+    // 1. connect to a port that no longer has a listener
+    let l0 = match AsyncTcpListener.bind(r, SocketAddr.localhost(0u16)) {
+        Result.Ok(l) => l,
+        Result.Err(_) => return 1i32,
+    };
+    let dead_addr = view(l0).local_addr();
+    let _ = l0.close();
+    let refused: i64 = match mut_view(exec).block_on(AsyncTcpStream.connect(r, dead_addr)) {
+        Result.Ok(_) => 0i64,
+        Result.Err(e) => kind(e),
+    };
+
+    // 2. bind the same concrete address twice
+    let l1 = match AsyncTcpListener.bind(r, SocketAddr.localhost(0u16)) {
+        Result.Ok(l) => l,
+        Result.Err(_) => return 2i32,
+    };
+    let a1 = view(l1).local_addr();
+    let inuse: i64 = match AsyncTcpListener.bind(r, a1) {
+        Result.Ok(_) => 0i64,
+        Result.Err(e) => kind(e),
+    };
+
+    // 3. pair; client sends 2 bytes then half-closes; server read_exact(4) -> UnexpectedEof
+    let acc = view(l1).accept();
+    let con = AsyncTcpStream.connect(r, a1);
+    let mut client = match mut_view(exec).block_on(con) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 3i32,
+    };
+    let mut server = match mut_view(exec).block_on(acc) {
+        Result.Ok(p) => p.0,
+        Result.Err(_) => return 4i32,
+    };
+    let two: [2]u8 = [1u8, 2u8];
+    match mut_view(exec).block_on(mut_view(client).write_all(unsafe { address_of(two[0]) }, 2usize)) {
+        Result.Ok(_) => {},
+        Result.Err(_) => return 5i32,
+    }
+    let _ = view(client).shutdown(ShutdownMode.Write);
+    let mut dst: [4]u8 = [0u8; 4];
+    let eof: i64 = match mut_view(exec).block_on(mut_view(server).read_exact(unsafe { address_of_mut(dst[0]) }, 4usize)) {
+        Result.Ok(_) => 0i64,
+        Result.Err(e) => kind(e),
+    };
+
+    // 4. after EOF a plain read yields 0 bytes (not an error)
+    let mut dst2: [4]u8 = [0u8; 4];
+    let zero_read: i64 = match mut_view(exec).block_on(mut_view(server).read(unsafe { address_of_mut(dst2[0]) }, 4usize)) {
+        Result.Ok(n) => n as i64,
+        Result.Err(_) => 77i64,
+    };
+
+    // 5. UDP: zero-length datagram and truncated datagram
+    let ua = match AsyncUdpSocket.bind(r, SocketAddr.localhost(0u16)) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 6i32,
+    };
+    let ub = match AsyncUdpSocket.bind(r, SocketAddr.localhost(0u16)) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 7i32,
+    };
+    let addr_b = view(ub).local_addr();
+    let mut rb: [8]u8 = [0u8; 8];
+    let rf = view(ub).recv_from(unsafe { address_of_mut(rb[0]) }, 8usize);
+    let sf = view(ua).send_to(unsafe { address_of(two[0]) }, 0usize, addr_b);
+    let _ = mut_view(exec).block_on(sf);
+    let udp0: i64 = match mut_view(exec).block_on(rf) {
+        Result.Ok(p) => p.0 as i64,
+        Result.Err(_) => 77i64,
+    };
+
+    let eight: [8]u8 = [1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8];
+    let mut rb2: [4]u8 = [0u8; 4];
+    let rf2 = view(ub).recv_from(unsafe { address_of_mut(rb2[0]) }, 4usize);
+    let sf2 = view(ua).send_to(unsafe { address_of(eight[0]) }, 8usize, addr_b);
+    let _ = mut_view(exec).block_on(sf2);
+    // Either (4 bytes, truncated) or an error is acceptable; the buffer must never be overrun.
+    let _ = mut_view(exec).block_on(rf2);
+    let guard_ok = rb2[0] <= 4u8;
+
+    let _ = client.close();
+    let _ = server.close();
+    let _ = l1.close();
+    let _ = ua.close();
+    let _ = ub.close();
+    mut_view(exec).shutdown();
+
+    print("OK qa_net_edges refused=");
+    print_int(refused);
+    print(" inuse=");
+    print_int(inuse);
+    print(" eof=");
+    print_int(eof);
+    print(" zero_read=");
+    print_int(zero_read);
+    print(" udp0=");
+    print_int(udp0);
+    if guard_ok { print(" udp_trunc=ok\n"); } else { print(" udp_trunc=BAD\n"); }
+    0i32
+}

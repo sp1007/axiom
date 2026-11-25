@@ -1,0 +1,177 @@
+// test: run
+// modes: interp native
+// timeout: 60
+// covers: REQ-CONC-152, REQ-ASY-152
+// stdout: OK async_tcp_split_duplex 8 8 1\n
+
+module test.async_tcp_split_duplex
+
+use std.core.result.Result
+use std.asyn.executor.LocalExecutor
+use std.asyn.task.TaskResult
+use std.io.async_io.IoBuf
+use std.net.SocketAddr
+use std.net.AsyncTcpListener
+use std.net.AsyncTcpStream
+use std.net.TcpReadHalf
+use std.net.TcpWriteHalf
+use std.net.tcp_rejoin
+
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+async fn run_writer(mut wh: TcpWriteHalf) -> i64 {
+    let m1: [4]u8 = [77u8, 83u8, 71u8, 49u8]; // "MSG1"
+    let m2: [4]u8 = [77u8, 83u8, 71u8, 50u8]; // "MSG2"
+    let mut total: i64 = 0i64;
+    let r1 = mut_view(wh).write_buf(IoBuf.from_slice(view(m1))).await;
+    match r1.res {
+        Result.Ok(n) => { total = total + (n as i64); },
+        Result.Err(_) => return -1i64,
+    }
+    let r2 = mut_view(wh).write_buf(IoBuf.from_slice(view(m2))).await;
+    match r2.res {
+        Result.Ok(n) => { total = total + (n as i64); },
+        Result.Err(_) => return -2i64,
+    }
+    let _ = mut_view(wh).shutdown_write();
+    total
+}
+
+async fn run_reader(mut rh: TcpReadHalf) -> i64 {
+    let expected: [8]u8 = [77u8, 83u8, 71u8, 49u8, 77u8, 83u8, 71u8, 50u8];
+    let mut got: usize = 0usize;
+    while got < 8usize {
+        let mut out = mut_view(rh).read_buf(IoBuf.with_capacity(8usize - got)).await;
+        let b = mut_view(out).take_buf();
+        match out.res {
+            Result.Ok(n) => {
+                if n == 0usize {
+                    return -1i64;
+                }
+                let mut i: usize = 0usize;
+                while i < n {
+                    if (unsafe { *(view(b).as_ptr() + i) }) != expected[got + i] {
+                        return -2i64;
+                    }
+                    i = i + 1;
+                }
+                got = got + n;
+            },
+            Result.Err(_) => return -3i64,
+        }
+    }
+    got as i64
+}
+
+async fn run_echo_server(mut sr: TcpReadHalf, mut sw: TcpWriteHalf) -> i64 {
+    let mut total: usize = 0usize;
+    while total < 8usize {
+        let mut out = mut_view(sr).read_buf(IoBuf.with_capacity(8usize)).await;
+        let echo_buf = mut_view(out).take_buf();
+        match out.res {
+            Result.Ok(n) => {
+                if n == 0usize {
+                    break;
+                }
+                let w = mut_view(sw).write_buf(echo_buf).await;
+                match w.res {
+                    Result.Ok(wn) => { total = total + wn; },
+                    Result.Err(_) => return -1i64,
+                }
+            },
+            Result.Err(_) => return -2i64,
+        }
+    }
+    total as i64
+}
+
+pub fn main() -> i32 {
+    let mut exec = LocalExecutor.new();
+    let r = view(exec).reactor();
+
+    let listener = match AsyncTcpListener.bind(r, SocketAddr.localhost(0u16)) {
+        Result.Ok(l) => l,
+        Result.Err(_) => return 1i32,
+    };
+    let bind_addr = view(listener).local_addr();
+
+    // Connection 1: full-duplex concurrent read/write via stream.split() across spawned tasks
+    let acc1 = view(listener).accept();
+    let con1 = AsyncTcpStream.connect(r, bind_addr);
+
+    let client1 = match mut_view(exec).block_on(con1) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 2i32,
+    };
+    let server1 = match mut_view(exec).block_on(acc1) {
+        Result.Ok(pair) => pair.0,
+        Result.Err(_) => return 3i32,
+    };
+
+    let (cr, cw) = client1.split();
+    let (sr, sw) = server1.split();
+
+    let h_srv = mut_view(exec).spawn_local(run_echo_server(sr, sw));
+    let h_wr = mut_view(exec).spawn_local(run_writer(cw));
+    let h_rd = mut_view(exec).spawn_local(run_reader(cr));
+
+    let sent_n = match mut_view(exec).block_on(h_wr.join()) {
+        TaskResult.Completed(v) => v,
+        _ => return 4i32,
+    };
+    let recvd_n = match mut_view(exec).block_on(h_rd.join()) {
+        TaskResult.Completed(v) => v,
+        _ => return 5i32,
+    };
+    let srv_n = match mut_view(exec).block_on(h_srv.join()) {
+        TaskResult.Completed(v) => v,
+        _ => return 6i32,
+    };
+    if srv_n != 8i64 {
+        return 7i32;
+    }
+
+    // Connection 2: split() then tcp_rejoin() back into AsyncTcpStream
+    let acc2 = view(listener).accept();
+    let con2 = AsyncTcpStream.connect(r, bind_addr);
+    let client2 = match mut_view(exec).block_on(con2) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 8i32,
+    };
+    let mut server2 = match mut_view(exec).block_on(acc2) {
+        Result.Ok(pair) => pair.0,
+        Result.Err(_) => return 9i32,
+    };
+    let (r2, w2) = client2.split();
+    let mut rejoined = match tcp_rejoin(r2, w2) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 10i32,
+    };
+    let ok_bytes: [2]u8 = [79u8, 75u8]; // "OK"
+    let w_out = mut_view(exec).block_on(mut_view(rejoined).write_buf(IoBuf.from_slice(view(ok_bytes))));
+    let mut rbuf2: [2]u8 = [0u8; 2];
+    let r_out = mut_view(exec).block_on(mut_view(server2).read_exact(unsafe { address_of_mut(rbuf2[0]) }, 2usize));
+    let w_ok = match w_out.res {
+        Result.Ok(n) => n == 2usize,
+        Result.Err(_) => false,
+    };
+    let r_ok = match r_out {
+        Result.Ok(_) => rbuf2[0] == 79u8 && rbuf2[1] == 75u8,
+        Result.Err(_) => false,
+    };
+    let rejoin_ok: i64 = if w_ok && r_ok { 1i64 } else { 0i64 };
+
+    let _ = rejoined.close();
+    let _ = server2.close();
+    let _ = listener.close();
+    mut_view(exec).shutdown();
+
+    print("OK async_tcp_split_duplex ");
+    print_int(sent_n);
+    print(" ");
+    print_int(recvd_n);
+    print(" ");
+    print_int(rejoin_ok);
+    print("\n");
+    0i32
+}

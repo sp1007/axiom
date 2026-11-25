@@ -57,6 +57,8 @@ extern "system" {
     fn FlushFileBuffers(hFile: *mut u8) -> i32;
     fn CloseHandle(hObject: *mut u8) -> i32;
     fn GetLastError() -> u32;
+    fn GetModuleHandleA(lpModuleName: *const u8) -> *mut u8;
+    fn GetProcAddress(hModule: *mut u8, lpProcName: *const u8) -> usize;
 }
 
 @link("ws2_32")
@@ -70,11 +72,9 @@ extern "system" {
         g: u32,
         dwFlags: u32
     ) -> usize;
-    fn bind(s: usize, name: *const u8, namelen: i32) -> i32;
     fn listen(s: usize, backlog: i32) -> i32;
     fn getsockname(s: usize, name: *mut u8, namelen: *mut i32) -> i32;
     fn getpeername(s: usize, name: *mut u8, namelen: *mut i32) -> i32;
-    fn shutdown(s: usize, how: i32) -> i32;
     fn closesocket(s: usize) -> i32;
     fn setsockopt(s: usize, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32;
     fn WSARecv(
@@ -212,6 +212,8 @@ struct WinAioRt {
     next_op_id: u64,
     accept_ex_fn: usize,
     connect_ex_fn: usize,
+    bind_fn: usize,
+    shutdown_fn: usize,
     reactors: [32]WinAioReactor,
     handles: [256]WinAioHandle,
     ops: [512]*mut AioOverlapped,
@@ -247,8 +249,35 @@ unsafe fn win_aio_ensure_wsa(rt: *mut WinAioRt) -> bool {
     if rc != 0 {
         return false;
     }
+    // Resolve ws2_32!bind and ws2_32!shutdown dynamically so they never collide with stdlib method symbols.
+    let mod_name: [11]u8 = [119u8, 115u8, 50u8, 95u8, 51u8, 50u8, 46u8, 100u8, 108u8, 108u8, 0u8]; // "ws2_32.dll\0"
+    let bind_name: [5]u8 = [98u8, 105u8, 110u8, 100u8, 0u8]; // "bind\0"
+    let shut_name: [9]u8 = [115u8, 104u8, 117u8, 116u8, 100u8, 111u8, 119u8, 110u8, 0u8]; // "shutdown\0"
+    let ws2_mod = GetModuleHandleA(address_of(mod_name[0]));
+    if (ws2_mod as usize) != 0 {
+        (*rt).bind_fn = GetProcAddress(ws2_mod, address_of(bind_name[0]));
+        (*rt).shutdown_fn = GetProcAddress(ws2_mod, address_of(shut_name[0]));
+    }
     (*rt).wsa_inited = 1u32;
     true
+}
+
+unsafe fn win_ws2_bind(rt: *mut WinAioRt, s: usize, name: *const u8, namelen: i32) -> i32 {
+    let fn_addr = (*rt).bind_fn;
+    if fn_addr == 0usize {
+        return -1;
+    }
+    let f: fn(usize, *const u8, i32) -> i32 = *(address_of(fn_addr) as *const fn(usize, *const u8, i32) -> i32);
+    f(s, name, namelen)
+}
+
+unsafe fn win_ws2_shutdown(rt: *mut WinAioRt, s: usize, how: i32) -> i32 {
+    let fn_addr = (*rt).shutdown_fn;
+    if fn_addr == 0usize {
+        return -1;
+    }
+    let f: fn(usize, i32) -> i32 = *(address_of(fn_addr) as *const fn(usize, i32) -> i32);
+    f(s, how)
 }
 
 unsafe fn win_aio_ensure_ext_fns(rt: *mut WinAioRt, sock: usize) {
@@ -856,7 +885,7 @@ pub fn __ax_host_aio_tcp_bind(reactor: i64, addr_ipv4: u32, port: u16) -> i64 {
         }
         let mut sa: [16]u8 = [0u8; 16];
         fill_sockaddr_in(address_of_mut(sa[0]), addr_ipv4, port);
-        if bind(sock, address_of(sa[0]), 16) != 0 {
+        if win_ws2_bind(rt, sock, address_of(sa[0]), 16) != 0 {
             let err = WSAGetLastError() as u32;
             let _ = closesocket(sock);
             return map_win32_error(err);
@@ -995,7 +1024,7 @@ pub fn __ax_host_aio_submit_connect(reactor: i64, addr_ipv4: u32, port: u16) -> 
         // ConnectEx requires socket to be bound to local ephemeral port first
         let mut local_sa: [16]u8 = [0u8; 16];
         fill_sockaddr_in(address_of_mut(local_sa[0]), 0u32, 0u16);
-        if bind(c_sock, address_of(local_sa[0]), 16) != 0 {
+        if win_ws2_bind(rt, c_sock, address_of(local_sa[0]), 16) != 0 {
             let err = WSAGetLastError() as u32;
             let _ = closesocket(c_sock);
             return map_win32_error(err);
@@ -1142,7 +1171,7 @@ pub fn __ax_host_aio_tcp_shutdown(stream: i64, how: u32) -> i64 {
         }
         let sock = (*rt).handles[hidx].os_handle as usize;
         LeaveCriticalSection(cs);
-        if shutdown(sock, how as i32) != 0 {
+        if win_ws2_shutdown(rt, sock, how as i32) != 0 {
             return map_win32_error(WSAGetLastError() as u32);
         }
         0i64
@@ -1173,7 +1202,7 @@ pub fn __ax_host_aio_udp_bind(reactor: i64, addr_ipv4: u32, port: u16) -> i64 {
         }
         let mut sa: [16]u8 = [0u8; 16];
         fill_sockaddr_in(address_of_mut(sa[0]), addr_ipv4, port);
-        if bind(sock, address_of(sa[0]), 16) != 0 {
+        if win_ws2_bind(rt, sock, address_of(sa[0]), 16) != 0 {
             let err = WSAGetLastError() as u32;
             let _ = closesocket(sock);
             return map_win32_error(err);

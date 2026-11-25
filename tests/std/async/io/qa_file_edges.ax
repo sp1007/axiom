@@ -1,0 +1,155 @@
+// test: run
+// modes: interp native
+// timeout: 60
+// covers: REQ-ASY-152, REQ-ASY-157
+// stdout: OK qa_file_edges notfound=1 size=104 hole=0 data=1 past_eof=0 zero_w=0 append=1\n
+
+module test.qa_file_edges
+
+use std.core.result.Result
+use std.core.option.Option
+use std.core.host.remove
+use std.asyn.executor.LocalExecutor
+use std.io.IoError
+use std.io.async_io.IoBuf
+use std.fs.async_file.AsyncFile
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+pub fn main() -> i32 {
+    let mut exec = LocalExecutor.new();
+    let r = view(exec).reactor();
+
+    // "build/qa_t427_edges.bin" (23 bytes)
+    let path: [23]u8 = [
+        98u8, 117u8, 105u8, 108u8, 100u8, 47u8,
+        113u8, 97u8, 95u8, 116u8, 52u8, 50u8, 55u8, 95u8,
+        101u8, 100u8, 103u8, 101u8, 115u8, 46u8, 98u8, 105u8, 110u8
+    ];
+    // "build/qa_t427_missing.bin" (25 bytes)
+    let missing: [25]u8 = [
+        98u8, 117u8, 105u8, 108u8, 100u8, 47u8,
+        113u8, 97u8, 95u8, 116u8, 52u8, 50u8, 55u8, 95u8,
+        109u8, 105u8, 115u8, 115u8, 105u8, 110u8, 103u8, 46u8, 98u8, 105u8, 110u8
+    ];
+    let _ = unsafe { remove(address_of(path[0]), 23usize) };
+
+    // 1. opening a missing file reports NotFound
+    let notfound: i64 = match AsyncFile.open_bytes(r, view(missing)) {
+        Result.Ok(_) => 0i64,
+        Result.Err(e) => match e {
+            IoError.NotFound => 1i64,
+            _ => 2i64,
+        },
+    };
+
+    // 2. write 4 bytes at offset 100 of a fresh file (creates a hole of 100 bytes)
+    let f = match AsyncFile.create_bytes(r, view(path)) {
+        Result.Ok(f) => f,
+        Result.Err(_) => return 1i32,
+    };
+    let payload: [4]u8 = [9u8, 8u8, 7u8, 6u8];
+    let wn = match mut_view(exec).block_on(view(f).write_at(100u64, unsafe { address_of(payload[0]) }, 4usize)) {
+        Result.Ok(n) => n,
+        Result.Err(_) => return 2i32,
+    };
+    if wn != 4usize { return 3i32; }
+
+    // zero-length write completes with 0 and does not extend the file
+    let zero_w: i64 = match mut_view(exec).block_on(view(f).write_at(500u64, unsafe { address_of(payload[0]) }, 0usize)) {
+        Result.Ok(n) => n as i64,
+        Result.Err(_) => 77i64,
+    };
+    match mut_view(exec).block_on(f.close()) {
+        Result.Ok(_) => {},
+        Result.Err(_) => return 4i32,
+    }
+
+    // 3. reopen; hole reads as zeros, data reads back, read past EOF yields 0 bytes
+    let g = match AsyncFile.open_bytes(r, view(path)) {
+        Result.Ok(f) => f,
+        Result.Err(_) => return 5i32,
+    };
+    let size: i64 = match view(g).file_size() {
+        Result.Ok(s) => s as i64,
+        Result.Err(_) => 77i64,
+    };
+    let mut hole_buf: [8]u8 = [255u8; 8];
+    let hn = match mut_view(exec).block_on(view(g).read_at(40u64, unsafe { address_of_mut(hole_buf[0]) }, 8usize)) {
+        Result.Ok(n) => n,
+        Result.Err(_) => return 6i32,
+    };
+    let mut hole_nonzero: i64 = 0i64;
+    let mut i: usize = 0;
+    while i < hn {
+        if hole_buf[i] != 0u8 { hole_nonzero = hole_nonzero + 1i64; }
+        i = i + 1;
+    }
+    if hn != 8usize { hole_nonzero = 55i64; }
+
+    let out = mut_view(exec).block_on(view(g).read_buf_at(98u64, IoBuf.with_capacity(16usize)));
+    let mut data_ok: i64 = 0i64;
+    match out.res {
+        Result.Ok(n) => {
+            // bytes 98..104 -> 0,0,9,8,7,6
+            if n == 6usize {
+                let a = match view(out.buf).get(2usize) { Option.Some(b) => b, Option.None => 0u8 };
+                let b = match view(out.buf).get(5usize) { Option.Some(b) => b, Option.None => 0u8 };
+                let z = match view(out.buf).get(1usize) { Option.Some(b) => b, Option.None => 1u8 };
+                if a == 9u8 && b == 6u8 && z == 0u8 { data_ok = 1i64; }
+            }
+        },
+        Result.Err(_) => {},
+    }
+    let mut pe: [4]u8 = [0u8; 4];
+    let past_eof: i64 = match mut_view(exec).block_on(view(g).read_at(1000u64, unsafe { address_of_mut(pe[0]) }, 4usize)) {
+        Result.Ok(n) => n as i64,
+        Result.Err(_) => 77i64,
+    };
+    match mut_view(exec).block_on(g.close()) {
+        Result.Ok(_) => {},
+        Result.Err(_) => return 7i32,
+    }
+
+    // 4. open_append: writes land after the existing 104 bytes
+    let mut ap = match AsyncFile.open_append_bytes(r, view(path)) {
+        Result.Ok(f) => f,
+        Result.Err(_) => return 8i32,
+    };
+    let tail: [2]u8 = [1u8, 2u8];
+    let _ = mut_view(exec).block_on(view(ap).write_at(104u64, unsafe { address_of(tail[0]) }, 2usize));
+    match mut_view(exec).block_on(ap.close()) {
+        Result.Ok(_) => {},
+        Result.Err(_) => return 9i32,
+    }
+    let h = match AsyncFile.open_bytes(r, view(path)) {
+        Result.Ok(f) => f,
+        Result.Err(_) => return 10i32,
+    };
+    let append_ok: i64 = match view(h).file_size() {
+        Result.Ok(s) => if s == 106u64 { 1i64 } else { 0i64 },
+        Result.Err(_) => 77i64,
+    };
+    let _ = mut_view(exec).block_on(h.close());
+
+    let _ = unsafe { remove(address_of(path[0]), 23usize) };
+    mut_view(exec).shutdown();
+
+    print("OK qa_file_edges notfound=");
+    print_int(notfound);
+    print(" size=");
+    print_int(size);
+    print(" hole=");
+    print_int(hole_nonzero);
+    print(" data=");
+    print_int(data_ok);
+    print(" past_eof=");
+    print_int(past_eof);
+    print(" zero_w=");
+    print_int(zero_w);
+    print(" append=");
+    print_int(append_ok);
+    print("\n");
+    0i32
+}

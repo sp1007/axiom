@@ -1,0 +1,583 @@
+// std.fs.async_file - Asynchronous Overlapped File I/O & Fallible Close (SPEC-35 §4 AXS-AIO-032..033, T427)
+module std.fs.async_file
+
+use std.core.prelude.Future
+use std.core.prelude.Poll
+use std.core.prelude.Context
+use std.core.result.Result
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.core.host.metadata
+use std.core.host.aio_file_open
+use std.core.host.aio_submit_read_at
+use std.core.host.aio_submit_write_at
+use std.core.host.aio_submit_flush
+use std.core.host.aio_close
+use std.io.IoError
+use std.io.io_error_from_code
+use std.io.async_io.IoBuf
+use std.io.async_io.IoResultBuf
+use std.io.async_io.AsyncRead
+use std.io.async_io.AsyncWrite
+use std.io.async_io.AsyncReadBufFuture
+use std.io.async_io.AsyncWriteBufFuture
+use std.io.async_io.AsyncReadSliceFuture
+use std.io.async_io.AsyncWriteSliceFuture
+use std.asyn.reactor.Reactor
+use std.asyn.reactor.IoOpId
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+// -----------------------------------------------------------------------------
+// AsyncFlushFuture & AsyncCloseFuture (AXS-AIO-032..033)
+// -----------------------------------------------------------------------------
+
+pub struct AsyncFlushFuture {
+    pub reactor: *mut Reactor,
+    pub op_id: IoOpId,
+    pub completed: bool,
+    pub immediate_done: bool,
+    pub immediate_code: i64,
+}
+
+unsafe impl Send for AsyncFlushFuture {}
+impl !Copy for AsyncFlushFuture {}
+
+impl Future for AsyncFlushFuture {
+    type Output = Result<(), IoError>;
+
+    fn poll(self: mut_view<AsyncFlushFuture>, cx: mut_view<Context>) -> Poll<Result<(), IoError>> {
+        if self.immediate_done {
+            self.completed = true;
+            if self.immediate_code < 0i64 {
+                return Poll.Ready(Result.Err(io_error_from_code(self.immediate_code)));
+            }
+            return Poll.Ready(Result.Ok(()));
+        }
+        let r = self.reactor;
+        match unsafe { (*r).poll_op(self.op_id, mut_view(*cx)) } {
+            Poll.Pending => Poll.Pending,
+            Poll.Ready(comp) => {
+                self.completed = true;
+                if comp.result < 0i64 {
+                    return Poll.Ready(Result.Err(io_error_from_code(comp.result)));
+                }
+                Poll.Ready(Result.Ok(()))
+            },
+        }
+    }
+}
+
+impl Drop for AsyncFlushFuture {
+    fn drop(self: mut_view<AsyncFlushFuture>) {
+        if !self.completed {
+            if !self.immediate_done && (self.reactor as usize) != 0 && self.op_id.raw != 0u64 {
+                let r = self.reactor;
+                unsafe { (*r).cancel_op(self.op_id); }
+            }
+            self.completed = true;
+        }
+    }
+}
+
+pub struct AsyncCloseFuture {
+    pub reactor: *mut Reactor,
+    pub reactor_handle: i64,
+    pub handle: i64,
+    pub op_id: IoOpId,
+    pub has_flush_op: bool,
+    pub completed: bool,
+    pub immediate_err: i64,
+}
+
+unsafe impl Send for AsyncCloseFuture {}
+impl !Copy for AsyncCloseFuture {}
+
+impl Future for AsyncCloseFuture {
+    type Output = Result<(), IoError>;
+
+    fn poll(self: mut_view<AsyncCloseFuture>, cx: mut_view<Context>) -> Poll<Result<(), IoError>> {
+        if self.completed {
+            return Poll.Ready(Result.Err(IoError.InvalidHandle));
+        }
+        if self.immediate_err < 0i64 {
+            self.completed = true;
+            if self.handle > 0i64 {
+                let _ = aio_close(self.reactor_handle, self.handle);
+                self.handle = -1i64;
+            }
+            return Poll.Ready(Result.Err(io_error_from_code(self.immediate_err)));
+        }
+        if self.has_flush_op {
+            let r = self.reactor;
+            match unsafe { (*r).poll_op(self.op_id, mut_view(*cx)) } {
+                Poll.Pending => return Poll.Pending,
+                Poll.Ready(comp) => {
+                    self.has_flush_op = false;
+                    let close_rc = aio_close(self.reactor_handle, self.handle);
+                    self.handle = -1i64;
+                    self.completed = true;
+                    if comp.result < 0i64 {
+                        return Poll.Ready(Result.Err(io_error_from_code(comp.result)));
+                    }
+                    if close_rc < 0i64 {
+                        return Poll.Ready(Result.Err(io_error_from_code(close_rc)));
+                    }
+                    return Poll.Ready(Result.Ok(()));
+                },
+            }
+        }
+        let close_rc = aio_close(self.reactor_handle, self.handle);
+        self.handle = -1i64;
+        self.completed = true;
+        if close_rc < 0i64 {
+            return Poll.Ready(Result.Err(io_error_from_code(close_rc)));
+        }
+        Poll.Ready(Result.Ok(()))
+    }
+}
+
+impl Drop for AsyncCloseFuture {
+    fn drop(self: mut_view<AsyncCloseFuture>) {
+        if !self.completed {
+            if self.has_flush_op && (self.reactor as usize) != 0 && self.op_id.raw != 0u64 {
+                let r = self.reactor;
+                unsafe { (*r).cancel_op(self.op_id); }
+                self.has_flush_op = false;
+            }
+            if self.handle > 0i64 {
+                let _ = aio_close(self.reactor_handle, self.handle);
+                self.handle = -1i64;
+            }
+            self.completed = true;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// AsyncFile (AXS-AIO-032..033)
+// -----------------------------------------------------------------------------
+
+pub struct AsyncFile {
+    pub reactor: *mut Reactor,
+    pub reactor_handle: i64,
+    pub handle: i64,
+    pub cursor: u64,
+    pub is_open: bool,
+    pub writable: bool,
+    pub path_ptr: *mut u8,
+    pub path_len: usize,
+}
+
+unsafe impl Send for AsyncFile {}
+unsafe impl Share for AsyncFile {}
+impl !Copy for AsyncFile {}
+
+impl Drop for AsyncFile {
+    fn drop(self: mut_view<AsyncFile>) {
+        // Non-fallible deterministic Drop (AXS-AIO-033): releases OS handle without propagating errors.
+        if self.is_open && self.handle > 0i64 {
+            let _ = aio_close(self.reactor_handle, self.handle);
+            self.is_open = false;
+            self.handle = -1i64;
+        }
+        if (self.path_ptr as usize) != 0 && self.path_len > 0 {
+            unsafe { heap_free(self.path_ptr, self.path_len, 1); }
+            self.path_ptr = 0 as *mut u8;
+            self.path_len = 0;
+        }
+    }
+}
+
+fn open_async_file_mode(reactor: *mut Reactor, path: Str, mode: u32) -> Result<AsyncFile, IoError> {
+    if (reactor as usize) == 0 {
+        return Result.Err(IoError.InvalidHandle);
+    }
+    let r_handle = unsafe { (*reactor).os_handle };
+    if r_handle <= 0i64 {
+        return Result.Err(IoError.InvalidHandle);
+    }
+    let plen = len(path);
+    if plen == 0 {
+        return Result.Err(IoError.InvalidData);
+    }
+    let p = unsafe { *(address_of(path) as *const *const u8) };
+    let h = unsafe { aio_file_open(r_handle, p, plen, mode) };
+    if h < 0i64 {
+        return Result.Err(io_error_from_code(h));
+    }
+    let pcopy = unsafe { heap_alloc(plen, 1) };
+    if (pcopy as usize) != 0 {
+        unsafe { ptr_copy_nonoverlapping<u8>(p, pcopy, plen); }
+    }
+    Result.Ok(AsyncFile {
+        reactor: reactor,
+        reactor_handle: r_handle,
+        handle: h,
+        cursor: 0u64,
+        is_open: true,
+        writable: mode != 0u32,
+        path_ptr: pcopy,
+        path_len: if (pcopy as usize) != 0 { plen } else { 0usize },
+    })
+}
+
+fn file_submit_read_buf(
+    reactor: *mut Reactor,
+    reactor_handle: i64,
+    handle: i64,
+    is_open: bool,
+    offset: u64,
+    mut buf: IoBuf,
+    cursor_ptr: *mut u64
+) -> AsyncReadBufFuture {
+    if !is_open || handle <= 0i64 || (reactor as usize) == 0 {
+        return AsyncReadBufFuture.ready_immediate(buf, -4i64);
+    }
+    if buf.cap == 0 || (buf.ptr as usize) == 0 {
+        return AsyncReadBufFuture.ready_immediate(buf, 0i64);
+    }
+    let p = buf.ptr;
+    let c = buf.cap;
+    let op_raw = unsafe { aio_submit_read_at(reactor_handle, handle, offset, p, c) };
+    if op_raw <= 0i64 {
+        let code = if op_raw < 0i64 { op_raw } else { -9i64 };
+        return AsyncReadBufFuture.ready_immediate(buf, code);
+    }
+    // Transfer IoBuf ownership into Reactor slot (AXS-AIO-011)
+    buf.ptr = 0 as *mut u8;
+    buf.len = 0;
+    buf.cap = 0;
+    let op_id = unsafe {
+        mut_view(*reactor).register_op(op_raw as u64, handle, p, c, 0 as *mut u8, 0, true)
+    };
+    AsyncReadBufFuture.pending(reactor, op_id, cursor_ptr)
+}
+
+fn file_submit_write_buf(
+    reactor: *mut Reactor,
+    reactor_handle: i64,
+    handle: i64,
+    is_open: bool,
+    offset: u64,
+    mut buf: IoBuf,
+    cursor_ptr: *mut u64
+) -> AsyncWriteBufFuture {
+    if !is_open || handle <= 0i64 || (reactor as usize) == 0 {
+        return AsyncWriteBufFuture.ready_immediate(buf, -4i64);
+    }
+    if buf.len == 0 || (buf.ptr as usize) == 0 {
+        return AsyncWriteBufFuture.ready_immediate(buf, 0i64);
+    }
+    let p = buf.ptr;
+    let l = buf.len;
+    let c = buf.cap;
+    let op_raw = unsafe { aio_submit_write_at(reactor_handle, handle, offset, p as *const u8, l) };
+    if op_raw <= 0i64 {
+        let code = if op_raw < 0i64 { op_raw } else { -9i64 };
+        return AsyncWriteBufFuture.ready_immediate(buf, code);
+    }
+    buf.ptr = 0 as *mut u8;
+    buf.len = 0;
+    buf.cap = 0;
+    let op_id = unsafe {
+        mut_view(*reactor).register_op(op_raw as u64, handle, p, c, 0 as *mut u8, 0, true)
+    };
+    AsyncWriteBufFuture.pending(reactor, op_id, l, cursor_ptr)
+}
+
+fn file_submit_read_slice(
+    reactor: *mut Reactor,
+    reactor_handle: i64,
+    handle: i64,
+    is_open: bool,
+    offset: u64,
+    dst: *mut u8,
+    cap: usize,
+    cursor_ptr: *mut u64
+) -> AsyncReadSliceFuture {
+    if !is_open || handle <= 0i64 || (reactor as usize) == 0 {
+        return AsyncReadSliceFuture.ready_immediate(-4i64);
+    }
+    if cap == 0 || (dst as usize) == 0 {
+        return AsyncReadSliceFuture.ready_immediate(0i64);
+    }
+    let staging = unsafe { heap_alloc(cap, 8) };
+    if (staging as usize) == 0 {
+        return AsyncReadSliceFuture.ready_immediate(-9i64);
+    }
+    let op_raw = unsafe { aio_submit_read_at(reactor_handle, handle, offset, staging, cap) };
+    if op_raw <= 0i64 {
+        unsafe { heap_free(staging, cap, 8); }
+        let code = if op_raw < 0i64 { op_raw } else { -9i64 };
+        return AsyncReadSliceFuture.ready_immediate(code);
+    }
+    let op_id = unsafe {
+        mut_view(*reactor).register_op(op_raw as u64, handle, staging, cap, dst, cap, true)
+    };
+    AsyncReadSliceFuture.pending(reactor, op_id, dst, cap, cursor_ptr)
+}
+
+fn file_submit_write_slice(
+    reactor: *mut Reactor,
+    reactor_handle: i64,
+    handle: i64,
+    is_open: bool,
+    offset: u64,
+    src: *const u8,
+    count: usize,
+    cursor_ptr: *mut u64
+) -> AsyncWriteSliceFuture {
+    if !is_open || handle <= 0i64 || (reactor as usize) == 0 {
+        return AsyncWriteSliceFuture.ready_immediate(-4i64);
+    }
+    if count == 0 || (src as usize) == 0 {
+        return AsyncWriteSliceFuture.ready_immediate(0i64);
+    }
+    let staging = unsafe { heap_alloc(count, 8) };
+    if (staging as usize) == 0 {
+        return AsyncWriteSliceFuture.ready_immediate(-9i64);
+    }
+    unsafe {
+        ptr_copy_nonoverlapping<u8>(src, staging, count);
+    }
+    let op_raw = unsafe { aio_submit_write_at(reactor_handle, handle, offset, staging as *const u8, count) };
+    if op_raw <= 0i64 {
+        unsafe { heap_free(staging, count, 8); }
+        let code = if op_raw < 0i64 { op_raw } else { -9i64 };
+        return AsyncWriteSliceFuture.ready_immediate(code);
+    }
+    let op_id = unsafe {
+        mut_view(*reactor).register_op(op_raw as u64, handle, staging, count, 0 as *mut u8, 0, true)
+    };
+    AsyncWriteSliceFuture.pending(reactor, op_id, cursor_ptr)
+}
+
+fn open_async_file_bytes_mode(reactor: *mut Reactor, path: view<[u8]>, mode: u32) -> Result<AsyncFile, IoError> {
+    if (reactor as usize) == 0 {
+        return Result.Err(IoError.InvalidHandle);
+    }
+    let r_handle = unsafe { (*reactor).os_handle };
+    if r_handle <= 0i64 {
+        return Result.Err(IoError.InvalidHandle);
+    }
+    let plen = len(path);
+    if plen == 0 {
+        return Result.Err(IoError.InvalidData);
+    }
+    let pcopy = unsafe { heap_alloc(plen, 1) };
+    if (pcopy as usize) == 0 {
+        return Result.Err(IoError.Other(-9i64));
+    }
+    let mut i: usize = 0;
+    while i < plen {
+        unsafe { *(pcopy + i) = path[i]; }
+        i = i + 1;
+    }
+    let h = unsafe { aio_file_open(r_handle, pcopy as *const u8, plen, mode) };
+    if h < 0i64 {
+        unsafe { heap_free(pcopy, plen, 1); }
+        return Result.Err(io_error_from_code(h));
+    }
+    Result.Ok(AsyncFile {
+        reactor: reactor,
+        reactor_handle: r_handle,
+        handle: h,
+        cursor: 0u64,
+        is_open: true,
+        writable: mode != 0u32,
+        path_ptr: pcopy,
+        path_len: plen,
+    })
+}
+
+impl AsyncFile {
+    pub fn open(reactor: *mut Reactor, path: Str) -> Result<AsyncFile, IoError> {
+        open_async_file_mode(reactor, path, 0u32)
+    }
+
+    pub fn create(reactor: *mut Reactor, path: Str) -> Result<AsyncFile, IoError> {
+        open_async_file_mode(reactor, path, 1u32)
+    }
+
+    pub fn open_append(reactor: *mut Reactor, path: Str) -> Result<AsyncFile, IoError> {
+        open_async_file_mode(reactor, path, 2u32)
+    }
+
+    pub fn open_rw(reactor: *mut Reactor, path: Str) -> Result<AsyncFile, IoError> {
+        open_async_file_mode(reactor, path, 3u32)
+    }
+
+    pub fn open_bytes(reactor: *mut Reactor, path: view<[u8]>) -> Result<AsyncFile, IoError> {
+        open_async_file_bytes_mode(reactor, path, 0u32)
+    }
+
+    pub fn create_bytes(reactor: *mut Reactor, path: view<[u8]>) -> Result<AsyncFile, IoError> {
+        open_async_file_bytes_mode(reactor, path, 1u32)
+    }
+
+    pub fn open_append_bytes(reactor: *mut Reactor, path: view<[u8]>) -> Result<AsyncFile, IoError> {
+        open_async_file_bytes_mode(reactor, path, 2u32)
+    }
+
+    pub fn open_rw_bytes(reactor: *mut Reactor, path: view<[u8]>) -> Result<AsyncFile, IoError> {
+        open_async_file_bytes_mode(reactor, path, 3u32)
+    }
+
+    pub fn read_at(self: view<AsyncFile>, offset: u64, dst: *mut u8, cap: usize) -> AsyncReadSliceFuture {
+        file_submit_read_slice(self.reactor, self.reactor_handle, self.handle, self.is_open, offset, dst, cap, 0 as *mut u64)
+    }
+
+    pub fn write_at(self: view<AsyncFile>, offset: u64, src: *const u8, count: usize) -> AsyncWriteSliceFuture {
+        file_submit_write_slice(self.reactor, self.reactor_handle, self.handle, self.is_open, offset, src, count, 0 as *mut u64)
+    }
+
+    pub fn read_buf_at(self: view<AsyncFile>, offset: u64, buf: IoBuf) -> AsyncReadBufFuture {
+        file_submit_read_buf(self.reactor, self.reactor_handle, self.handle, self.is_open, offset, buf, 0 as *mut u64)
+    }
+
+    pub fn write_buf_at(self: view<AsyncFile>, offset: u64, buf: IoBuf) -> AsyncWriteBufFuture {
+        file_submit_write_buf(self.reactor, self.reactor_handle, self.handle, self.is_open, offset, buf, 0 as *mut u64)
+    }
+
+    pub fn flush(self: view<AsyncFile>) -> AsyncFlushFuture {
+        if !self.is_open || self.handle <= 0i64 || (self.reactor as usize) == 0 {
+            return AsyncFlushFuture {
+                reactor: 0 as *mut Reactor,
+                op_id: IoOpId { raw: 0u64 },
+                completed: false,
+                immediate_done: true,
+                immediate_code: -4i64,
+            };
+        }
+        let op_raw = aio_submit_flush(self.reactor_handle, self.handle);
+        if op_raw <= 0i64 {
+            let code = if op_raw < 0i64 { op_raw } else { -9i64 };
+            return AsyncFlushFuture {
+                reactor: 0 as *mut Reactor,
+                op_id: IoOpId { raw: 0u64 },
+                completed: false,
+                immediate_done: true,
+                immediate_code: code,
+            };
+        }
+        let op_id = unsafe {
+            mut_view(*self.reactor).register_op(op_raw as u64, self.handle, 0 as *mut u8, 0, 0 as *mut u8, 0, false)
+        };
+        AsyncFlushFuture {
+            reactor: self.reactor,
+            op_id: op_id,
+            completed: false,
+            immediate_done: false,
+            immediate_code: 0i64,
+        }
+    }
+
+    pub fn file_size(self: view<AsyncFile>) -> Result<u64, IoError> {
+        if !self.is_open || self.handle <= 0i64 || (self.path_ptr as usize) == 0 {
+            return Result.Err(IoError.InvalidHandle);
+        }
+        let mut out: [2]u64 = [0u64; 2];
+        let rc = unsafe { metadata(self.path_ptr as *const u8, self.path_len, address_of_mut(out[0])) };
+        if rc != 0i64 {
+            return Result.Err(io_error_from_code(rc));
+        }
+        Result.Ok(out[1])
+    }
+
+    pub fn position(self: view<AsyncFile>) -> u64 {
+        self.cursor
+    }
+
+    pub fn seek(self: mut_view<AsyncFile>, pos: u64) {
+        self.cursor = pos;
+    }
+
+    // Explicit fallible close consuming AsyncFile by value (AXS-AIO-033).
+    pub fn close(mut self: AsyncFile) -> AsyncCloseFuture {
+        if !self.is_open || self.handle <= 0i64 || (self.reactor as usize) == 0 {
+            self.is_open = false;
+            self.handle = -1i64;
+            return AsyncCloseFuture {
+                reactor: 0 as *mut Reactor,
+                reactor_handle: 0i64,
+                handle: -1i64,
+                op_id: IoOpId { raw: 0u64 },
+                has_flush_op: false,
+                completed: false,
+                immediate_err: -4i64,
+            };
+        }
+        let r = self.reactor;
+        let rh = self.reactor_handle;
+        let h = self.handle;
+        let wr = self.writable;
+        // Disarm Drop on self so AsyncCloseFuture owns the handle
+        self.is_open = false;
+        self.handle = -1i64;
+
+        if wr {
+            let op_raw = aio_submit_flush(rh, h);
+            if op_raw <= 0i64 {
+                let code = if op_raw < 0i64 { op_raw } else { -9i64 };
+                return AsyncCloseFuture {
+                    reactor: r,
+                    reactor_handle: rh,
+                    handle: h,
+                    op_id: IoOpId { raw: 0u64 },
+                    has_flush_op: false,
+                    completed: false,
+                    immediate_err: code,
+                };
+            }
+            let op_id = unsafe {
+                mut_view(*r).register_op(op_raw as u64, h, 0 as *mut u8, 0, 0 as *mut u8, 0, false)
+            };
+            return AsyncCloseFuture {
+                reactor: r,
+                reactor_handle: rh,
+                handle: h,
+                op_id: op_id,
+                has_flush_op: true,
+                completed: false,
+                immediate_err: 0i64,
+            };
+        }
+
+        AsyncCloseFuture {
+            reactor: r,
+            reactor_handle: rh,
+            handle: h,
+            op_id: IoOpId { raw: 0u64 },
+            has_flush_op: false,
+            completed: false,
+            immediate_err: 0i64,
+        }
+    }
+}
+
+impl AsyncRead for AsyncFile {
+    fn read_buf(self: mut_view<AsyncFile>, buf: IoBuf) -> AsyncReadBufFuture {
+        let cptr = unsafe { address_of_mut(self.cursor) };
+        file_submit_read_buf(self.reactor, self.reactor_handle, self.handle, self.is_open, self.cursor, buf, cptr)
+    }
+
+    fn read(self: mut_view<AsyncFile>, dst: *mut u8, cap: usize) -> AsyncReadSliceFuture {
+        let cptr = unsafe { address_of_mut(self.cursor) };
+        file_submit_read_slice(self.reactor, self.reactor_handle, self.handle, self.is_open, self.cursor, dst, cap, cptr)
+    }
+}
+
+impl AsyncWrite for AsyncFile {
+    fn write_buf(self: mut_view<AsyncFile>, buf: IoBuf) -> AsyncWriteBufFuture {
+        let cptr = unsafe { address_of_mut(self.cursor) };
+        file_submit_write_buf(self.reactor, self.reactor_handle, self.handle, self.is_open, self.cursor, buf, cptr)
+    }
+
+    fn write(self: mut_view<AsyncFile>, src: *const u8, count: usize) -> AsyncWriteSliceFuture {
+        let cptr = unsafe { address_of_mut(self.cursor) };
+        file_submit_write_slice(self.reactor, self.reactor_handle, self.handle, self.is_open, self.cursor, src, count, cptr)
+    }
+}

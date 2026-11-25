@@ -1,0 +1,189 @@
+// test: run
+// modes: interp native
+// timeout: 60
+// covers: REQ-ASY-152, REQ-ASY-157
+// stdout: OK async_file_overlapped 16 16 AXIOM-01AXIOM-02\n
+
+module test.async_file_overlapped
+
+use std.core.result.Result
+use std.core.option.Option
+use std.core.host.remove
+use std.asyn.executor.LocalExecutor
+use std.io.async_io.IoBuf
+use std.io.async_io.read_exact
+use std.fs.async_file.AsyncFile
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+pub fn main() -> i32 {
+    let mut exec = LocalExecutor.new();
+    let r = view(exec).reactor();
+
+    // "build/t427_file.bin" (19 bytes)
+    let path: [19]u8 = [
+        98u8, 117u8, 105u8, 108u8, 100u8, 47u8,
+        116u8, 52u8, 50u8, 55u8, 95u8,
+        102u8, 105u8, 108u8, 101u8, 46u8,
+        98u8, 105u8, 110u8
+    ];
+
+    // "AXIOM-01" and "AXIOM-02"
+    let msg1: [8]u8 = [65u8, 88u8, 73u8, 79u8, 77u8, 45u8, 48u8, 49u8];
+    let msg2: [8]u8 = [65u8, 88u8, 73u8, 79u8, 77u8, 45u8, 48u8, 50u8];
+    let expected: [16]u8 = [
+        65u8, 88u8, 73u8, 79u8, 77u8, 45u8, 48u8, 49u8,
+        65u8, 88u8, 73u8, 79u8, 77u8, 45u8, 48u8, 50u8
+    ];
+
+    // 1. Create file and issue TWO concurrent overlapped positional writes at offsets 0 and 8
+    let f_w = match AsyncFile.create_bytes(r, view(path)) {
+        Result.Ok(f) => f,
+        Result.Err(_) => {
+            print("ERR create\n");
+            return 1i32;
+        },
+    };
+
+    let buf_a = IoBuf.from_slice(view(msg1));
+    let buf_b = IoBuf.from_slice(view(msg2));
+    // Submit both overlapped writes concurrently before awaiting either
+    let fut_w1 = view(f_w).write_buf_at(0u64, buf_a);
+    let fut_w2 = view(f_w).write_buf_at(8u64, buf_b);
+
+    let res_w1 = mut_view(exec).block_on(fut_w1);
+    let res_w2 = mut_view(exec).block_on(fut_w2);
+
+    let n1 = match res_w1.res {
+        Result.Ok(n) => n,
+        Result.Err(_) => {
+            print("ERR w1\n");
+            return 2i32;
+        },
+    };
+    let n2 = match res_w2.res {
+        Result.Ok(n) => n,
+        Result.Err(_) => {
+            print("ERR w2\n");
+            return 3i32;
+        },
+    };
+    if n1 != 8usize || n2 != 8usize {
+        print("ERR wlen\n");
+        return 4i32;
+    }
+
+    // Explicit flush + explicit fallible close().await
+    match mut_view(exec).block_on(view(f_w).flush()) {
+        Result.Ok(_) => {},
+        Result.Err(_) => {
+            print("ERR flush\n");
+            return 5i32;
+        },
+    }
+    match mut_view(exec).block_on(f_w.close()) {
+        Result.Ok(_) => {},
+        Result.Err(_) => {
+            print("ERR close_w\n");
+            return 6i32;
+        },
+    }
+
+    // 2. Re-open read-only and issue TWO concurrent overlapped positional reads at offsets 0 and 8
+    let f_r = match AsyncFile.open_bytes(r, view(path)) {
+        Result.Ok(f) => f,
+        Result.Err(_) => {
+            print("ERR open_r\n");
+            return 7i32;
+        },
+    };
+    let fsz = match view(f_r).file_size() {
+        Result.Ok(sz) => sz,
+        Result.Err(_) => 0u64,
+    };
+
+    let r_buf1 = IoBuf.with_capacity(8usize);
+    let r_buf2 = IoBuf.with_capacity(8usize);
+    let fut_r1 = view(f_r).read_buf_at(0u64, r_buf1);
+    let fut_r2 = view(f_r).read_buf_at(8u64, r_buf2);
+
+    let out_r1 = mut_view(exec).block_on(fut_r1);
+    let out_r2 = mut_view(exec).block_on(fut_r2);
+
+    let rn1 = match out_r1.res {
+        Result.Ok(n) => n,
+        Result.Err(_) => return 8i32,
+    };
+    let rn2 = match out_r2.res {
+        Result.Ok(n) => n,
+        Result.Err(_) => return 9i32,
+    };
+
+    // Verify IoBuf ownership returned intact with exact bytes
+    let mut ok = (rn1 == 8usize) && (rn2 == 8usize) && (view(out_r1.buf).len() == 8usize) && (view(out_r2.buf).len() == 8usize);
+    let mut i: usize = 0;
+    while i < 8usize {
+        match view(out_r1.buf).get(i) {
+            Option.Some(b) => {
+                if b != expected[i] { ok = false; }
+            },
+            Option.None => { ok = false; },
+        }
+        match view(out_r2.buf).get(i) {
+            Option.Some(b) => {
+                if b != expected[i + 8usize] { ok = false; }
+            },
+            Option.None => { ok = false; },
+        }
+        i = i + 1;
+    }
+
+    // Explicit fallible close on read handle
+    match mut_view(exec).block_on(f_r.close()) {
+        Result.Ok(_) => {},
+        Result.Err(_) => return 10i32,
+    }
+
+    // 3. Test sequential AsyncRead + read_exact and deterministic Drop
+    let mut seq_buf: [16]u8 = [0u8; 16];
+    {
+        let mut f_seq = match AsyncFile.open_bytes(r, view(path)) {
+            Result.Ok(f) => f,
+            Result.Err(_) => return 11i32,
+        };
+        let re_res = mut_view(exec).block_on(read_exact(mut_view(f_seq), unsafe { address_of_mut(seq_buf[0]) }, 16usize));
+        match re_res {
+            Result.Ok(_) => {},
+            Result.Err(_) => return 12i32,
+        }
+        if view(f_seq).position() != 16u64 {
+            ok = false;
+        }
+        // f_seq drops here without calling close().await (tests non-fallible Drop)
+    }
+
+    let mut j: usize = 0;
+    while j < 16usize {
+        if seq_buf[j] != expected[j] {
+            ok = false;
+        }
+        j = j + 1;
+    }
+
+    // Cleanup file
+    let _ = unsafe { remove(address_of(path[0]), 19usize) };
+    mut_view(exec).shutdown();
+
+    if !ok {
+        print("ERR mismatch\n");
+        return 13i32;
+    }
+
+    print("OK async_file_overlapped ");
+    print_int(fsz as i64);
+    print(" ");
+    print_int((rn1 + rn2) as i64);
+    print(" AXIOM-01AXIOM-02\n");
+    0i32
+}

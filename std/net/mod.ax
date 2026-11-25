@@ -1,0 +1,1025 @@
+// std.net - Asynchronous TCP & UDP Networking over Unified Reactor (SPEC-35 §5 AXS-AIO-040..044, T427)
+module std.net
+
+use std.core.prelude.Future
+use std.core.prelude.Poll
+use std.core.prelude.Context
+use std.core.result.Result
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.core.host.aio_tcp_bind
+use std.core.host.aio_socket_local_port
+use std.core.host.aio_submit_accept
+use std.core.host.aio_submit_connect
+use std.core.host.aio_submit_recv
+use std.core.host.aio_submit_send
+use std.core.host.aio_tcp_shutdown
+use std.core.host.aio_udp_bind
+use std.core.host.aio_submit_recv_from
+use std.core.host.aio_submit_send_to
+use std.core.host.aio_close
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.sync.arc.Arc
+use std.io.IoError
+use std.io.io_error_from_code
+use std.io.async_io.IoBuf
+use std.io.async_io.IoResultBuf
+use std.io.async_io.AsyncRead
+use std.io.async_io.AsyncWrite
+use std.io.async_io.AsyncReadBufFuture
+use std.io.async_io.AsyncWriteBufFuture
+use std.io.async_io.AsyncReadSliceFuture
+use std.io.async_io.AsyncWriteSliceFuture
+use std.io.async_io.ReadExactFuture
+use std.io.async_io.WriteAllFuture
+use std.io.async_io.read_exact
+use std.io.async_io.write_all
+use std.asyn.reactor.Reactor
+use std.asyn.reactor.IoOpId
+
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+// -----------------------------------------------------------------------------
+// Endpoint Types `Ipv4Addr` & `SocketAddr` (AXS-AIO-040)
+// -----------------------------------------------------------------------------
+
+@derive(Copy)
+pub struct Ipv4Addr {
+    pub octets: [4]u8,
+}
+
+@derive(Copy)
+pub struct SocketAddr {
+    pub ip: Ipv4Addr,
+    pub port: u16,
+}
+
+impl Ipv4Addr {
+    pub fn new(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
+        Ipv4Addr { octets: [a, b, c, d] }
+    }
+
+    pub fn localhost() -> Ipv4Addr {
+        Ipv4Addr { octets: [127u8, 0u8, 0u8, 1u8] }
+    }
+
+    pub fn unspecified() -> Ipv4Addr {
+        Ipv4Addr { octets: [0u8, 0u8, 0u8, 0u8] }
+    }
+
+    pub fn to_u32_be(self: Ipv4Addr) -> u32 {
+        let a = self.octets[0] as u32;
+        let b = self.octets[1] as u32;
+        let c = self.octets[2] as u32;
+        let d = self.octets[3] as u32;
+        (a << 24u32) | (b << 16u32) | (c << 8u32) | d
+    }
+
+    pub fn from_u32_be(bits: u32) -> Ipv4Addr {
+        let a = ((bits >> 24u32) & 0xFFu32) as u8;
+        let b = ((bits >> 16u32) & 0xFFu32) as u8;
+        let c = ((bits >> 8u32) & 0xFFu32) as u8;
+        let d = (bits & 0xFFu32) as u8;
+        Ipv4Addr { octets: [a, b, c, d] }
+    }
+
+    pub fn eq(self: view<Ipv4Addr>, other: view<Ipv4Addr>) -> bool {
+        self.octets[0] == other.octets[0] &&
+        self.octets[1] == other.octets[1] &&
+        self.octets[2] == other.octets[2] &&
+        self.octets[3] == other.octets[3]
+    }
+}
+
+impl SocketAddr {
+    pub fn new(ip: Ipv4Addr, port: u16) -> SocketAddr {
+        SocketAddr { ip: ip, port: port }
+    }
+
+    pub fn localhost(port: u16) -> SocketAddr {
+        SocketAddr { ip: Ipv4Addr.localhost(), port: port }
+    }
+
+    pub fn from_aux(aux: u64) -> SocketAddr {
+        let ip_bits = ((aux >> 16u64) & 0xFFFFFFFFu64) as u32;
+        let port = (aux & 0xFFFFu64) as u16;
+        SocketAddr {
+            ip: Ipv4Addr.from_u32_be(ip_bits),
+            port: port,
+        }
+    }
+
+    pub fn eq(self: view<SocketAddr>, other: view<SocketAddr>) -> bool {
+        self.port == other.port && view(self.ip).eq(view(other.ip))
+    }
+}
+
+@derive(Copy)
+pub enum ShutdownMode {
+    Read,
+    Write,
+    Both,
+}
+
+fn shutdown_mode_to_u32(how: ShutdownMode) -> u32 {
+    match how {
+        ShutdownMode.Read => 0u32,
+        ShutdownMode.Write => 1u32,
+        ShutdownMode.Both => 2u32,
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Internal Socket Submit Helpers (Completion-Safe Staging / Owned IoBuf)
+// -----------------------------------------------------------------------------
+
+fn tcp_submit_read_buf(
+    reactor: *mut Reactor,
+    reactor_handle: i64,
+    handle: i64,
+    is_open: bool,
+    mut buf: IoBuf
+) -> AsyncReadBufFuture {
+    if !is_open || handle <= 0i64 || (reactor as usize) == 0 {
+        return AsyncReadBufFuture.ready_immediate(buf, -4i64);
+    }
+    if buf.cap == 0 || (buf.ptr as usize) == 0 {
+        return AsyncReadBufFuture.ready_immediate(buf, 0i64);
+    }
+    let p = buf.ptr;
+    let c = buf.cap;
+    let op_raw = unsafe { aio_submit_recv(reactor_handle, handle, p, c) };
+    if op_raw <= 0i64 {
+        let code = if op_raw < 0i64 { op_raw } else { -9i64 };
+        return AsyncReadBufFuture.ready_immediate(buf, code);
+    }
+    buf.ptr = 0 as *mut u8;
+    buf.len = 0;
+    buf.cap = 0;
+    let op_id = unsafe {
+        mut_view(*reactor).register_op(op_raw as u64, handle, p, c, 0 as *mut u8, 0, true)
+    };
+    AsyncReadBufFuture.pending(reactor, op_id, 0 as *mut u64)
+}
+
+fn tcp_submit_write_buf(
+    reactor: *mut Reactor,
+    reactor_handle: i64,
+    handle: i64,
+    is_open: bool,
+    mut buf: IoBuf
+) -> AsyncWriteBufFuture {
+    if !is_open || handle <= 0i64 || (reactor as usize) == 0 {
+        return AsyncWriteBufFuture.ready_immediate(buf, -4i64);
+    }
+    if buf.len == 0 || (buf.ptr as usize) == 0 {
+        return AsyncWriteBufFuture.ready_immediate(buf, 0i64);
+    }
+    let p = buf.ptr;
+    let l = buf.len;
+    let c = buf.cap;
+    let op_raw = unsafe { aio_submit_send(reactor_handle, handle, p as *const u8, l) };
+    if op_raw <= 0i64 {
+        let code = if op_raw < 0i64 { op_raw } else { -9i64 };
+        return AsyncWriteBufFuture.ready_immediate(buf, code);
+    }
+    buf.ptr = 0 as *mut u8;
+    buf.len = 0;
+    buf.cap = 0;
+    let op_id = unsafe {
+        mut_view(*reactor).register_op(op_raw as u64, handle, p, c, 0 as *mut u8, 0, true)
+    };
+    AsyncWriteBufFuture.pending(reactor, op_id, l, 0 as *mut u64)
+}
+
+fn tcp_submit_read_slice(
+    reactor: *mut Reactor,
+    reactor_handle: i64,
+    handle: i64,
+    is_open: bool,
+    dst: *mut u8,
+    cap: usize
+) -> AsyncReadSliceFuture {
+    if !is_open || handle <= 0i64 || (reactor as usize) == 0 {
+        return AsyncReadSliceFuture.ready_immediate(-4i64);
+    }
+    if cap == 0 || (dst as usize) == 0 {
+        return AsyncReadSliceFuture.ready_immediate(0i64);
+    }
+    let staging = unsafe { heap_alloc(cap, 8) };
+    if (staging as usize) == 0 {
+        return AsyncReadSliceFuture.ready_immediate(-9i64);
+    }
+    let op_raw = unsafe { aio_submit_recv(reactor_handle, handle, staging, cap) };
+    if op_raw <= 0i64 {
+        unsafe { heap_free(staging, cap, 8); }
+        let code = if op_raw < 0i64 { op_raw } else { -9i64 };
+        return AsyncReadSliceFuture.ready_immediate(code);
+    }
+    let op_id = unsafe {
+        mut_view(*reactor).register_op(op_raw as u64, handle, staging, cap, dst, cap, true)
+    };
+    AsyncReadSliceFuture.pending(reactor, op_id, dst, cap, 0 as *mut u64)
+}
+
+fn tcp_submit_write_slice(
+    reactor: *mut Reactor,
+    reactor_handle: i64,
+    handle: i64,
+    is_open: bool,
+    src: *const u8,
+    count: usize
+) -> AsyncWriteSliceFuture {
+    if !is_open || handle <= 0i64 || (reactor as usize) == 0 {
+        return AsyncWriteSliceFuture.ready_immediate(-4i64);
+    }
+    if count == 0 || (src as usize) == 0 {
+        return AsyncWriteSliceFuture.ready_immediate(0i64);
+    }
+    let staging = unsafe { heap_alloc(count, 8) };
+    if (staging as usize) == 0 {
+        return AsyncWriteSliceFuture.ready_immediate(-9i64);
+    }
+    unsafe {
+        ptr_copy_nonoverlapping<u8>(src, staging, count);
+    }
+    let op_raw = unsafe { aio_submit_send(reactor_handle, handle, staging as *const u8, count) };
+    if op_raw <= 0i64 {
+        unsafe { heap_free(staging, count, 8); }
+        let code = if op_raw < 0i64 { op_raw } else { -9i64 };
+        return AsyncWriteSliceFuture.ready_immediate(code);
+    }
+    let op_id = unsafe {
+        mut_view(*reactor).register_op(op_raw as u64, handle, staging, count, 0 as *mut u8, 0, true)
+    };
+    AsyncWriteSliceFuture.pending(reactor, op_id, 0 as *mut u64)
+}
+
+// -----------------------------------------------------------------------------
+// AsyncTcpListener & AcceptFuture (AXS-AIO-041)
+// -----------------------------------------------------------------------------
+
+pub struct AsyncTcpListener {
+    pub reactor: *mut Reactor,
+    pub reactor_handle: i64,
+    pub handle: i64,
+    pub local: SocketAddr,
+    pub is_open: bool,
+}
+
+unsafe impl Send for AsyncTcpListener {}
+unsafe impl Share for AsyncTcpListener {}
+impl !Copy for AsyncTcpListener {}
+
+impl Drop for AsyncTcpListener {
+    fn drop(self: mut_view<AsyncTcpListener>) {
+        if self.is_open && self.handle > 0i64 {
+            let _ = aio_close(self.reactor_handle, self.handle);
+            self.is_open = false;
+            self.handle = -1i64;
+        }
+    }
+}
+
+pub struct AcceptFuture {
+    pub reactor: *mut Reactor,
+    pub reactor_handle: i64,
+    pub op_id: IoOpId,
+    pub completed: bool,
+    pub immediate_err: i64,
+}
+
+unsafe impl Send for AcceptFuture {}
+impl !Copy for AcceptFuture {}
+
+impl Future for AcceptFuture {
+    type Output = Result<(AsyncTcpStream, SocketAddr), IoError>;
+
+    fn poll(self: mut_view<AcceptFuture>, cx: mut_view<Context>) -> Poll<Result<(AsyncTcpStream, SocketAddr), IoError>> {
+        if self.immediate_err < 0i64 {
+            self.completed = true;
+            return Poll.Ready(Result.Err(io_error_from_code(self.immediate_err)));
+        }
+        let r = self.reactor;
+        match unsafe { (*r).poll_op(self.op_id, mut_view(*cx)) } {
+            Poll.Pending => Poll.Pending,
+            Poll.Ready(comp) => {
+                self.completed = true;
+                if comp.result <= 0i64 {
+                    let code = if comp.result < 0i64 { comp.result } else { -9i64 };
+                    return Poll.Ready(Result.Err(io_error_from_code(code)));
+                }
+                let peer = SocketAddr.from_aux(comp.aux);
+                let stream = AsyncTcpStream {
+                    reactor: self.reactor,
+                    reactor_handle: self.reactor_handle,
+                    handle: comp.result,
+                    peer: peer,
+                    is_open: true,
+                };
+                Poll.Ready(Result.Ok((stream, peer)))
+            },
+        }
+    }
+}
+
+impl Drop for AcceptFuture {
+    fn drop(self: mut_view<AcceptFuture>) {
+        if !self.completed {
+            if self.immediate_err == 0i64 && (self.reactor as usize) != 0 && self.op_id.raw != 0u64 {
+                let r = self.reactor;
+                unsafe { (*r).cancel_op(self.op_id); }
+            }
+            self.completed = true;
+        }
+    }
+}
+
+impl AsyncTcpListener {
+    pub fn bind(reactor: *mut Reactor, addr: SocketAddr) -> Result<AsyncTcpListener, IoError> {
+        if (reactor as usize) == 0 {
+            return Result.Err(IoError.InvalidHandle);
+        }
+        let r_handle = unsafe { (*reactor).os_handle };
+        if r_handle <= 0i64 {
+            return Result.Err(IoError.InvalidHandle);
+        }
+        let h = aio_tcp_bind(r_handle, addr.ip.to_u32_be(), addr.port);
+        if h < 0i64 {
+            return Result.Err(io_error_from_code(h));
+        }
+        let bound_port_rc = aio_socket_local_port(h);
+        let actual_port = if bound_port_rc > 0i64 { bound_port_rc as u16 } else { addr.port };
+        Result.Ok(AsyncTcpListener {
+            reactor: reactor,
+            reactor_handle: r_handle,
+            handle: h,
+            local: SocketAddr.new(addr.ip, actual_port),
+            is_open: true,
+        })
+    }
+
+    pub fn local_addr(self: view<AsyncTcpListener>) -> SocketAddr {
+        self.local
+    }
+
+    pub fn accept(self: view<AsyncTcpListener>) -> AcceptFuture {
+        if !self.is_open || self.handle <= 0i64 || (self.reactor as usize) == 0 {
+            return AcceptFuture {
+                reactor: 0 as *mut Reactor,
+                reactor_handle: 0i64,
+                op_id: IoOpId { raw: 0u64 },
+                completed: false,
+                immediate_err: -4i64,
+            };
+        }
+        let op_raw = aio_submit_accept(self.reactor_handle, self.handle);
+        if op_raw <= 0i64 {
+            let code = if op_raw < 0i64 { op_raw } else { -9i64 };
+            return AcceptFuture {
+                reactor: 0 as *mut Reactor,
+                reactor_handle: 0i64,
+                op_id: IoOpId { raw: 0u64 },
+                completed: false,
+                immediate_err: code,
+            };
+        }
+        let op_id = unsafe {
+            mut_view(*self.reactor).register_op(op_raw as u64, self.handle, 0 as *mut u8, 0, 0 as *mut u8, 0, false)
+        };
+        AcceptFuture {
+            reactor: self.reactor,
+            reactor_handle: self.reactor_handle,
+            op_id: op_id,
+            completed: false,
+            immediate_err: 0i64,
+        }
+    }
+
+    pub fn close(mut self: AsyncTcpListener) -> Result<(), IoError> {
+        if !self.is_open || self.handle <= 0i64 {
+            self.is_open = false;
+            self.handle = -1i64;
+            return Result.Err(IoError.InvalidHandle);
+        }
+        let rc = aio_close(self.reactor_handle, self.handle);
+        self.is_open = false;
+        self.handle = -1i64;
+        if rc < 0i64 {
+            return Result.Err(io_error_from_code(rc));
+        }
+        Result.Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// AsyncTcpStream & ConnectFuture (AXS-AIO-042, REQ-CONC-152)
+// -----------------------------------------------------------------------------
+
+pub struct AsyncTcpStream {
+    pub reactor: *mut Reactor,
+    pub reactor_handle: i64,
+    pub handle: i64,
+    pub peer: SocketAddr,
+    pub is_open: bool,
+}
+
+// Send (can move between tasks), !Copy, and !Share (prevents unsynchronized concurrent
+// mutation across tasks without AsyncMutex or stream.split() per REQ-CONC-152).
+unsafe impl Send for AsyncTcpStream {}
+impl !Copy for AsyncTcpStream {}
+
+impl Drop for AsyncTcpStream {
+    fn drop(self: mut_view<AsyncTcpStream>) {
+        if self.is_open && self.handle > 0i64 {
+            let _ = aio_close(self.reactor_handle, self.handle);
+            self.is_open = false;
+            self.handle = -1i64;
+        }
+    }
+}
+
+pub struct ConnectFuture {
+    pub reactor: *mut Reactor,
+    pub reactor_handle: i64,
+    pub peer: SocketAddr,
+    pub op_id: IoOpId,
+    pub completed: bool,
+    pub immediate_err: i64,
+}
+
+unsafe impl Send for ConnectFuture {}
+impl !Copy for ConnectFuture {}
+
+impl Future for ConnectFuture {
+    type Output = Result<AsyncTcpStream, IoError>;
+
+    fn poll(self: mut_view<ConnectFuture>, cx: mut_view<Context>) -> Poll<Result<AsyncTcpStream, IoError>> {
+        if self.immediate_err < 0i64 {
+            self.completed = true;
+            return Poll.Ready(Result.Err(io_error_from_code(self.immediate_err)));
+        }
+        let r = self.reactor;
+        match unsafe { (*r).poll_op(self.op_id, mut_view(*cx)) } {
+            Poll.Pending => Poll.Pending,
+            Poll.Ready(comp) => {
+                self.completed = true;
+                if comp.result <= 0i64 {
+                    let code = if comp.result < 0i64 { comp.result } else { -9i64 };
+                    return Poll.Ready(Result.Err(io_error_from_code(code)));
+                }
+                Poll.Ready(Result.Ok(AsyncTcpStream {
+                    reactor: self.reactor,
+                    reactor_handle: self.reactor_handle,
+                    handle: comp.result,
+                    peer: self.peer,
+                    is_open: true,
+                }))
+            },
+        }
+    }
+}
+
+impl Drop for ConnectFuture {
+    fn drop(self: mut_view<ConnectFuture>) {
+        if !self.completed {
+            if self.immediate_err == 0i64 && (self.reactor as usize) != 0 && self.op_id.raw != 0u64 {
+                let r = self.reactor;
+                unsafe { (*r).cancel_op(self.op_id); }
+            }
+            self.completed = true;
+        }
+    }
+}
+
+impl AsyncTcpStream {
+    pub fn connect(reactor: *mut Reactor, addr: SocketAddr) -> ConnectFuture {
+        if (reactor as usize) == 0 {
+            return ConnectFuture {
+                reactor: 0 as *mut Reactor,
+                reactor_handle: 0i64,
+                peer: addr,
+                op_id: IoOpId { raw: 0u64 },
+                completed: false,
+                immediate_err: -4i64,
+            };
+        }
+        let r_handle = unsafe { (*reactor).os_handle };
+        if r_handle <= 0i64 {
+            return ConnectFuture {
+                reactor: 0 as *mut Reactor,
+                reactor_handle: 0i64,
+                peer: addr,
+                op_id: IoOpId { raw: 0u64 },
+                completed: false,
+                immediate_err: -4i64,
+            };
+        }
+        let op_raw = aio_submit_connect(r_handle, addr.ip.to_u32_be(), addr.port);
+        if op_raw <= 0i64 {
+            let code = if op_raw < 0i64 { op_raw } else { -9i64 };
+            return ConnectFuture {
+                reactor: 0 as *mut Reactor,
+                reactor_handle: 0i64,
+                peer: addr,
+                op_id: IoOpId { raw: 0u64 },
+                completed: false,
+                immediate_err: code,
+            };
+        }
+        let op_id = unsafe {
+            mut_view(*reactor).register_op(op_raw as u64, 0i64, 0 as *mut u8, 0, 0 as *mut u8, 0, false)
+        };
+        ConnectFuture {
+            reactor: reactor,
+            reactor_handle: r_handle,
+            peer: addr,
+            op_id: op_id,
+            completed: false,
+            immediate_err: 0i64,
+        }
+    }
+
+    pub fn peer_addr(self: view<AsyncTcpStream>) -> SocketAddr {
+        self.peer
+    }
+
+    pub fn read_exact(self: mut_view<AsyncTcpStream>, dst: *mut u8, count: usize) -> ReadExactFuture<AsyncTcpStream> {
+        read_exact(self, dst, count)
+    }
+
+    pub fn write_all(self: mut_view<AsyncTcpStream>, src: *const u8, count: usize) -> WriteAllFuture<AsyncTcpStream> {
+        write_all(self, src, count)
+    }
+
+    pub fn shutdown(self: view<AsyncTcpStream>, how: ShutdownMode) -> Result<(), IoError> {
+        if !self.is_open || self.handle <= 0i64 {
+            return Result.Err(IoError.InvalidHandle);
+        }
+        let rc = aio_tcp_shutdown(self.handle, shutdown_mode_to_u32(how));
+        if rc < 0i64 {
+            return Result.Err(io_error_from_code(rc));
+        }
+        Result.Ok(())
+    }
+
+    // Split into directional read and write capabilities for concurrent full-duplex I/O (AXS-AIO-043, REQ-CONC-152).
+    pub fn split(mut self: AsyncTcpStream) -> (TcpReadHalf, TcpWriteHalf) {
+        let shared = TcpStreamShared {
+            reactor: self.reactor,
+            reactor_handle: self.reactor_handle,
+            handle: self.handle,
+            peer: self.peer,
+            closed: Atomic.new(!self.is_open),
+        };
+        // Disarm Drop on AsyncTcpStream; Arc<TcpStreamShared> now owns the handle lifetime.
+        self.is_open = false;
+        self.handle = -1i64;
+        let arc_r = Arc.new(shared);
+        let arc_w = view(arc_r).clone();
+        (TcpReadHalf { inner: arc_r }, TcpWriteHalf { inner: arc_w })
+    }
+
+    pub fn close(mut self: AsyncTcpStream) -> Result<(), IoError> {
+        if !self.is_open || self.handle <= 0i64 {
+            self.is_open = false;
+            self.handle = -1i64;
+            return Result.Err(IoError.InvalidHandle);
+        }
+        let rc = aio_close(self.reactor_handle, self.handle);
+        self.is_open = false;
+        self.handle = -1i64;
+        if rc < 0i64 {
+            return Result.Err(io_error_from_code(rc));
+        }
+        Result.Ok(())
+    }
+}
+
+impl AsyncRead for AsyncTcpStream {
+    fn read_buf(self: mut_view<AsyncTcpStream>, buf: IoBuf) -> AsyncReadBufFuture {
+        tcp_submit_read_buf(self.reactor, self.reactor_handle, self.handle, self.is_open, buf)
+    }
+
+    fn read(self: mut_view<AsyncTcpStream>, dst: *mut u8, cap: usize) -> AsyncReadSliceFuture {
+        tcp_submit_read_slice(self.reactor, self.reactor_handle, self.handle, self.is_open, dst, cap)
+    }
+}
+
+impl AsyncWrite for AsyncTcpStream {
+    fn write_buf(self: mut_view<AsyncTcpStream>, buf: IoBuf) -> AsyncWriteBufFuture {
+        tcp_submit_write_buf(self.reactor, self.reactor_handle, self.handle, self.is_open, buf)
+    }
+
+    fn write(self: mut_view<AsyncTcpStream>, src: *const u8, count: usize) -> AsyncWriteSliceFuture {
+        tcp_submit_write_slice(self.reactor, self.reactor_handle, self.handle, self.is_open, src, count)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Full-Duplex Split Halves: TcpReadHalf, TcpWriteHalf & tcp_rejoin (AXS-AIO-043)
+// -----------------------------------------------------------------------------
+
+pub struct TcpStreamShared {
+    pub reactor: *mut Reactor,
+    pub reactor_handle: i64,
+    pub handle: i64,
+    pub peer: SocketAddr,
+    pub closed: Atomic<bool>,
+}
+
+unsafe impl Send for TcpStreamShared {}
+unsafe impl Share for TcpStreamShared {}
+impl !Copy for TcpStreamShared {}
+
+impl Drop for TcpStreamShared {
+    fn drop(self: mut_view<TcpStreamShared>) {
+        let was_closed = self.closed.swap(true, Ordering.AcqRel);
+        if !was_closed && self.handle > 0i64 {
+            let _ = aio_close(self.reactor_handle, self.handle);
+        }
+    }
+}
+
+pub struct TcpReadHalf {
+    pub inner: Arc<TcpStreamShared>,
+}
+
+unsafe impl Send for TcpReadHalf {}
+impl !Copy for TcpReadHalf {}
+
+pub struct TcpWriteHalf {
+    pub inner: Arc<TcpStreamShared>,
+}
+
+unsafe impl Send for TcpWriteHalf {}
+impl !Copy for TcpWriteHalf {}
+
+impl TcpReadHalf {
+    pub fn peer_addr(self: view<TcpReadHalf>) -> SocketAddr {
+        let p = view(self.inner).as_ptr();
+        unsafe { (*p).peer }
+    }
+
+    pub fn read_exact(self: mut_view<TcpReadHalf>, dst: *mut u8, count: usize) -> ReadExactFuture<TcpReadHalf> {
+        read_exact(self, dst, count)
+    }
+}
+
+impl AsyncRead for TcpReadHalf {
+    fn read_buf(self: mut_view<TcpReadHalf>, buf: IoBuf) -> AsyncReadBufFuture {
+        let p = view(self.inner).as_ptr();
+        let is_open = !(unsafe { (*p).closed.load(Ordering.Acquire) });
+        tcp_submit_read_buf(unsafe { (*p).reactor }, unsafe { (*p).reactor_handle }, unsafe { (*p).handle }, is_open, buf)
+    }
+
+    fn read(self: mut_view<TcpReadHalf>, dst: *mut u8, cap: usize) -> AsyncReadSliceFuture {
+        let p = view(self.inner).as_ptr();
+        let is_open = !(unsafe { (*p).closed.load(Ordering.Acquire) });
+        tcp_submit_read_slice(unsafe { (*p).reactor }, unsafe { (*p).reactor_handle }, unsafe { (*p).handle }, is_open, dst, cap)
+    }
+}
+
+impl TcpWriteHalf {
+    pub fn peer_addr(self: view<TcpWriteHalf>) -> SocketAddr {
+        let p = view(self.inner).as_ptr();
+        unsafe { (*p).peer }
+    }
+
+    pub fn write_all(self: mut_view<TcpWriteHalf>, src: *const u8, count: usize) -> WriteAllFuture<TcpWriteHalf> {
+        write_all(self, src, count)
+    }
+
+    pub fn shutdown_write(self: mut_view<TcpWriteHalf>) -> Result<(), IoError> {
+        let p = view(self.inner).as_ptr();
+        let is_open = !(unsafe { (*p).closed.load(Ordering.Acquire) });
+        let h = unsafe { (*p).handle };
+        if !is_open || h <= 0i64 {
+            return Result.Err(IoError.InvalidHandle);
+        }
+        let rc = aio_tcp_shutdown(h, 1u32);
+        if rc < 0i64 {
+            return Result.Err(io_error_from_code(rc));
+        }
+        Result.Ok(())
+    }
+}
+
+impl AsyncWrite for TcpWriteHalf {
+    fn write_buf(self: mut_view<TcpWriteHalf>, buf: IoBuf) -> AsyncWriteBufFuture {
+        let p = view(self.inner).as_ptr();
+        let is_open = !(unsafe { (*p).closed.load(Ordering.Acquire) });
+        tcp_submit_write_buf(unsafe { (*p).reactor }, unsafe { (*p).reactor_handle }, unsafe { (*p).handle }, is_open, buf)
+    }
+
+    fn write(self: mut_view<TcpWriteHalf>, src: *const u8, count: usize) -> AsyncWriteSliceFuture {
+        let p = view(self.inner).as_ptr();
+        let is_open = !(unsafe { (*p).closed.load(Ordering.Acquire) });
+        tcp_submit_write_slice(unsafe { (*p).reactor }, unsafe { (*p).reactor_handle }, unsafe { (*p).handle }, is_open, src, count)
+    }
+}
+
+pub fn tcp_rejoin(read_half: TcpReadHalf, write_half: TcpWriteHalf) -> Result<AsyncTcpStream, IoError> {
+    if read_half.inner.ptr != write_half.inner.ptr {
+        return Result.Err(IoError.InvalidHandle);
+    }
+    let p = view(read_half.inner).as_ptr();
+    let was_closed = unsafe { (*p).closed.swap(true, Ordering.AcqRel) };
+    if was_closed {
+        return Result.Err(IoError.InvalidHandle);
+    }
+    let stream = AsyncTcpStream {
+        reactor: unsafe { (*p).reactor },
+        reactor_handle: unsafe { (*p).reactor_handle },
+        handle: unsafe { (*p).handle },
+        peer: unsafe { (*p).peer },
+        is_open: true,
+    };
+    Result.Ok(stream)
+}
+
+// -----------------------------------------------------------------------------
+// AsyncUdpSocket, UdpRecvFromFuture & UdpSendToFuture (AXS-AIO-044)
+// -----------------------------------------------------------------------------
+
+pub struct AsyncUdpSocket {
+    pub reactor: *mut Reactor,
+    pub reactor_handle: i64,
+    pub handle: i64,
+    pub local: SocketAddr,
+    pub is_open: bool,
+}
+
+unsafe impl Send for AsyncUdpSocket {}
+unsafe impl Share for AsyncUdpSocket {}
+impl !Copy for AsyncUdpSocket {}
+
+impl Drop for AsyncUdpSocket {
+    fn drop(self: mut_view<AsyncUdpSocket>) {
+        if self.is_open && self.handle > 0i64 {
+            let _ = aio_close(self.reactor_handle, self.handle);
+            self.is_open = false;
+            self.handle = -1i64;
+        }
+    }
+}
+
+pub struct UdpRecvFromFuture {
+    pub reactor: *mut Reactor,
+    pub op_id: IoOpId,
+    pub dst_ptr: *mut u8,
+    pub dst_cap: usize,
+    pub completed: bool,
+    pub immediate_err: i64,
+}
+
+unsafe impl Send for UdpRecvFromFuture {}
+impl !Copy for UdpRecvFromFuture {}
+
+impl Future for UdpRecvFromFuture {
+    type Output = Result<(usize, SocketAddr), IoError>;
+
+    fn poll(self: mut_view<UdpRecvFromFuture>, cx: mut_view<Context>) -> Poll<Result<(usize, SocketAddr), IoError>> {
+        if self.immediate_err < 0i64 {
+            self.completed = true;
+            return Poll.Ready(Result.Err(io_error_from_code(self.immediate_err)));
+        }
+        let r = self.reactor;
+        match unsafe { (*r).poll_op(self.op_id, mut_view(*cx)) } {
+            Poll.Pending => Poll.Pending,
+            Poll.Ready(comp) => {
+                self.completed = true;
+                if comp.result > 0i64 && (self.dst_ptr as usize) != 0 && (comp.owned_buf_ptr as usize) != 0 {
+                    let mut n = comp.result as usize;
+                    if n > self.dst_cap {
+                        n = self.dst_cap;
+                    }
+                    unsafe {
+                        ptr_copy_nonoverlapping<u8>(comp.owned_buf_ptr as *const u8, self.dst_ptr, n);
+                    }
+                }
+                if (comp.owned_buf_ptr as usize) != 0 && comp.owned_buf_cap > 0 {
+                    unsafe {
+                        heap_free(comp.owned_buf_ptr, comp.owned_buf_cap, 8);
+                    }
+                }
+                if comp.result < 0i64 {
+                    return Poll.Ready(Result.Err(io_error_from_code(comp.result)));
+                }
+                let sender = SocketAddr.from_aux(comp.aux);
+                Poll.Ready(Result.Ok((comp.result as usize, sender)))
+            },
+        }
+    }
+}
+
+impl Drop for UdpRecvFromFuture {
+    fn drop(self: mut_view<UdpRecvFromFuture>) {
+        if !self.completed {
+            if self.immediate_err == 0i64 && (self.reactor as usize) != 0 && self.op_id.raw != 0u64 {
+                let r = self.reactor;
+                unsafe { (*r).cancel_op(self.op_id); }
+            }
+            self.completed = true;
+        }
+    }
+}
+
+pub struct UdpSendToFuture {
+    pub reactor: *mut Reactor,
+    pub op_id: IoOpId,
+    pub completed: bool,
+    pub immediate_done: bool,
+    pub immediate_code: i64,
+}
+
+unsafe impl Send for UdpSendToFuture {}
+impl !Copy for UdpSendToFuture {}
+
+impl Future for UdpSendToFuture {
+    type Output = Result<usize, IoError>;
+
+    fn poll(self: mut_view<UdpSendToFuture>, cx: mut_view<Context>) -> Poll<Result<usize, IoError>> {
+        if self.immediate_done {
+            self.completed = true;
+            if self.immediate_code < 0i64 {
+                return Poll.Ready(Result.Err(io_error_from_code(self.immediate_code)));
+            }
+            return Poll.Ready(Result.Ok(self.immediate_code as usize));
+        }
+        let r = self.reactor;
+        match unsafe { (*r).poll_op(self.op_id, mut_view(*cx)) } {
+            Poll.Pending => Poll.Pending,
+            Poll.Ready(comp) => {
+                self.completed = true;
+                if (comp.owned_buf_ptr as usize) != 0 && comp.owned_buf_cap > 0 {
+                    unsafe {
+                        heap_free(comp.owned_buf_ptr, comp.owned_buf_cap, 8);
+                    }
+                }
+                if comp.result < 0i64 {
+                    return Poll.Ready(Result.Err(io_error_from_code(comp.result)));
+                }
+                Poll.Ready(Result.Ok(comp.result as usize))
+            },
+        }
+    }
+}
+
+impl Drop for UdpSendToFuture {
+    fn drop(self: mut_view<UdpSendToFuture>) {
+        if !self.completed {
+            if !self.immediate_done && (self.reactor as usize) != 0 && self.op_id.raw != 0u64 {
+                let r = self.reactor;
+                unsafe { (*r).cancel_op(self.op_id); }
+            }
+            self.completed = true;
+        }
+    }
+}
+
+impl AsyncUdpSocket {
+    pub fn bind(reactor: *mut Reactor, addr: SocketAddr) -> Result<AsyncUdpSocket, IoError> {
+        if (reactor as usize) == 0 {
+            return Result.Err(IoError.InvalidHandle);
+        }
+        let r_handle = unsafe { (*reactor).os_handle };
+        if r_handle <= 0i64 {
+            return Result.Err(IoError.InvalidHandle);
+        }
+        let h = aio_udp_bind(r_handle, addr.ip.to_u32_be(), addr.port);
+        if h < 0i64 {
+            return Result.Err(io_error_from_code(h));
+        }
+        let bound_port_rc = aio_socket_local_port(h);
+        let actual_port = if bound_port_rc > 0i64 { bound_port_rc as u16 } else { addr.port };
+        Result.Ok(AsyncUdpSocket {
+            reactor: reactor,
+            reactor_handle: r_handle,
+            handle: h,
+            local: SocketAddr.new(addr.ip, actual_port),
+            is_open: true,
+        })
+    }
+
+    pub fn local_addr(self: view<AsyncUdpSocket>) -> SocketAddr {
+        self.local
+    }
+
+    pub fn send_to(self: view<AsyncUdpSocket>, src: *const u8, count: usize, target: SocketAddr) -> UdpSendToFuture {
+        if !self.is_open || self.handle <= 0i64 || (self.reactor as usize) == 0 {
+            return UdpSendToFuture {
+                reactor: 0 as *mut Reactor,
+                op_id: IoOpId { raw: 0u64 },
+                completed: false,
+                immediate_done: true,
+                immediate_code: -4i64,
+            };
+        }
+        let alloc_sz = if count == 0 { 1usize } else { count };
+        let staging = unsafe { heap_alloc(alloc_sz, 8) };
+        if (staging as usize) == 0 {
+            return UdpSendToFuture {
+                reactor: 0 as *mut Reactor,
+                op_id: IoOpId { raw: 0u64 },
+                completed: false,
+                immediate_done: true,
+                immediate_code: -9i64,
+            };
+        }
+        if count > 0 && (src as usize) != 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(src, staging, count);
+            }
+        }
+        let op_raw = unsafe {
+            aio_submit_send_to(self.reactor_handle, self.handle, staging as *const u8, count, target.ip.to_u32_be(), target.port)
+        };
+        if op_raw <= 0i64 {
+            unsafe { heap_free(staging, alloc_sz, 8); }
+            let code = if op_raw < 0i64 { op_raw } else { -9i64 };
+            return UdpSendToFuture {
+                reactor: 0 as *mut Reactor,
+                op_id: IoOpId { raw: 0u64 },
+                completed: false,
+                immediate_done: true,
+                immediate_code: code,
+            };
+        }
+        let op_id = unsafe {
+            mut_view(*self.reactor).register_op(op_raw as u64, self.handle, staging, alloc_sz, 0 as *mut u8, 0, true)
+        };
+        UdpSendToFuture {
+            reactor: self.reactor,
+            op_id: op_id,
+            completed: false,
+            immediate_done: false,
+            immediate_code: 0i64,
+        }
+    }
+
+    pub fn recv_from(self: view<AsyncUdpSocket>, dst: *mut u8, cap: usize) -> UdpRecvFromFuture {
+        if !self.is_open || self.handle <= 0i64 || (self.reactor as usize) == 0 {
+            return UdpRecvFromFuture {
+                reactor: 0 as *mut Reactor,
+                op_id: IoOpId { raw: 0u64 },
+                dst_ptr: 0 as *mut u8,
+                dst_cap: 0,
+                completed: false,
+                immediate_err: -4i64,
+            };
+        }
+        let alloc_sz = if cap == 0 { 1usize } else { cap };
+        let staging = unsafe { heap_alloc(alloc_sz, 8) };
+        if (staging as usize) == 0 {
+            return UdpRecvFromFuture {
+                reactor: 0 as *mut Reactor,
+                op_id: IoOpId { raw: 0u64 },
+                dst_ptr: 0 as *mut u8,
+                dst_cap: 0,
+                completed: false,
+                immediate_err: -9i64,
+            };
+        }
+        let op_raw = unsafe { aio_submit_recv_from(self.reactor_handle, self.handle, staging, cap) };
+        if op_raw <= 0i64 {
+            unsafe { heap_free(staging, alloc_sz, 8); }
+            let code = if op_raw < 0i64 { op_raw } else { -9i64 };
+            return UdpRecvFromFuture {
+                reactor: 0 as *mut Reactor,
+                op_id: IoOpId { raw: 0u64 },
+                dst_ptr: 0 as *mut u8,
+                dst_cap: 0,
+                completed: false,
+                immediate_err: code,
+            };
+        }
+        let op_id = unsafe {
+            mut_view(*self.reactor).register_op(op_raw as u64, self.handle, staging, alloc_sz, dst, cap, true)
+        };
+        UdpRecvFromFuture {
+            reactor: self.reactor,
+            op_id: op_id,
+            dst_ptr: dst,
+            dst_cap: cap,
+            completed: false,
+            immediate_err: 0i64,
+        }
+    }
+
+    pub fn close(mut self: AsyncUdpSocket) -> Result<(), IoError> {
+        if !self.is_open || self.handle <= 0i64 {
+            self.is_open = false;
+            self.handle = -1i64;
+            return Result.Err(IoError.InvalidHandle);
+        }
+        let rc = aio_close(self.reactor_handle, self.handle);
+        self.is_open = false;
+        self.handle = -1i64;
+        if rc < 0i64 {
+            return Result.Err(io_error_from_code(rc));
+        }
+        Result.Ok(())
+    }
+}
