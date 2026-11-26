@@ -35,6 +35,12 @@ use compiler.hir.hir.HIR_EXPR_LITERAL
 use compiler.hir.hir.HIR_ITEM_EXTERN_BLOCK
 use compiler.hir.hir.HIR_ITEM_FN
 use compiler.hir.hir.HIR_ITEM_IMPL
+use compiler.hir.hir.HIR_ITEM_STATIC
+use compiler.hir.hir.HIR_STMT_LET
+use compiler.hir.hir.HirBlock
+use compiler.hir.hir.HirFieldInit
+use compiler.hir.hir.HirMatchArm
+use compiler.hir.hir.HirStmt
 use compiler.hir.hir.HIR_ITEM_TRAIT
 use compiler.hir.hir.HirAttr
 use compiler.hir.hir.HirAttrArg
@@ -221,16 +227,25 @@ use compiler.interp.value.INTERP_MSG_PANIC_SHIFT_RANGE
 use compiler.interp.value.INTERP_MSG_PANIC_UNREACHABLE
 use compiler.interp.value.INTERP_MSG_PANIC_UNRESOLVED_CALL
 use compiler.interp.value.INTERP_MSG_PANIC_UNSUPPORTED_TERM
+use compiler.interp.value.INTERP_FNCODE_BASE
+use compiler.interp.value.INTERP_FNCODE_STRIDE
+use compiler.interp.value.INTERP_MSG_UB_INVALID_FIXED_ADDR
+use compiler.interp.value.INTERP_MSG_UB_INVALID_PROVENANCE
 use compiler.interp.value.INTERP_MSG_UB_MISALIGNED
+use compiler.interp.value.INTERP_MSG_UB_UNINIT_READ
 use compiler.interp.value.INTERP_MSG_UB_OVERLAP
 use compiler.interp.value.INTERP_MSG_UB_USIZE_AS_PTR
 use compiler.interp.value.INTERP_SYNTH_BASE_COMPTIME
 use compiler.interp.value.INTERP_SYNTH_BASE_RUNTIME
 use compiler.interp.value.InterpCtx
+use compiler.interp.value.InterpAlloc
 use compiler.interp.value.InterpValue
 use compiler.interp.value.MirBodyMap
 use compiler.interp.value.interp_alloc_at
 use compiler.interp.value.interp_check_step_limit
+use compiler.interp.value.interp_check_write_perm
+use compiler.interp.value.interp_find_fixed
+use compiler.interp.value.interp_register_fixed
 use compiler.interp.value.interp_arg_store
 use compiler.interp.value.interp_copy_bytes
 use compiler.interp.value.interp_ctx_alloc_zeroed
@@ -1513,6 +1528,437 @@ fn is_self_entry_fn_item(ctx: view<InterpCtx>, func: *const HirItem) -> bool {
     false
 }
 
+// T502 (SPEC-50 AXS-UNS-021/023): constant value of the hidden `const __ax_addr_<n>: usize = E` item of an `@addr(E)` / `@at(E)`
+// placement (false when the item carries none or `E` is not a constant).
+fn interp_placement_const(ctx: view<InterpCtx>, src: *mut HirItem, out: mut_view<u64>) -> bool {
+    if (src as usize) == 0 || (ctx.thir as usize) == 0 {
+        return false;
+    }
+    let cv = unsafe { sym_constmap_get(view((*ctx.thir).symbol_consts), SymbolId { v: (*src).symbol.v }) };
+    if (cv as usize) != 0 && (unsafe { (*cv).kind }) == CONST_INT {
+        *out = unsafe { (*cv).int_val };
+        return true;
+    }
+    false
+}
+
+// The `kind` item (fn or static) whose constant `@addr` placement is `addr`; null when there is none.
+fn interp_find_placed_item(ctx: view<InterpCtx>, kind: u8, addr: u64) -> *mut HirItem {
+    if (ctx.hir as usize) == 0 {
+        return 0 as *mut HirItem;
+    }
+    let mut it: *mut HirItem = unsafe { (*ctx.hir).items };
+    while (it as usize) != 0 {
+        let ik = unsafe { (*it).kind };
+        let mut v: u64 = 0u64;
+        if ik == kind && interp_placement_const(ctx, unsafe { (*it).addr_src }, mut_view(v)) && v == addr {
+            return it;
+        }
+        if ik == HIR_ITEM_IMPL || ik == HIR_ITEM_TRAIT || ik == HIR_ITEM_EXTERN_BLOCK {
+            let mut m: *mut HirItem = unsafe { (*it).members };
+            while (m as usize) != 0 {
+                let mut mv: u64 = 0u64;
+                if (unsafe { (*m).kind }) == kind && interp_placement_const(ctx, unsafe { (*m).addr_src }, mut_view(mv)) && mv == addr {
+                    return m;
+                }
+                m = unsafe { (*m).next };
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+    0 as *mut HirItem
+}
+
+/// The oracle's code address of function symbol `sym_v` (SPEC-50 AXS-UNS-021): its `@addr(A)` / `@at(A)` placement, else the
+/// deterministic `INTERP_FNCODE_BASE + INTERP_FNCODE_STRIDE * sym_v` of the synthetic `.text` segment.
+pub fn interp_fn_code_addr(ctx: view<InterpCtx>, sym_v: u64) -> u64 {
+    let item = find_func_by_symbol(ctx, sym_v);
+    if (item as usize) != 0 {
+        let mut a: u64 = 0u64;
+        if interp_placement_const(ctx, unsafe { (*item).addr_src }, mut_view(a)) {
+            return a;
+        }
+    }
+    INTERP_FNCODE_BASE + INTERP_FNCODE_STRIDE * sym_v
+}
+
+/// Inverse of `interp_fn_code_addr`: the function symbol whose code address is `addr` (0 when no function has it).
+pub fn interp_fn_from_code_addr(ctx: view<InterpCtx>, addr: u64) -> u64 {
+    let placed = interp_find_placed_item(ctx, HIR_ITEM_FN, addr);
+    if (placed as usize) != 0 {
+        return unsafe { (*placed).symbol.v as u64 };
+    }
+    if addr >= INTERP_FNCODE_BASE && ((addr - INTERP_FNCODE_BASE) % INTERP_FNCODE_STRIDE) == 0u64 {
+        let sym_v = (addr - INTERP_FNCODE_BASE) / INTERP_FNCODE_STRIDE;
+        if sym_v != 0u64 && sym_v <= 0xFFFFFFFFu64 {
+            let item = find_func_by_symbol(ctx, sym_v);
+            if (item as usize) != 0 {
+                return sym_v;
+            }
+        }
+    }
+    0u64
+}
+
+// ---- placement statements (block-scope `@addr(E)` / `@at(E)` declarations) ----------------------------------------------------
+// The MIR cast that binds the hidden address slot carries the span of its declaration statement, so the oracle recognises a bind
+// point by looking that span up in the list of HIR statements that carry a placement (collected once, on first need).
+
+fn interp_note_placement(ctx: mut_view<InterpCtx>, sp: Span) {
+    if ctx.placement_count >= ctx.placement_cap {
+        let new_cap: usize = if ctx.placement_cap == 0 { 16 } else { interp_mul_usize(ctx.placement_cap, 2) };
+        let new_bytes = interp_mul_usize(new_cap, size_of<Span>());
+        let new_arr = arena_alloc_raw(mut_view(ctx.arena), new_bytes, align_of<Span>()) as *mut Span;
+        if ctx.placement_count > 0 {
+            let old_bytes = interp_mul_usize(ctx.placement_count, size_of<Span>());
+            unsafe {
+                interp_copy_bytes(new_arr as *mut u8, ctx.placement_spans as *const u8, old_bytes);
+            }
+        }
+        ctx.placement_spans = new_arr;
+        ctx.placement_cap = new_cap;
+    }
+    let dst = ((ctx.placement_spans as usize) + interp_mul_usize(ctx.placement_count, size_of<Span>())) as *mut Span;
+    unsafe {
+        *dst = sp;
+    }
+    ctx.placement_count = ctx.placement_count + 1;
+}
+
+fn interp_scan_block(ctx: mut_view<InterpCtx>, blk: *mut HirBlock) {
+    if (blk as usize) == 0 {
+        return;
+    }
+    let mut st: *mut HirStmt = unsafe { (*blk).stmts };
+    while (st as usize) != 0 {
+        if (unsafe { (*st).kind }) == HIR_STMT_LET && (unsafe { (*st).addr_sym.v }) != 0u32 {
+            interp_note_placement(mut_view(*ctx), Span {
+                file: FileId { v: unsafe { (*st).span.file.v } },
+                start: unsafe { (*st).span.start },
+                end: unsafe { (*st).span.end },
+            });
+        }
+        interp_scan_expr(mut_view(*ctx), unsafe { (*st).left });
+        interp_scan_expr(mut_view(*ctx), unsafe { (*st).right });
+        interp_scan_expr(mut_view(*ctx), unsafe { (*st).expr });
+        interp_scan_block(mut_view(*ctx), unsafe { (*st).else_block });
+        st = unsafe { (*st).next };
+    }
+}
+
+fn interp_scan_expr(ctx: mut_view<InterpCtx>, e: *mut HirExpr) {
+    if (e as usize) == 0 {
+        return;
+    }
+    interp_scan_block(mut_view(*ctx), unsafe { (*e).block });
+    interp_scan_expr(mut_view(*ctx), unsafe { (*e).cond });
+    interp_scan_expr(mut_view(*ctx), unsafe { (*e).else_branch });
+    interp_scan_expr(mut_view(*ctx), unsafe { (*e).iter });
+    interp_scan_expr(mut_view(*ctx), unsafe { (*e).inner });
+    interp_scan_expr(mut_view(*ctx), unsafe { (*e).body });
+    interp_scan_expr(mut_view(*ctx), unsafe { (*e).start_expr });
+    interp_scan_expr(mut_view(*ctx), unsafe { (*e).end_expr });
+    interp_scan_expr(mut_view(*ctx), unsafe { (*e).left });
+    interp_scan_expr(mut_view(*ctx), unsafe { (*e).right });
+    interp_scan_expr(mut_view(*ctx), unsafe { (*e).base });
+    interp_scan_expr(mut_view(*ctx), unsafe { (*e).callee });
+    interp_scan_expr(mut_view(*ctx), unsafe { (*e).receiver });
+    interp_scan_expr(mut_view(*ctx), unsafe { (*e).index_arg });
+    interp_scan_expr(mut_view(*ctx), unsafe { (*e).count_expr });
+    let mut el: *mut HirExpr = unsafe { (*e).elems };
+    while (el as usize) != 0 {
+        interp_scan_expr(mut_view(*ctx), el);
+        el = unsafe { (*el).next };
+    }
+    let mut ar: *mut HirExpr = unsafe { (*e).args };
+    while (ar as usize) != 0 {
+        interp_scan_expr(mut_view(*ctx), ar);
+        ar = unsafe { (*ar).next };
+    }
+    let mut fi: *mut HirFieldInit = unsafe { (*e).fields };
+    while (fi as usize) != 0 {
+        interp_scan_expr(mut_view(*ctx), unsafe { (*fi).expr });
+        fi = unsafe { (*fi).next };
+    }
+    let mut arm: *mut HirMatchArm = unsafe { (*e).arms };
+    while (arm as usize) != 0 {
+        interp_scan_expr(mut_view(*ctx), unsafe { (*arm).guard });
+        interp_scan_expr(mut_view(*ctx), unsafe { (*arm).body });
+        arm = unsafe { (*arm).next };
+    }
+}
+
+fn interp_scan_placements(ctx: mut_view<InterpCtx>) {
+    ctx.placement_scanned = true;
+    if (ctx.hir as usize) == 0 {
+        return;
+    }
+    let mut it: *mut HirItem = unsafe { (*ctx.hir).items };
+    while (it as usize) != 0 {
+        let ik = unsafe { (*it).kind };
+        if ik == HIR_ITEM_FN {
+            interp_scan_block(mut_view(*ctx), unsafe { (*it).body });
+        }
+        if ik == HIR_ITEM_IMPL || ik == HIR_ITEM_TRAIT {
+            let mut m: *mut HirItem = unsafe { (*it).members };
+            while (m as usize) != 0 {
+                if (unsafe { (*m).kind }) == HIR_ITEM_FN {
+                    interp_scan_block(mut_view(*ctx), unsafe { (*m).body });
+                }
+                m = unsafe { (*m).next };
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+}
+
+// True when the statement being executed is a block-scope `@addr(E)` declaration (the span of the current MIR statement equals the
+// span of a HIR `let` / `static` that carries a placement), i.e. this integer-to-pointer cast binds the hidden address slot.
+fn interp_current_is_placement(ctx: mut_view<InterpCtx>) -> bool {
+    if !ctx.placement_scanned {
+        interp_scan_placements(mut_view(*ctx));
+    }
+    let mut i: usize = 0;
+    while i < ctx.placement_count {
+        let spp = ((ctx.placement_spans as usize) + interp_mul_usize(i, size_of<Span>())) as *mut Span;
+        let same = unsafe {
+            (*spp).file.v == ctx.current_span.file.v && (*spp).start == ctx.current_span.start && (*spp).end == ctx.current_span.end
+        };
+        if same {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+// An integer-to-pointer cast (SPEC-50 AXS-UNS-011): the address must lie in a live allocation (exposed provenance), in a mapped
+// `@addr` region, or bind a fixed-address declaration (a block-scope `@addr(E)` slot, or a constant equal to the placement of a
+// static item), in which case its region is mapped on demand (`FixedAddrMap`). Anything else is a forged pointer (UB-01).
+fn interp_check_int_to_ptr(ctx: mut_view<InterpCtx>, stmt: *mut MirStmt, dest_ty: TypeId, addr: u64) {
+    let mut pt_size: u64 = 1u64;
+    let mut pt_align: u32 = 1u32;
+    if dest_ty.v != 0u32 && (ctx.thir as usize) != 0 {
+        let pt = unsafe { type_get(view((*ctx.thir).interner), dest_ty) };
+        if (pt as usize) != 0 {
+            let pte = interp_view_pointee_ty(pt);
+            if pte.v != 0u32 {
+                pt_size = unsafe { type_size(TypeId { v: pte.v }, view((*ctx.thir).interner)) } as u64;
+                pt_align = unsafe { type_align(TypeId { v: pte.v }, view((*ctx.thir).interner)) };
+            }
+        }
+    }
+    let aligned = pt_align <= 1u32 || (addr % (pt_align as u64)) == 0u64;
+    let is_const_op = (unsafe { (*stmt).rvalue.use_op.kind }) == MIR_OP_CONST;
+    let mut known = false;
+    let mut partial_fixed = false;
+    if addr != 0u64 {
+        let mut i: usize = 0;
+        while i < ctx.alloc_count {
+            let a = unsafe { interp_alloc_at(ctx.allocs, i) };
+            let is_live = unsafe { (*a).is_live };
+            let base = unsafe { (*a).base_addr };
+            let sz = unsafe { (*a).size };
+            if is_live && addr >= base && addr <= base + sz {
+                known = true;
+                break;
+            }
+            i = i + 1;
+        }
+        if !known {
+            let fr = interp_find_fixed(view(*ctx), addr, true);
+            if (fr as usize) != 0 {
+                known = true;
+                // a region that starts inside an existing one but extends past its end is a partial overlap
+                partial_fixed = addr + pt_size > (unsafe { (*fr).base_addr }) + (unsafe { (*fr).size });
+            }
+        }
+    }
+    if known && aligned && !partial_fixed {
+        return;
+    }
+    // Slow path: only a bind point of a block-scope `@addr(E)` slot needs the address to be non-null and aligned.
+    let slot_bind = !is_const_op && interp_current_is_placement(mut_view(*ctx));
+    if slot_bind && (addr == 0u64 || !aligned) {
+        interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_INVALID_FIXED_ADDR);
+        return;
+    }
+    if addr == 0u64 || (known && !partial_fixed) {
+        return;
+    }
+    let mut is_placement = slot_bind;
+    let mut placed: *mut HirItem = 0 as *mut HirItem;
+    if !is_placement && is_const_op {
+        placed = interp_find_placed_item(view(*ctx), HIR_ITEM_STATIC, addr);
+        is_placement = (placed as usize) != 0;
+    }
+    if is_placement {
+        if !aligned {
+            interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_INVALID_FIXED_ADDR);
+            return;
+        }
+        let r = interp_register_fixed(mut_view(*ctx), addr, pt_size);
+        if (r as usize) == 0 {
+            interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_INVALID_FIXED_ADDR);
+        }
+        return;
+    }
+    if known {
+        // a plain cast that ends past a mapped region: the access reports the out-of-bounds
+        return;
+    }
+    interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_INVALID_PROVENANCE);
+}
+
+// ---- UB-04 on aggregates: only the bytes of real fields count, padding never traps (SPEC-50 UB-04 row) ----------------------
+
+// Checks (`mode` 0: true when an uninitialised byte is found) or marks (`mode` 1: sets the bytes initialised) the bytes `[off, off + n)`
+// of the shadow of `a`.
+fn interp_shadow_range(a: *mut InterpAlloc, off: usize, n: usize, mode: u8) -> bool {
+    let sh = unsafe { (*a).init };
+    let total = unsafe { (*a).size as usize };
+    if (sh as usize) == 0 || off >= total || n == 0 {
+        return false;
+    }
+    let mut end = off + n;
+    if end > total {
+        end = total;
+    }
+    if mode == 1u8 {
+        unsafe {
+            interp_fill_bytes(sh + off, 1u8, end - off);
+        }
+        return false;
+    }
+    let mut i: usize = off;
+    while i < end {
+        if (unsafe { *(sh + i) }) == 0u8 {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+// Walks the non-padding bytes of type `ty_v` at block offset `off`: struct, tuple and array members recurse; an enum, closure or
+// coroutine is not inspected by the check (a false negative, never a false positive) and counts as one range when marking.
+fn interp_walk_init(ctx: mut_view<InterpCtx>, a: *mut InterpAlloc, off: usize, ty_v: u32, mode: u8, depth: u32) -> bool {
+    if ty_v == 0u32 || (ctx.thir as usize) == 0 {
+        return false;
+    }
+    let ty = unsafe { type_get(view((*ctx.thir).interner), TypeId { v: ty_v }) };
+    if (ty as usize) == 0 {
+        return false;
+    }
+    let sz = unsafe { type_size(TypeId { v: ty_v }, view((*ctx.thir).interner)) } as usize;
+    let tk = unsafe { (*ty).kind };
+    if depth < 16u32 && (tk == TY_STRUCT || tk == TY_TUPLE) {
+        let n = unsafe { (*ty).field_count };
+        let mut i: usize = 0;
+        while i < n {
+            let fty_v = unsafe { (*typeid_at((*ty).fields, i)).v };
+            let foff = unsafe { type_field_offset(TypeId { v: ty_v }, i, view((*ctx.thir).interner)) } as usize;
+            if interp_walk_init(mut_view(*ctx), a, off + foff, fty_v, mode, depth + 1u32) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+    if depth < 16u32 && tk == TY_ARRAY {
+        let elem_v = unsafe { (*ty).elem.v };
+        let elem_sz = unsafe { type_size(TypeId { v: elem_v }, view((*ctx.thir).interner)) } as usize;
+        let elem_ty = unsafe { type_get(view((*ctx.thir).interner), TypeId { v: elem_v }) };
+        let mut ek: u8 = 0u8;
+        if (elem_ty as usize) != 0 {
+            ek = unsafe { (*elem_ty).kind };
+        }
+        if ek == TY_STRUCT || ek == TY_TUPLE || ek == TY_ARRAY {
+            let len = unsafe { (*ty).array_len } as usize;
+            let mut i: usize = 0;
+            while i < len {
+                if interp_walk_init(mut_view(*ctx), a, off + interp_mul_usize(i, elem_sz), elem_v, mode, depth + 1u32) {
+                    return true;
+                }
+                i = i + 1;
+            }
+            return false;
+        }
+        return interp_shadow_range(a, off, sz, mode);
+    }
+    if (tk == TY_ENUM || tk == TY_CLOSURE || tk == TY_COROUTINE) && mode == 0u8 {
+        return false;
+    }
+    interp_shadow_range(a, off, sz, mode)
+}
+
+// The offset of host address `host` in the live tracked block `a` the last raw-pointer validation resolved into.
+fn interp_tracked_block(a: *mut InterpAlloc, host: *const u8, size: usize, out_off: mut_view<usize>) -> bool {
+    if (a as usize) == 0 || (unsafe { (*a).init } as usize) == 0 || !(unsafe { (*a).is_live }) {
+        return false;
+    }
+    let hp = unsafe { (*a).host_ptr as usize };
+    let total = unsafe { (*a).size as usize };
+    let h = host as usize;
+    if hp == 0 || h < hp || h + size > hp + total {
+        return false;
+    }
+    *out_off = h - hp;
+    true
+}
+
+// UB-04 for a typed load of `ty_v` (`size` bytes): scalars check their whole range, aggregates only their fields.
+fn interp_check_init_read_ty(ctx: mut_view<InterpCtx>, host: *const u8, ty_v: u32, size: u32) {
+    let a = ctx.ub_last_alloc;
+    let mut off: usize = 0;
+    if size == 0u32 || !interp_tracked_block(a, host, size as usize, mut_view(off)) {
+        return;
+    }
+    if interp_walk_init(mut_view(*ctx), a, off, ty_v, 0u8, 0u32) {
+        interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_UNINIT_READ);
+    }
+}
+
+// After an aggregate was copied into a tracked block, the copy's byte state is that of its fields: they are initialised (the source
+// check guaranteed it), the padding stays uninitialised.
+fn interp_aggregate_copied(ctx: mut_view<InterpCtx>, a: *mut InterpAlloc, dest: *const u8, ty_v: u32) {
+    if ty_v == 0u32 || (ctx.thir as usize) == 0 {
+        return;
+    }
+    let ty = unsafe { type_get(view((*ctx.thir).interner), TypeId { v: ty_v }) };
+    if (ty as usize) == 0 {
+        return;
+    }
+    let tk = unsafe { (*ty).kind };
+    if tk != TY_STRUCT && tk != TY_TUPLE {
+        return;
+    }
+    let sz = unsafe { type_size(TypeId { v: ty_v }, view((*ctx.thir).interner)) } as usize;
+    let mut off: usize = 0;
+    if !interp_tracked_block(a, dest, sz, mut_view(off)) {
+        return;
+    }
+    unsafe {
+        interp_fill_bytes((*a).init + off, 0u8, sz);
+    }
+    let _ = interp_walk_init(mut_view(*ctx), a, off, ty_v, 1u8, 0u32);
+}
+
+// Resolves the source place of a typed load (UB-04: the initialisation state of a heap block is checked, not updated).
+fn interp_load_place_ptr(
+    ctx: mut_view<InterpCtx>,
+    frame: view<CallFrame>,
+    place: view<MirPlace>,
+    out_ty: mut_view<TypeId>,
+    out_fat_len: mut_view<u64>
+) -> *mut u8 {
+    ctx.ub_load_ctx = true;
+    ctx.ub_last_alloc = 0 as *mut InterpAlloc;
+    let p = get_place_ptr(mut_view(*ctx), frame, place, mut_view(*out_ty), mut_view(*out_fat_len));
+    ctx.ub_load_ctx = false;
+    p
+}
+
 fn resolve_const_op_val(ctx: view<InterpCtx>, frame: view<CallFrame>, op: view<MirOperand>) -> u64 {
     let mut val = op.constant.val;
     if val == 0u64 && op.constant.sym.v != 0u32 {
@@ -1539,8 +1985,12 @@ fn eval_operand_u64_raw(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, op: vi
     }
     let mut ty = TypeId { v: 0u32 };
     let mut fat_len: u64 = 0u64;
-    let ptr = get_place_ptr(mut_view(*ctx), frame, view(op.place), mut_view(ty), mut_view(fat_len));
+    let ptr = interp_load_place_ptr(mut_view(*ctx), frame, view(op.place), mut_view(ty), mut_view(fat_len));
+    let ty_v = ty.v;
     let sz = unsafe { type_size(ty, view((*ctx.thir).interner)) };
+    if op.place.proj_count > 0 {
+        interp_check_init_read_ty(mut_view(*ctx), ptr as *const u8, ty_v, sz);
+    }
     if sz == 1u32 {
         return unsafe { *ptr as u64 };
     }
@@ -1559,9 +2009,11 @@ pub fn eval_operand_u64(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, op: vi
     }
     let mut ty = TypeId { v: 0u32 };
     let mut fat_len: u64 = 0u64;
-    let ptr = get_place_ptr(mut_view(*ctx), frame, view(op.place), mut_view(ty), mut_view(fat_len));
+    let ptr = interp_load_place_ptr(mut_view(*ctx), frame, view(op.place), mut_view(ty), mut_view(fat_len));
+    let ty_v = ty.v;
     let sz = unsafe { type_size(ty, view((*ctx.thir).interner)) };
     if op.place.proj_count > 0 {
+        interp_check_init_read_ty(mut_view(*ctx), ptr as *const u8, ty_v, sz);
         let is_raw = place_has_raw_ptr_deref(view(*ctx), frame, view(op.place));
         oracle_record_ordinary_read(mut_view(*ctx), ptr as *const u8, sz, is_raw);
     }
@@ -1586,9 +2038,11 @@ pub fn eval_operand_u128(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, op: v
     }
     let mut ty = TypeId { v: 0u32 };
     let mut fat_len: u64 = 0u64;
-    let ptr = get_place_ptr(mut_view(*ctx), frame, view(op.place), mut_view(ty), mut_view(fat_len));
+    let ptr = interp_load_place_ptr(mut_view(*ctx), frame, view(op.place), mut_view(ty), mut_view(fat_len));
+    let ty_v = ty.v;
     let sz = unsafe { type_size(ty, view((*ctx.thir).interner)) };
     if op.place.proj_count > 0 {
+        interp_check_init_read_ty(mut_view(*ctx), ptr as *const u8, ty_v, sz);
         let is_raw = place_has_raw_ptr_deref(view(*ctx), frame, view(op.place));
         oracle_record_ordinary_read(mut_view(*ctx), ptr as *const u8, sz, is_raw);
     }
@@ -2453,6 +2907,13 @@ fn exec_assign_use(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, stmt: *mut 
     let mut dest_ty = TypeId { v: 0u32 };
     let mut dummy_len: u64 = 0u64;
     let dest = get_place_ptr(mut_view(*ctx), frame, unsafe { view((*stmt).place) }, mut_view(dest_ty), mut_view(dummy_len));
+    let dest_alloc = ctx.ub_last_alloc;
+    if (unsafe { (*stmt).place.proj_count }) > 0 {
+        interp_check_write_perm(mut_view(*ctx), dest as *const u8);
+        if ctx.failed {
+            return;
+        }
+    }
     let use_kind = unsafe { (*stmt).rvalue.use_op.kind };
     let dest_ty_v = dest_ty.v;
     let d_size = unsafe { type_size(dest_ty, view((*ctx.thir).interner)) };
@@ -2495,7 +2956,14 @@ fn exec_assign_use(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, stmt: *mut 
     } else {
         let mut src_ty = TypeId { v: 0u32 };
         let mut src_len: u64 = 0u64;
-        let src = get_place_ptr(mut_view(*ctx), frame, unsafe { view((*stmt).rvalue.use_op.place) }, mut_view(src_ty), mut_view(src_len));
+        let src = interp_load_place_ptr(mut_view(*ctx), frame, unsafe { view((*stmt).rvalue.use_op.place) }, mut_view(src_ty), mut_view(src_len));
+        let src_ty_v = src_ty.v;
+        if (unsafe { (*stmt).rvalue.use_op.place.proj_count }) > 0 {
+            interp_check_init_read_ty(mut_view(*ctx), src as *const u8, src_ty_v, d_size);
+            if ctx.failed {
+                return;
+            }
+        }
         if (unsafe { (*stmt).rvalue.use_op.place.proj_count }) > 0 ||
            place_is_shared_mut_static(frame, unsafe { view((*stmt).rvalue.use_op.place) }) {
             let is_raw = place_has_raw_ptr_deref(view(*ctx), frame, unsafe { view((*stmt).rvalue.use_op.place) });
@@ -2508,6 +2976,9 @@ fn exec_assign_use(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, stmt: *mut 
         if size > 0 {
             unsafe {
                 interp_copy_bytes(dest, src as *const u8, size);
+            }
+            if (unsafe { (*stmt).place.proj_count }) > 0 {
+                interp_aggregate_copied(mut_view(*ctx), dest_alloc, dest as *const u8, dest_ty_v);
             }
         }
     }
@@ -2523,6 +2994,12 @@ fn exec_assign_aggregate(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, stmt:
         return;
     }
     let agg_sz = unsafe { type_size(TypeId { v: dest_ty_v }, view((*ctx.thir).interner)) };
+    if (unsafe { (*stmt).place.proj_count }) > 0 {
+        interp_check_write_perm(mut_view(*ctx), dest as *const u8);
+        if ctx.failed {
+            return;
+        }
+    }
     if is_atomic_struct_ty(view(*ctx), dest_ty) {
         oracle_reset_atomic_loc(mut_view(*ctx), dest as *const u8, agg_sz);
     } else if (unsafe { (*stmt).place.proj_count }) > 0 ||
@@ -3429,6 +3906,7 @@ fn exec_assign_cast(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, stmt: *mut
     let op_hi = ctx.val_hi;
     let src_ty = operand_type_id(mut_view(*ctx), frame, unsafe { view((*stmt).rvalue.use_op) });
     let dest_ty = TypeId { v: unsafe { (*stmt).rvalue.target_ty.v } };
+    let dest_ty_raw: u32 = dest_ty.v;
 
     let mut src_signed = false;
     let mut src_bits: i32 = 64;
@@ -3445,6 +3923,21 @@ fn exec_assign_cast(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, stmt: *mut
         if dest_bits == 1 {
             dest_bits = 64;
         }
+    }
+
+    // T502 (SPEC-50 AXS-UNS-021): a function value (its symbol) cast to an integer is the oracle's code address of the function
+    // (its `@addr(A)` placement or the deterministic synthetic `.text` address); the inverse cast maps a code address back.
+    if s_kind == TY_FN && (d_kind == TY_USIZE || d_kind == TY_U64 || d_kind == TY_ISIZE || d_kind == TY_I64) {
+        ctx.val_hi = 0u64;
+        return interp_fn_code_addr(view(*ctx), op_val);
+    }
+    if d_kind == TY_FN && (s_kind == TY_USIZE || s_kind == TY_U64) {
+        ctx.val_hi = 0u64;
+        let fsym = interp_fn_from_code_addr(view(*ctx), op_val);
+        if fsym == 0u64 && op_val != 0u64 {
+            interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_INVALID_PROVENANCE);
+        }
+        return fsym;
     }
 
     // T458 (SPEC-41 AXS-FLT-022..024): the three float cast kinds. Every conversion rounds to nearest-even
@@ -3525,23 +4018,9 @@ fn exec_assign_cast(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, stmt: *mut
         }
     }
 
-    if d_kind == TY_PTR && res_lo != 0u64 {
-        let mut found_live = false;
-        let mut i: usize = 0;
-        while i < ctx.alloc_count {
-            let a = unsafe { interp_alloc_at(ctx.allocs, i) };
-            let is_live = unsafe { (*a).is_live };
-            let base = unsafe { (*a).base_addr };
-            let sz = unsafe { (*a).size };
-            if is_live && res_lo >= base && res_lo <= base + sz {
-                found_live = true;
-                break;
-            }
-            i = i + 1;
-        }
-        if !found_live {
-            interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_USIZE_AS_PTR);
-        }
+    if d_kind == TY_PTR {
+        // T502: provenance of an integer-to-pointer cast and binding of `@addr(E)` / `@at(E)` fixed-address declarations.
+        interp_check_int_to_ptr(mut_view(*ctx), stmt, TypeId { v: dest_ty_raw }, res_lo);
     }
     ctx.val_hi = res_hi;
     res_lo
@@ -4058,7 +4537,10 @@ fn exec_single_mir_stmt(
                     let mut dummy_len: u64 = 0u64;
                     let dest = get_place_ptr(mut_view(*ctx), frame, unsafe { view((*stmt).place) }, mut_view(dest_ty), mut_view(dummy_len));
                     let dest_size = unsafe { type_size(dest_ty, view((*ctx.thir).interner)) };
-                    if (unsafe { (*stmt).place.proj_count }) > 0 ||
+                    if (unsafe { (*stmt).place.proj_count }) > 0 {
+                        interp_check_write_perm(mut_view(*ctx), dest as *const u8);
+                    }
+                    if (unsafe { (*stmt).place.proj_count }) > 0 && !ctx.failed ||
                        is_shared_static_lhs ||
                        oracle_has_active_atomic_at(view(*ctx), dest as *const u8, dest_size) {
                         oracle_record_ordinary_write(mut_view(*ctx), dest as *const u8, dest_size);

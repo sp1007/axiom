@@ -8,7 +8,7 @@ model: sonnet
 gate_model: sonnet
 depends: [T501]
 priority: 152
-status: doing
+status: done
 attempts: 1
 paths: [compiler/interp, tests/run/unsafe/oracle_ub]
 locks: [compiler/target/x64/frame.ax]
@@ -16,7 +16,7 @@ spec: [spec/SPEC-50-unsafe-ub-ffi.md, spec/SPEC-77-regalloc-machine-opt.md, spec
 covers: [REQ-OWNER-008, REQ-CAP-001, REQ-CAP-002, REQ-CAP-005, REQ-CAP-007, REQ-CAP-019, REQ-CAP-037, REQ-CAP-038, REQ-CAP-041, REQ-CAP-048, REQ-FFI-027, REQ-FFI-038, REQ-FFI-044, REQ-FFI-045, REQ-CAP-059, REQ-CAP-078, REQ-CAP-084, REQ-CAP-087, REQ-CAP-088, REQ-CAP-091, REQ-CAP-095, REQ-CAP-098, REQ-CAP-103, REQ-CAP-111, REQ-FFI-085, REQ-FFI-088, REQ-CAP-124, REQ-CAP-126, REQ-CAP-133, REQ-MIR-142, REQ-CAP-145, REQ-FFI-128]
 started: 2026-11-26 05:57:15
 unblocks: 1
-agent: T502-impl
+finished: 2026-11-26 11:19:49
 ---
 # T502 — E13.1 — Oracle strict-provenance & UB detector (use-after-free, unaligned, uninit, REQ-OWNER-008 round-trip)
 
@@ -53,3 +53,4 @@ Extend the MIR oracle (`--interp`) with strict pointer provenance tags, determin
 - 2026-11-26 architect unblock: ADR-0052 (frame-metadata trailer is part of the slot_offsets allocation contract, SPEC-77 AXS-RA-026 item 4); lock compiler/target/x64/frame.ax added; add data.ub_kind data entries (Diagnostic already has `data`); UB-06 + REQ-CAP-071 moved to T542; item-scope `@addr` static with initializer stays with T526/T528/T540 (`_workspaces/reports/unblock-T502.md`)
 - 2026-11-26 04:28:33 unblocked (cycle 1) 
 - 2026-11-26 05:57:15 started (attempt 1) T502-impl
+- 2026-11-26 11:19:49 accepted by QA -> done
