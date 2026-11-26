@@ -6,7 +6,7 @@ owner: axiom-semantics
 reviewer: axiom-qa
 model: opus
 gate_model: opus
-depends: [T428a]
+depends: [T428a, T428m]
 priority: 12
 status: todo
 attempts: 0
@@ -15,6 +15,8 @@ paths: [tests/modules/same_name_types, tests/run/same_name_std_types]
 locks: [compiler/types/typeck.ax, _workspaces/baseline-failures.txt]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-02-grammar.md]
 covers: [REQ-TYP-072, REQ-MOD-003, REQ-MOD-064]
+started: 2026-11-26 10:14:53
+unblocks: 1
 ---
 # T428g — A type name must resolve to the item the resolver bound, never to the first same-named item
 
@@ -39,20 +41,28 @@ path's last segment. It ignores the resolver's binding already present on the pa
 `String` yields a different type. This violates nominal identity (REQ-TYP-072) and "a module is a namespace" (REQ-MOD-003).
 
 ## Scope
-1. In `compiler/types/typeck.ax`, resolve a path type to the item named by the resolver: match on the path's
-   `def_mod` + `def_name` (or `symbol`) when `def_dom != 0`; keep the bare-name walk only for paths that have no
-   resolver binding (locals, generic params, synthetic HIR), and there prefer the current module's item. Apply the
-   same rule to the fn/const/static branches of the same walk and to any other bare-name item scan in typeck that
-   decides a type (grep `sv_eq(view(it_name)`; list each one in the report with what you did).
-2. Do not change the resolver or the HIR shape; if a path that reaches the walk has no binding where it should,
-   stop and report it (Blocked) instead of adding a heuristic.
-3. Tests (`modes: interp native`, exact `// stdout:`):
+Revised 2026-11-26 (`_workspaces/reports/unblock-T428g.md`): attempt 1 showed that the paths reaching the bare-name walk
+are generic-argument paths the resolver never bound. **T428m** (frontend) makes the resolver bind them; HIR lowering
+already carries the binding, so after T428m those paths take typeck's symbol-indexed branch of `lookup_path_type`.
+1. First re-run the repros and the planned tests on HEAD with T428m in. Record which still fail; typeck work is only what
+   remains after the binding exists.
+2. In `compiler/types/typeck.ax` `lookup_path_type_by_name` (fn, const/static, struct, enum and type-alias branches):
+   - a path with a binding (`symbol != 0` or `def_dom != 0`) never reaches the bare-name walk; if one still does, select
+     the item by `symbol` (or `def_mod` + `def_name`), never by bare name;
+   - the bare-name walk stays only for paths that truly have no resolver binding (synthetic HIR, lowering sentinels);
+     there prefer the current module's item, and when more than one module defines that name and none is the current
+     module, do not pick one: emit `AX_NAME_UNRESOLVED` (no silent first match).
+   - inventory the other bare-name item scans (attempt 1 found `register_intrinsic_callee`, intrinsic names only, out of
+     scope) and list each one in the report.
+3. Do not change the resolver or the HIR shape (T428m owns them). A bound path that typeck still mistypes is a typeck
+   bug and is fixed here; a path that is still unbound where it should be bound is reported as `BLOCKED` against T428m.
+4. Tests (`modes: interp native`, exact `// stdout:`):
    - `tests/run/same_name_std_types/`: the three repros above compile and run (user `String`, user `IoError`, both std
      `String`s imported in one program, values of each type created and used).
    - `tests/modules/same_name_types/`: a package with modules `a` and `b` each defining `struct S` and `fn mk() -> S`
      with different fields, used together from `main` (also as `Option<a.S>` / `Result<b.S, a.S>` generic args); and a
      compile-fail case assigning `a.S` to `b.S` (`AX_TYPE_MISMATCH`).
-4. Remove the two lines naming `T428g` (and their comment block) from `_workspaces/baseline-failures.txt` once both
+5. Remove the two lines naming `T428g` (and their comment block) from `_workspaces/baseline-failures.txt` once both
    e11_5 tests pass in all their modes.
 
 ## Acceptance
@@ -65,3 +75,6 @@ path's last segment. It ignores the resolver's binding already present on the pa
 
 ## Log
 - 2026-11-26 created by architect (`_workspaces/reports/unblock-T428a.md`)
+- 2026-11-26 10:14:53 started (attempt 1) T428g-impl
+- 2026-11-26 10:40:50 block: root cause in resolver: resolve_type/resolve_path_seg never bind generic_args segments (Result<String, IoError>, Option<a.S> get symbol=0), so typeck falls back to bare-name walk; needs a frontend resolver task first
+- 2026-11-26 10:43:43 unblocked (cycle 1) 

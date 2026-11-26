@@ -8,13 +8,15 @@ model: opus
 gate_model: opus
 depends: []
 priority: 20
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 240
 paths: [tests/run/agg_self_assign]
 locks: [compiler/mir/builder.ax]
 spec: [spec/SPEC-03-core-semantics.md]
 covers: [REQ-EXP-007, REQ-EXP-102, REQ-MIR-006]
+started: 2026-11-26 10:41:15
+agent: T428j-impl
 ---
 # T428j — Evaluate every operand of an aggregate before writing the destination
 
@@ -52,3 +54,4 @@ fields already overwritten. Axiom evaluates all operands left to right before th
 
 ## Log
 - 2026-11-26 created by architect (`_workspaces/reports/unblock-T428a.md`, triage of T428a-qa.md defect 5)
+- 2026-11-26 10:41:15 started (attempt 1) T428j-impl
