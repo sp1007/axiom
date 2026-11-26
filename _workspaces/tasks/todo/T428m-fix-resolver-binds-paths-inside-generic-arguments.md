@@ -8,7 +8,7 @@ model: opus
 gate_model: opus
 depends: [T428a]
 priority: 11
-status: doing
+status: blocked
 attempts: 1
 timeout_min: 240
 paths: [tests/resolve/generic_args_binding]
@@ -16,7 +16,6 @@ locks: [compiler/resolve/resolver.ax, compiler/hir/lower.ax]
 spec: [spec/SPEC-02-grammar.md, spec/SPEC-03-core-semantics.md]
 covers: [REQ-MOD-003, REQ-MOD-064]
 started: 2026-11-26 11:20:52
-agent: T428m-impl
 ---
 # T428m — Every path inside a generic argument list is resolved in the enclosing scope
 
@@ -79,3 +78,4 @@ AST node, so once the resolver binds the segment the `HirPath` carries `symbol/d
 ## Log
 - 2026-11-26 created by architect (`_workspaces/reports/unblock-T428g.md`)
 - 2026-11-26 11:20:52 started (attempt 1) T428m-impl
+- 2026-11-26 16:41:56 block: fallout outside locks: compiler/interp/frame.ax needs InterpAlloc import; 4 goldens, 2 ui, 8 selfhost .ax.in need intended refresh

@@ -61041,6 +61041,171 @@ fn mb_emit_stmt(b: mut_view<MirBuilder>, stmt: view<MirStmt>) {
     }
 }
 
+// ---- Aggregate stores that read their own destination (T428j) ----
+//
+// An aggregate rvalue (`Aggregate` / `Repeat`) is executed by the oracle and by the backend as a
+// sequence of per-field stores into the destination that read each operand when its field is
+// written. When an operand reads memory the destination covers (`arr = [arr[2], arr[0], arr[1]]`,
+// `p = P { a: p.b, b: p.a }`, `*q = S { a: (*q).b, .. }`), a later operand would observe a field
+// already overwritten. SPEC-03 evaluates every operand left to right before the assignment takes
+// effect (REQ-EXP-007, REQ-EXP-102), so such operands are first copied (or moved) into fresh
+// temporaries; an aggregate whose operands cannot alias its destination is still built in place.
+
+fn mb_place_has_deref(place: view<MirPlace>) -> bool {
+    mb_place_has_deref_from(place, 0)
+}
+
+// True when a projection at index `start` or later is a DEREF.
+fn mb_place_has_deref_from(place: view<MirPlace>, start: usize) -> bool {
+    let mut i: usize = start;
+    while i < place.proj_count {
+        if (unsafe { (*mir_proj_at(place.projs, i)).kind }) == MIR_PROJ_DEREF {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn mb_local_kind_of(b: view<MirBuilder>, l: u32) -> u8 {
+    if (b.body as usize) == 0 || (l as usize) >= (unsafe { (*b.body).local_count }) {
+        return MIR_LOCAL_USER;
+    }
+    unsafe { (*mir_local_at((*b.body).locals, l as usize)).kind }
+}
+
+// Conservative: true unless storing into `dest` provably leaves the memory `src` reads unchanged.
+// Same root: disjoint only when, after an identical prefix of field/deref/same-variant projections,
+// the two places select different fields. Different roots: disjoint when neither goes through a
+// pointer; otherwise only a fresh temporary destination (nothing points into it) or a temporary /
+// constant source read without a pointer is known not to alias.
+fn mb_places_may_overlap(b: view<MirBuilder>, dest: view<MirPlace>, src: view<MirPlace>) -> bool {
+    if dest.local.v == src.local.v {
+        let mut n: usize = src.proj_count;
+        if dest.proj_count <= n {
+            n = dest.proj_count;
+        }
+        let mut i: usize = 0;
+        while i < n {
+            let pd = unsafe { mir_proj_at(dest.projs, i) };
+            let ps = unsafe { mir_proj_at(src.projs, i) };
+            let kd = unsafe { (*pd).kind };
+            let ks = unsafe { (*ps).kind };
+            if kd == MIR_PROJ_FIELD && ks == MIR_PROJ_FIELD {
+                if (unsafe { (*pd).field_idx }) != (unsafe { (*ps).field_idx }) {
+                    // Different fields of the same storage are disjoint only while neither place goes
+                    // on through a pointer held in its field (`*h.p = .. (*h.q).b ..` with h.p == h.q,
+                    // or `o.v = .. (*o.p).b ..` with o.p -> o.v): such a place addresses memory
+                    // outside this local, so the pointer rule applies (only a fresh temporary
+                    // destination, read without a pointer, is known not to alias).
+                    if !mb_place_has_deref_from(dest, i + 1) && !mb_place_has_deref_from(src, i + 1) {
+                        return false;
+                    }
+                    if !mb_place_has_deref(dest) && mb_local_kind_of(b, dest.local.v) == MIR_LOCAL_TEMP {
+                        return false;
+                    }
+                    return true;
+                }
+            } else if kd == MIR_PROJ_DEREF && ks == MIR_PROJ_DEREF {
+                // Same pointer value: keep comparing what lies behind it.
+            } else if kd == MIR_PROJ_DOWNCAST && ks == MIR_PROJ_DOWNCAST &&
+                (unsafe { (*pd).variant_idx }) == (unsafe { (*ps).variant_idx }) {
+                // Same variant view of the same storage.
+            } else {
+                // Index, sub-slice, different variants (shared storage) or mixed kinds.
+                return true;
+            }
+            i = i + 1;
+        }
+        // One place is a prefix of the other.
+        return true;
+    }
+    let dd = mb_place_has_deref(dest);
+    let sd = mb_place_has_deref(src);
+    if !dd && !sd {
+        return false;
+    }
+    if !dd && mb_local_kind_of(b, dest.local.v) == MIR_LOCAL_TEMP {
+        return false;
+    }
+    if !sd {
+        let sk = mb_local_kind_of(b, src.local.v);
+        if sk == MIR_LOCAL_TEMP || sk == MIR_LOCAL_CONST {
+            return false;
+        }
+    }
+    true
+}
+
+fn mb_operand_may_read_dest(b: view<MirBuilder>, dest: view<MirPlace>, op: view<MirOperand>) -> bool {
+    if op.kind != MIR_OP_COPY && op.kind != MIR_OP_MOVE {
+        return false;
+    }
+    mb_places_may_overlap(b, dest, view(op.place))
+}
+
+// Evaluates `op` into a fresh temporary and rewrites it to read that temporary; `op` is left
+// unchanged when its type is unknown.
+fn mb_spill_operand(b: mut_view<MirBuilder>, op: mut_view<MirOperand>, sp: view<Span>) {
+    let ty = unsafe { mir_drop_place_type(view(*b.body), view(*b.thir), view(op.place)) };
+    if ty.v == 0u32 {
+        return;
+    }
+    let tmp = mb_new_temp(mut_view(*b), (TypeId { v: ty.v }), sp);
+    let tmp_pl = mir_local_place(tmp.v);
+    mb_emit_assign_use(mut_view(*b), view(tmp_pl), view(*op), sp);
+    mir_copy_place(mut_view(op.place), view(tmp_pl));
+}
+
+fn mb_spill_agg_overlaps(b: mut_view<MirBuilder>, dest: view<MirPlace>, rv: mut_view<MirRvalue>, sp: view<Span>) {
+    if b.is_diverged {
+        return;
+    }
+    if rv.kind == MIR_RVALUE_REPEAT {
+        if mb_operand_may_read_dest(view(*b), dest, view(rv.use_op)) {
+            mb_spill_operand(mut_view(*b), mut_view(rv.use_op), sp);
+        }
+        return;
+    }
+    if rv.kind != MIR_RVALUE_AGGREGATE || rv.operand_count == 0 || (rv.operands as usize) == 0 {
+        return;
+    }
+    let mut any = false;
+    let mut i: usize = 0;
+    while i < rv.operand_count {
+        let op_i = unsafe { mir_op_at(rv.operands, i) };
+        if unsafe { mb_operand_may_read_dest(view(*b), dest, view(*op_i)) } {
+            any = true;
+            break;
+        }
+        i = i + 1;
+    }
+    if !any {
+        return;
+    }
+    // Fresh operand array: the caller's array is left as it was.
+    let bytes = mir_mul_usize(rv.operand_count, size_of<MirOperand>());
+    let ops = unsafe {
+        arena_alloc_raw(mut_view(*b.arena), bytes, align_of<MirOperand>()) as *mut MirOperand
+    };
+    i = 0;
+    while i < rv.operand_count {
+        let src_op = unsafe { mir_op_at(rv.operands, i) };
+        let dst_op = unsafe { mir_op_at(ops, i) };
+        unsafe {
+            mir_copy_operand(mut_view(*dst_op), view(*src_op));
+        }
+        // Left to right, so a moved operand is taken in source order.
+        if unsafe { mb_operand_may_read_dest(view(*b), dest, view(*dst_op)) } {
+            unsafe {
+                mb_spill_operand(mut_view(*b), mut_view(*dst_op), sp);
+            }
+        }
+        i = i + 1;
+    }
+    rv.operands = ops;
+}
+
 fn mb_emit_assign(b: mut_view<MirBuilder>, place: view<MirPlace>, rv: view<MirRvalue>, sp: view<Span>) {
     let mut stmt = MirStmt {
         kind: MIR_STMT_ASSIGN,
@@ -61076,6 +61241,7 @@ fn mb_emit_assign(b: mut_view<MirBuilder>, place: view<MirPlace>, rv: view<MirRv
     };
     mir_copy_place(mut_view(stmt.place), place);
     mir_copy_rvalue(mut_view(stmt.rvalue), rv);
+    mb_spill_agg_overlaps(mut_view(*b), place, mut_view(stmt.rvalue), sp);
     mb_emit_stmt(mut_view(*b), view(stmt));
 }
 
