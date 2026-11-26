@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 0
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tests/run/unsafe/oracle_ub_compiler_sites, tests/selfhost/opt/harness_opt_pipeline.ax.in, tests/conformance/p15/e15_3_loops_bce/e15_3_loops_bce_probe.ax.in, tests/conformance/p15/e15_4_inline_specialize_devirt/e15_4_inline_specialize_devirt_probe.ax.in, tests/opt2/opt2_sroa_inline_probe.ax.in, tests/run/opt_bce/opt_bce_probe.ax.in, tests/run/opt_ipa_devirt/opt_ipa_devirt_probe.ax.in, tests/run/static_items/opt_static_summary_alias_probe.ax.in]
 locks: [compiler/opt/inline/mod.ax, compiler/opt/escape/mod.ax, compiler/opt/ipa/mod.ax, compiler/opt/sroa/mod.ax, compiler/mir/mir.ax, _workspaces/baseline-failures.txt]
 spec: [spec/SPEC-50-unsafe-ub-ffi.md, spec/decisions/ADR-0052-x64-frame-meta-trailer-contract.md, 0071, tasks/0339]
 covers: [REQ-CAP-037, REQ-CAP-038]
+started: 2026-11-26 17:04:01
+finished: 2026-11-26 20:22:01
 ---
 # T543 — Remove the two latent uninitialised reads that T502's UB-04 detector exposed
 
@@ -77,3 +79,5 @@ forbids weakening the detector; the reads are fixed at their source.
 
 ## Log
 - 2026-11-26 created by architect (`_workspaces/reports/triage-2026-11-26-T502-regression.md`)
+- 2026-11-26 17:04:01 started (attempt 1) T543-impl
+- 2026-11-26 20:22:01 accepted by QA -> done
