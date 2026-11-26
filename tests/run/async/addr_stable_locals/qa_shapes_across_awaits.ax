@@ -1,0 +1,327 @@
+// test: run
+// modes: interp native
+// timeout: 60
+// covers: REQ-ASY-122
+// stdout: branch=15,2 1,22\nshadow=11,25,0\nbig=36,57\ngeneric=77 1.5 999\nnested=123,456\nmatched=907\nslice=3:5 idx=90\ndeferred=1 5\nearly=3\nwidths=255,65535,-128,true,x\nempty=1\n
+
+// QA T428a: shapes of address-observable locals across `.await`: address taken in one branch only, shadowed names,
+// whole-value reassignment from a call that takes the same in-place value, generic async fns, nested async
+// calls that write into the caller's local, enum payloads, in-place slice bounds/indices, deferred initialization,
+// early returns, sub-word widths and a zero-sized local.
+
+use std.future.block_on.block_on;
+use std.future.Context;
+
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+struct Put<T> {
+    pub dst: *mut T,
+    pub val: T,
+    pub polls: u32,
+}
+
+impl<T: Copy> Future for Put<T> {
+    type Output = i64;
+
+    fn poll(self: mut_view<Put<T>>, cx: mut_view<Context>) -> Poll<i64> {
+        if self.polls < 2u32 {
+            self.polls = self.polls + 1u32;
+            return Poll.Pending;
+        }
+        let d = self.dst;
+        unsafe { *d = self.val; }
+        Poll.Ready(1i64)
+    }
+}
+
+fn put<T: Copy>(dst: *mut T, val: T) -> Put<T> {
+    Put { dst: dst, val: val, polls: 0u32 }
+}
+
+async fn branch(c: bool) -> i64 {
+    let mut x: i64 = 1i64;
+    let mut y: i64 = 2i64;
+    let p = if c { unsafe { address_of_mut(x) } } else { unsafe { address_of_mut(y) } };
+    let w = if c { 15i64 } else { 22i64 };
+    let _ = put<i64>(p, w).await;
+    if c {
+        let q = unsafe { address_of_mut(y) };
+        let _ = put<i64>(q, 2i64).await;
+    }
+    x * 100i64 + y
+}
+
+async fn shadow() -> i64 {
+    let mut x: i64 = 1i64;
+    let p1 = unsafe { address_of_mut(x) };
+    let mut x: i64 = 2i64;
+    let p2 = unsafe { address_of_mut(x) };
+    let mut diff: i64 = 0i64;
+    {
+        let mut x: i64 = 3i64;
+        let p3 = unsafe { address_of_mut(x) };
+        let _ = put<i64>(p3, 30i64).await;
+        if x != 30i64 {
+            diff = 1i64;
+        }
+    }
+    let _ = put<i64>(p1, 11i64).await;
+    let _ = put<i64>(p2, 25i64).await;
+    let old = unsafe { *p1 };
+    old * 10000i64 + x * 10i64 + diff
+}
+
+struct Big {
+    pub a: [8]i64,
+    pub n: i64,
+}
+
+fn bump(b: Big) -> Big {
+    let mut r = Big { a: [0i64; 8], n: b.n + 1i64 };
+    let mut i: usize = 0;
+    while i < 8usize {
+        r.a[i] = b.a[7usize - i];
+        i = i + 1;
+    }
+    r.n = r.n + b.a[0];
+    r
+}
+
+async fn rebuild() -> i64 {
+    let mut big = Big { a: [1i64, 2i64, 3i64, 4i64, 5i64, 6i64, 7i64, 8i64], n: 0i64 };
+    let pn = unsafe { address_of_mut(big.n) };
+    let _ = put<i64>(pn, 10i64).await;
+    big = bump(big);
+    big = bump(big);
+    let _ = put<i64>(unsafe { address_of_mut(big.a[7]) }, 8i64).await;
+    let mut s: i64 = 0i64;
+    let mut i: usize = 0;
+    while i < 8usize {
+        s = s + big.a[i];
+        i = i + 1;
+    }
+    print("big=");
+    print_int(s);
+    print(",");
+    print_int(big.n + s);
+    print("\n");
+    0i64
+}
+
+@derive(Copy)
+struct Pod {
+    pub a: u8,
+    pub b: i64,
+    pub c: bool,
+}
+
+async fn generic<T: Copy>(mut v: T, spare: T, next: T) -> T {
+    let p = unsafe { address_of_mut(v) };
+    let mut o: T = spare;
+    let q = unsafe { address_of_mut(o) };
+    let _ = put<T>(p, next).await;
+    let _ = put<T>(q, v).await;
+    o
+}
+
+async fn inner(out: *mut i64, v: i64) -> i64 {
+    let mut own: i64 = 0i64;
+    let p = unsafe { address_of_mut(own) };
+    let _ = put<i64>(p, v).await;
+    unsafe { *out = own; }
+    let _ = put<i64>(p, v + 1i64).await;
+    own
+}
+
+async fn mid(out: *mut i64, v: i64) -> i64 {
+    let mut own: i64 = 0i64;
+    let a = inner(unsafe { address_of_mut(own) }, v).await;
+    let _ = put<i64>(out, own).await;
+    a
+}
+
+async fn nested() -> i64 {
+    let mut a: i64 = 0i64;
+    let mut b: i64 = 0i64;
+    let r = mid(unsafe { address_of_mut(a) }, 123i64).await + mid(unsafe { address_of_mut(b) }, 456i64).await;
+    if r != 581i64 {
+        return -1i64;
+    }
+    a * 1000i64 + b
+}
+
+@derive(Copy)
+enum Slot {
+    Empty,
+    Full(i64, [2]i64),
+}
+
+async fn matched() -> i64 {
+    let mut s = Slot.Full(1i64, [2i64, 3i64]);
+    let p = unsafe { address_of_mut(s) };
+    let _ = put<Slot>(p, Slot.Full(100i64, [2i64, 405i64])).await;
+    match s {
+        Slot.Full(a, arr) => a * 5i64 + arr[0] + arr[1],
+        Slot.Empty => -1i64,
+    }
+}
+
+fn sum(s: view<[i64]>) -> i64 {
+    let mut t: i64 = 0i64;
+    let mut i: usize = 0;
+    while i < len(s) {
+        t = t + s[i];
+        i = i + 1;
+    }
+    t
+}
+
+async fn sliced() -> i64 {
+    let mut data: [6]i64 = [10i64, 20i64, 30i64, 40i64, 50i64, 60i64];
+    let mut lo: usize = 0usize;
+    let mut hi: usize = 1usize;
+    let plo = unsafe { address_of_mut(lo) };
+    let phi = unsafe { address_of_mut(hi) };
+    let _ = put<usize>(plo, 3usize).await;
+    let _ = put<usize>(phi, 5usize).await;
+    let t = sum(data[lo..hi]);
+    data[lo] = data[lo] + 0i64;
+    print("slice=");
+    print_int(lo as i64);
+    print(":");
+    print_int(hi as i64);
+    print(" idx=");
+    print_int(t);
+    print("\n");
+    t
+}
+
+struct Cell {
+    pub n: i64,
+}
+
+fn peek(v: view<Cell>) -> i64 {
+    v.n
+}
+
+async fn deferred(c: bool) -> i64 {
+    let x: Cell;
+    let mut seen: i64 = 0i64;
+    if c {
+        x = Cell { n: 5i64 };
+        seen = peek(view(x));
+    }
+    let next = if c { seen } else { seen + 1i64 };
+    let _ = put<i64>(unsafe { address_of_mut(seen) }, next).await;
+    seen
+}
+
+async fn early() -> i64 {
+    let mut acc: i64 = 0i64;
+    let p = unsafe { address_of_mut(acc) };
+    let mut i: i64 = 0i64;
+    'outer: loop {
+        let mut step: i64 = 0i64;
+        let ps = unsafe { address_of_mut(step) };
+        loop {
+            let _ = put<i64>(ps, 1i64).await;
+            if i == 1i64 {
+                i = i + 1i64;
+                continue 'outer;
+            }
+            break;
+        }
+        let _ = put<i64>(p, acc + step).await;
+        i = i + 1i64;
+        if acc == 3i64 {
+            return acc;
+        }
+        if i > 20i64 {
+            break 'outer;
+        }
+    }
+    -1i64
+}
+
+async fn widths() -> i64 {
+    let mut a: u8 = 0u8;
+    let mut b: u16 = 0u16;
+    let mut c: i8 = 0i8;
+    let mut d: bool = false;
+    let mut e: char = 'a';
+    let _ = put<u8>(unsafe { address_of_mut(a) }, 255u8).await;
+    let _ = put<u16>(unsafe { address_of_mut(b) }, 65535u16).await;
+    let _ = put<i8>(unsafe { address_of_mut(c) }, -128i8).await;
+    let _ = put<bool>(unsafe { address_of_mut(d) }, true).await;
+    let _ = put<char>(unsafe { address_of_mut(e) }, 'x').await;
+    print("widths=");
+    print_int(a as i64);
+    print(",");
+    print_int(b as i64);
+    print(",");
+    print_int(c as i64);
+    print(if d { ",true," } else { ",false," });
+    print(if e == 'x' { "x\n" } else { "?\n" });
+    0i64
+}
+
+struct Zst {}
+
+fn touch(z: view<Zst>) -> i64 {
+    1i64
+}
+
+async fn empty() -> i64 {
+    let z = Zst {};
+    let mut t: i64 = 0i64;
+    let _ = touch(view(z));
+    let _ = put<i64>(unsafe { address_of_mut(t) }, touch(view(z))).await;
+    t * touch(view(z))
+}
+
+fn pr(v: i64, m: i64) {
+    print_int(v / m);
+    print(",");
+    print_int(v % m);
+}
+
+fn main() -> i32 {
+    print("branch=");
+    pr(block_on(branch(true)), 100i64);
+    print(" ");
+    pr(block_on(branch(false)), 100i64);
+    print("\n");
+    let s = block_on(shadow());
+    print("shadow=");
+    print_int(s / 10000i64);
+    print(",");
+    print_int((s / 10i64) % 1000i64);
+    print(",");
+    print_int(s % 10i64);
+    print("\n");
+    let _ = block_on(rebuild());
+    print("generic=");
+    print_int(block_on(generic<i64>(7i64, 1i64, 77i64)));
+    let f = block_on(generic<f64>(0.5, 0.25, 1.5));
+    print(if f == 1.5 { " 1.5 " } else { " ? " });
+    let g = block_on(generic<Pod>(Pod { a: 1u8, b: 2i64, c: false }, Pod { a: 2u8, b: 3i64, c: false }, Pod { a: 9u8, b: 99i64, c: true }));
+    print_int(g.b * 10i64 + (g.a as i64) + (if g.c { 0i64 } else { 5000i64 }));
+    print("\nnested=");
+    pr(block_on(nested()), 1000i64);
+    print("\nmatched=");
+    print_int(block_on(matched()));
+    print("\n");
+    let _ = block_on(sliced());
+    print("deferred=");
+    print_int(block_on(deferred(false)));
+    print(" ");
+    print_int(block_on(deferred(true)));
+    print("\nearly=");
+    print_int(block_on(early()));
+    print("\n");
+    let _ = block_on(widths());
+    print("empty=");
+    print_int(block_on(empty()));
+    print("\n");
+    0i32
+}

@@ -6,6 +6,10 @@ Each run test is one `.ax` file that concatenates, verbatim, the live std source
 `src/<name>.axsrc`. This guarantees the suite exercises exactly the code in std/async and std/fiber
 (same scheme as tests/std/async/* and tests/std/fiber). `--check` fails when a committed bundle is out
 of date.
+
+The listed std sources are seeds: the generator adds the dependency closure of their imports and of the
+test program's imports (`tests/std/async/structured/bundle_closure.py`, T449a; adopted here by T428a), so a std
+module that gains an import cannot make a bundle stale or incomplete.
 """
 
 import argparse
@@ -13,21 +17,17 @@ import os
 import re
 import sys
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "std", "async", "structured"))
+from bundle_closure import bundle_sources  # noqa: E402  (shared helper, T449a)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
 SRC = os.path.join(HERE, "src")
 
-COMMON_PREREQS = [
-    "std/sync/atomic.ax",
-    "std/sys/windows/heap.ax",
-    "std/sys/windows/time.ax",
-    "std/sys/windows/thread.ax",
-    "std/time/time.ax",
-    "std/text/utf8.ax",
-    "std/text/string.ax",
-    "std/thread/local.ax",
-    "std/thread/mod.ax",
-]
+# The async tests need no std module beyond the import closure that `bundle_sources` derives from the sources
+# listed below and from the test program; std.text.string / std.thread bundled next to std.io (which defines its
+# own `String`/`string_new`) give AX_TYPE_MISMATCH on `Result.Ok(string_new())` (same fix as T449a).
+COMMON_PREREQS = []
 
 ASYNC_CORE = COMMON_PREREQS + [
     "std/async/waker.ax",
@@ -158,9 +158,10 @@ def build_bundle(name, covers, expected_stdout, sources, timeout):
         "// stdout: %s\n" % (timeout, covers, expected_stdout)
     )
     parts = [header.rstrip("\n")]
-    for rel in sources:
+    program = number_checks(read_text(os.path.join(SRC, name + ".axsrc"))).strip()
+    for rel in bundle_sources(ROOT, sources, program):
         parts.append(read_text(os.path.join(ROOT, rel.replace("/", os.sep))).strip())
-    parts.append(number_checks(read_text(os.path.join(SRC, name + ".axsrc"))).strip())
+    parts.append(program)
     parts.append(CHECK_DEF.strip())
     return "\n\n".join(parts) + "\n"
 

@@ -57716,6 +57716,11 @@ use compiler.mir.mir.MIR_OP_CONST
 use compiler.mir.mir.MIR_OP_COPY
 use compiler.mir.mir.MIR_OP_MOVE
 use compiler.mir.mir.MIR_PROJ_DEREF
+use compiler.mir.mir.MirTerminator
+use compiler.mir.mir.MIR_RVALUE_LEN
+use compiler.mir.mir.MIR_STMT_ATOMIC
+use compiler.mir.mir.MIR_STMT_STORAGE_DEAD
+use compiler.mir.mir.MIR_STMT_STORAGE_LIVE
 use compiler.mir.mir.MIR_PROJ_DOWNCAST
 use compiler.mir.mir.MIR_PROJ_FIELD
 use compiler.mir.mir.MIR_PROJ_INDEX
@@ -60451,6 +60456,237 @@ fn drop_expand_block(
 }
 
 // =================================================================================================
+// In-place `async fn` locals (ADR-0050, SPEC-33 AXS-ASY-043 item 7)
+// =================================================================================================
+
+// `map[slot]` is the state field of an in-place `poll` local, 0 for every other local.
+struct InplaceMap {
+    map: *mut u32,
+    len: usize,
+}
+
+fn inplace_field_of(m: view<InplaceMap>, l: u32) -> u32 {
+    if (l as usize) >= m.len {
+        return 0u32;
+    }
+    unsafe { *u32_at(m.map, l as usize) }
+}
+
+// `(*_1).field` followed by the projections of `place`.
+fn inplace_place(arena: mut_view<Arena>, field: u32, place: mut_view<MirPlace>) {
+    let n = place.proj_count;
+    let projs = arena_alloc_raw(mut_view(*arena), mir_mul_usize(n + 2, size_of<MirProjection>()), align_of<MirProjection>()) as *mut MirProjection;
+    unsafe {
+        let d0 = mir_proj_at(projs, 0);
+        mir_proj_reset(mut_view(*d0), MIR_PROJ_DEREF);
+        let d1 = mir_proj_at(projs, 1);
+        mir_proj_reset(mut_view(*d1), MIR_PROJ_FIELD);
+        (*d1).field_idx = field;
+        let mut i: usize = 0;
+        while i < n {
+            *mir_proj_at(projs, i + 2) = *mir_proj_at(place.projs, i);
+            i = i + 1;
+        }
+    }
+    place.local.v = 1u32;
+    place.projs = projs;
+    place.proj_count = n + 2;
+}
+
+// A projection names an index/bound local, not a place: its slot is refreshed from the field before the use.
+fn inplace_refresh(m: view<InplaceMap>, l: u32, buf: mut_view<DropStmtBuf>, arena: mut_view<Arena>) {
+    let field = inplace_field_of(m, l);
+    if field == 0u32 {
+        return;
+    }
+    let mut src = mir_local_place(l);
+    inplace_place(mut_view(*arena), field, mut_view(src));
+    let st = drop_stmt_buf_next(mut_view(*buf), mut_view(*arena));
+    unsafe {
+        mir_stmt_zero(mut_view(*st), MIR_STMT_ASSIGN);
+        mir_place_reset_u32(mut_view((*st).place), l);
+        (*st).rvalue.kind = MIR_RVALUE_USE;
+        mir_operand_zero(mut_view((*st).rvalue.use_op), MIR_OP_COPY);
+        mir_copy_place(mut_view((*st).rvalue.use_op.place), view(src));
+    }
+}
+
+fn inplace_rewrite_place(m: view<InplaceMap>, p: mut_view<MirPlace>, buf: mut_view<DropStmtBuf>, arena: mut_view<Arena>) {
+    let mut i: usize = 0;
+    while i < p.proj_count {
+        let pr = unsafe { mir_proj_at(p.projs, i) };
+        let pk = unsafe { (*pr).kind };
+        if pk == MIR_PROJ_INDEX {
+            inplace_refresh(m, (unsafe { (*pr).index_local.v }), mut_view(*buf), mut_view(*arena));
+        } else if pk == MIR_PROJ_SUB_SLICE {
+            if unsafe { (*pr).has_from } {
+                inplace_refresh(m, (unsafe { (*pr).from_local.v }), mut_view(*buf), mut_view(*arena));
+            }
+            if unsafe { (*pr).has_to } {
+                inplace_refresh(m, (unsafe { (*pr).to_local.v }), mut_view(*buf), mut_view(*arena));
+            }
+        }
+        i = i + 1;
+    }
+    let field = inplace_field_of(m, p.local.v);
+    if field != 0u32 {
+        inplace_place(mut_view(*arena), field, mut_view(*p));
+    }
+}
+
+fn inplace_rewrite_operand(m: view<InplaceMap>, op: mut_view<MirOperand>, buf: mut_view<DropStmtBuf>, arena: mut_view<Arena>) {
+    if op.kind == MIR_OP_COPY || op.kind == MIR_OP_MOVE {
+        inplace_rewrite_place(m, mut_view(op.place), mut_view(*buf), mut_view(*arena));
+    }
+}
+
+fn inplace_rewrite_rvalue(m: view<InplaceMap>, rv: mut_view<MirRvalue>, buf: mut_view<DropStmtBuf>, arena: mut_view<Arena>) {
+    let k = rv.kind;
+    if k == MIR_RVALUE_USE || k == MIR_RVALUE_CAST || k == MIR_RVALUE_UNARY_OP || k == MIR_RVALUE_REPEAT {
+        inplace_rewrite_operand(m, mut_view(rv.use_op), mut_view(*buf), mut_view(*arena));
+        if k == MIR_RVALUE_REPEAT && (rv.repeat_count_op as usize) != 0 {
+            inplace_rewrite_operand(m, unsafe { mut_view(*rv.repeat_count_op) }, mut_view(*buf), mut_view(*arena));
+        }
+    } else if k == MIR_RVALUE_REF || k == MIR_RVALUE_LEN || k == MIR_RVALUE_DISCRIMINANT {
+        inplace_rewrite_place(m, mut_view(rv.place), mut_view(*buf), mut_view(*arena));
+    } else if k == MIR_RVALUE_BINARY_OP || k == MIR_RVALUE_OVERFLOWS_BINARY_OP {
+        inplace_rewrite_operand(m, mut_view(rv.lhs), mut_view(*buf), mut_view(*arena));
+        inplace_rewrite_operand(m, mut_view(rv.rhs), mut_view(*buf), mut_view(*arena));
+    } else if k == MIR_RVALUE_AGGREGATE {
+        let mut i: usize = 0;
+        while i < rv.operand_count {
+            let op = unsafe { mir_op_at(rv.operands, i) };
+            inplace_rewrite_operand(m, unsafe { mut_view(*op) }, mut_view(*buf), mut_view(*arena));
+            i = i + 1;
+        }
+    }
+}
+
+fn inplace_rewrite_terminator(m: view<InplaceMap>, term: mut_view<MirTerminator>, buf: mut_view<DropStmtBuf>, arena: mut_view<Arena>) {
+    let tk = term.kind;
+    if tk == MIR_TERM_SWITCH_INT {
+        inplace_rewrite_operand(m, mut_view(term.discr), mut_view(*buf), mut_view(*arena));
+    } else if tk == MIR_TERM_CALL {
+        inplace_rewrite_operand(m, mut_view(term.func), mut_view(*buf), mut_view(*arena));
+        let mut a: usize = 0;
+        while a < term.arg_count {
+            let op = unsafe { mir_op_at(term.args, a) };
+            inplace_rewrite_operand(m, unsafe { mut_view(*op) }, mut_view(*buf), mut_view(*arena));
+            a = a + 1;
+        }
+        if term.has_destination {
+            inplace_rewrite_place(m, mut_view(term.destination), mut_view(*buf), mut_view(*arena));
+        }
+    } else if tk == MIR_TERM_ASSERT {
+        inplace_rewrite_operand(m, mut_view(term.cond), mut_view(*buf), mut_view(*arena));
+    } else if tk == MIR_TERM_DROP {
+        inplace_rewrite_place(m, mut_view(term.drop_place), mut_view(*buf), mut_view(*arena));
+    }
+}
+
+// Is `slot` a whole in-place local and `field_pl` exactly its state field `(*_1).field`?
+fn inplace_is_own_field(m: view<InplaceMap>, slot: view<MirPlace>, field_pl: view<MirPlace>) -> bool {
+    let field = inplace_field_of(m, slot.local.v);
+    if field == 0u32 || slot.proj_count != 0 || field_pl.local.v != 1u32 || field_pl.proj_count != 2 {
+        return false;
+    }
+    let d0 = unsafe { mir_proj_at(field_pl.projs, 0) };
+    let d1 = unsafe { mir_proj_at(field_pl.projs, 1) };
+    (unsafe { (*d0).kind }) == MIR_PROJ_DEREF && (unsafe { (*d1).kind }) == MIR_PROJ_FIELD && (unsafe { (*d1).field_idx }) == field
+}
+
+fn inplace_is_save_or_restore(m: view<InplaceMap>, st: view<MirStmt>) -> bool {
+    if st.kind != MIR_STMT_ASSIGN || st.rvalue.kind != MIR_RVALUE_USE || st.rvalue.use_op.kind != MIR_OP_MOVE {
+        return false;
+    }
+    inplace_is_own_field(m, view(st.place), view(st.rvalue.use_op.place)) ||
+        inplace_is_own_field(m, view(st.rvalue.use_op.place), view(st.place))
+}
+
+fn inplace_is_marker(st: view<MirStmt>) -> bool {
+    st.kind == MIR_STMT_STORAGE_LIVE && st.place.local.v == 1u32 && st.place.proj_count == 2
+}
+
+// Gives the in-place locals of a synthesized `poll` body their storage in the state machine: the dispatch block
+// names each slot and its field (`StorageLive(slot)` with `place = (*_1).field`, `async_lower.ax`). Slot and field
+// never hold different values (the field is only written by the save and read by the restore of its slot), so
+// every place rooted at the slot becomes `(*_1).field..` and the save/restore moves and storage markers of the slot
+// are removed. Runs after drop elaboration, whose flags therefore treat in-place locals like all other locals.
+fn drop_coalesce_inplace(body: mut_view<MirBody>, arena: mut_view<Arena>) {
+    if !body.async_lowered || body.bb_count == 0 {
+        return;
+    }
+    let bb0 = unsafe { mir_bb_at(body.bbs, 0) };
+    let mut m = InplaceMap { map: 0 as *mut u32, len: 0 };
+    let mut s: usize = 0;
+    while s < (unsafe { (*bb0).stmt_count }) {
+        let st = unsafe { mir_stmt_at((*bb0).stmts, s) };
+        if inplace_is_marker(unsafe { view(*st) }) {
+            if m.len == 0 {
+                m.len = body.local_count;
+                m.map = arena_alloc_raw(mut_view(*arena), m.len << 2, align_of<u32>()) as *mut u32;
+                let mut z: usize = 0;
+                while z < m.len {
+                    unsafe { *u32_at(m.map, z) = 0u32; }
+                    z = z + 1;
+                }
+            }
+            let slot = (unsafe { (*st).storage_local.v }) as usize;
+            if slot < m.len {
+                let fp = unsafe { mir_proj_at((*st).place.projs, 1) };
+                unsafe { *u32_at(m.map, slot) = (*fp).field_idx; }
+            }
+        }
+        s = s + 1;
+    }
+    if m.len == 0 {
+        return;
+    }
+    let mut b: usize = 0;
+    while b < body.bb_count {
+        let bb = unsafe { mir_bb_at(body.bbs, b) };
+        let sc = unsafe { (*bb).stmt_count };
+        let mut buf = drop_stmt_buf_new(mut_view(*arena), sc + 4);
+        s = 0;
+        while s < sc {
+            let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+            let sk = unsafe { (*st).kind };
+            let is_storage = sk == MIR_STMT_STORAGE_LIVE || sk == MIR_STMT_STORAGE_DEAD;
+            let dead = (is_storage && inplace_field_of(view(m), (unsafe { (*st).storage_local.v })) != 0u32) ||
+                inplace_is_save_or_restore(view(m), unsafe { view(*st) });
+            if !dead {
+                unsafe {
+                    if sk == MIR_STMT_ASSIGN {
+                        inplace_rewrite_rvalue(view(m), mut_view((*st).rvalue), mut_view(buf), mut_view(*arena));
+                        inplace_rewrite_place(view(m), mut_view((*st).place), mut_view(buf), mut_view(*arena));
+                    } else if sk == MIR_STMT_DROP {
+                        inplace_rewrite_place(view(m), mut_view((*st).place), mut_view(buf), mut_view(*arena));
+                    } else if sk == MIR_STMT_ATOMIC {
+                        inplace_rewrite_operand(view(m), mut_view((*st).rvalue.use_op), mut_view(buf), mut_view(*arena));
+                        inplace_rewrite_operand(view(m), mut_view((*st).rvalue.lhs), mut_view(buf), mut_view(*arena));
+                        inplace_rewrite_operand(view(m), mut_view((*st).rvalue.rhs), mut_view(buf), mut_view(*arena));
+                        inplace_rewrite_place(view(m), mut_view((*st).place), mut_view(buf), mut_view(*arena));
+                    }
+                    drop_stmt_buf_push_copy(mut_view(buf), mut_view(*arena), view(*st));
+                }
+            }
+            s = s + 1;
+        }
+        if unsafe { (*bb).has_terminator } {
+            unsafe {
+                inplace_rewrite_terminator(view(m), mut_view((*bb).terminator), mut_view(buf), mut_view(*arena));
+            }
+        }
+        unsafe {
+            (*bb).stmts = buf.stmts;
+            (*bb).stmt_count = buf.count;
+            (*bb).stmt_cap = buf.cap;
+        }
+        b = b + 1;
+    }
+}
+
+// =================================================================================================
 // Entry point (port of ax_mir_drop_elaborate)
 // =================================================================================================
 
@@ -60686,6 +60922,9 @@ pub fn mir_drop_elaborate(
         }
         start_bb = current_count;
     }
+
+    // 6. In-place locals of a lowered `async fn` move into their state field (ADR-0050).
+    drop_coalesce_inplace(mut_view(*body), mut_view(*arena));
 }
 
 // Axiom Compiler — HIR+THIR -> MIR Lowering & Builder (compiler/mir/builder.ax)
@@ -76301,6 +76540,10 @@ use compiler.mir.mir.MirTerminator
 use compiler.mir.mir.MIR_LOCAL_RETURN
 use compiler.mir.mir.MIR_LOCAL_ARG
 use compiler.mir.mir.MIR_LOCAL_TEMP
+use compiler.mir.mir.MIR_LOCAL_USER
+use compiler.mir.mir.MIR_LOCAL_STATIC
+use compiler.mir.mir.MIR_LOCAL_TLS
+use compiler.mir.mir.MIR_LOCAL_CONST
 use compiler.mir.mir.MIR_OP_COPY
 use compiler.mir.mir.MIR_OP_MOVE
 use compiler.mir.mir.MIR_OP_CONST
@@ -76333,6 +76576,7 @@ use compiler.mir.mir.MIR_PROJ_DEREF
 use compiler.mir.mir.MIR_PROJ_FIELD
 use compiler.mir.mir.MIR_PROJ_INDEX
 use compiler.mir.mir.MIR_PROJ_DOWNCAST
+use compiler.mir.mir.MIR_PROJ_SUB_SLICE
 use compiler.mir.mir.MIR_BORROW_MUT
 use compiler.mir.mir.MIR_DROP_FLAG_NONE
 use compiler.mir.mir.MIR_REGION_UNKNOWN
@@ -76406,6 +76650,9 @@ pub struct AsyncLayoutData {
     pub sp_spans: *mut Span,
     pub live_names: *mut *mut StrId,
     pub live_counts: *mut usize,
+    // Per suspension point, parallel to `live_names`: 1u8 when the live local stays in place in its state
+    // field for its whole lifetime (address-observable, ADR-0050), 0u8 when it is saved/restored.
+    pub live_in_place: *mut *mut u8,
 }
 
 unsafe fn span_at_mut(base: *mut Span, idx: usize) -> *mut Span {
@@ -76836,6 +77083,78 @@ pub fn async_local_maybe_init_at(body: view<MirBody>, target_bb: usize, l: u32, 
     result
 }
 
+// ---- Address-observable locals (ADR-0050, SPEC-33 AXS-ASY-043 item 7) ----
+
+// Locals that stand for a static, thread-local or constant: their storage is not in the frame.
+fn al_local_is_global(decl: view<MirLocalDecl>) -> bool {
+    decl.kind == MIR_LOCAL_STATIC || decl.kind == MIR_LOCAL_TLS || decl.kind == MIR_LOCAL_CONST
+}
+
+// Conservative "address observable" test on MIR (ADR-0050): `l` (or a projection of it) is the base of a
+// borrow / address-of rvalue somewhere in the body. `address_of(x)`, `address_of_mut(x)`, `view(x)` and
+// `mut_view(x)` (including the implicit receiver borrow of a method call) all lower to `Ref`.
+pub fn async_local_is_addr_observable(body: view<MirBody>, l: u32) -> bool {
+    al_local_is_borrowed(body, l, 0 as *const Thir, 0 as *const Span)
+}
+
+// `Ref` of `l` restricted to the borrows accepted by the filters: with `thir`, only borrows stored as a raw
+// pointer (`address_of*`); with `within`, only borrows whose statement lies inside that source span.
+fn al_local_is_borrowed(body: view<MirBody>, l: u32, thir: *const Thir, within: *const Span) -> bool {
+    let mut b: usize = 0;
+    while b < body.bb_count {
+        let bb = unsafe { mir_bb_at(body.bbs, b) };
+        let sc = unsafe { (*bb).stmt_count };
+        let mut s: usize = 0;
+        while s < sc {
+            let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+            if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN && (unsafe { (*st).rvalue.kind }) == MIR_RVALUE_REF &&
+               (unsafe { (*st).rvalue.place.local.v }) == l {
+                let mut ok = true;
+                if (thir as usize) != 0 {
+                    let dty = unsafe { mir_drop_place_type(body, view(*thir), view((*st).place)) };
+                    let dt = unsafe { type_get(view((*thir).interner), TypeId { v: dty.v }) };
+                    ok = (dt as usize) != 0 && (unsafe { (*dt).kind }) == TY_PTR;
+                }
+                if ok && (within as usize) != 0 {
+                    ok = unsafe { (*st).span.file.v == (*within).file.v && (*st).span.start >= (*within).start && (*st).span.end <= (*within).end };
+                }
+                if ok {
+                    return true;
+                }
+            }
+            s = s + 1;
+        }
+        b = b + 1;
+    }
+    false
+}
+
+// Address-observable storage can be reached through a pointer the MIR does not connect to the local, so it is
+// live across a suspension while it is initialized and in scope (`async_local_maybe_init_at` ends at `StorageDead`),
+// not only while the local itself is named again (ADR-0050). This holds for user variables and parameters, for
+// temporaries converted to a raw pointer, and for temporaries borrowed inside the awaited expression
+// (`make().method().await`). Views are not storage in this sense (they never cross `.await`, AXS-ASY-034).
+fn al_local_storage_live_across(body: view<MirBody>, thir: *const Thir, sp_span: *const Span, l: u32, param_m: usize) -> bool {
+    let decl = unsafe { mir_local_at(body.locals, l as usize) };
+    if al_local_is_global(unsafe { view(*decl) }) {
+        return false;
+    }
+    let lt = unsafe { type_get(view((*thir).interner), TypeId { v: (*decl).ty.v }) };
+    if (lt as usize) == 0 || (unsafe { (*lt).kind }) == TY_VIEW || (unsafe { (*lt).kind }) == TY_MUT_VIEW {
+        return false;
+    }
+    let is_user = (l as usize) <= param_m || (unsafe { (*decl).kind }) == MIR_LOCAL_USER;
+    if is_user {
+        if !async_local_is_addr_observable(body, l) {
+            return false;
+        }
+    } else if !al_local_is_borrowed(body, l, thir, 0 as *const Span) &&
+        !al_local_is_borrowed(body, l, 0 as *const Thir, sp_span) {
+        return false;
+    }
+    true
+}
+
 // ---- Type Interning Helpers ----
 
 fn al_item_is_std_prelude(it: *const HirItem, str_in: *const StrInterner) -> bool {
@@ -77016,86 +77335,126 @@ fn init_place(p: mut_view<MirPlace>, local_v: u32, projs: *mut MirProjection, co
     p.proj_count = count;
 }
 
-fn remap_place(p: mut_view<MirPlace>, map: *const u32, map_len: usize) {
-    let old_loc = (p.local.v) as usize;
-    if old_loc < map_len {
-        p.local.v = unsafe { *u32_at(map as *mut u32, old_loc) };
+// Local renaming from the source coroutine body into the synthesized `poll` body.
+struct AlRemap {
+    arena: *mut Arena,
+    map: *const u32,
+    len: usize,
+}
+
+fn al_map_local(rm: view<AlRemap>, l: u32) -> u32 {
+    let li = l as usize;
+    if li < rm.len {
+        return unsafe { *u32_at(rm.map as *mut u32, li) };
     }
+    l
+}
+
+// Renames the locals of `p`. The projection array is copied first: the builder lets several places share one
+// array (a bounds check, a load and a store of `buf[i]`), and its index locals must be renamed only once.
+fn remap_place(rm: view<AlRemap>, p: mut_view<MirPlace>) {
+    p.local.v = al_map_local(rm, p.local.v);
     p.drop_flag = MIR_DROP_FLAG_NONE;
+    let n = p.proj_count;
+    if n == 0 {
+        return;
+    }
+    let projs = al_alloc_z(unsafe { mut_view(*rm.arena) }, mul_usize(n, size_of<MirProjection>()), align_of<MirProjection>()) as *mut MirProjection;
     let mut i: usize = 0;
-    while i < p.proj_count {
-        let pr = unsafe { mir_proj_at(p.projs, i) };
-        if (unsafe { (*pr).kind }) == MIR_PROJ_INDEX {
-            let iloc = (unsafe { (*pr).index_local.v }) as usize;
-            if iloc < map_len {
-                unsafe { (*pr).index_local.v = *u32_at(map as *mut u32, iloc); }
+    while i < n {
+        let src = unsafe { mir_proj_at(p.projs, i) };
+        let dst = unsafe { mir_proj_at(projs, i) };
+        unsafe {
+            *dst = *src;
+            let pk = (*dst).kind;
+            if pk == MIR_PROJ_INDEX {
+                (*dst).index_local.v = al_map_local(rm, (*dst).index_local.v);
+            } else if pk == MIR_PROJ_SUB_SLICE {
+                if (*dst).has_from {
+                    (*dst).from_local.v = al_map_local(rm, (*dst).from_local.v);
+                }
+                if (*dst).has_to {
+                    (*dst).to_local.v = al_map_local(rm, (*dst).to_local.v);
+                }
             }
         }
         i = i + 1;
     }
+    p.projs = projs;
 }
 
-fn remap_operand(op: mut_view<MirOperand>, map: *const u32, map_len: usize) {
+fn remap_operand(rm: view<AlRemap>, op: mut_view<MirOperand>) {
     if op.kind == MIR_OP_COPY || op.kind == MIR_OP_MOVE {
-        remap_place(mut_view(op.place), map, map_len);
+        remap_place(rm, mut_view(op.place));
     }
 }
 
-fn remap_rvalue(rv: mut_view<MirRvalue>, map: *const u32, map_len: usize) {
+fn remap_rvalue(rm: view<AlRemap>, rv: mut_view<MirRvalue>) {
     let k = rv.kind;
     if k == MIR_RVALUE_USE {
-        remap_operand(mut_view(rv.use_op), map, map_len);
+        remap_operand(rm, mut_view(rv.use_op));
     } else if k == MIR_RVALUE_REPEAT {
-        remap_operand(mut_view(rv.use_op), map, map_len);
+        remap_operand(rm, mut_view(rv.use_op));
         if (rv.repeat_count_op as usize) != 0 {
-            remap_operand(unsafe { mut_view(*rv.repeat_count_op) }, map, map_len);
+            remap_operand(rm, unsafe { mut_view(*rv.repeat_count_op) });
         }
     } else if k == MIR_RVALUE_REF {
-        remap_place(mut_view(rv.place), map, map_len);
+        remap_place(rm, mut_view(rv.place));
     } else if k == MIR_RVALUE_LEN {
-        remap_place(mut_view(rv.place), map, map_len);
+        remap_place(rm, mut_view(rv.place));
     } else if k == MIR_RVALUE_CAST {
-        remap_operand(mut_view(rv.use_op), map, map_len);
+        remap_operand(rm, mut_view(rv.use_op));
     } else if k == MIR_RVALUE_BINARY_OP || k == MIR_RVALUE_OVERFLOWS_BINARY_OP {
-        remap_operand(mut_view(rv.lhs), map, map_len);
-        remap_operand(mut_view(rv.rhs), map, map_len);
+        remap_operand(rm, mut_view(rv.lhs));
+        remap_operand(rm, mut_view(rv.rhs));
     } else if k == MIR_RVALUE_UNARY_OP {
-        remap_operand(mut_view(rv.use_op), map, map_len);
+        remap_operand(rm, mut_view(rv.use_op));
     } else if k == MIR_RVALUE_DISCRIMINANT {
-        remap_place(mut_view(rv.place), map, map_len);
+        remap_place(rm, mut_view(rv.place));
     } else if k == MIR_RVALUE_AGGREGATE {
         let mut i: usize = 0;
         while i < rv.operand_count {
             let op = unsafe { mir_op_at(rv.operands, i) };
-            remap_operand(unsafe { mut_view(*op) }, map, map_len);
+            remap_operand(rm, unsafe { mut_view(*op) });
             i = i + 1;
         }
     }
 }
 
-fn remap_stmt(st: mut_view<MirStmt>, map: *const u32, map_len: usize) {
+fn remap_stmt(rm: view<AlRemap>, st: mut_view<MirStmt>) {
     let sk = st.kind;
     if sk == MIR_STMT_ASSIGN {
-        remap_place(mut_view(st.place), map, map_len);
-        remap_rvalue(mut_view(st.rvalue), map, map_len);
+        remap_place(rm, mut_view(st.place));
+        remap_rvalue(rm, mut_view(st.rvalue));
     } else if sk == MIR_STMT_STORAGE_LIVE || sk == MIR_STMT_STORAGE_DEAD {
-        let sloc = (st.storage_local.v) as usize;
-        if sloc < map_len {
-            st.storage_local.v = unsafe { *u32_at(map as *mut u32, sloc) };
-        }
+        st.storage_local.v = al_map_local(rm, st.storage_local.v);
     } else if sk == MIR_STMT_DROP {
-        remap_place(mut_view(st.place), map, map_len);
+        remap_place(rm, mut_view(st.place));
     }
 }
 
-fn remap_terminator(term: mut_view<MirTerminator>, map: *const u32, map_len: usize, bb_offset: usize) {
+// `StorageLive(slot)` with `place = (*_1).field`: tells `drop_coalesce_inplace` that `slot` lives in that field.
+fn al_emit_inplace_marker(arena: mut_view<Arena>, st: *mut MirStmt, slot: u32, field: u32) {
+    let pr = al_alloc_z(mut_view(*arena), mul_usize(2, size_of<MirProjection>()), align_of<MirProjection>()) as *mut MirProjection;
+    unsafe {
+        (*pr).kind = MIR_PROJ_DEREF;
+        let pr1 = mir_proj_at(pr, 1);
+        (*pr1).kind = MIR_PROJ_FIELD;
+        (*pr1).field_idx = field;
+        mir_stmt_zero(mut_view(*st), MIR_STMT_STORAGE_LIVE);
+        (*st).storage_local.v = slot;
+        init_place(mut_view((*st).place), 1u32, pr, 2);
+    }
+}
+
+fn remap_terminator(rm: view<AlRemap>, term: mut_view<MirTerminator>, bb_offset: usize) {
     let tk = term.kind;
     if tk == MIR_TERM_GOTO {
         term.goto_target.v = term.goto_target.v + (bb_offset as u32);
     } else if tk == MIR_TERM_RETURN {
         // Handled specially
     } else if tk == MIR_TERM_SWITCH_INT {
-        remap_operand(mut_view(term.discr), map, map_len);
+        remap_operand(rm, mut_view(term.discr));
         let sc = term.switch_count;
         let mut s: usize = 0;
         while s < sc {
@@ -77105,29 +77464,29 @@ fn remap_terminator(term: mut_view<MirTerminator>, map: *const u32, map_len: usi
         }
         term.otherwise.v = term.otherwise.v + (bb_offset as u32);
     } else if tk == MIR_TERM_CALL {
-        remap_operand(mut_view(term.func), map, map_len);
+        remap_operand(rm, mut_view(term.func));
         let ac = term.arg_count;
         let mut a: usize = 0;
         while a < ac {
             let op = unsafe { mir_op_at(term.args, a) };
-            remap_operand(unsafe { mut_view(*op) }, map, map_len);
+            remap_operand(rm, unsafe { mut_view(*op) });
             a = a + 1;
         }
         if term.has_destination {
-            remap_place(mut_view(term.destination), map, map_len);
+            remap_place(rm, mut_view(term.destination));
             term.call_target.v = term.call_target.v + (bb_offset as u32);
         }
         if (term.call_unwind.v) > 0u32 && (term.call_unwind.v) != 0xFFFFFFFFu32 {
             term.call_unwind.v = term.call_unwind.v + (bb_offset as u32);
         }
     } else if tk == MIR_TERM_DROP {
-        remap_place(mut_view(term.drop_place), map, map_len);
+        remap_place(rm, mut_view(term.drop_place));
         term.drop_target.v = term.drop_target.v + (bb_offset as u32);
         if (term.drop_unwind.v) > 0u32 && (term.drop_unwind.v) != 0xFFFFFFFFu32 {
             term.drop_unwind.v = term.drop_unwind.v + (bb_offset as u32);
         }
     } else if tk == MIR_TERM_ASSERT {
-        remap_operand(mut_view(term.cond), map, map_len);
+        remap_operand(rm, mut_view(term.cond));
         term.assert_target.v = term.assert_target.v + (bb_offset as u32);
         if (term.assert_unwind.v) > 0u32 && (term.assert_unwind.v) != 0xFFFFFFFFu32 {
             term.assert_unwind.v = term.assert_unwind.v + (bb_offset as u32);
@@ -77395,11 +77754,18 @@ pub fn mir_lower_async_body(
 
         let mut l: u32 = 1u32;
         while (l as usize) < orig_lc {
-            if l != fut_l && l != dest_l {
+            let dest_whole = l == dest_l && (unsafe { (*spi).dest_place.proj_count }) == 0;
+            if l != fut_l {
                 let l_ty = TypeId { v: unsafe { (*mir_local_at((*body).locals, l as usize)).ty.v } };
                 let copy_moves = unsafe { mir_type_needs_drop(l_ty, view(*thir), view(*hir), view(*str_in)) };
                 let is_assigned = async_local_maybe_init_at(unsafe { view(*body) }, sp_bb, l, (l as usize) <= param_m, copy_moves);
-                if is_assigned && async_local_used_from(unsafe { view(*body) }, resume_bb, l) {
+                // A destination that is overwritten as a whole needs no old value unless its address is observable;
+                // a destination inside `l` needs the rest of `l`.
+                let is_live = is_assigned && (
+                    (l == dest_l && !dest_whole) ||
+                    (!dest_whole && async_local_used_from(unsafe { view(*body) }, resume_bb, l)) ||
+                    al_local_storage_live_across(unsafe { view(*body) }, thir as *const Thir, unsafe { address_of((*spi).span) }, l, param_m));
+                if is_live {
                     unsafe {
                         *u32_at(sp_live, sp_live_cnt) = l;
                     }
@@ -77428,6 +77794,25 @@ pub fn mir_lower_async_body(
             (*spi).live_count = sp_live_cnt;
         }
         k = k + 1;
+    }
+
+    // 2b. Address-observable live locals stay in place in their state field (ADR-0050, AXS-ASY-043 item 7):
+    //     `inplace_field[l]` = field index, 0 = saved/restored. The `poll` body below is built with save/restore
+    //     moves for every live local, so that drop elaboration tracks in-place locals like any other local;
+    //     `bb_dispatch` then names each in-place slot with its field (`al_emit_inplace_marker`) and
+    //     `mir_drop_elaborate` finally coalesces slot and field (`drop_coalesce_inplace`): every use becomes
+    //     `(*_1).field` and the save/restore moves disappear.
+    let inplace_field = al_alloc_z(mut_view(*arena), mul_usize(orig_lc + 1, size_of<u32>()), align_of<u32>()) as *mut u32;
+    let mut inplace_count: usize = 0;
+    let mut ip: usize = 0;
+    while ip < unique_live_count {
+        let l = unsafe { *u32_at(unique_live_buf, ip) };
+        let l_decl = unsafe { mir_local_at((*body).locals, l as usize) };
+        if async_local_is_addr_observable(unsafe { view(*body) }, l) && !al_local_is_global(unsafe { view(*l_decl) }) {
+            unsafe { *u32_at(inplace_field, l as usize) = (1 + param_m + ip) as u32; }
+            inplace_count = inplace_count + 1;
+        }
+        ip = ip + 1;
     }
 
     // 3. Setup structural state machine layout for `coro_t`
@@ -77541,6 +77926,7 @@ pub fn mir_lower_async_body(
     let sp_spans = al_alloc_z(unsafe { mut_view((*thir).interner.arena) }, mul_usize(if sp_count == 0 { 1 } else { sp_count }, size_of<Span>()), align_of<Span>()) as *mut Span;
     let live_names = al_alloc_z(unsafe { mut_view((*thir).interner.arena) }, mul_usize(if sp_count == 0 { 1 } else { sp_count }, size_of<*mut StrId>()), align_of<*mut StrId>()) as *mut *mut StrId;
     let live_counts = al_alloc_z(unsafe { mut_view((*thir).interner.arena) }, mul_usize(if sp_count == 0 { 1 } else { sp_count }, size_of<usize>()), align_of<usize>()) as *mut usize;
+    let live_in_place = al_alloc_z(unsafe { mut_view((*thir).interner.arena) }, mul_usize(if sp_count == 0 { 1 } else { sp_count }, size_of<*mut u8>()), align_of<*mut u8>()) as *mut *mut u8;
     let mut lk: usize = 0;
     while lk < sp_count {
         let spi = unsafe { (sp_info as usize + lk * size_of<SuspendPointInfo>()) as *mut SuspendPointInfo };
@@ -77551,21 +77937,25 @@ pub fn mir_lower_async_body(
         }
         if live_cnt > 0 {
             let l_names = al_alloc_z(unsafe { mut_view((*thir).interner.arena) }, mul_usize(live_cnt, size_of<StrId>()), align_of<StrId>()) as *mut StrId;
+            let l_inpl = al_alloc_z(unsafe { mut_view((*thir).interner.arena) }, live_cnt, 1);
             let mut li: usize = 0;
             while li < live_cnt {
                 let l_orig = unsafe { *u32_at((*spi).live_locals, li) };
                 let loc_decl = unsafe { mir_local_at((*body).locals, l_orig as usize) };
                 unsafe {
                     *strid_at_mut(l_names, li) = (*loc_decl).name;
+                    *u8_at(l_inpl, li) = if (*u32_at(inplace_field, l_orig as usize)) != 0u32 { 1u8 } else { 0u8 };
                 }
                 li = li + 1;
             }
             unsafe {
                 *(live_names + lk) = l_names;
+                *(live_in_place + lk) = l_inpl;
             }
         } else {
             unsafe {
                 *(live_names + lk) = 0 as *mut StrId;
+                *(live_in_place + lk) = 0 as *mut u8;
             }
         }
         lk = lk + 1;
@@ -77576,6 +77966,7 @@ pub fn mir_lower_async_body(
         (*layout_data).sp_spans = sp_spans;
         (*layout_data).live_names = live_names;
         (*layout_data).live_counts = live_counts;
+        (*layout_data).live_in_place = live_in_place;
         (*coro_mut).captures = layout_data as *mut ClosureCapture;
         (*coro_mut).capture_count = sp_count;
     }
@@ -77862,6 +78253,8 @@ pub fn mir_lower_async_body(
         ol = ol + 1;
     }
 
+    let rm = AlRemap { arena: unsafe { address_of(*arena) as *mut Arena }, map: local_map as *const u32, len: orig_lc };
+
     // Block Allocation for poll_body:
     // bb0: bb_dispatch
     // bb1: bb_unpack_0
@@ -77883,7 +78276,7 @@ pub fn mir_lower_async_body(
     // _3 = (*_1).0;
     // switchInt(_3) -> [0: bb1, 1: bb_poll_0, ..., N: bb_poll_{N-1}, otherwise: bb_invalid]
     let bb_disp_ptr = unsafe { mir_bb_at(poll_bbs, 0) };
-    let disp_stmts = al_alloc_z(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt;
+    let disp_stmts = al_alloc_z(mut_view(*arena), mul_usize(1 + inplace_count, size_of<MirStmt>()), align_of<MirStmt>()) as *mut MirStmt;
     let pr_disp = al_alloc_z(mut_view(*arena), mul_usize(2, size_of<MirProjection>()), align_of<MirProjection>()) as *mut MirProjection;
     let sw_values = al_alloc_z(mut_view(*arena), mul_usize(1 + sp_count, size_of<u64>()), align_of<u64>()) as *mut u64;
     let sw_targets = al_alloc_z(mut_view(*arena), mul_usize(1 + sp_count, size_of<MirBbId>()), align_of<MirBbId>()) as *mut MirBbId;
@@ -77899,8 +78292,18 @@ pub fn mir_lower_async_body(
         (*pr_disp1).field_idx = 0u32; // state_tag
         init_place(mut_view((*disp_stmts).rvalue.use_op.place), 1u32, pr_disp, 2);
 
+        let mut dn: usize = 1;
+        let mut dl: usize = 1;
+        while dl < orig_lc {
+            let df = *u32_at(inplace_field, dl);
+            if df != 0u32 {
+                al_emit_inplace_marker(mut_view(*arena), mir_stmt_at(disp_stmts, dn), *u32_at(local_map, dl), df);
+                dn = dn + 1;
+            }
+            dl = dl + 1;
+        }
         (*bb_disp_ptr).stmts = disp_stmts;
-        (*bb_disp_ptr).stmt_count = 1;
+        (*bb_disp_ptr).stmt_count = dn;
 
         // State 0 -> bb1 (bb_unpack_0)
         *mir_u64_at(sw_values, 0) = 0u64;
@@ -77992,7 +78395,7 @@ pub fn mir_lower_async_body(
                 let d_st = unsafe { mir_stmt_at(stmts, si) };
                 unsafe {
                     *d_st = *s_st;
-                    remap_stmt(mut_view(*d_st), local_map as *const u32, orig_lc);
+                    remap_stmt(view(rm), mut_view(*d_st));
                 }
                 si = si + 1;
             }
@@ -78091,7 +78494,7 @@ pub fn mir_lower_async_body(
                     (*s_fut).rvalue.kind = MIR_RVALUE_USE;
                     mir_operand_zero(mut_view((*s_fut).rvalue.use_op), MIR_OP_MOVE);
                     mir_copy_place(mut_view((*s_fut).rvalue.use_op.place), view((*spi).fut_place));
-                    remap_place(mut_view((*s_fut).rvalue.use_op.place), local_map as *const u32, orig_lc);
+                    remap_place(view(rm), mut_view((*s_fut).rvalue.use_op.place));
                 }
 
                 // 2. Save live locals: (*_1).(live_field_idx) = move _v;
@@ -78169,7 +78572,7 @@ pub fn mir_lower_async_body(
         } else {
             // Remap normal terminator
             unsafe {
-                remap_terminator(mut_view((*d_bb).terminator), local_map as *const u32, orig_lc, bb_offset);
+                remap_terminator(view(rm), mut_view((*d_bb).terminator), bb_offset);
             }
         }
         b = b + 1;
@@ -78295,8 +78698,8 @@ pub fn mir_lower_async_body(
         }
 
         // 8.4 bb_ready_k:
-        // dest_place = move _poll_res.0 (downcast 0, field 0);
         // restore live locals: _v = move (*_1).(live_field_idx);
+        // dest_place = move _poll_res.0 (downcast 0, field 0);
         // (*_1).0 = 0xFFFF_FFFEu32;
         // goto resume_bb;
         let live_cnt = unsafe { (*spi).live_count };
@@ -78304,25 +78707,7 @@ pub fn mir_lower_async_body(
         let ready_bb = unsafe { mir_bb_at(poll_bbs, bb_ready_k_idx) };
         let ready_stmts = al_alloc_z(mut_view(*arena), mul_usize(total_ready_stmts, size_of<MirStmt>()), align_of<MirStmt>()) as *mut MirStmt;
 
-        // 1. dest_place = move _poll_res.Ready.0
-        let rst0 = unsafe { mir_stmt_at(ready_stmts, 0) };
-        let pr_dc = al_alloc_z(mut_view(*arena), mul_usize(2, size_of<MirProjection>()), align_of<MirProjection>()) as *mut MirProjection;
-        unsafe {
-            mir_stmt_zero(mut_view(*rst0), MIR_STMT_ASSIGN);
-            mir_copy_place(mut_view((*rst0).place), view((*spi).dest_place));
-            remap_place(mut_view((*rst0).place), local_map as *const u32, orig_lc);
-
-            (*rst0).rvalue.kind = MIR_RVALUE_USE;
-            mir_operand_zero(mut_view((*rst0).rvalue.use_op), MIR_OP_MOVE);
-            (*pr_dc).kind = MIR_PROJ_DOWNCAST;
-            (*pr_dc).variant_idx = 0u32; // Ready
-            let pr1 = (pr_dc as usize + size_of<MirProjection>()) as *mut MirProjection;
-            (*pr1).kind = MIR_PROJ_FIELD;
-            (*pr1).field_idx = 0u32;
-            init_place(mut_view((*rst0).rvalue.use_op.place), loc_poll_res, pr_dc, 2);
-        }
-
-        // 2. Restore live locals
+        // 1. Restore live locals
         let mut li: usize = 0;
         while li < live_cnt {
             let l_orig = unsafe { *u32_at((*spi).live_locals, li) };
@@ -78336,7 +78721,7 @@ pub fn mir_lower_async_body(
                 ui = ui + 1;
             }
 
-            let r_live = unsafe { mir_stmt_at(ready_stmts, 1 + li) };
+            let r_live = unsafe { mir_stmt_at(ready_stmts, li) };
             let pr_rl = al_alloc_z(mut_view(*arena), mul_usize(2, size_of<MirProjection>()), align_of<MirProjection>()) as *mut MirProjection;
             unsafe {
                 mir_stmt_zero(mut_view(*r_live), MIR_STMT_ASSIGN);
@@ -78350,6 +78735,24 @@ pub fn mir_lower_async_body(
                 init_place(mut_view((*r_live).rvalue.use_op.place), 1u32, pr_rl, 2);
             }
             li = li + 1;
+        }
+
+        // 2. dest_place = move _poll_res.Ready.0 (after the restores: it may be a part of a live local)
+        let rst0 = unsafe { mir_stmt_at(ready_stmts, live_cnt) };
+        let pr_dc = al_alloc_z(mut_view(*arena), mul_usize(2, size_of<MirProjection>()), align_of<MirProjection>()) as *mut MirProjection;
+        unsafe {
+            mir_stmt_zero(mut_view(*rst0), MIR_STMT_ASSIGN);
+            mir_copy_place(mut_view((*rst0).place), view((*spi).dest_place));
+            remap_place(view(rm), mut_view((*rst0).place));
+
+            (*rst0).rvalue.kind = MIR_RVALUE_USE;
+            mir_operand_zero(mut_view((*rst0).rvalue.use_op), MIR_OP_MOVE);
+            (*pr_dc).kind = MIR_PROJ_DOWNCAST;
+            (*pr_dc).variant_idx = 0u32; // Ready
+            let pr1 = (pr_dc as usize + size_of<MirProjection>()) as *mut MirProjection;
+            (*pr1).kind = MIR_PROJ_FIELD;
+            (*pr1).field_idx = 0u32;
+            init_place(mut_view((*rst0).rvalue.use_op.place), loc_poll_res, pr_dc, 2);
         }
 
         // 3. (*_1).0 = 0xFFFF_FFFEu32;
@@ -78840,6 +79243,13 @@ fn emit_async_layout_for_fn(
                     diag_buf_push_u32(mut_view(*out), live_sz);
                     diag_push_lit(mut_view(*out), ", needs_drop=");
                     diag_push_lit(mut_view(*out), if needs_drop { "true" } else { "false" });
+                    let in_place: bool = if (layout_data as usize) != 0 && (unsafe { (*layout_data).live_in_place as usize }) != 0 {
+                        let sp_inpl: *mut u8 = unsafe { *((*layout_data).live_in_place + k) };
+                        (sp_inpl as usize) != 0 && (li - 1) < (unsafe { *usize_at((*layout_data).live_counts, k) }) && (unsafe { *u8_at(sp_inpl, li - 1) }) != 0u8
+                    } else {
+                        false
+                    };
+                    diag_push_lit(mut_view(*out), if in_place { ", in_place=true" } else { ", in_place=false" });
                     diag_push_lit(mut_view(*out), ")\n");
                     li = li + 1;
                 }

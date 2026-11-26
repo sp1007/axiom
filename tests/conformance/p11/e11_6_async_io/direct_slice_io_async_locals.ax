@@ -1,0 +1,255 @@
+// test: run
+// modes: interp native
+// timeout: 90
+// covers: REQ-ASY-122 REQ-ASY-155 REQ-ASY-157
+// stdout: OK direct_slice_io_async_locals tcp 40 820 udp 4 10 again 3 1\n
+
+// AXS-AIO-012 item 2, AXS-ASY-005 item 4 (ADR-0050): the direct slice form of the I/O API. Streams, sockets and
+// every destination/source buffer are locals of the spawned `async fn` tasks; `read`, `read_exact`, `write_all`,
+// `recv_from` and `send_to` keep raw pointers to them across `.await`.
+//   tcp:   the client sends 40 bytes 1..40 from a local array in four `write_all` calls; the server reads a 4-byte
+//          prefix with `read_exact`, the rest with `read` calls of at most 7 bytes into the same local array, and
+//          answers the byte sum (820) as two bytes; both tasks own their stream.
+//   udp:   a task receives four datagrams into one local buffer it reuses in a loop and acknowledges each from a
+//          second local buffer; the peer task adds up the acknowledgements.
+//   again: three pings on one socket whose receive buffer is only read through a pointer taken before the first one.
+
+module test.direct_slice_io_async_locals
+
+use std.core.result.Result
+use std.asyn.executor.LocalExecutor
+use std.asyn.task.TaskResult
+use std.asyn.task.LocalTaskHandle
+use std.asyn.reactor.Reactor
+use std.io.async_io.AsyncRead
+use std.net.SocketAddr
+use std.net.AsyncTcpListener
+use std.net.AsyncTcpStream
+use std.net.AsyncUdpSocket
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+// Returns the number of bytes received, or a negative error.
+async fn tcp_server(listener: *const AsyncTcpListener) -> i64 {
+    let mut s = match unsafe { view(*listener).accept().await } {
+        Result.Ok(p) => p.0,
+        Result.Err(_) => return -1i64,
+    };
+    let mut buf: [64]u8 = [0u8; 64];
+    match mut_view(s).read_exact(unsafe { address_of_mut(buf[0]) }, 4usize).await {
+        Result.Ok(_) => {},
+        Result.Err(_) => return -2i64,
+    }
+    let mut got: usize = 4usize;
+    while got < 40usize {
+        let mut want: usize = 40usize - got;
+        if want > 7usize {
+            want = 7usize;
+        }
+        match mut_view(s).read(unsafe { address_of_mut(buf[got]) }, want).await {
+            Result.Ok(n) => {
+                if n == 0usize || n > want {
+                    return -3i64;
+                }
+                got = got + n;
+            },
+            Result.Err(_) => return -4i64,
+        }
+    }
+    let mut sum: usize = 0usize;
+    let mut k: usize = 0usize;
+    while k < got {
+        if buf[k] != ((k + 1usize) as u8) {
+            return -5i64;
+        }
+        sum = sum + (buf[k] as usize);
+        k = k + 1usize;
+    }
+    let mut out: [2]u8 = [0u8; 2];
+    out[0] = (sum / 256usize) as u8;
+    out[1] = (sum % 256usize) as u8;
+    match mut_view(s).write_all(unsafe { address_of(out[0]) }, 2usize).await {
+        Result.Ok(_) => {},
+        Result.Err(_) => return -6i64,
+    }
+    let _ = s.close();
+    got as i64
+}
+
+// Returns the sum reported by the server, or a negative error.
+async fn tcp_client(r: *mut Reactor, port: u16) -> i64 {
+    let mut c = match AsyncTcpStream.connect(r, SocketAddr.localhost(port)).await {
+        Result.Ok(s) => s,
+        Result.Err(_) => return -1i64,
+    };
+    let mut chunk: [10]u8 = [0u8; 10];
+    let mut round: usize = 0usize;
+    while round < 4usize {
+        let mut k: usize = 0usize;
+        while k < 10usize {
+            chunk[k] = (round * 10usize + k + 1usize) as u8;
+            k = k + 1usize;
+        }
+        match mut_view(c).write_all(unsafe { address_of(chunk[0]) }, 10usize).await {
+            Result.Ok(_) => {},
+            Result.Err(_) => return -2i64,
+        }
+        round = round + 1usize;
+    }
+    let mut reply: [2]u8 = [0u8; 2];
+    match mut_view(c).read_exact(unsafe { address_of_mut(reply[0]) }, 2usize).await {
+        Result.Ok(_) => {},
+        Result.Err(_) => return -3i64,
+    }
+    let _ = c.close();
+    (reply[0] as i64) * 256i64 + (reply[1] as i64)
+}
+
+// Four datagrams `[seq, seq * 2]`; each is acknowledged with `[seq + 1]`. Returns the number of datagrams.
+async fn udp_server(sock: AsyncUdpSocket) -> i64 {
+    let mut buf: [8]u8 = [0u8; 8];
+    let mut ack: [1]u8 = [0u8; 1];
+    let mut n: i64 = 0i64;
+    while n < 4i64 {
+        let from = match sock.recv_from(unsafe { address_of_mut(buf[0]) }, 8usize).await {
+            Result.Ok(p) => {
+                if p.0 != 2usize || buf[1] != buf[0] * 2u8 {
+                    return -1i64;
+                }
+                p.1
+            },
+            Result.Err(_) => return -2i64,
+        };
+        ack[0] = buf[0] + 1u8;
+        match sock.send_to(unsafe { address_of(ack[0]) }, 1usize, from).await {
+            Result.Ok(_) => {},
+            Result.Err(_) => return -3i64,
+        }
+        n = n + 1i64;
+    }
+    let _ = sock.close();
+    n
+}
+
+// Returns the sum of the acknowledgements (1 + 2 + 3 + 4).
+async fn udp_client(sock: AsyncUdpSocket, port: u16) -> i64 {
+    let mut msg: [2]u8 = [0u8; 2];
+    let mut ack: [4]u8 = [0u8; 4];
+    let mut seq: u8 = 0u8;
+    let mut total: i64 = 0i64;
+    while seq < 4u8 {
+        msg[0] = seq;
+        msg[1] = seq * 2u8;
+        match sock.send_to(unsafe { address_of(msg[0]) }, 2usize, SocketAddr.localhost(port)).await {
+            Result.Ok(_) => {},
+            Result.Err(_) => return -1i64,
+        }
+        match sock.recv_from(unsafe { address_of_mut(ack[0]) }, 4usize).await {
+            Result.Ok(p) => {
+                if p.0 != 1usize {
+                    return -2i64;
+                }
+            },
+            Result.Err(_) => return -3i64,
+        }
+        total = total + (ack[0] as i64);
+        seq = seq + 1u8;
+    }
+    let _ = sock.close();
+    total
+}
+
+// Sends itself three datagrams; the receive buffer is never named after its address was taken.
+async fn self_ping(sock: AsyncUdpSocket, port: u16) -> i64 {
+    let mut cell: [1]u8 = [0u8; 1];
+    let p = unsafe { address_of_mut(cell[0]) };
+    let mut good: i64 = 0i64;
+    let mut i: u8 = 1u8;
+    while i <= 3u8 {
+        let out: [1]u8 = [i * 50u8];
+        match sock.send_to(unsafe { address_of(out[0]) }, 1usize, SocketAddr.localhost(port)).await {
+            Result.Ok(_) => {},
+            Result.Err(_) => return -1i64,
+        }
+        match sock.recv_from(p, 1usize).await {
+            Result.Ok(_) => {},
+            Result.Err(_) => return -2i64,
+        }
+        if unsafe { *p } == i * 50u8 {
+            good = good + 1i64;
+        }
+        i = i + 1u8;
+    }
+    let _ = sock.close();
+    good
+}
+
+fn join_i64(exec: mut_view<LocalExecutor>, h: LocalTaskHandle<i64>) -> i64 {
+    match exec.block_on(h.join()) {
+        TaskResult.Completed(v) => v,
+        _ => -100i64,
+    }
+}
+
+fn udp(r: *mut Reactor) -> Result<AsyncUdpSocket, i32> {
+    match AsyncUdpSocket.bind(r, SocketAddr.localhost(0u16)) {
+        Result.Ok(s) => Result.Ok(s),
+        Result.Err(_) => Result.Err(1i32),
+    }
+}
+
+pub fn main() -> i32 {
+    let mut exec = LocalExecutor.new();
+    let r = view(exec).reactor();
+    let listener = match AsyncTcpListener.bind(r, SocketAddr.localhost(0u16)) {
+        Result.Ok(l) => l,
+        Result.Err(_) => return 1i32,
+    };
+    let port = view(listener).local_addr().port;
+    let h_srv = mut_view(exec).spawn_local(tcp_server(unsafe { address_of(listener) }));
+    let h_cli = mut_view(exec).spawn_local(tcp_client(r, port));
+    let sum = join_i64(mut_view(exec), h_cli);
+    let got = join_i64(mut_view(exec), h_srv);
+
+    let us = match udp(r) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 2i32,
+    };
+    let uc = match udp(r) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 3i32,
+    };
+    let us_port = view(us).local_addr().port;
+    let h_us = mut_view(exec).spawn_local(udp_server(us));
+    let h_uc = mut_view(exec).spawn_local(udp_client(uc, us_port));
+    let acks = join_i64(mut_view(exec), h_uc);
+    let dgrams = join_i64(mut_view(exec), h_us);
+
+    let up = match udp(r) {
+        Result.Ok(s) => s,
+        Result.Err(_) => return 4i32,
+    };
+    let up_port = view(up).local_addr().port;
+    let h_up = mut_view(exec).spawn_local(self_ping(up, up_port));
+    let pings = join_i64(mut_view(exec), h_up);
+
+    let _ = listener.close();
+    mut_view(exec).shutdown();
+
+    let ok = got == 40i64 && sum == 820i64 && dgrams == 4i64 && acks == 10i64 && pings == 3i64;
+    print("OK direct_slice_io_async_locals tcp ");
+    print_int(got);
+    print(" ");
+    print_int(sum);
+    print(" udp ");
+    print_int(dgrams);
+    print(" ");
+    print_int(acks);
+    print(" again ");
+    print_int(pings);
+    print(" ");
+    print_int(if ok { 1i64 } else { 0i64 });
+    print("\n");
+    0i32
+}

@@ -1,0 +1,186 @@
+// test: run
+// modes: interp native
+// covers: REQ-ASY-122 REQ-ASY-047
+// stdout: moved v=8 | d1 sum=8\nlate d2 d1 v=12\nloop d1 d2 d3 v=6\nparam d4 v=9\npartial d5 d6 v=11\ncancel c1 c2 end\n
+
+// ADR-0050 + SPEC-12 AXS-DROP-003: drop flags of in-place locals with `Drop`. Every `Guard` is address-observable
+// (a pointer to its field is kept by the awaited future) and must be dropped exactly once:
+//   moved   - moved out before a later `.await`; the scope-end drop runs in another poll and must do nothing;
+//   late    - a second guard that does not exist yet at the first suspension;
+//   loop    - one guard per iteration, dropped at the end of each iteration;
+//   param   - a guard that arrives as a parameter;
+//   partial - one field moved out, the other dropped at scope end;
+//   cancel  - dropped while pending at the second suspension: guards in scope only, each once.
+
+use std.future.block_on.block_on;
+use std.future.Context;
+use std.future.Waker;
+use std.future.RawWaker;
+use std.future.RawWakerVTable;
+
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+struct Guard {
+    pub val: i64,
+    pub tag: i64,
+}
+
+impl Drop for Guard {
+    fn drop(self: mut_view<Guard>) {
+        if self.tag >= 100i64 {
+            print("c");
+            print_int(self.tag - 100i64);
+        } else {
+            print("d");
+            print_int(self.tag);
+        }
+        print(" ");
+    }
+}
+
+struct AddLater {
+    pub dst: *mut i64,
+    pub add: i64,
+    pub polls: u32,
+    pub never: bool,
+}
+
+impl Future for AddLater {
+    type Output = i64;
+
+    fn poll(self: mut_view<AddLater>, cx: mut_view<Context>) -> Poll<i64> {
+        if self.never || self.polls < 1u32 {
+            self.polls = self.polls + 1u32;
+            return Poll.Pending;
+        }
+        let d = self.dst;
+        unsafe { *d = *d + self.add; }
+        Poll.Ready(self.add)
+    }
+}
+
+fn later(dst: *mut i64, add: i64) -> AddLater {
+    AddLater { dst: dst, add: add, polls: 0u32, never: false }
+}
+
+fn consume(g: Guard) -> i64 {
+    let v = g.val;
+    print("| ");
+    v
+}
+
+async fn moved() -> i64 {
+    let mut g = Guard { val: 1i64, tag: 1i64 };
+    let mut other: i64 = 0i64;
+    let _ = later(unsafe { address_of_mut(g.val) }, 7i64).await;
+    print("moved v=");
+    print_int(g.val);
+    print(" ");
+    let v = consume(g);
+    let _ = later(unsafe { address_of_mut(other) }, 5i64).await;
+    let _ = later(unsafe { address_of_mut(other) }, 5i64).await;
+    print("sum=");
+    print_int(v + other - 10i64);
+    print("\n");
+    v
+}
+
+async fn late() -> i64 {
+    let mut a = Guard { val: 1i64, tag: 1i64 };
+    let _ = later(unsafe { address_of_mut(a.val) }, 2i64).await;
+    let mut b = Guard { val: 4i64, tag: 2i64 };
+    let _ = later(unsafe { address_of_mut(b.val) }, 5i64).await;
+    print("late ");
+    a.val + b.val
+}
+
+async fn looped() -> i64 {
+    let mut sum: i64 = 0i64;
+    print("loop ");
+    let mut i: i64 = 1i64;
+    while i <= 3i64 {
+        let mut g = Guard { val: 0i64, tag: i };
+        let _ = later(unsafe { address_of_mut(g.val) }, i).await;
+        sum = sum + g.val;
+        i = i + 1i64;
+    }
+    sum
+}
+
+async fn param(mut g: Guard) -> i64 {
+    let p = unsafe { address_of_mut(g.val) };
+    let _ = later(p, 4i64).await;
+    let _ = later(p, 1i64).await;
+    g.val
+}
+
+struct Two {
+    pub a: Guard,
+    pub b: Guard,
+    pub n: i64,
+}
+
+fn eat(g: Guard) -> i64 {
+    g.val
+}
+
+async fn partial() -> i64 {
+    let mut two = Two { a: Guard { val: 3i64, tag: 5i64 }, b: Guard { val: 2i64, tag: 6i64 }, n: 0i64 };
+    let pn = unsafe { address_of_mut(two.n) };
+    let _ = later(pn, 6i64).await;
+    print("partial ");
+    let v = eat(two.a);
+    v + two.b.val + two.n
+}
+
+async fn cancelled() -> i64 {
+    let mut done = Guard { val: 1i64, tag: 101i64 };
+    let _ = later(unsafe { address_of_mut(done.val) }, 1i64).await;
+    let keep = done.val;
+    consume_silent(done);
+    let mut live = Guard { val: keep, tag: 102i64 };
+    let f = AddLater { dst: unsafe { address_of_mut(live.val) }, add: 1i64, polls: 0u32, never: true };
+    let r = f.await;
+    live.val + r
+}
+
+fn consume_silent(g: Guard) {
+    let _ = g.val;
+}
+
+fn finish(v: i64) {
+    print("v=");
+    print_int(v);
+    print("\n");
+}
+
+fn main() -> i32 {
+    let _ = block_on(moved());
+    finish(block_on(late()));
+    finish(block_on(looped()));
+    print("param ");
+    finish(block_on(param(Guard { val: 4i64, tag: 4i64 })));
+    finish(block_on(partial()));
+    print("cancel ");
+    {
+        let mut fut = cancelled();
+        let mut cx = Context {
+            waker_val: Waker {
+                raw: RawWaker {
+                    data: 0 as *const u8,
+                    vtable: 0 as *const RawWakerVTable,
+                },
+            },
+        };
+        let mut n: i32 = 0i32;
+        while n < 4i32 {
+            match fut.poll(mut_view(cx)) {
+                Poll.Pending => {},
+                Poll.Ready(_) => return 2i32,
+            }
+            n = n + 1i32;
+        }
+    }
+    print("end\n");
+    0i32
+}

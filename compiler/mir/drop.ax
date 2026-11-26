@@ -96,6 +96,11 @@ use compiler.mir.mir.MIR_OP_CONST
 use compiler.mir.mir.MIR_OP_COPY
 use compiler.mir.mir.MIR_OP_MOVE
 use compiler.mir.mir.MIR_PROJ_DEREF
+use compiler.mir.mir.MirTerminator
+use compiler.mir.mir.MIR_RVALUE_LEN
+use compiler.mir.mir.MIR_STMT_ATOMIC
+use compiler.mir.mir.MIR_STMT_STORAGE_DEAD
+use compiler.mir.mir.MIR_STMT_STORAGE_LIVE
 use compiler.mir.mir.MIR_PROJ_DOWNCAST
 use compiler.mir.mir.MIR_PROJ_FIELD
 use compiler.mir.mir.MIR_PROJ_INDEX
@@ -2831,6 +2836,237 @@ fn drop_expand_block(
 }
 
 // =================================================================================================
+// In-place `async fn` locals (ADR-0050, SPEC-33 AXS-ASY-043 item 7)
+// =================================================================================================
+
+// `map[slot]` is the state field of an in-place `poll` local, 0 for every other local.
+struct InplaceMap {
+    map: *mut u32,
+    len: usize,
+}
+
+fn inplace_field_of(m: view<InplaceMap>, l: u32) -> u32 {
+    if (l as usize) >= m.len {
+        return 0u32;
+    }
+    unsafe { *u32_at(m.map, l as usize) }
+}
+
+// `(*_1).field` followed by the projections of `place`.
+fn inplace_place(arena: mut_view<Arena>, field: u32, place: mut_view<MirPlace>) {
+    let n = place.proj_count;
+    let projs = arena_alloc_raw(mut_view(*arena), mir_mul_usize(n + 2, size_of<MirProjection>()), align_of<MirProjection>()) as *mut MirProjection;
+    unsafe {
+        let d0 = mir_proj_at(projs, 0);
+        mir_proj_reset(mut_view(*d0), MIR_PROJ_DEREF);
+        let d1 = mir_proj_at(projs, 1);
+        mir_proj_reset(mut_view(*d1), MIR_PROJ_FIELD);
+        (*d1).field_idx = field;
+        let mut i: usize = 0;
+        while i < n {
+            *mir_proj_at(projs, i + 2) = *mir_proj_at(place.projs, i);
+            i = i + 1;
+        }
+    }
+    place.local.v = 1u32;
+    place.projs = projs;
+    place.proj_count = n + 2;
+}
+
+// A projection names an index/bound local, not a place: its slot is refreshed from the field before the use.
+fn inplace_refresh(m: view<InplaceMap>, l: u32, buf: mut_view<DropStmtBuf>, arena: mut_view<Arena>) {
+    let field = inplace_field_of(m, l);
+    if field == 0u32 {
+        return;
+    }
+    let mut src = mir_local_place(l);
+    inplace_place(mut_view(*arena), field, mut_view(src));
+    let st = drop_stmt_buf_next(mut_view(*buf), mut_view(*arena));
+    unsafe {
+        mir_stmt_zero(mut_view(*st), MIR_STMT_ASSIGN);
+        mir_place_reset_u32(mut_view((*st).place), l);
+        (*st).rvalue.kind = MIR_RVALUE_USE;
+        mir_operand_zero(mut_view((*st).rvalue.use_op), MIR_OP_COPY);
+        mir_copy_place(mut_view((*st).rvalue.use_op.place), view(src));
+    }
+}
+
+fn inplace_rewrite_place(m: view<InplaceMap>, p: mut_view<MirPlace>, buf: mut_view<DropStmtBuf>, arena: mut_view<Arena>) {
+    let mut i: usize = 0;
+    while i < p.proj_count {
+        let pr = unsafe { mir_proj_at(p.projs, i) };
+        let pk = unsafe { (*pr).kind };
+        if pk == MIR_PROJ_INDEX {
+            inplace_refresh(m, (unsafe { (*pr).index_local.v }), mut_view(*buf), mut_view(*arena));
+        } else if pk == MIR_PROJ_SUB_SLICE {
+            if unsafe { (*pr).has_from } {
+                inplace_refresh(m, (unsafe { (*pr).from_local.v }), mut_view(*buf), mut_view(*arena));
+            }
+            if unsafe { (*pr).has_to } {
+                inplace_refresh(m, (unsafe { (*pr).to_local.v }), mut_view(*buf), mut_view(*arena));
+            }
+        }
+        i = i + 1;
+    }
+    let field = inplace_field_of(m, p.local.v);
+    if field != 0u32 {
+        inplace_place(mut_view(*arena), field, mut_view(*p));
+    }
+}
+
+fn inplace_rewrite_operand(m: view<InplaceMap>, op: mut_view<MirOperand>, buf: mut_view<DropStmtBuf>, arena: mut_view<Arena>) {
+    if op.kind == MIR_OP_COPY || op.kind == MIR_OP_MOVE {
+        inplace_rewrite_place(m, mut_view(op.place), mut_view(*buf), mut_view(*arena));
+    }
+}
+
+fn inplace_rewrite_rvalue(m: view<InplaceMap>, rv: mut_view<MirRvalue>, buf: mut_view<DropStmtBuf>, arena: mut_view<Arena>) {
+    let k = rv.kind;
+    if k == MIR_RVALUE_USE || k == MIR_RVALUE_CAST || k == MIR_RVALUE_UNARY_OP || k == MIR_RVALUE_REPEAT {
+        inplace_rewrite_operand(m, mut_view(rv.use_op), mut_view(*buf), mut_view(*arena));
+        if k == MIR_RVALUE_REPEAT && (rv.repeat_count_op as usize) != 0 {
+            inplace_rewrite_operand(m, unsafe { mut_view(*rv.repeat_count_op) }, mut_view(*buf), mut_view(*arena));
+        }
+    } else if k == MIR_RVALUE_REF || k == MIR_RVALUE_LEN || k == MIR_RVALUE_DISCRIMINANT {
+        inplace_rewrite_place(m, mut_view(rv.place), mut_view(*buf), mut_view(*arena));
+    } else if k == MIR_RVALUE_BINARY_OP || k == MIR_RVALUE_OVERFLOWS_BINARY_OP {
+        inplace_rewrite_operand(m, mut_view(rv.lhs), mut_view(*buf), mut_view(*arena));
+        inplace_rewrite_operand(m, mut_view(rv.rhs), mut_view(*buf), mut_view(*arena));
+    } else if k == MIR_RVALUE_AGGREGATE {
+        let mut i: usize = 0;
+        while i < rv.operand_count {
+            let op = unsafe { mir_op_at(rv.operands, i) };
+            inplace_rewrite_operand(m, unsafe { mut_view(*op) }, mut_view(*buf), mut_view(*arena));
+            i = i + 1;
+        }
+    }
+}
+
+fn inplace_rewrite_terminator(m: view<InplaceMap>, term: mut_view<MirTerminator>, buf: mut_view<DropStmtBuf>, arena: mut_view<Arena>) {
+    let tk = term.kind;
+    if tk == MIR_TERM_SWITCH_INT {
+        inplace_rewrite_operand(m, mut_view(term.discr), mut_view(*buf), mut_view(*arena));
+    } else if tk == MIR_TERM_CALL {
+        inplace_rewrite_operand(m, mut_view(term.func), mut_view(*buf), mut_view(*arena));
+        let mut a: usize = 0;
+        while a < term.arg_count {
+            let op = unsafe { mir_op_at(term.args, a) };
+            inplace_rewrite_operand(m, unsafe { mut_view(*op) }, mut_view(*buf), mut_view(*arena));
+            a = a + 1;
+        }
+        if term.has_destination {
+            inplace_rewrite_place(m, mut_view(term.destination), mut_view(*buf), mut_view(*arena));
+        }
+    } else if tk == MIR_TERM_ASSERT {
+        inplace_rewrite_operand(m, mut_view(term.cond), mut_view(*buf), mut_view(*arena));
+    } else if tk == MIR_TERM_DROP {
+        inplace_rewrite_place(m, mut_view(term.drop_place), mut_view(*buf), mut_view(*arena));
+    }
+}
+
+// Is `slot` a whole in-place local and `field_pl` exactly its state field `(*_1).field`?
+fn inplace_is_own_field(m: view<InplaceMap>, slot: view<MirPlace>, field_pl: view<MirPlace>) -> bool {
+    let field = inplace_field_of(m, slot.local.v);
+    if field == 0u32 || slot.proj_count != 0 || field_pl.local.v != 1u32 || field_pl.proj_count != 2 {
+        return false;
+    }
+    let d0 = unsafe { mir_proj_at(field_pl.projs, 0) };
+    let d1 = unsafe { mir_proj_at(field_pl.projs, 1) };
+    (unsafe { (*d0).kind }) == MIR_PROJ_DEREF && (unsafe { (*d1).kind }) == MIR_PROJ_FIELD && (unsafe { (*d1).field_idx }) == field
+}
+
+fn inplace_is_save_or_restore(m: view<InplaceMap>, st: view<MirStmt>) -> bool {
+    if st.kind != MIR_STMT_ASSIGN || st.rvalue.kind != MIR_RVALUE_USE || st.rvalue.use_op.kind != MIR_OP_MOVE {
+        return false;
+    }
+    inplace_is_own_field(m, view(st.place), view(st.rvalue.use_op.place)) ||
+        inplace_is_own_field(m, view(st.rvalue.use_op.place), view(st.place))
+}
+
+fn inplace_is_marker(st: view<MirStmt>) -> bool {
+    st.kind == MIR_STMT_STORAGE_LIVE && st.place.local.v == 1u32 && st.place.proj_count == 2
+}
+
+// Gives the in-place locals of a synthesized `poll` body their storage in the state machine: the dispatch block
+// names each slot and its field (`StorageLive(slot)` with `place = (*_1).field`, `async_lower.ax`). Slot and field
+// never hold different values (the field is only written by the save and read by the restore of its slot), so
+// every place rooted at the slot becomes `(*_1).field..` and the save/restore moves and storage markers of the slot
+// are removed. Runs after drop elaboration, whose flags therefore treat in-place locals like all other locals.
+fn drop_coalesce_inplace(body: mut_view<MirBody>, arena: mut_view<Arena>) {
+    if !body.async_lowered || body.bb_count == 0 {
+        return;
+    }
+    let bb0 = unsafe { mir_bb_at(body.bbs, 0) };
+    let mut m = InplaceMap { map: 0 as *mut u32, len: 0 };
+    let mut s: usize = 0;
+    while s < (unsafe { (*bb0).stmt_count }) {
+        let st = unsafe { mir_stmt_at((*bb0).stmts, s) };
+        if inplace_is_marker(unsafe { view(*st) }) {
+            if m.len == 0 {
+                m.len = body.local_count;
+                m.map = arena_alloc_raw(mut_view(*arena), m.len << 2, align_of<u32>()) as *mut u32;
+                let mut z: usize = 0;
+                while z < m.len {
+                    unsafe { *u32_at(m.map, z) = 0u32; }
+                    z = z + 1;
+                }
+            }
+            let slot = (unsafe { (*st).storage_local.v }) as usize;
+            if slot < m.len {
+                let fp = unsafe { mir_proj_at((*st).place.projs, 1) };
+                unsafe { *u32_at(m.map, slot) = (*fp).field_idx; }
+            }
+        }
+        s = s + 1;
+    }
+    if m.len == 0 {
+        return;
+    }
+    let mut b: usize = 0;
+    while b < body.bb_count {
+        let bb = unsafe { mir_bb_at(body.bbs, b) };
+        let sc = unsafe { (*bb).stmt_count };
+        let mut buf = drop_stmt_buf_new(mut_view(*arena), sc + 4);
+        s = 0;
+        while s < sc {
+            let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+            let sk = unsafe { (*st).kind };
+            let is_storage = sk == MIR_STMT_STORAGE_LIVE || sk == MIR_STMT_STORAGE_DEAD;
+            let dead = (is_storage && inplace_field_of(view(m), (unsafe { (*st).storage_local.v })) != 0u32) ||
+                inplace_is_save_or_restore(view(m), unsafe { view(*st) });
+            if !dead {
+                unsafe {
+                    if sk == MIR_STMT_ASSIGN {
+                        inplace_rewrite_rvalue(view(m), mut_view((*st).rvalue), mut_view(buf), mut_view(*arena));
+                        inplace_rewrite_place(view(m), mut_view((*st).place), mut_view(buf), mut_view(*arena));
+                    } else if sk == MIR_STMT_DROP {
+                        inplace_rewrite_place(view(m), mut_view((*st).place), mut_view(buf), mut_view(*arena));
+                    } else if sk == MIR_STMT_ATOMIC {
+                        inplace_rewrite_operand(view(m), mut_view((*st).rvalue.use_op), mut_view(buf), mut_view(*arena));
+                        inplace_rewrite_operand(view(m), mut_view((*st).rvalue.lhs), mut_view(buf), mut_view(*arena));
+                        inplace_rewrite_operand(view(m), mut_view((*st).rvalue.rhs), mut_view(buf), mut_view(*arena));
+                        inplace_rewrite_place(view(m), mut_view((*st).place), mut_view(buf), mut_view(*arena));
+                    }
+                    drop_stmt_buf_push_copy(mut_view(buf), mut_view(*arena), view(*st));
+                }
+            }
+            s = s + 1;
+        }
+        if unsafe { (*bb).has_terminator } {
+            unsafe {
+                inplace_rewrite_terminator(view(m), mut_view((*bb).terminator), mut_view(buf), mut_view(*arena));
+            }
+        }
+        unsafe {
+            (*bb).stmts = buf.stmts;
+            (*bb).stmt_count = buf.count;
+            (*bb).stmt_cap = buf.cap;
+        }
+        b = b + 1;
+    }
+}
+
+// =================================================================================================
 // Entry point (port of ax_mir_drop_elaborate)
 // =================================================================================================
 
@@ -3066,4 +3302,7 @@ pub fn mir_drop_elaborate(
         }
         start_bb = current_count;
     }
+
+    // 6. In-place locals of a lowered `async fn` move into their state field (ADR-0050).
+    drop_coalesce_inplace(mut_view(*body), mut_view(*arena));
 }
