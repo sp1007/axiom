@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 20
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tests/selfhost/obj_link_driver/qa_t442_obj_link_driver_bounds_oracle.py]
 locks: [_workspaces/baseline-failures.txt]
 spec: [spec/decisions/ADR-0041-complete-suite-baseline-and-test-cache.md, spec/SPEC-20-selfhost.md]
 covers: [REQ-TST-072]
+started: 2026-11-26 23:59:12
+finished: 2026-11-27 01:02:47
 ---
 # T546 — The T442 boundary oracle no longer reads the baseline file
 
@@ -46,3 +48,5 @@ every HEAD with a non-empty baseline, independent of any compiler change.
 
 ## Log
 - 2026-11-26 created by architect (`_workspaces/reports/triage-2026-11-26-preexisting.md`)
+- 2026-11-26 23:59:12 started (attempt 1) T546-impl
+- 2026-11-27 01:02:47 accepted by QA -> done

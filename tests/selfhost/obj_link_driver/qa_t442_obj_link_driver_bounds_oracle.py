@@ -11,8 +11,7 @@
    (with `.axmeta`, `0` dead `std.` symbols) and `main_42.exe` is the 2,048-byte PE32+ image,
    and cross-checks against live `{compiler}` builds of single-file (`main_42.ax`) and multi-file
    package (`tests/modules/hello/src/main.ax`) targets.
-4. Verifies `_workspaces/baseline-failures.txt` has 0 active baseline test IDs and no temporary
-   `build/tmp_obj_link_driver_*` or `_gen_ref*` artifacts remain on disk.
+4. Verifies no temporary `build/tmp_obj_link_driver_*` or `_gen_ref*` artifacts remain on disk.
 """
 
 import glob
@@ -207,21 +206,7 @@ def check_blobs_and_live_compiler(compiler, tmp, root):
             )
 
 
-def check_baseline_and_temp_cleanup(root):
-    baseline_path = os.path.join(root, "_workspaces", "baseline-failures.txt")
-    if os.path.isfile(baseline_path):
-        with open(baseline_path, "rb") as f:
-            raw = f.read()
-        if b"\r" in raw:
-            fail("CR byte found in _workspaces/baseline-failures.txt")
-        active = [
-            ln.strip()
-            for ln in raw.decode("utf-8", "replace").split("\n")
-            if ln.strip() and not ln.lstrip().startswith("#")
-        ]
-        if active:
-            fail("_workspaces/baseline-failures.txt still has active lines: %r" % active)
-
+def check_temp_cleanup(root):
     leftovers = (
         glob.glob(os.path.join(root, "build", "tmp_obj_link_driver_*"))
         + glob.glob(os.path.join(root, "tests", "selfhost", "obj_link_driver", "_gen_ref*"))
@@ -240,7 +225,7 @@ def main():
     check_generators(root)
     check_bundle_headers_and_stdout(root)
     check_blobs_and_live_compiler(compiler, tmp, root)
-    check_baseline_and_temp_cleanup(root)
+    check_temp_cleanup(root)
     print("T442-BOUNDS ok bundles=8 smoke_blobs=19 diff_blobs=55 main42_obj=336 main42_exe=2048")
     return 0
 
