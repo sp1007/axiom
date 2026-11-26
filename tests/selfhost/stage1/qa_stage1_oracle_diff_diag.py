@@ -57,6 +57,50 @@ def test_canonical_json_and_text_diff():
     assert '+      "message": "mutated second"' in diff_txt, diff_txt
 
 
+def _diag_run(code):
+    doc = b'{"schema": 1, "errors": 1, "warnings": 0, "diagnostics": [{"code": "%s", "message": "m", "primary": {"start": 0, "end": 1}}]}\n' % code.encode()
+    return (1, b"", doc)
+
+
+def test_post_freeze_skip_rule(tmp):
+    skip = oracle.stage0_reports_post_freeze
+    # Only axiom0's own AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP marks a file as post-freeze.
+    assert skip(_diag_run("AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP")), "bootstrap-unsupported must be skipped"
+    assert not skip(_diag_run("AX_TYPE_MISMATCH")), "any other diagnostic must still be compared"
+    assert not skip((0, b"", b"")), "clean output must still be compared"
+    assert not skip((1, b"", b"not json")), "unparsable output must not be silently skipped"
+    # A skipped file is mixed with others: still one flagged diagnostic is enough.
+    mixed = b'{"diagnostics": [{"code": "AX_TYPE_MISMATCH"}, {"code": "AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP"}]}'
+    assert skip((1, b"", mixed))
+
+    # collect_sample refills from the next matching file and reports skipped / starved patterns.
+    sroot = os.path.join(tmp, "sample_root")
+    for d in ("a", "b"):
+        os.makedirs(os.path.join(sroot, "tests", d), exist_ok=True)
+    names_a = ["f1.ax", "f2.ax", "f3.ax", "f4.ax", "f5.ax"]
+    for n in names_a:
+        with open(os.path.join(sroot, "tests", "a", n), "w", encoding="utf-8", newline="\n") as f:
+            f.write("// test: ui\n")
+    with open(os.path.join(sroot, "tests", "b", "only.ax"), "w", encoding="utf-8", newline="\n") as f:
+        f.write("// test: ui\n")
+    bad = {"tests/a/f2.ax", "tests/b/only.ax"}
+    skipped, starved = [], []
+    got = oracle.collect_sample(
+        sroot,
+        ["tests/a/*.ax", "tests/b/*.ax"],
+        per_pattern=3,
+        accept=lambda rel: rel not in bad,
+        skipped=skipped,
+        starved=starved,
+    )
+    assert got == ["tests/a/f1.ax", "tests/a/f3.ax", "tests/a/f4.ax"], got
+    assert skipped == ["tests/a/f2.ax", "tests/b/only.ax"], skipped
+    assert starved == ["tests/b/*.ax"], starved
+    # Without a filter the behaviour is unchanged (first three files).
+    plain = oracle.collect_sample(sroot, ["tests/a/*.ax"], per_pattern=3)
+    assert plain == ["tests/a/f1.ax", "tests/a/f2.ax", "tests/a/f3.ax"], plain
+
+
 def test_bytes_diff_and_fail_step():
     # Equal-length byte divergence
     bdiff = oracle.format_bytes_diff(
@@ -135,6 +179,7 @@ def main():
     tmp = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else os.path.join(HERE, "_tmp_diag")
     os.makedirs(tmp, exist_ok=True)
     test_canonical_json_and_text_diff()
+    test_post_freeze_skip_rule(tmp)
     test_bytes_diff_and_fail_step()
     test_subprocess_failure_paths(root, tmp)
     test_driver_generator_and_lf(root)

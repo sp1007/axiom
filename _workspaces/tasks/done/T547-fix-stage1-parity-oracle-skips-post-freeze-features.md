@@ -8,13 +8,15 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 20
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 300
 paths: [tests/selfhost/stage1/stage1_oracle.py]
 locks: [tests/selfhost/stage1/qa_stage1_oracle_diff_diag.py, _workspaces/baseline-failures.txt]
 spec: [spec/SPEC-41-floating-point.md, spec/SPEC-20-selfhost.md, spec/decisions/ADR-0041-complete-suite-baseline-and-test-cache.md]
 covers: [REQ-TST-089]
+started: 2026-11-27 01:03:13
+finished: 2026-11-27 02:26:04
 ---
 # T547 — The stage-1 parity oracle compares only the frozen axiom0 language subset
 
@@ -58,3 +60,5 @@ stopped holding when the first post-freeze feature landed. The architect's run o
 
 ## Log
 - 2026-11-26 created by architect (`_workspaces/reports/triage-2026-11-26-preexisting.md`)
+- 2026-11-27 01:03:13 started (attempt 1) T547-impl
+- 2026-11-27 02:26:04 accepted by QA -> done

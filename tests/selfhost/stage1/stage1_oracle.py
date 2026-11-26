@@ -160,16 +160,58 @@ def is_helper_file(path):
     return False
 
 
-def collect_sample(root, patterns, per_pattern=3):
+POST_FREEZE_CODE = "AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP"
+
+
+def stage0_reports_post_freeze(result):
+    """True when the frozen axiom0 rejects a file as outside its bootstrap subset (T547).
+
+    `result` is the `run_cmd` triple of `axiom0 check --json <file>`. Such a file exercises a
+    feature added after the axiom0 freeze (SPEC-41 AXS-FLT-001 rule 2: floats), so axiomc is
+    expected to diverge from axiom0 on it and it has no stage-0 parity to compare.
+    """
+    _rc, out_bytes, err_bytes = result
+    raw = (err_bytes if err_bytes.strip() else out_bytes).decode("utf-8", "replace").strip()
+    if not raw:
+        return False
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        return False
+    if not isinstance(doc, dict):
+        return False
+    for d in doc.get("diagnostics", []):
+        if isinstance(d, dict) and d.get("code") == POST_FREEZE_CODE:
+            return True
+    return False
+
+
+def collect_sample(root, patterns, per_pattern=3, accept=None, skipped=None, starved=None):
+    """Pick up to `per_pattern` non-helper files per glob.
+
+    `accept(rel)` (optional) filters candidates; a rejected file is appended to `skipped` and the
+    next file of the same pattern is taken instead. A pattern that has at least one non-helper
+    file but ends with none selected is appended to `starved`.
+    """
     out = []
     seen = set()
     for pat in patterns:
         matches = [m for m in sorted(glob.glob(os.path.join(root, pat))) if not is_helper_file(m)]
-        for m in matches[:per_pattern]:
+        kept = 0
+        for m in matches:
+            if kept >= per_pattern:
+                break
             rel = os.path.relpath(m, root).replace("\\", "/")
+            if accept is not None and not accept(rel):
+                if skipped is not None:
+                    skipped.append(rel)
+                continue
+            kept += 1
             if rel not in seen:
                 seen.add(rel)
                 out.append(rel)
+        if matches and kept == 0 and starved is not None:
+            starved.append(pat)
     return out
 
 
@@ -271,7 +313,30 @@ def main():
     stage2 = resolve_stage2(compiler_arg, root, stage0, axiomc1)
 
     # 2. Verify canonical `--json` diagnostics across UI categories + clean programs
-    diag_files = collect_sample(root, UI_DIAG_PATTERNS, per_pattern=3)
+    def in_frozen_subset(rel):
+        return not stage0_reports_post_freeze(
+            run_cmd([stage0, "check", "--json", "--std-root", std, rel], root)
+        )
+
+    skipped_post_freeze = []
+    starved_patterns = []
+    diag_files = collect_sample(
+        root,
+        UI_DIAG_PATTERNS,
+        per_pattern=3,
+        accept=in_frozen_subset,
+        skipped=skipped_post_freeze,
+        starved=starved_patterns,
+    )
+    for rel in skipped_post_freeze:
+        print("STAGE1-PARITY skipped-post-freeze: %s" % rel, flush=True)
+    if starved_patterns:
+        return fail_step(
+            "step2:check-json",
+            "every candidate of %d pattern(s) was skipped as post-freeze; nothing left to compare"
+            % len(starved_patterns),
+            "\n".join(starved_patterns),
+        )
     run_files = collect_sample(root, RUN_PARITY_PATTERNS, per_pattern=3)
     all_json_files = diag_files + run_files
     for rel in all_json_files:
