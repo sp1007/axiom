@@ -224,6 +224,8 @@ def main() -> int:
         ("fs", [win_sys_dir / "fs.ax"]),
         ("process", [win_sys_dir / "process.ax"]),
         ("time", [win_sys_dir / "time.ax"]),
+        # The async I/O reactor providers (`__ax_host_aio_*`, IOCP + Winsock); the async run tests (T428a) need them.
+        ("iocp", [win_sys_dir / "iocp.ax"]),
         ("thread", [win_sys_dir / "thread.ax", win_sys_dir / "fiber.ax"]),
         ("fiber", [win_sys_dir / "fiber.ax", win_sys_dir / "thread.ax"]),
     ]

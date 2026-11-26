@@ -8,13 +8,15 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 5
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 300
 paths: [tests/link/dll/gnu_ld_run_oracle.py]
 locks: [compiler/driver/pipeline.ax, _workspaces/baseline-failures.txt]
 spec: [spec/SPEC-26-windows-artifact-kinds.md, spec/decisions/ADR-0048-std-module-loading-host-providers.md, spec/decisions/ADR-0034-oracle-independence.md, spec/decisions/ADR-0002-oracle-host-interface.md]
 covers: [REQ-TST-072]
+started: 2026-11-26 22:42:45
+finished: 2026-11-26 23:26:17
 ---
 # T423j — The GNU ld cross-link oracle links the async I/O host providers
 
@@ -50,3 +52,5 @@ this task as its fix task.
 
 ## Log
 - 2026-11-26 created by architect (`_workspaces/reports/unblock-T428m.md`)
+- 2026-11-26 22:42:45 started (attempt 1) T423j-impl
+- 2026-11-26 23:26:17 accepted by QA -> done
