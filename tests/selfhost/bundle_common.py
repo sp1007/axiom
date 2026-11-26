@@ -3,7 +3,7 @@
 
 Every generator under `tests/selfhost/**/gen_*.py` loads `compiler/` modules from
 HEAD (`ROOT/compiler/`), keeping every `compiler/` function body 100% verbatim.
-Header-only import shims (`_interner_shim`, `_session_mod_shim`, `_own_mir_shim`,
+Header-only import shims (`_session_mod_shim`, `_own_mir_shim`,
 `_typeck_diag_shim`, `_typeck_unsafe_shim`, `host_intrinsics`) bridge module-header
 imports when concatenating `compiler/*` into a single multi-module `.ax` bundle.
 """
@@ -23,15 +23,6 @@ STD_SYS_WINDOWS_FILES = [
     "std/sys/windows/process.ax",
     "std/sys/windows/time.ax",
 ]
-
-INTERNER_SHIM_MODULE = """\
-module _interner_shim
-pub const cap: usize = 1;
-pub const mcap: usize = 1;
-pub fn old_(x: usize) -> usize { x }
-pub fn cur_(x: usize) -> usize { x }
-pub fn new_(x: usize) -> usize { 1048576 }
-"""
 
 SESSION_SHIM_MODULE = """\
 module _session_mod_helper
@@ -489,15 +480,6 @@ def assemble_compiler_modules(mod_list, root=ROOT, caller=None):
         src = _ensure_host_heap_imports(src)
 
         if raw_name == "compiler.kernel.interner":
-            parts.append(INTERNER_SHIM_MODULE)
-            src = _inject_after_module_line(
-                src,
-                "use _interner_shim.cap\n"
-                "use _interner_shim.mcap\n"
-                "use _interner_shim.old_\n"
-                "use _interner_shim.cur_\n"
-                "use _interner_shim.new_",
-            )
             src = src.replace("pub struct StrView {", "@derive(Copy)\npub struct StrView {", 1)
 
         if raw_name == "compiler.kernel_source_diag.session":
