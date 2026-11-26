@@ -8,13 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 20
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tests/ui/security_profiles]
 locks: [compiler/types/typeck.ax, compiler/own/unsafe.ax, _workspaces/baseline-failures.txt]
 spec: [spec/SPEC-53-safety-profiles-capability-security.md, spec/SPEC-50-unsafe-ub-ffi.md, spec/decisions/ADR-0001-fixed-address-declarations.md]
 covers: [REQ-CAP-010, REQ-OWNER-008]
-started: 2026-11-26 01:42:36
+started: 2026-11-26 23:32:40
+finished: 2026-11-26 23:58:43
 ---
 # T540 — Baseline fix: safety_profile_safe_neg vs the T501 `@addr` placement rule
 
@@ -60,3 +61,5 @@ bootstrap rejection (T526 already owns the `@addr` UI tests).
 - 2026-11-26 01:42:36 started (attempt 1) T540-impl
 - 2026-11-26 01:42:45 requeue: orchestrator: baseline-failures.txt has an uncommitted edit from blocked T428a (and its unblock); wait (not charged: attempt refunded)
 - 2026-11-26 architect: scope item 4 added (forbid_unsafe_constructs_neg.ax, same cause; unblock-T428m.md)
+- 2026-11-26 23:32:40 started (attempt 1) T540-impl
+- 2026-11-26 23:58:43 accepted by QA -> done
