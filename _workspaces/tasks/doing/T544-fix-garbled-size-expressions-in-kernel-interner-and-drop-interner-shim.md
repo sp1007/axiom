@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 15
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/kernel/interner.ax, tests/selfhost/kernel/qa_kernel_interner.ax.in]
 locks: [tests/selfhost/bundle_common.py]
 spec: [spec/SPEC-20-selfhost.md, spec/SPEC-50-unsafe-ub-ffi.md]
 covers: [REQ-CAP-037]
+started: 2026-11-26 20:23:22
+agent: T544-impl
 ---
 # T544 — Repair the interner's allocation sizes and remove the bundle shim that hides them
 
@@ -60,3 +62,4 @@ the axiomc bundle contains `module _interner_shim`). Consequences in the shipped
 
 ## Log
 - 2026-11-26 created by architect (`_workspaces/reports/triage-2026-11-26-T502-regression.md`)
+- 2026-11-26 20:23:22 started (attempt 1) T544-impl

@@ -8,14 +8,15 @@ model: opus
 gate_model: opus
 depends: [T428a]
 priority: 11
-status: blocked
-attempts: 1
+status: todo
+attempts: 0
 timeout_min: 240
-paths: [tests/resolve/generic_args_binding]
-locks: [compiler/resolve/resolver.ax, compiler/hir/lower.ax]
+paths: [tests/resolve/generic_args_binding, tests/ui/impl_generic_in_method_bound/qa_adversarial_bounds_unresolved_fnonce.ax]
+locks: [compiler/resolve/resolver.ax, compiler/hir/lower.ax, compiler/interp/frame.ax, tests/resolve/more.resolved, tests/hir/more.hir, tests/typeck/generic/generic_subst.thir, tests/typeck/async/async_basic_pos.thir, tests/ui/resolve/ui_tests.ax, tests/ui/impl_generic_in_method_bound/qa_adversarial_bounds_reject.ax, tests/selfhost/resolve/qa_resolve_corpus_pos.ax.in, tests/selfhost/resolve/qa_resolve_corpus_neg_c.ax.in, tests/selfhost/resolve_hir/qa_resolve_hir_corpus_pos_b.ax.in, tests/selfhost/resolve_hir/qa_resolve_hir_corpus_pos_c.ax.in, tests/selfhost/resolve_hir/qa_resolve_hir_corpus_neg_c.ax.in, tests/selfhost/resolve_hir/qa_resolve_hir_corpus_wide_b.ax.in, tests/selfhost/hir/qa_hir_corpus.ax.in, tests/selfhost/hir/qa_hir_desugar_and_drop.ax.in]
 spec: [spec/SPEC-02-grammar.md, spec/SPEC-03-core-semantics.md]
 covers: [REQ-MOD-003, REQ-MOD-064]
 started: 2026-11-26 11:20:52
+unblocks: 1
 ---
 # T428m — Every path inside a generic argument list is resolved in the enclosing scope
 
@@ -64,6 +65,23 @@ AST node, so once the resolver binds the segment the `HirPath` carries `symbol/d
      projection `T.Item` inside an argument, and `Option<i128>` / `Option<never>`-style sentinels;
    - compile-fail: an unimported or misspelled name inside a generic argument gives `AX_NAME_UNRESOLVED` at that
      argument's span (`// error:` directive), and a private item gives `AX_NAME_PRIVATE`.
+6. **Fallout round (architect decision 2026-11-26, `_workspaces/reports/unblock-T428m.md`).** The resolver change and
+   its fallout land in one commit (the stage-2 build is broken without item a). The locks were widened to exactly:
+   a. `compiler/interp/frame.ax`: add `use compiler.interp.value.InterpAlloc` (used by `size_of<InterpAlloc>()` at
+      lines 357/366, found until now only by typeck's bare-name walk). No other change in that file.
+   b. Re-bless the 4 goldens `tests/resolve/more.resolved`, `tests/hir/more.hir`,
+      `tests/typeck/generic/generic_subst.thir`, `tests/typeck/async/async_basic_pos.thir`. The only allowed diff is
+      the new bindings (`@Sym(n)` / `(TypePath @n)`) and, in `async_basic_pos.thir`, the +1 shift of later local ids
+      caused by binding `Poll<Self.Output>`; the report shows the diff summary per file.
+   c. `tests/ui/resolve/ui_tests.ax:3`: add the second `//~ ERROR AX_NAME_UNRESOLVED` (for the undeclared `T`).
+   d. Split `tests/ui/impl_generic_in_method_bound/qa_adversarial_bounds_reject.ax`: move `impl<R> Bad<R>` (lines
+      81–86) and its two uses at the end of `main` into the new
+      `qa_adversarial_bounds_unresolved_fnonce.ax` (expects `AX_NAME_UNRESOLVED` at `FnOnce<MissingBoundTy>`); the
+      original keeps every typeck expectation (lines 90 ×2, 94, 97) and must still produce them.
+   e. Refresh the embedded expected data (`CORPUS_DATA` and the synthetic cases) of the 8 selfhost templates in
+      `locks:` so they match (b)–(d). Edit only the `.ax.in` templates; the generated bundles are the harness's
+      (never list them).
+   Anything else that breaks is still reported as fallout, not patched.
 
 ## Acceptance
 - [ ] The tests above pass (interp, native, native-O1; WEAK-NATIVE 0); the `.resolved` / HIR goldens show the binding.
@@ -71,7 +89,10 @@ AST node, so once the resolver binds the segment the `HirPath` carries `symbol/d
 - [ ] Gate: the task's tests + the selfhost groups of `compiler/resolve` and `compiler/hir` + a **Tier-1 non-selfhost
       sweep** (this change touches every program, so the grep-based affected set is the whole suite); the set of
       failing ids is a subset of `_workspaces/baseline-failures.txt`. The two `T428g` baseline ids may start passing;
-      they stay listed (T428g removes them).
+      they stay listed (T428g removes them). The selfhost groups `selfhost/resolve/qa_resolve_all`,
+      `selfhost/resolve_hir/qa_resolve_hir_all` and `selfhost/hir/qa_hir_all` pass.
+- [ ] The fallout items 6a–6e are done; `ui/impl_generic_in_method_bound/qa_adversarial_bounds_reject.ax` still
+      passes with all four typeck expectations, and the new split test passes.
 - [ ] Report `_workspaces/reports/T428m-report.md`: the helper and its call sites, whether `lower.ax` changed, the fallout
       list (empty or each item with its owner), and an exact `## Files changed`.
 
@@ -79,3 +100,6 @@ AST node, so once the resolver binds the segment the `HirPath` carries `symbol/d
 - 2026-11-26 created by architect (`_workspaces/reports/unblock-T428g.md`)
 - 2026-11-26 11:20:52 started (attempt 1) T428m-impl
 - 2026-11-26 16:41:56 block: fallout outside locks: compiler/interp/frame.ax needs InterpAlloc import; 4 goldens, 2 ui, 8 selfhost .ax.in need intended refresh
+- 2026-11-26 architect: locks widened to the 15 fallout files + split test in paths (unblock-T428m.md); pre-existing
+  `link/dll/gnu_ld_run.test` -> baseline (T423j), `ui/security_profiles/forbid_unsafe_constructs_neg.ax` -> baseline (T540)
+- 2026-11-26 20:34:57 unblocked (cycle 1) 

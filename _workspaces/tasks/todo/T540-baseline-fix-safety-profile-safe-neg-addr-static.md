@@ -40,10 +40,17 @@ bootstrap rejection (T526 already owns the `@addr` UI tests).
    item under `@forbid_unsafe` / `--safety-profile safe` yields exactly one `AX_SEC_UNSAFE_FORBIDDEN`.
 2. Add one companion case to `tests/ui/security_profiles/` that pins the interaction explicitly: an `@addr`
    overlay `fn` placement under `--safety-profile safe` gives `AX_SEC_UNSAFE_FORBIDDEN`.
-3. Remove the T540 line from `_workspaces/baseline-failures.txt` in the same change.
+3. Remove the T540 lines from `_workspaces/baseline-failures.txt` in the same change.
+4. (Added 2026-11-26, `_workspaces/reports/unblock-T428m.md`.) The same defect hits
+   `tests/ui/security_profiles/forbid_unsafe_constructs_neg.ax` (AXS-SEC-001): its line 45
+   `@at(0x1000usize) static MMIO_REG: u32 = 0u32;` gives `AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP`, which stops the
+   pipeline before the `@forbid_unsafe` check, so all 15 expected `AX_SEC_UNSAFE_FORBIDDEN` are missing (identical
+   with the HEAD compiler `axiomc2_O1_642250f08b7af786.exe`, T428m sweep). Apply the same rewrite (overlay form
+   without initializer, `unsafe` modifier per ADR-0001 §2) and keep all 15 expectations.
 
 ## Acceptance
-- [ ] `ui/security_profiles/safety_profile_safe_neg.ax` and the new case pass; all of `tests/ui/security_profiles`
+- [ ] `ui/security_profiles/safety_profile_safe_neg.ax`, `ui/security_profiles/forbid_unsafe_constructs_neg.ax` and
+      the new case pass; all of `tests/ui/security_profiles`
       and `tests/ui/fixed_addr*` / `tests/ui/unsafe*` (if present) still pass.
 - [ ] Baseline line removed.
 - [ ] Normal gate. Report `_workspaces/reports/T540-report.md` with an exact `## Files changed`.
@@ -52,3 +59,4 @@ bootstrap rejection (T526 already owns the `@addr` UI tests).
 - 2026-11-25 created by architect (triage after T427 accept, `_workspaces/reports/triage-2026-11-25-T427.md`)
 - 2026-11-26 01:42:36 started (attempt 1) T540-impl
 - 2026-11-26 01:42:45 requeue: orchestrator: baseline-failures.txt has an uncommitted edit from blocked T428a (and its unblock); wait (not charged: attempt refunded)
+- 2026-11-26 architect: scope item 4 added (forbid_unsafe_constructs_neg.ax, same cause; unblock-T428m.md)
