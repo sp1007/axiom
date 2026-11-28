@@ -5272,6 +5272,203 @@ pub fn lookup_path_type(cx: mut_view<TypeckCtx>, path: view<HirPath>, out_args: 
     lookup_path_type_by_name(mut_view(*cx), path, mut_view(*out_args), name)
 }
 
+fn tc_item_matches_def_mod(str_in: view<StrInterner>, it: *const HirItem, def_mod: view<StrView>) -> bool {
+    if (it as usize) == 0 {
+        return false;
+    }
+    let count = unsafe { (*it).module_path.count };
+    if count == 0 {
+        return def_mod.len == 0;
+    }
+    let segs = unsafe { (*it).module_path.segments };
+    if (segs as usize) == 0 || (def_mod.ptr as usize) == 0 {
+        return false;
+    }
+    let mut pos: usize = 0;
+    let mut i: usize = 0;
+    while i < count {
+        if i > 0 {
+            if pos >= def_mod.len || (unsafe { *(def_mod.ptr + pos) }) != 46u8 {
+                return false;
+            }
+            pos = pos + 1;
+        }
+        let sid_v = unsafe { (*strid_at_const(segs as *const StrId, i)).v };
+        let seg_sv = interner_get(str_in, (StrId { v: sid_v }));
+        if pos + seg_sv.len > def_mod.len {
+            return false;
+        }
+        let mut j: usize = 0;
+        while j < seg_sv.len {
+            if (unsafe { *(def_mod.ptr + pos + j) }) != (unsafe { *(seg_sv.ptr + j) }) {
+                return false;
+            }
+            j = j + 1;
+        }
+        pos = pos + seg_sv.len;
+        i = i + 1;
+    }
+    pos == def_mod.len
+}
+
+fn tc_is_impl_member_clone(cx: view<TypeckCtx>, it: *mut HirItem) -> bool {
+    if (it as usize) == 0 || (cx.hir as usize) == 0 {
+        return false;
+    }
+    let ik = unsafe { (*it).kind };
+    if ik == HIR_ITEM_FN {
+        let orig = unsafe {
+            find_orig_impl_member_with_thir(view(*cx.hir), cx.thir as *const Thir, it as *const HirItem)
+        };
+        return (orig as usize) != 0;
+    }
+    if ik == HIR_ITEM_TYPE_ALIAS {
+        let orig = tc_alias_orig_member(cx.hir as *const HirFile, it as *const HirItem);
+        return (orig as usize) != 0;
+    }
+    if ik == HIR_ITEM_CONST {
+        let ty_p = unsafe { (*it).ty as usize };
+        let ex_p = unsafe { (*it).expr as usize };
+        let mut im: *mut HirItem = unsafe { (*cx.hir).items };
+        while (im as usize) != 0 {
+            if (unsafe { (*im).kind }) == HIR_ITEM_IMPL {
+                let mut m: *mut HirItem = unsafe { (*im).members };
+                while (m as usize) != 0 {
+                    if (unsafe { (*m).kind }) == HIR_ITEM_CONST && (m as usize) != (it as usize) &&
+                       ((ty_p != 0 && (unsafe { (*m).ty as usize }) == ty_p) ||
+                        (ex_p != 0 && (unsafe { (*m).expr as usize }) == ex_p)) {
+                        return true;
+                    }
+                    m = unsafe { (*m).next };
+                }
+            }
+            im = unsafe { (*im).next };
+        }
+    }
+    false
+}
+
+fn tc_current_module_anchor(cx: view<TypeckCtx>, path: view<HirPath>) -> *const HirItem {
+    if (cx.current_fn as usize) != 0 {
+        let sym_v = unsafe { (*cx.current_fn).symbol.v };
+        if sym_v < 0x40000000u32 || sym_v >= 0x50000000u32 {
+            return cx.current_fn;
+        }
+    }
+    if (cx.current_impl as usize) != 0 {
+        return cx.current_impl;
+    }
+    if path.span.file.v != 0u32 && (cx.hir as usize) != 0 {
+        let mut last_match: *const HirItem = 0 as *const HirItem;
+        let mut it: *mut HirItem = unsafe { (*cx.hir).items };
+        while (it as usize) != 0 {
+            let ik = unsafe { (*it).kind };
+            if ik != HIR_ITEM_MODULE && (unsafe { (*it).span.file.v }) == path.span.file.v {
+                if (unsafe { (*it).span.start }) <= path.span.start {
+                    if !tc_is_impl_member_clone(cx, it) {
+                        last_match = it as *const HirItem;
+                    }
+                }
+            }
+            it = unsafe { (*it).next };
+        }
+        if (last_match as usize) != 0 {
+            return last_match;
+        }
+    }
+    0 as *const HirItem
+}
+
+fn tc_resolve_matched_path_item(
+    cx: mut_view<TypeckCtx>,
+    it: *mut HirItem,
+    path: view<HirPath>,
+    out_args: mut_view<GenericArgsSlice>,
+    is_bound: bool
+) -> TypeId {
+    if (it as usize) == 0 {
+        return (TypeId { v: 0u32 });
+    }
+    let ik = unsafe { (*it).kind };
+    if ik == HIR_ITEM_FN {
+        if (cx.str_in as usize) != 0 {
+            let bk = unsafe { intrinsic_attr_builtin_ty(it, view(*cx.str_in)) };
+            if bk != 0u8 && bk != TY_BUILTIN_LEN && bk != TY_BUILTIN_PRINT && bk != TY_BUILTIN_PRINT_INT && bk != TY_BUILTIN_DROP {
+                let sty = unsafe { intern_singleton(mut_view((*cx.thir).interner), bk) };
+                return instantiate_path(mut_view(*cx), sty, it, path, mut_view(*out_args));
+            }
+        }
+        let mut t = unsafe { thir_get_item_type(view(*cx.thir), it) };
+        if t.v == 0u32 && is_bound && !tc_is_impl_member_clone(view(*cx), it) {
+            let old_fn = cx.current_fn;
+            let old_impl = cx.current_impl;
+            let old_self = cx.self_ty.v;
+            let enc = tc_fn_enclosing_impl(cx.hir as *const HirFile, it as *const HirItem);
+            register_item_sig(mut_view(*cx), it, enc);
+            cx.current_fn = old_fn;
+            cx.current_impl = old_impl;
+            cx.self_ty.v = old_self;
+            t = unsafe { thir_get_item_type(view(*cx.thir), it) };
+        }
+        if t.v != 0u32 {
+            return instantiate_path(mut_view(*cx), (TypeId { v: t.v }), it, path, mut_view(*out_args));
+        }
+        return (TypeId { v: 0u32 });
+    }
+    if ik == HIR_ITEM_CONST || ik == HIR_ITEM_STATIC {
+        let mut t = unsafe { thir_get_item_type(view(*cx.thir), it) };
+        if t.v == 0u32 && is_bound {
+            let cty_node: *mut HirType = unsafe { (*it).ty };
+            if (cty_node as usize) != 0 {
+                let err_ty = unsafe { (*cx.thir).interner.t_error };
+                unsafe { thir_set_item_type(mut_view(*cx.thir), it, err_ty); }
+                t = tc_alias_type_in_scope(mut_view(*cx), it, cty_node);
+                unsafe { thir_set_item_type(mut_view(*cx.thir), it, (TypeId { v: t.v })); }
+                let isym = unsafe { (*it).symbol };
+                if isym.v != 0u32 {
+                    unsafe { thir_set_sym_type(mut_view(*cx.thir), (SymbolId { v: isym.v }), (TypeId { v: t.v })); }
+                }
+            }
+        }
+        if t.v != 0u32 {
+            return (TypeId { v: t.v });
+        }
+        return (TypeId { v: 0u32 });
+    }
+    if ik == HIR_ITEM_STRUCT {
+        let t = tc_item_type_on_demand(mut_view(*cx), it);
+        if t.v != 0u32 {
+            return instantiate_path(mut_view(*cx), (TypeId { v: t.v }), it, path, mut_view(*out_args));
+        }
+        let ev = unsafe { (*cx.thir).interner.t_error.v };
+        return (TypeId { v: ev });
+    }
+    if ik == HIR_ITEM_ENUM {
+        let t = tc_item_type_on_demand(mut_view(*cx), it);
+        if t.v != 0u32 {
+            return instantiate_path(mut_view(*cx), (TypeId { v: t.v }), it, path, mut_view(*out_args));
+        }
+        return (TypeId { v: 0u32 });
+    }
+    if ik == HIR_ITEM_TYPE_ALIAS {
+        let mut t = unsafe { thir_get_item_type(view(*cx.thir), it) };
+        if t.v == 0u32 {
+            let aty_node: *mut HirType = unsafe { (*it).ty };
+            if (aty_node as usize) != 0 {
+                t = tc_alias_type_in_scope(mut_view(*cx), it, aty_node);
+                if !is_error(mut_view(*cx), (TypeId { v: t.v })) && t.v != 0u32 {
+                    unsafe { thir_set_item_type(mut_view(*cx.thir), it, (TypeId { v: t.v })); }
+                }
+            }
+        }
+        if t.v != 0u32 {
+            return instantiate_path(mut_view(*cx), (TypeId { v: t.v }), it, path, mut_view(*out_args));
+        }
+        return (TypeId { v: 0u32 });
+    }
+    (TypeId { v: 0u32 })
+}
+
 fn lookup_path_type_by_name(
     cx: mut_view<TypeckCtx>,
     path: view<HirPath>,
@@ -5314,6 +5511,109 @@ fn lookup_path_type_by_name(
         }
     }
 
+    // T428g (REQ-TYP-072, REQ-MOD-003): a path carrying a resolver binding (`symbol != 0` or `def_dom != 0`)
+    // must never reach the bare-name walk; select strictly by `symbol` (or `def_mod` + `def_name`).
+    let is_bound: bool = path.symbol.v != 0u32 || path.def_dom != 0u8;
+    if is_bound {
+        if (cx.hir as usize) != 0 {
+            if path.symbol.v != 0u32 {
+                let mut it: *mut HirItem = unsafe { (*cx.hir).items };
+                while (it as usize) != 0 {
+                    let ik = unsafe { (*it).kind };
+                    let isym = unsafe { (*it).symbol.v };
+                    let mut matched_it: *mut HirItem = 0 as *mut HirItem;
+                    if (ik == HIR_ITEM_FN || ik == HIR_ITEM_CONST || ik == HIR_ITEM_STATIC ||
+                        ik == HIR_ITEM_STRUCT || ik == HIR_ITEM_TYPE_ALIAS) && isym == path.symbol.v {
+                        matched_it = it;
+                    } else if ik == HIR_ITEM_ENUM {
+                        if isym == path.symbol.v {
+                            matched_it = it;
+                        } else {
+                            let mut v: *mut HirVariantDecl = unsafe { (*it).variants };
+                            while (v as usize) != 0 {
+                                if (unsafe { (*v).symbol.v }) == path.symbol.v {
+                                    matched_it = it;
+                                    break;
+                                }
+                                v = unsafe { (*v).next };
+                            }
+                        }
+                    } else if ik == HIR_ITEM_EXTERN_BLOCK || ik == HIR_ITEM_IMPL || ik == HIR_ITEM_TRAIT {
+                        let mut m: *mut HirItem = unsafe { (*it).members };
+                        while (m as usize) != 0 {
+                            let mk = unsafe { (*m).kind };
+                            if (mk == HIR_ITEM_FN || mk == HIR_ITEM_CONST || mk == HIR_ITEM_TYPE_ALIAS) &&
+                               (unsafe { (*m).symbol.v }) == path.symbol.v {
+                                matched_it = m;
+                                break;
+                            }
+                            m = unsafe { (*m).next };
+                        }
+                    }
+                    if (matched_it as usize) != 0 {
+                        let res = tc_resolve_matched_path_item(mut_view(*cx), matched_it, path, mut_view(*out_args), true);
+                        if res.v != 0u32 {
+                            return res;
+                        }
+                    }
+                    it = unsafe { (*it).next };
+                }
+            } else if (cx.str_in as usize) != 0 && path.def_name.len > 0 {
+                let mut def_enum_len = path.def_name.len;
+                let mut dk: usize = 0;
+                while dk < path.def_name.len {
+                    let dch = unsafe { *(path.def_name.ptr + dk) };
+                    if dch == 46u8 || dch == 60u8 {
+                        def_enum_len = dk;
+                        break;
+                    }
+                    dk = dk + 1;
+                }
+                let def_enum_prefix = StrView { ptr: path.def_name.ptr, len: def_enum_len };
+                let mut it: *mut HirItem = unsafe { (*cx.hir).items };
+                while (it as usize) != 0 {
+                    let ik = unsafe { (*it).kind };
+                    if (ik == HIR_ITEM_FN || ik == HIR_ITEM_CONST || ik == HIR_ITEM_STATIC ||
+                        ik == HIR_ITEM_STRUCT || ik == HIR_ITEM_ENUM || ik == HIR_ITEM_TYPE_ALIAS) &&
+                       !tc_is_impl_member_clone(view(*cx), it) &&
+                       unsafe { tc_item_matches_def_mod(view(*cx.str_in), it, view(path.def_mod)) } {
+                        let iname_id = unsafe { (*it).name.v };
+                        let it_name = unsafe { interner_get(view(*cx.str_in), (StrId { v: iname_id })) };
+                        let name_ok = if ik == HIR_ITEM_ENUM {
+                            sv_eq(view(it_name), view(path.def_name)) || sv_eq(view(it_name), view(def_enum_prefix))
+                        } else {
+                            sv_eq(view(it_name), view(path.def_name))
+                        };
+                        if name_ok {
+                            let res = tc_resolve_matched_path_item(mut_view(*cx), it, path, mut_view(*out_args), true);
+                            if res.v != 0u32 {
+                                return res;
+                            }
+                        }
+                    }
+                    it = unsafe { (*it).next };
+                }
+            }
+        }
+        if path.symbol.v != 0u32 && (cx.current_fn as usize) != 0 {
+            let mut p: *mut HirParam = unsafe { (*cx.current_fn).params };
+            while (p as usize) != 0 {
+                if (unsafe { (*p).symbol.v }) == path.symbol.v {
+                    let st = unsafe { thir_get_symbol_type(view(*cx.thir), (SymbolId { v: path.symbol.v })) };
+                    if st.v != 0u32 {
+                        return (TypeId { v: st.v });
+                    }
+                    let pt = unsafe { thir_get_param_type(view(*cx.thir), p) };
+                    if pt.v != 0u32 {
+                        return (TypeId { v: pt.v });
+                    }
+                }
+                p = unsafe { (*p).next };
+            }
+        }
+        return type_error(mut_view(*cx), view(path.span), AX_NAME_UNRESOLVED);
+    }
+
     if (path.generic_args as usize) == 0 && (cx.str_in as usize) != 0 {
         let impl_n_b = if (cx.current_impl as usize) != 0 && (cx.current_fn as usize) != (cx.current_impl as usize) {
             tc_item_generic_count(cx.current_impl)
@@ -5354,104 +5654,108 @@ fn lookup_path_type_by_name(
         }
     }
 
+    // T428g: bare-name walk only for truly unbound paths (`symbol == 0 && def_dom == 0`, e.g. synthetic HIR).
+    // Prefer the current module's item; if more than one module defines the name and none is the current module,
+    // emit `AX_NAME_UNRESOLVED` instead of picking the first global match.
     if (cx.hir as usize) != 0 && (cx.str_in as usize) != 0 {
+        let mut no_lt_len = name.len;
+        let mut k0: usize = 0;
+        while k0 < name.len {
+            if (unsafe { *(name.ptr + k0) }) == 60u8 { // '<'
+                no_lt_len = k0;
+                break;
+            }
+            k0 = k0 + 1;
+        }
+        let no_lt_name = StrView { ptr: name.ptr, len: no_lt_len };
+
+        let mut enum_len = name.len;
+        let mut k1: usize = 0;
+        while k1 < name.len {
+            let ch = unsafe { *(name.ptr + k1) };
+            if ch == 46u8 || ch == 60u8 { // '.' or '<'
+                enum_len = k1;
+                break;
+            }
+            k1 = k1 + 1;
+        }
+        let enum_name = StrView { ptr: name.ptr, len: enum_len };
+
+        let anchor = tc_current_module_anchor(view(*cx), path);
+        let mut cur_mod_match: *mut HirItem = 0 as *mut HirItem;
+        let mut other_mod_match: *mut HirItem = 0 as *mut HirItem;
+        let mut other_mod_ambiguous: bool = false;
+
         let mut it: *mut HirItem = unsafe { (*cx.hir).items };
         while ((it as usize) != 0) {
             let ik = unsafe { (*it).kind };
-            if ik == HIR_ITEM_FN {
+            let mut item_matched = false;
+            if (ik == HIR_ITEM_FN || ik == HIR_ITEM_CONST || ik == HIR_ITEM_STATIC ||
+                ik == HIR_ITEM_STRUCT || ik == HIR_ITEM_ENUM || ik == HIR_ITEM_TYPE_ALIAS) &&
+               !tc_is_impl_member_clone(view(*cx), it) {
                 let iname_id = unsafe { (*it).name.v };
                 let it_name = unsafe { interner_get(view(*cx.str_in), (StrId { v: iname_id })) };
-                if sv_eq(view(it_name), view(name)) {
-                    let bk = unsafe { intrinsic_attr_builtin_ty(it, view(*cx.str_in)) };
-                    if bk != 0u8 && bk != TY_BUILTIN_LEN && bk != TY_BUILTIN_PRINT && bk != TY_BUILTIN_PRINT_INT && bk != TY_BUILTIN_DROP {
-                        let sty = unsafe { intern_singleton(mut_view((*cx.thir).interner), bk) };
-                        return instantiate_path(mut_view(*cx), sty, it, path, mut_view(*out_args));
-                    }
-                    let t = unsafe { thir_get_item_type(view(*cx.thir), it) };
-                    if t.v != 0u32 {
-                        return instantiate_path(mut_view(*cx), (TypeId { v: t.v }), it, path, mut_view(*out_args));
-                    }
-                }
-            } else if ik == HIR_ITEM_CONST || ik == HIR_ITEM_STATIC {
-                let iname_id = unsafe { (*it).name.v };
-                let it_name = unsafe { interner_get(view(*cx.str_in), (StrId { v: iname_id })) };
-                if sv_eq(view(it_name), view(name)) {
-                    let t = unsafe { thir_get_item_type(view(*cx.thir), it) };
-                    if t.v != 0u32 {
-                        return (TypeId { v: t.v });
-                    }
-                }
-            } else if ik == HIR_ITEM_STRUCT {
-                let iname_id = unsafe { (*it).name.v };
-                let it_name = unsafe { interner_get(view(*cx.str_in), (StrId { v: iname_id })) };
-                let mut s_len = name.len;
-                let mut k: usize = 0;
-                while (k < name.len) {
-                    if unsafe { *(name.ptr + k) } == 60u8 { // '<'
-                        s_len = k;
-                        break;
-                    }
-                    k = k + 1;
-                }
-                let struct_name = StrView { ptr: name.ptr, len: s_len };
-                if sv_eq(view(it_name), view(struct_name)) {
-                    let t = tc_item_type_on_demand(mut_view(*cx), it);
-                    if t.v != 0u32 {
-                        return instantiate_path(mut_view(*cx), (TypeId { v: t.v }), it, path, mut_view(*out_args));
-                    }
-                    let ev = unsafe { (*cx.thir).interner.t_error.v };
-                    return (TypeId { v: ev });
-                }
-            } else if ik == HIR_ITEM_ENUM {
-                let iname_id = unsafe { (*it).name.v };
-                let it_name = unsafe { interner_get(view(*cx.str_in), (StrId { v: iname_id })) };
-                let mut e_len = name.len;
-                let mut k: usize = 0;
-                while (k < name.len) {
-                    let ch = unsafe { *(name.ptr + k) };
-                    if ch == 46u8 || ch == 60u8 { // '.' or '<'
-                        e_len = k;
-                        break;
-                    }
-                    k = k + 1;
-                }
-                let enum_name = StrView { ptr: name.ptr, len: e_len };
-                if sv_eq(view(it_name), view(enum_name)) {
-                    let t = tc_item_type_on_demand(mut_view(*cx), it);
-                    if t.v != 0u32 {
-                        return instantiate_path(mut_view(*cx), (TypeId { v: t.v }), it, path, mut_view(*out_args));
-                    }
-                }
-            } else if ik == HIR_ITEM_TYPE_ALIAS {
-                let iname_id = unsafe { (*it).name.v };
-                let it_name = unsafe { interner_get(view(*cx.str_in), (StrId { v: iname_id })) };
-                let mut a_len = name.len;
-                let mut k: usize = 0;
-                while (k < name.len) {
-                    if unsafe { *(name.ptr + k) } == 60u8 {
-                        a_len = k;
-                        break;
-                    }
-                    k = k + 1;
-                }
-                let alias_name = StrView { ptr: name.ptr, len: a_len };
-                if sv_eq(view(it_name), view(alias_name)) {
-                    let mut t = unsafe { thir_get_item_type(view(*cx.thir), it) };
-                    if t.v == 0u32 {
-                        let aty_node: *mut HirType = unsafe { (*it).ty };
-                        if (aty_node as usize) != 0 {
-                            t = tc_alias_type_in_scope(mut_view(*cx), it, aty_node);
-                            if !is_error(mut_view(*cx), (TypeId { v: t.v })) && t.v != 0u32 {
-                                unsafe { thir_set_item_type(mut_view(*cx.thir), it, (TypeId { v: t.v })); }
-                            }
+                if ik == HIR_ITEM_FN {
+                    if sv_eq(view(it_name), view(name)) {
+                        let bk = unsafe { intrinsic_attr_builtin_ty(it, view(*cx.str_in)) };
+                        let has_intr = bk != 0u8 && bk != TY_BUILTIN_LEN && bk != TY_BUILTIN_PRINT && bk != TY_BUILTIN_PRINT_INT && bk != TY_BUILTIN_DROP;
+                        let ft = unsafe { thir_get_item_type(view(*cx.thir), it) };
+                        if has_intr || ft.v != 0u32 {
+                            item_matched = true;
                         }
                     }
-                    if t.v != 0u32 {
-                        return instantiate_path(mut_view(*cx), (TypeId { v: t.v }), it, path, mut_view(*out_args));
+                } else if ik == HIR_ITEM_CONST || ik == HIR_ITEM_STATIC {
+                    if sv_eq(view(it_name), view(name)) {
+                        let ct = unsafe { thir_get_item_type(view(*cx.thir), it) };
+                        if ct.v != 0u32 {
+                            item_matched = true;
+                        }
+                    }
+                } else if ik == HIR_ITEM_STRUCT {
+                    if sv_eq(view(it_name), view(no_lt_name)) {
+                        item_matched = true;
+                    }
+                } else if ik == HIR_ITEM_ENUM {
+                    if sv_eq(view(it_name), view(enum_name)) {
+                        item_matched = true;
+                    }
+                } else if ik == HIR_ITEM_TYPE_ALIAS {
+                    if sv_eq(view(it_name), view(no_lt_name)) {
+                        let at = unsafe { thir_get_item_type(view(*cx.thir), it) };
+                        if at.v != 0u32 || ((unsafe { (*it).ty }) as usize) != 0 {
+                            item_matched = true;
+                        }
                     }
                 }
             }
+
+            if item_matched {
+                if (anchor as usize) != 0 &&
+                   unsafe { dotted_name_eq(view((*anchor).module_path), view((*it).module_path)) } {
+                    cur_mod_match = it;
+                    break;
+                }
+                if (other_mod_match as usize) == 0 {
+                    other_mod_match = it;
+                } else if !unsafe { dotted_name_eq(view((*other_mod_match).module_path), view((*it).module_path)) } {
+                    other_mod_ambiguous = true;
+                }
+            }
             it = unsafe { (*it).next };
+        }
+
+        if (cur_mod_match as usize) != 0 {
+            let res = tc_resolve_matched_path_item(mut_view(*cx), cur_mod_match, path, mut_view(*out_args), false);
+            if res.v != 0u32 {
+                return res;
+            }
+        } else if other_mod_ambiguous {
+            return type_error(mut_view(*cx), view(path.span), AX_NAME_UNRESOLVED);
+        } else if (other_mod_match as usize) != 0 {
+            let res = tc_resolve_matched_path_item(mut_view(*cx), other_mod_match, path, mut_view(*out_args), false);
+            if res.v != 0u32 {
+                return res;
+            }
         }
     }
 
@@ -13242,6 +13546,14 @@ fn register_item_sig(cx: mut_view<TypeckCtx>, it: *mut HirItem, parent_impl: *co
     }
     let ik = unsafe { (*it).kind };
     if ik == HIR_ITEM_FN {
+        if !tc_is_default_inst(it as *const HirItem) {
+            let existing_ft = unsafe { thir_get_item_type(view(*cx.thir), it) };
+            if existing_ft.v != 0u32 {
+                return;
+            }
+            let err_ft = unsafe { (*cx.thir).interner.t_error };
+            unsafe { thir_set_item_type(mut_view(*cx.thir), it, err_ft); }
+        }
         cx.current_fn = it;
         cx.current_impl = parent_impl;
         if (parent_impl as usize) != 0 {
@@ -13427,23 +13739,39 @@ fn register_item_sig(cx: mut_view<TypeckCtx>, it: *mut HirItem, parent_impl: *co
         }
         cx.current_fn = 0 as *const HirItem;
     } else if ik == HIR_ITEM_CONST {
-        cx.current_fn = it;
-        let cty_node: *mut HirType = unsafe { (*it).ty };
-        let ty = hir_type_to_typeid(mut_view(*cx), cty_node);
-        unsafe { thir_set_item_type(mut_view(*cx.thir), it, (TypeId { v: ty.v })); }
-        let isym = unsafe { (*it).symbol };
-        if isym.v != 0u32 {
-            unsafe { thir_set_sym_type(mut_view(*cx.thir), (SymbolId { v: isym.v }), (TypeId { v: ty.v })); }
-        }
-        cx.current_fn = 0 as *const HirItem;
-    } else if ik == HIR_ITEM_STATIC {
-        let sty_node: *mut HirType = unsafe { (*it).ty };
-        if (sty_node as usize) != 0 {
-            let ty = hir_type_to_typeid(mut_view(*cx), sty_node);
+        let existing_ct = unsafe { thir_get_item_type(view(*cx.thir), it) };
+        if existing_ct.v != 0u32 {
+            let isym = unsafe { (*it).symbol };
+            if isym.v != 0u32 {
+                unsafe { thir_set_sym_type(mut_view(*cx.thir), (SymbolId { v: isym.v }), (TypeId { v: existing_ct.v })); }
+            }
+        } else {
+            cx.current_fn = it;
+            let cty_node: *mut HirType = unsafe { (*it).ty };
+            let ty = hir_type_to_typeid(mut_view(*cx), cty_node);
             unsafe { thir_set_item_type(mut_view(*cx.thir), it, (TypeId { v: ty.v })); }
             let isym = unsafe { (*it).symbol };
             if isym.v != 0u32 {
                 unsafe { thir_set_sym_type(mut_view(*cx.thir), (SymbolId { v: isym.v }), (TypeId { v: ty.v })); }
+            }
+            cx.current_fn = 0 as *const HirItem;
+        }
+    } else if ik == HIR_ITEM_STATIC {
+        let existing_st = unsafe { thir_get_item_type(view(*cx.thir), it) };
+        if existing_st.v != 0u32 {
+            let isym = unsafe { (*it).symbol };
+            if isym.v != 0u32 {
+                unsafe { thir_set_sym_type(mut_view(*cx.thir), (SymbolId { v: isym.v }), (TypeId { v: existing_st.v })); }
+            }
+        } else {
+            let sty_node: *mut HirType = unsafe { (*it).ty };
+            if (sty_node as usize) != 0 {
+                let ty = hir_type_to_typeid(mut_view(*cx), sty_node);
+                unsafe { thir_set_item_type(mut_view(*cx.thir), it, (TypeId { v: ty.v })); }
+                let isym = unsafe { (*it).symbol };
+                if isym.v != 0u32 {
+                    unsafe { thir_set_sym_type(mut_view(*cx.thir), (SymbolId { v: isym.v }), (TypeId { v: ty.v })); }
+                }
             }
         }
     }

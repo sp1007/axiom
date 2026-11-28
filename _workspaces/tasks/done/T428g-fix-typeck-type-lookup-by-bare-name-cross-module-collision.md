@@ -8,15 +8,16 @@ model: opus
 gate_model: opus
 depends: [T428a, T428m]
 priority: 12
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 240
 paths: [tests/modules/same_name_types, tests/run/same_name_std_types]
 locks: [compiler/types/typeck.ax, _workspaces/baseline-failures.txt]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-02-grammar.md]
 covers: [REQ-TYP-072, REQ-MOD-003, REQ-MOD-064]
-started: 2026-11-26 10:14:53
+started: 2026-11-28 16:46:42
 unblocks: 1
+finished: 2026-11-28 19:57:36
 ---
 # T428g — A type name must resolve to the item the resolver bound, never to the first same-named item
 
@@ -78,3 +79,5 @@ already carries the binding, so after T428m those paths take typeck's symbol-ind
 - 2026-11-26 10:14:53 started (attempt 1) T428g-impl
 - 2026-11-26 10:40:50 block: root cause in resolver: resolve_type/resolve_path_seg never bind generic_args segments (Result<String, IoError>, Option<a.S> get symbol=0), so typeck falls back to bare-name walk; needs a frontend resolver task first
 - 2026-11-26 10:43:43 unblocked (cycle 1) 
+- 2026-11-28 16:46:42 started (attempt 1) axiom-semantics
+- 2026-11-28 19:57:36 accepted by QA -> done
