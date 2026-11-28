@@ -77213,6 +77213,10 @@ use compiler.mir.mir.MIR_STMT_ASSIGN
 use compiler.mir.mir.MIR_STMT_STORAGE_LIVE
 use compiler.mir.mir.MIR_STMT_STORAGE_DEAD
 use compiler.mir.mir.MIR_STMT_DROP
+use compiler.mir.mir.MIR_STMT_ATOMIC
+use compiler.mir.mir.MIR_ATOMIC_STORE
+use compiler.mir.mir.MIR_ATOMIC_CMPXCHG
+use compiler.mir.mir.MIR_ATOMIC_CMPXCHG_WEAK
 use compiler.mir.mir.MIR_TERM_GOTO
 use compiler.mir.mir.MIR_TERM_RETURN
 use compiler.mir.mir.MIR_TERM_SWITCH_INT
@@ -77322,19 +77326,31 @@ pub use compiler.mir.builder.mir_prebuilt_set;
 
 // ---- Local CFG Liveness Analysis ----
 
-fn place_uses_local(p: view<MirPlace>, l: u32) -> bool {
-    if p.local.v == l {
-        return true;
-    }
+fn place_proj_uses_local(p: view<MirPlace>, l: u32) -> bool {
     let mut i: usize = 0;
     while i < p.proj_count {
         let pr = unsafe { mir_proj_at(p.projs, i) };
-        if (unsafe { (*pr).kind }) == MIR_PROJ_INDEX && (unsafe { (*pr).index_local.v }) == l {
+        let pk = unsafe { (*pr).kind };
+        if pk == MIR_PROJ_INDEX && (unsafe { (*pr).index_local.v }) == l {
             return true;
+        } else if pk == MIR_PROJ_SUB_SLICE {
+            if (unsafe { (*pr).has_from }) && (unsafe { (*pr).from_local.v }) == l {
+                return true;
+            }
+            if (unsafe { (*pr).has_to }) && (unsafe { (*pr).to_local.v }) == l {
+                return true;
+            }
         }
         i = i + 1;
     }
     false
+}
+
+fn place_uses_local(p: view<MirPlace>, l: u32) -> bool {
+    if p.local.v == l {
+        return true;
+    }
+    place_proj_uses_local(p, l)
 }
 
 fn op_uses_local(op: view<MirOperand>, l: u32) -> bool {
@@ -77416,6 +77432,8 @@ pub fn async_local_used_from(body: view<MirBody>, resume_bb: usize, l: u32) -> b
             if sk == MIR_STMT_ASSIGN {
                 if rvalue_uses_local(unsafe { view((*st).rvalue) }, l) {
                     used = true;
+                } else if place_proj_uses_local(unsafe { view((*st).place) }, l) {
+                    used = true;
                 } else if (unsafe { (*st).place.local.v }) == l {
                     if (unsafe { (*st).place.proj_count }) == 0 {
                         killed = true;
@@ -77431,6 +77449,27 @@ pub fn async_local_used_from(body: view<MirBody>, resume_bb: usize, l: u32) -> b
             } else if sk == MIR_STMT_STORAGE_DEAD {
                 if (unsafe { (*st).storage_local.v }) == l {
                     killed = true;
+                }
+            } else if sk == MIR_STMT_ATOMIC {
+                let aop = unsafe { (*st).rvalue.bin_op };
+                if aop <= MIR_ATOMIC_CMPXCHG_WEAK && op_uses_local(unsafe { view((*st).rvalue.use_op) }, l) {
+                    used = true;
+                } else if aop >= MIR_ATOMIC_STORE && aop <= MIR_ATOMIC_CMPXCHG_WEAK &&
+                          op_uses_local(unsafe { view((*st).rvalue.lhs) }, l) {
+                    used = true;
+                } else if (aop == MIR_ATOMIC_CMPXCHG || aop == MIR_ATOMIC_CMPXCHG_WEAK) &&
+                          op_uses_local(unsafe { view((*st).rvalue.rhs) }, l) {
+                    used = true;
+                } else if aop <= MIR_ATOMIC_CMPXCHG_WEAK && aop != MIR_ATOMIC_STORE {
+                    if place_proj_uses_local(unsafe { view((*st).place) }, l) {
+                        used = true;
+                    } else if (unsafe { (*st).place.local.v }) == l {
+                        if (unsafe { (*st).place.proj_count }) == 0 {
+                            killed = true;
+                        } else {
+                            used = true;
+                        }
+                    }
                 }
             }
             i = i + 1;
@@ -77463,6 +77502,17 @@ pub fn async_local_used_from(body: view<MirBody>, resume_bb: usize, l: u32) -> b
                     }
                     a = a + 1;
                 }
+                if !used && (unsafe { (*bb).terminator.has_destination }) {
+                    if place_proj_uses_local(unsafe { view((*bb).terminator.destination) }, l) {
+                        used = true;
+                    } else if (unsafe { (*bb).terminator.destination.local.v }) == l {
+                        if (unsafe { (*bb).terminator.destination.proj_count }) == 0 {
+                            killed = true;
+                        } else {
+                            used = true;
+                        }
+                    }
+                }
             } else if tk == MIR_TERM_ASSERT {
                 if op_uses_local(unsafe { view((*bb).terminator.cond) }, l) {
                     used = true;
@@ -77470,10 +77520,18 @@ pub fn async_local_used_from(body: view<MirBody>, resume_bb: usize, l: u32) -> b
             } else if tk == MIR_TERM_SUSPEND {
                 if place_uses_local(unsafe { view((*bb).terminator.drop_place) }, l) {
                     used = true;
+                } else if place_proj_uses_local(unsafe { view((*bb).terminator.destination) }, l) {
+                    used = true;
+                } else if (unsafe { (*bb).terminator.destination.local.v }) == l {
+                    if (unsafe { (*bb).terminator.destination.proj_count }) == 0 {
+                        killed = true;
+                    } else {
+                        used = true;
+                    }
                 }
             }
 
-            if !used {
+            if !used && !killed {
                 // Push normal successors
                 if tk == MIR_TERM_GOTO {
                     let tgt = (unsafe { (*bb).terminator.goto_target.v }) as usize;
@@ -77610,6 +77668,24 @@ fn maybe_init_stmts(body: view<MirBody>, b: usize, l: u32, copy_moves: bool, st_
             if (unsafe { (*s).place.local.v }) == l && (unsafe { (*s).place.proj_count }) == 0 {
                 st = false;
             }
+        } else if sk == MIR_STMT_ATOMIC {
+            let aop = unsafe { (*s).rvalue.bin_op };
+            if aop <= MIR_ATOMIC_CMPXCHG_WEAK && op_moves_local(unsafe { view((*s).rvalue.use_op) }, l, copy_moves) {
+                st = false;
+            }
+            if aop >= MIR_ATOMIC_STORE && aop <= MIR_ATOMIC_CMPXCHG_WEAK &&
+               op_moves_local(unsafe { view((*s).rvalue.lhs) }, l, copy_moves) {
+                st = false;
+            }
+            if (aop == MIR_ATOMIC_CMPXCHG || aop == MIR_ATOMIC_CMPXCHG_WEAK) &&
+               op_moves_local(unsafe { view((*s).rvalue.rhs) }, l, copy_moves) {
+                st = false;
+            }
+            if aop <= MIR_ATOMIC_CMPXCHG_WEAK && aop != MIR_ATOMIC_STORE {
+                if (unsafe { (*s).place.local.v }) == l && (unsafe { (*s).place.proj_count }) == 0 {
+                    st = true;
+                }
+            }
         }
         i = i + 1;
     }
@@ -77679,10 +77755,12 @@ pub fn async_local_maybe_init_at(body: view<MirBody>, target_bb: usize, l: u32, 
                     } else if tk == MIR_TERM_ASSERT {
                         t0 = (unsafe { (*bb).terminator.assert_target.v }) as usize;
                     } else if tk == MIR_TERM_SUSPEND {
-                        if (unsafe { (*bb).terminator.drop_place.local.v }) == l {
+                        if (unsafe { (*bb).terminator.drop_place.local.v }) == l &&
+                            (unsafe { (*bb).terminator.drop_place.proj_count }) == 0 {
                             st = false;
                         }
-                        if (unsafe { (*bb).terminator.destination.local.v }) == l {
+                        if (unsafe { (*bb).terminator.destination.local.v }) == l &&
+                            (unsafe { (*bb).terminator.destination.proj_count }) == 0 {
                             st = true;
                         }
                         t0 = (unsafe { (*bb).terminator.call_target.v }) as usize;
@@ -78079,6 +78157,20 @@ fn remap_stmt(rm: view<AlRemap>, st: mut_view<MirStmt>) {
         st.storage_local.v = al_map_local(rm, st.storage_local.v);
     } else if sk == MIR_STMT_DROP {
         remap_place(rm, mut_view(st.place));
+    } else if sk == MIR_STMT_ATOMIC {
+        let aop = st.rvalue.bin_op;
+        if aop <= MIR_ATOMIC_CMPXCHG_WEAK && aop != MIR_ATOMIC_STORE {
+            remap_place(rm, mut_view(st.place));
+        }
+        if aop <= MIR_ATOMIC_CMPXCHG_WEAK {
+            remap_operand(rm, mut_view(st.rvalue.use_op));
+        }
+        if aop >= MIR_ATOMIC_STORE && aop <= MIR_ATOMIC_CMPXCHG_WEAK {
+            remap_operand(rm, mut_view(st.rvalue.lhs));
+        }
+        if aop == MIR_ATOMIC_CMPXCHG || aop == MIR_ATOMIC_CMPXCHG_WEAK {
+            remap_operand(rm, mut_view(st.rvalue.rhs));
+        }
     }
 }
 
@@ -78403,15 +78495,17 @@ pub fn mir_lower_async_body(
 
         let mut l: u32 = 1u32;
         while (l as usize) < orig_lc {
+            let l_decl = unsafe { mir_local_at((*body).locals, l as usize) };
             let dest_whole = l == dest_l && (unsafe { (*spi).dest_place.proj_count }) == 0;
-            if l != fut_l {
-                let l_ty = TypeId { v: unsafe { (*mir_local_at((*body).locals, l as usize)).ty.v } };
+            if l != fut_l && !al_local_is_global(unsafe { view(*l_decl) }) {
+                let l_ty = TypeId { v: unsafe { (*l_decl).ty.v } };
                 let copy_moves = unsafe { mir_type_needs_drop(l_ty, view(*thir), view(*hir), view(*str_in)) };
                 let is_assigned = async_local_maybe_init_at(unsafe { view(*body) }, sp_bb, l, (l as usize) <= param_m, copy_moves);
                 // A destination that is overwritten as a whole needs no old value unless its address is observable;
-                // a destination inside `l` needs the rest of `l`.
+                // a destination inside `l` needs the rest of `l`, and projection index/slice locals are read on resume.
                 let is_live = is_assigned && (
                     (l == dest_l && !dest_whole) ||
+                    place_proj_uses_local(unsafe { view((*spi).dest_place) }, l) ||
                     (!dest_whole && async_local_used_from(unsafe { view(*body) }, resume_bb, l)) ||
                     al_local_storage_live_across(unsafe { view(*body) }, thir as *const Thir, unsafe { address_of((*spi).span) }, l, param_m));
                 if is_live {
@@ -78853,7 +78947,9 @@ pub fn mir_lower_async_body(
         let new_decl = unsafe { mir_local_at(poll_locals, base_orig_local + ol) };
         unsafe {
             *new_decl = *orig_decl;
-            (*new_decl).kind = MIR_LOCAL_TEMP;
+            if !al_local_is_global(view(*orig_decl)) {
+                (*new_decl).kind = MIR_LOCAL_TEMP;
+            }
         }
         ol = ol + 1;
     }

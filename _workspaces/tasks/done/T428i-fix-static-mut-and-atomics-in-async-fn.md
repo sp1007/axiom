@@ -8,13 +8,15 @@ model: opus
 gate_model: opus
 depends: [T428a]
 priority: 28
-status: todo
-attempts: 0
+status: done
+attempts: 1
 timeout_min: 300
 paths: [tests/run/async/statics_atomics_in_async]
 locks: [compiler/mir/async_lower.ax]
 spec: [spec/SPEC-33-async.md, spec/SPEC-31-atomics.md]
 covers: [REQ-ASY-082, REQ-MIR-144]
+started: 2026-11-28 22:01:25
+finished: 2026-11-29 01:40:29
 ---
 # T428i — Statics and atomics keep their meaning across async lowering
 
@@ -45,3 +47,5 @@ REQ-ASY-082 (AASYNC-38): async lowering must preserve synchronization semantics 
 
 ## Log
 - 2026-11-26 created by architect (`_workspaces/reports/unblock-T428a.md`, triage of T428a-qa.md defects 2-3)
+- 2026-11-28 22:01:25 started (attempt 1) axiom-semantics
+- 2026-11-29 01:40:29 accepted by QA -> done
