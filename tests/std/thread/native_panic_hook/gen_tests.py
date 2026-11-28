@@ -97,7 +97,7 @@ def main():
         else:
             with open(target, "w", encoding="utf-8", newline="\n") as f:
                 f.write(expected)
-            print("Generated " + name + ".ax")
+            print("wrote " + os.path.relpath(target, ROOT).replace(os.sep, "/"))
 
     if args.check:
         if mismatches:

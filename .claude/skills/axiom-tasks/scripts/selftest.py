@@ -910,6 +910,88 @@ def test_d():
           and os.path.isfile(os.path.join(d, B3))
           and show_head(d, B3) == "// generated\nc1"
           and B2 not in show_head(d, MAN) and B3 in show_head(d, MAN), out2)
+
+    # ---- T449b: class (a) std live-source bundles vs class (b) static fixture generators
+    STD_GEN_SRC = '''#!/usr/bin/env python3
+import os, sys
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
+SRC = os.path.join(ROOT, "std", "sync", "demo.ax")
+OUT = os.path.join(HERE, "sync_bundle.ax")
+
+
+def main(argv):
+    data = "// std bundle\\n" + open(SRC, encoding="utf-8").read()
+    if "--check" in argv:
+        ok = os.path.exists(OUT) and open(OUT, encoding="utf-8", newline="").read() == data
+        print("OK" if ok else "ERROR: sync_bundle.ax out of date")
+        return 0 if ok else 1
+    with open(OUT, "w", encoding="utf-8", newline="\\n") as fh:
+        fh.write(data)
+    print("wrote " + os.path.relpath(OUT, ROOT).replace(os.sep, "/"))
+    return 0
+
+
+sys.exit(main(sys.argv[1:]))
+'''
+    CONF_GEN_SRC = '''#!/usr/bin/env python3
+import os, sys
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
+SRC = os.path.join(ROOT, "std", "sync", "demo.ax")
+OUT = os.path.join(HERE, "conf_bundle.ax")
+
+
+def main(argv):
+    data = "// conf bundle\\n" + open(SRC, encoding="utf-8").read()
+    if "--check" in argv:
+        ok = os.path.exists(OUT) and open(OUT, encoding="utf-8", newline="").read() == data
+        print("OK" if ok else "ERROR: conf_bundle.ax out of date")
+        return 0 if ok else 1
+    with open(OUT, "w", encoding="utf-8", newline="\\n") as fh:
+        fh.write(data)
+    print("Generated conf_bundle.ax")
+    return 0
+
+
+sys.exit(main(sys.argv[1:]))
+'''
+    CLASS_B_SRC = '''#!/usr/bin/env python3
+import os, sys
+HERE = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(HERE, "SHOULD_NEVER_RUN.sentinel"), "w", encoding="utf-8") as fh:
+    fh.write("ran\\n")
+sys.exit(99)
+'''
+    SB = "tests/std/sync/sync_bundle.ax"
+    CB = "tests/conformance/p11/e11_3_threads_sync/conf_bundle.ax"
+    write(d, "std/sync/demo.ax", "fn v() = 1\n")
+    write(d, "tests/std/sync/gen_tests.py", STD_GEN_SRC)
+    write(d, "tests/conformance/p11/e11_3_threads_sync/gen_tests.py", CONF_GEN_SRC)
+    write(d, "tests/std/num/gen_tests.py", CLASS_B_SRC)  # class (b): static fixtures, must NEVER run
+    rc, out = bundles_cli(d, "regen", "--root", d)
+    rc_lst, out_lst = bundles_cli(d, "list", "--root", d)
+    check("T449b bundles.py regen/list includes class (a) std + conformance bundles and skips class (b)",
+          rc == 0 and rc_lst == 0 and SB in out_lst and CB in out_lst
+          and not os.path.exists(os.path.join(d, "tests/std/num/SHOULD_NEVER_RUN.sentinel")), out + "\n" + out_lst)
+    write(d, T + "T018-std.md", task("T018", 28, ["T017"], ["std/sync/demo.ax"]))
+    commit_all(d, "add std bundles")
+    tc(d, "start", "T018", "--agent", "T018-impl")
+    write(d, "std/sync/demo.ax", "fn v() = 2\n")
+    pass_gate(d, "T018", ["std/sync/demo.ax"])
+    rc, out = tc(d, "snapshot", "T018")
+    s18 = os.path.join(d, "build-snap-T018")
+    check("T449b std/ change regenerates class (a) bundles in snapshot and never runs class (b)",
+          rc == 0 and open(os.path.join(s18, SB)).read() == "// std bundle\nfn v() = 2\n"
+          and open(os.path.join(s18, CB)).read() == "// conf bundle\nfn v() = 2\n"
+          and not os.path.exists(os.path.join(s18, "tests/std/num/SHOULD_NEVER_RUN.sentinel")), out)
+    rc, out = tc(d, "accept", "T018")
+    hf = head_files(d)
+    check("T449b accept stages regenerated class (a) std/conformance bundles in single commit and never runs class (b)",
+          rc == 0 and SB in hf and CB in hf
+          and show_head(d, SB) == "// std bundle\nfn v() = 2"
+          and show_head(d, CB) == "// conf bundle\nfn v() = 2"
+          and not os.path.exists(os.path.join(d, "tests/std/num/SHOULD_NEVER_RUN.sentinel")), out + "\n" + hf)
     sh(["git", "worktree", "prune"], d)
 
 

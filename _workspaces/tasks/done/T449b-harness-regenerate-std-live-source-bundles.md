@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T449a]
 priority: 25
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [.claude/skills/axiom-tasks/scripts/bundles.py, tests/std/async/executor/gen_tests.py, tests/std/async/structured/gen_tests.py, tests/std/async/waker/gen_tests.py, tests/std/async/waker_qa/gen_tests.py, tests/std/channel/gen_tests.py, tests/std/fiber/gen_tests.py, tests/std/sync/gen_tests.py, tests/std/thread/native_panic_hook/gen_tests.py]
 locks: [.claude/skills/axiom-tasks/scripts/selftest.py, .claude/skills/axiom-tasks/scripts/taskctl.py, .claude/skills/axiom-tasks/SKILL.md, .claude/skills/axiom-testing/SKILL.md]
 spec: [spec/SPEC-20-selfhost.md]
 covers: [REQ-TST-072]
+started: 2026-11-28 21:40:20
+finished: 2026-11-28 22:00:49
 ---
 # T449b — Harness: regenerate std live-source test bundles automatically
 
@@ -55,3 +57,5 @@ fixed once by T449a). This task removes the class of failure instead of re-fixin
 ## Log
 - 2026-11-25 created by architect (triage after T427 accept, `_workspaces/reports/triage-2026-11-25-T427.md`)
 - 2026-11-25 priority 120 -> 25 by architect (T428 triage: T428d/T428e/T428f edit std/async and wait for the harness-owned std bundle regeneration)
+- 2026-11-28 21:40:20 started (attempt 1) axiom-qa
+- 2026-11-28 22:00:49 accepted by QA -> done

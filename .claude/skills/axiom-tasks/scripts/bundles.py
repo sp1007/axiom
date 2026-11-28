@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
-"""bundles — regenerate the committed selfhost bundles of a tree (harness, owner decision 2026-11-17).
+"""bundles — regenerate the committed live-source test bundles of a tree (harness, owner decision 2026-11-17, T449b).
 
-The generators `tests/selfhost/**/gen_*.py` concatenate `compiler/` (and some `std/`) modules into
-committed `.ax` bundles. Tasks never write or commit those files by hand: `taskctl.py snapshot`
-regenerates them inside the task snapshot (so the gate tests exactly what will be committed) and
-`taskctl.py accept` regenerates them again on the current HEAD + the task's change set and stages
-them in the task's single commit. This module is that one regeneration routine.
+The generators `tests/selfhost/**/gen_*.py` and the allowlisted live-source std/conformance/perf
+generators (`EXTRA_GENERATORS`) concatenate live `compiler/` and `std/` modules into committed `.ax`
+bundles. Tasks never write or commit those files by hand: `taskctl.py snapshot` regenerates them
+inside the task snapshot (so the gate tests exactly what will be committed) and `taskctl.py accept`
+regenerates them again on the current HEAD + the task's change set and stages them in the task's
+single commit. This module is that one regeneration routine.
 
-Every generator resolves ROOT from its own file location, so running `<tree>/tests/selfhost/x/gen.py`
-regenerates the bundles of <tree> from <tree>'s sources only. Plain write mode never runs a compiler
-(axiom0-captured goldens are extracted from the bundle already on disk; only `--refresh-goldens` /
-`--axiom0` re-capture them), so a regeneration is a pure function of the tree.
+Every generator resolves ROOT from its own file location, so running `<tree>/<gen>` regenerates the
+bundles of <tree> from <tree>'s sources only. Plain write mode never runs a compiler (axiom0-captured
+goldens are extracted from the bundle already on disk; only `--refresh-goldens` / `--axiom0`
+re-capture them), so a regeneration is a pure function of the tree.
 
 Generators of one directory run one after another (some import a sibling and write the same files);
 directories run in parallel (-j). The set of generated files is the "wrote <path>" output of a write
-run; it is kept in the committed manifest MANIFEST (itself a generated file).
+run (plus "Generated <rel>" relative to the generator's directory for allowlisted legacy generators);
+it is kept in the committed manifest MANIFEST (itself a generated file).
 
 Usage (from anywhere):
     python bundles.py regen [--root DIR] [-j N]   write every bundle of DIR (default: repo root)
@@ -32,6 +34,23 @@ import time
 
 MANIFEST = "tests/selfhost/generated-files.txt"
 GEN_GLOB = ("tests", "selfhost", "**", "gen_*.py")
+# Explicit allowlist of live-source bundle generators outside tests/selfhost/ (T449b).
+# Static fixture generators (class b) are intentionally excluded so they are never run here.
+EXTRA_GENERATORS = (
+    "tests/std/async/executor/gen_tests.py",
+    "tests/std/async/structured/gen_tests.py",
+    "tests/std/async/waker/gen_tests.py",
+    "tests/std/async/waker_qa/gen_tests.py",
+    "tests/std/channel/gen_tests.py",
+    "tests/std/fiber/gen_tests.py",
+    "tests/std/sync/gen_tests.py",
+    "tests/std/thread/native_panic_hook/gen_tests.py",
+    "tests/conformance/p11/e11_3_threads_sync/gen_tests.py",
+    "tests/conformance/p11/e11_5_executors/gen_tests.py",
+    "tests/conformance/p11/e11_6_async_io/gen_tests.py",
+    "tests/perf/p11_executor/gen_tests.py",
+)
+_EXTRA_SET = frozenset(EXTRA_GENERATORS)
 TEMPLATE_ROOT = "tests/selfhost"
 DEFAULT_JOBS = 3
 GEN_TIMEOUT_S = 1800
@@ -48,7 +67,11 @@ def _rel(tree, p):
 def generators(tree):
     """Relative paths of every generator of the tree, sorted."""
     out = glob.glob(os.path.join(tree, *GEN_GLOB), recursive=True)
-    return sorted(_rel(tree, g) for g in out if "__pycache__" not in g)
+    found = {_rel(tree, g) for g in out if "__pycache__" not in g}
+    for rel in EXTRA_GENERATORS:
+        if os.path.isfile(os.path.join(tree, *rel.split("/"))):
+            found.add(rel)
+    return sorted(found)
 
 
 def _groups(gens):
@@ -77,9 +100,14 @@ def _run_group(tree, group, check):
             tail = "\n".join((bad or text.strip().splitlines())[-12:])
             failures.append((g, rc, tail))
         if not check:
+            gdir = os.path.dirname(g)
             for ln in text.splitlines():
                 if ln.startswith("wrote "):
                     outputs.append(_rel(tree, ln[len("wrote "):]))
+                elif g in _EXTRA_SET and ln.startswith("Generated "):
+                    rel_name = ln[len("Generated "):].strip()
+                    if rel_name:
+                        outputs.append(_rel(tree, os.path.join(tree, gdir, rel_name)))
     return outputs, failures, time.time() - t0
 
 
@@ -117,7 +145,8 @@ def run(tree, check=False, jobs=DEFAULT_JOBS):
 
 
 def write_manifest(tree, outputs):
-    lines = ["# Files written by tests/selfhost/**/gen_*.py (harness: .claude/skills/axiom-tasks/scripts/bundles.py).",
+    lines = ["# Files written by live-source bundle generators (tests/selfhost/**/gen_*.py and EXTRA_GENERATORS;",
+             "# harness: .claude/skills/axiom-tasks/scripts/bundles.py).",
              "# Generated: tasks never edit, list or commit these by hand; `taskctl snapshot` and `taskctl accept`",
              "# regenerate them. This manifest is regenerated with them."]
     data = "\n".join(lines + sorted(set(outputs) - {MANIFEST})) + "\n"

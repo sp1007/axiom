@@ -1187,7 +1187,7 @@ def main():
         else:
             with open(target_path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(expected)
-            print(f"Generated {fname}")
+            print("wrote " + os.path.relpath(target_path, ROOT).replace(os.sep, "/"))
 
     if args.check:
         if mismatches:

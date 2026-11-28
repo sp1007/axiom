@@ -27,13 +27,14 @@ Optional keys: locks (shared files, honoured like paths), needs (requirement ids
 reqcov), timeout_min (hang limit for impl/fix, see overdue.py), unblocks, unblock_failures,
 superseded_by.
 
-Generated selfhost bundles (owner decision 2026-11-17): the files written by tests/selfhost/**/gen_*.py
-(list: tests/selfhost/generated-files.txt, plus every X with an X.in template) belong to the harness,
-not to tasks. An unlisted change to one of them in the main tree is ignored (never staged, never a
-REFUSED entry); `snapshot` regenerates them inside the snapshot and `accept` regenerates them on the
-current HEAD + the task's change set and stages them in the task's commit (see bundles.py). A listed
-generated file (legacy report, or a bundle whose axiom0 goldens were refreshed on purpose) is copied
-into the snapshot as an input and regenerated over.
+Generated live-source bundles (owner decision 2026-11-17, T449b): the files written by
+tests/selfhost/**/gen_*.py and the allowlisted live-source std/conformance/perf generators in
+bundles.EXTRA_GENERATORS (list: tests/selfhost/generated-files.txt, plus every X with an X.in
+template) belong to the harness, not to tasks. An unlisted change to one of them in the main tree
+is ignored (never staged, never a REFUSED entry); `snapshot` regenerates them inside the snapshot
+and `accept` regenerates them on the current HEAD + the task's change set and stages them in the
+task's commit (see bundles.py). A listed generated file (legacy report, or a bundle whose axiom0
+goldens were refreshed on purpose) is copied into the snapshot as an input and regenerated over.
 
 Commands (exit 0 ok, 1 refused/check failed, 2 usage or board error, 3 wait, 4 parked, 5 re-gate):
     status [--json]            board summary; --json adds total/finished for the tick
@@ -874,8 +875,10 @@ NO_BUNDLE_INPUT = ("spec/", "_workspaces/", ".claude/")
 def touches_bundle_inputs(files):
     """False when no file of the change set can be read by a bundle generator (specs, board, reports,
     harness, Markdown): accept then skips the ~2 min regeneration. Anything else (compiler/, std/,
-    tests/, tools/, bootstrap/ ...) regenerates."""
-    return (bundles is not None and any(not (f.startswith(NO_BUNDLE_INPUT) or f.endswith(".md")) for f in files)
+    tests/, tools/, bootstrap/ ..., or bundles.py itself) regenerates."""
+    return (bundles is not None
+            and any(f.endswith("/bundles.py") or not (f.startswith(NO_BUNDLE_INPUT) or f.endswith(".md"))
+                    for f in files)
             and bool(bundles.generators(ROOT)))
 
 
