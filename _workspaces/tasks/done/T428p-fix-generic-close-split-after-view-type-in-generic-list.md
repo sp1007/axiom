@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 25
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tests/parse/view_in_generic_args]
 locks: [compiler/syntax/parse.ax]
 spec: [spec/SPEC-02-grammar.md]
 covers: [REQ-GRM-151, REQ-GRM-076]
+started: 2026-11-28 19:58:29
+finished: 2026-11-28 21:39:16
 ---
 # T428p — A capability type closes a generic list like any other type
 
@@ -45,3 +47,5 @@ argument lists (~1121), but the `view<T>` / `mut_view<T>` type parser (`TOK_KW_V
 
 ## Log
 - 2026-11-26 created by architect (`_workspaces/reports/unblock-T428m.md`)
+- 2026-11-28 19:58:29 started (attempt 1) axiom-frontend
+- 2026-11-28 21:39:16 accepted by QA -> done
