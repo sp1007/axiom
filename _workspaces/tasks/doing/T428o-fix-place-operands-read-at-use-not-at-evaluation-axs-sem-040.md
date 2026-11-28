@@ -8,13 +8,15 @@ model: opus
 gate_model: opus
 depends: [T428j]
 priority: 25
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 timeout_min: 240
 paths: [tests/run/eval_order_operand_snapshot]
 locks: [compiler/mir/builder.ax]
 spec: [spec/SPEC-03-core-semantics.md]
 covers: [REQ-EXP-007, REQ-MIR-006, REQ-CORE-025, REQ-CORE-026]
+started: 2026-11-28 16:11:45
+agent: axiom-semantics
 ---
 # T428o — Operands keep the value they had when they were evaluated
 
@@ -75,3 +77,4 @@ clear, all three execution modes agree on the wrong value (so no differential te
 
 ## Log
 - 2026-11-26 created by architect (`_workspaces/reports/triage-2026-11-26-T502-regression.md`)
+- 2026-11-28 16:11:45 started (attempt 1) axiom-semantics

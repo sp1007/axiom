@@ -8,7 +8,7 @@ model: opus
 gate_model: opus
 depends: [T428a]
 priority: 11
-status: doing
+status: done
 attempts: 1
 timeout_min: 240
 paths: [tests/resolve/generic_args_binding, tests/ui/impl_generic_in_method_bound/qa_adversarial_bounds_unresolved_fnonce.ax]
@@ -17,7 +17,7 @@ spec: [spec/SPEC-02-grammar.md, spec/SPEC-03-core-semantics.md]
 covers: [REQ-MOD-003, REQ-MOD-064]
 started: 2026-11-26 23:26:36
 unblocks: 1
-agent: T428m-impl
+finished: 2026-11-28 16:45:51
 ---
 # T428m — Every path inside a generic argument list is resolved in the enclosing scope
 
@@ -105,3 +105,4 @@ AST node, so once the resolver binds the segment the `HirPath` carries `symbol/d
   `link/dll/gnu_ld_run.test` -> baseline (T423j), `ui/security_profiles/forbid_unsafe_constructs_neg.ax` -> baseline (T540)
 - 2026-11-26 20:34:57 unblocked (cycle 1) 
 - 2026-11-26 23:26:36 started (attempt 1) T428m-impl
+- 2026-11-28 16:45:51 accepted by QA -> done
